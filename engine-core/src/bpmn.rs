@@ -83,16 +83,65 @@ pub enum ParseError {
     /// deployment (`INVALID_ARGUMENT` → HTTP 400) rather than silently dropping
     /// the link, so Nano surfaces it as a hard parse error for parity.
     InvalidLinkedResource { task_id: String, attribute: String },
-    /// A flow node's `<incoming>`/`<outgoing>` child references a `sequenceFlow`
-    /// id that is not declared anywhere in the process. These are QName element
-    /// references to `SequenceFlow` (`FlowNodeImpl` `incoming`/`outgoing`
-    /// collections); Zeebe rejects an unresolved reference at deploy with
+    /// A dangling QName/id reference: a reference site (`kind`) points at an
+    /// `id` that is not declared anywhere the reference can resolve against.
+    ///
+    /// This is the **single** unresolved-reference variant shared across the
+    /// whole deploy-validation-parity epic (#850). `kind` names the reference
+    /// site — one of `"incoming"`, `"outgoing"`, `"messageRef"`, `"errorRef"`,
+    /// `"signalRef"`, `"escalationRef"`, `"linkThrow"`, `"default"`,
+    /// `"attachedToRef"` — and `id` is the dangling id. Zeebe resolves these
+    /// QName references eagerly and rejects an unresolved one at deploy with
     /// `INVALID_ARGUMENT`, so Nano does the same rather than silently accepting.
-    UnresolvedFlowReference {
+    /// Sibling validators reuse this variant; do **not** add per-ref bespoke
+    /// variants.
+    UnresolvedReference { kind: String, id: String },
+    /// An unmodelled flow-element tag or event definition that Nano's parser
+    /// does not recognise (e.g. `complexGateway`, `transaction`,
+    /// `compensateEventDefinition`). Zeebe only transforms known element types
+    /// and rejects the rest at deploy; Nano surfaces the offending `tag` and
+    /// `element_id` rather than silently dropping it. Raised by the
+    /// `unsupported_elements` validator (#853).
+    UnsupportedElement { tag: String, element_id: String },
+    /// A gateway with more than one outgoing flow declared a non-default branch
+    /// with no condition (an exclusive/inclusive gateway must gate every
+    /// non-default outgoing branch with a condition, or make it the `default`).
+    /// Raised by the `gateway_conditions` validator (#854).
+    InvalidGateway {
         process_id: String,
-        node_id: String,
-        direction: &'static str,
-        flow_id: String,
+        gateway_id: String,
+        reason: String,
+    },
+    /// A process's start events violate Zeebe's start-event rules: it has no
+    /// start event ("must have at least one start event"), or it declares more
+    /// than one *none* start event ("multiple none start events are not
+    /// allowed"). Raised by the `start_events` validator (#855).
+    InvalidStartEvents { process_id: String, reason: String },
+    /// An end event declares an outgoing sequence flow (an end event must have
+    /// no outgoing flow). Raised by the `cheap_rules` validator (#856).
+    InvalidEndEvent {
+        process_id: String,
+        element_id: String,
+        reason: String,
+    },
+    /// Two start events in one process correlate on the same message or signal
+    /// (no duplicate message/signal start events). `correlation_kind` is
+    /// `"message"` or `"signal"` and `reference` is the shared id/name. Raised
+    /// by the `cheap_rules` validator (#856).
+    DuplicateStartEvent {
+        process_id: String,
+        correlation_kind: String,
+        reference: String,
+        reason: String,
+    },
+    /// A required `zeebe:taskDefinition` attribute is present but empty (its
+    /// `type` — and `retries` when declared — must be non-empty). Raised by the
+    /// `cheap_rules` validator (#856).
+    InvalidTaskDefinition {
+        process_id: String,
+        task_id: String,
+        attribute: String,
+        reason: String,
     },
 }
 
@@ -124,21 +173,155 @@ impl std::fmt::Display for ParseError {
                     "linkedResource on '{task_id}' is missing required attribute '{attribute}'"
                 )
             }
-            ParseError::UnresolvedFlowReference {
+            ParseError::UnresolvedReference { kind, id } => write!(
+                f,
+                "unresolved {kind} reference to '{id}': the referenced element is not declared"
+            ),
+            ParseError::UnsupportedElement { tag, element_id } => write!(
+                f,
+                "unsupported element <{tag}> (id '{element_id}'): Nano does not model this construct"
+            ),
+            ParseError::InvalidGateway {
                 process_id,
-                node_id,
-                direction,
-                flow_id,
+                gateway_id,
+                reason,
             } => write!(
                 f,
-                "process {process_id}: flow node '{node_id}' has an {direction} \
-                 reference to sequenceFlow '{flow_id}', which is not declared"
+                "process {process_id}: gateway '{gateway_id}' is invalid: {reason}"
+            ),
+            ParseError::InvalidStartEvents { process_id, reason } => {
+                write!(f, "process {process_id}: {reason}")
+            }
+            ParseError::InvalidEndEvent {
+                process_id,
+                element_id,
+                reason,
+            } => write!(
+                f,
+                "process {process_id}: end event '{element_id}' is invalid: {reason}"
+            ),
+            ParseError::DuplicateStartEvent {
+                process_id,
+                correlation_kind,
+                reference,
+                reason,
+            } => write!(
+                f,
+                "process {process_id}: duplicate {correlation_kind} start event on '{reference}': {reason}"
+            ),
+            ParseError::InvalidTaskDefinition {
+                process_id,
+                task_id,
+                attribute,
+                reason,
+            } => write!(
+                f,
+                "process {process_id}: task '{task_id}' zeebe:taskDefinition attribute '{attribute}' is invalid: {reason}"
             ),
         }
     }
 }
 
 impl std::error::Error for ParseError {}
+
+/// Whether a tag reaching the in-process catch-all is genuinely ignorable
+/// non-flow noise (diagram interchange, documentation, extension-element
+/// children Nano reads elsewhere, structural/data/collaboration BPMN, and the
+/// event definitions Nano *does* model), as opposed to an unmodelled flow
+/// element / event definition that must be recorded for the unsupported-element
+/// validator (#853).
+///
+/// This is deliberately an *exclusion* list of noise: anything not listed here
+/// is recorded as a candidate unmodelled element, and #853 decides — from the
+/// canonical supported-element registry — which recorded candidates are
+/// genuinely unsupported. Over-recording a rare non-flow tag is harmless (the
+/// validator filters it); silently dropping a real flow element is the bug this
+/// closes.
+fn is_ignorable_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        // Diagram interchange (BPMNDI / OMGDI / DC).
+        "BPMNDiagram"
+            | "BPMNPlane"
+            | "BPMNShape"
+            | "BPMNLabel"
+            | "BPMNLabelStyle"
+            | "BPMNEdge"
+            | "DiagramElement"
+            | "Bounds"
+            | "waypoint"
+            | "Label"
+            | "Font"
+            // Documentation / extension containers (their meaningful children are
+            // matched explicitly above, or intentionally ignored).
+            | "documentation"
+            | "extensionElements"
+            | "text"
+            | "modelerTemplate"
+            | "userTaskForm"
+            // Event definitions Nano *does* model (timer via <timeDuration>,
+            // message/signal/error/escalation/link via their refs, conditional
+            // via <condition>) — not "unsupported", so never recorded.
+            | "timerEventDefinition"
+            | "messageEventDefinition"
+            | "signalEventDefinition"
+            | "errorEventDefinition"
+            | "escalationEventDefinition"
+            | "linkEventDefinition"
+            | "conditionalEventDefinition"
+            // Nested value/config children of already-modelled constructs.
+            | "condition"
+            | "conditionExpression"
+            | "timeDuration"
+            | "timeCycle"
+            | "timeDate"
+            | "completionCondition"
+            | "loopCardinality"
+            | "activationCondition"
+            | "transitionCondition"
+            | "incoming"
+            | "outgoing"
+            // Structural / data / collaboration / resourcing elements that carry
+            // no executable flow semantics for Nano.
+            | "laneSet"
+            | "lane"
+            | "flowNodeRef"
+            | "childLaneSet"
+            | "dataObject"
+            | "dataObjectReference"
+            | "dataStore"
+            | "dataStoreReference"
+            | "property"
+            | "dataInput"
+            | "dataOutput"
+            | "dataInputAssociation"
+            | "dataOutputAssociation"
+            | "inputSet"
+            | "outputSet"
+            | "ioSpecification"
+            | "sourceRef"
+            | "targetRef"
+            | "association"
+            | "group"
+            | "textAnnotation"
+            | "participant"
+            | "collaboration"
+            | "messageFlow"
+            | "category"
+            | "categoryValue"
+            | "categoryValueRef"
+            | "auditing"
+            | "monitoring"
+            | "relationship"
+            | "resource"
+            | "resourceRef"
+            | "resourceAssignmentExpression"
+            | "potentialOwner"
+            | "humanPerformer"
+            | "performer"
+            | "rendering"
+    )
+}
 
 /// Parses BPMN 2.0 XML into the executable [`ProcessDefinition`]s it contains.
 ///
@@ -190,6 +373,11 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // Index of the intermediate catch event currently being read (timer or
     // message), and a buffer for its nested `timeDuration` text while inside it.
     let mut cur_intermediate: Option<usize> = None;
+    // Index of the intermediate *throw* event currently being read, so a nested
+    // `linkEventDefinition` (a throw link) is captured with its source node.
+    // Throw events are pass-throughs for execution, but the reference-integrity
+    // validator (#851) needs the link name to check throw↔catch pairing.
+    let mut cur_throw: Option<usize> = None;
     // Index of the call activity currently being read, so a nested
     // `zeebe:calledElement processId="…"` child can record its callee.
     let mut cur_call: Option<usize> = None;
@@ -210,6 +398,11 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     let mut cur_message: Option<String> = None;
     // Definitions-level `<signal id=… name=…>` declarations: id -> name.
     let mut signals: HashMap<String, String> = HashMap::new();
+    // Definitions-level `<escalation id=… name=…>` declarations: id -> name.
+    // Captured so the reference-integrity validator (#851) can resolve an
+    // `escalationRef` against a declared escalation. The parser does not model
+    // escalation execution today; this only records the declarations.
+    let mut escalations: HashMap<String, String> = HashMap::new();
     // Stack of activity node indices that can carry a `zeebe:ioMapping`, so a
     // nested `zeebe:input`/`zeebe:output` attaches to the innermost open
     // activity. `in_io_mapping` gates input/output reads to a real ioMapping.
@@ -296,6 +489,18 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     "signal" => {
                         if let Some(id) = attr(attrs, "id") {
                             signals.insert(
+                                id.to_string(),
+                                attr(attrs, "name").unwrap_or(id).to_string(),
+                            );
+                        }
+                    }
+                    // Definitions-level escalation declarations live outside
+                    // <process>; referenced by an `escalationEventDefinition
+                    // escalationRef`. Not modelled for execution — recorded so the
+                    // reference-integrity validator (#851) can resolve the ref.
+                    "escalation" => {
+                        if let Some(id) = attr(attrs, "id") {
+                            escalations.insert(
                                 id.to_string(),
                                 attr(attrs, "name").unwrap_or(id).to_string(),
                             );
@@ -486,9 +691,49 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 }
                             }
                             "errorEventDefinition" => {
+                                let error_ref = attr(attrs, "errorRef").unwrap_or("").to_string();
                                 if let Some(boundary) = cur_boundary.as_mut() {
-                                    boundary.error_ref =
-                                        Some(attr(attrs, "errorRef").unwrap_or("").to_string());
+                                    boundary.error_ref = Some(error_ref);
+                                } else if let Some(idx) =
+                                    flow_node_stack.iter().rev().find_map(|e| *e)
+                                {
+                                    // An `errorRef` on a non-boundary error event
+                                    // (an error end / throw event). Recorded so the
+                                    // reference-integrity validator (#851) can
+                                    // resolve it against declared `<error>`s.
+                                    let node_id = acc.nodes[idx].id.clone();
+                                    acc.error_refs_extra.push((node_id, error_ref));
+                                }
+                            }
+                            // `escalationEventDefinition escalationRef="…"` on an
+                            // escalation throw/catch/boundary event. Not modelled
+                            // for execution; the ref is recorded for #851.
+                            "escalationEventDefinition" => {
+                                let escalation_ref =
+                                    attr(attrs, "escalationRef").unwrap_or("").to_string();
+                                let owner = if let Some(boundary) = cur_boundary.as_ref() {
+                                    Some(boundary.id.clone())
+                                } else {
+                                    flow_node_stack
+                                        .iter()
+                                        .rev()
+                                        .find_map(|e| *e)
+                                        .map(|i| acc.nodes[i].id.clone())
+                                };
+                                if let Some(node_id) = owner {
+                                    acc.escalation_refs.push((node_id, escalation_ref));
+                                }
+                            }
+                            // `linkEventDefinition name="…"` on an intermediate
+                            // link throw or catch event. Recorded by direction so
+                            // #851 can verify each throw link has a matching catch
+                            // (Zeebe `ModelUtil.verifyLinkIntermediateEvents`).
+                            "linkEventDefinition" => {
+                                let link_name = attr(attrs, "name").unwrap_or("").to_string();
+                                if cur_throw.is_some() {
+                                    acc.link_throws.push(link_name);
+                                } else if cur_intermediate.is_some() {
+                                    acc.link_catches.push(link_name);
                                 }
                             }
                             "messageEventDefinition" => {
@@ -658,7 +903,10 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             // straight to its outgoing flow. Any nested event
                             // definition is ignored.
                             "intermediateThrowEvent" => {
-                                acc.add_node(attrs, NodeKind::IntermediateThrow);
+                                let idx = acc.add_node(attrs, NodeKind::IntermediateThrow);
+                                if !self_closing {
+                                    cur_throw = idx;
+                                }
                             }
                             // An abstract `task` (or `manualTask`) has no
                             // execution semantics — Zeebe/C8 accept it and treat
@@ -965,7 +1213,24 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     );
                                 }
                             }
-                            _ => {}
+                            // Any other tag inside a <process> the parser does
+                            // not model. Instead of silently dropping it (which
+                            // makes a flow into it fail deploy with a misleading
+                            // "unknown target element" error, or an unattached
+                            // element deploy clean and mis-execute), record
+                            // genuinely-unmodelled flow elements / event
+                            // definitions as `(tag, element_id)`. The
+                            // unsupported-elements validator (#853) consumes this
+                            // list; an explicit ignore-list keeps out non-flow
+                            // noise (DI, documentation, extensionElements children
+                            // Nano reads elsewhere, structural BPMN, and the event
+                            // definitions Nano does model).
+                            other => {
+                                if !is_ignorable_tag(other) {
+                                    let element_id = attr(attrs, "id").unwrap_or("").to_string();
+                                    acc.unmodelled.push((other.to_string(), element_id));
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -1015,6 +1280,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     cur_flow = None;
                     cur_boundary = None;
                     cur_intermediate = None;
+                    cur_throw = None;
                     duration_text = None;
                     cur_start = None;
                     cycle_text = None;
@@ -1137,6 +1403,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     }
                     cur_intermediate = None;
                 }
+                "intermediateThrowEvent" => cur_throw = None,
                 "multiInstanceLoopCharacteristics" => cur_multi_instance = None,
                 "completionCondition" => {
                     if let Some(text) = completion_condition_text.take() {
@@ -1251,15 +1518,24 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
 
     processes
         .into_iter()
-        .map(|acc| acc.build(&errors, &messages, &signals))
-        // Retain the verbatim source XML on each parsed definition so it can be
-        // served back (getProcessDefinitionXML / console diagram). Every process
-        // in one resource shares that resource's XML.
-        .map(|def| {
-            def.map(|d| ProcessDefinition {
+        .map(|acc| {
+            // Snapshot the raw parse data for post-parse validation before the
+            // builder consumes the accumulator.
+            let capture = acc.capture(&errors, &messages, &signals, &escalations);
+            let def = acc.build(&errors, &messages, &signals)?;
+            // Retain the verbatim source XML on each parsed definition so it can
+            // be served back (getProcessDefinitionXML / console diagram). Every
+            // process in one resource shares that resource's XML.
+            let def = ProcessDefinition {
                 xml: xml.to_string(),
-                ..d
-            })
+                ..def
+            };
+            // Run the post-parse validators (deploy-validation parity, #850).
+            crate::validate::run(&crate::validate::ValidationInput {
+                def: &def,
+                capture: &capture,
+            })?;
+            Ok(def)
         })
         .collect()
 }
@@ -1454,6 +1730,25 @@ struct ProcessAcc {
     /// `<incoming>`/`<outgoing>` references declared on flow nodes, resolved
     /// against `flows` at build time.
     flow_refs: Vec<FlowRef>,
+    /// `escalationRef`s declared on `escalationEventDefinition`s, as
+    /// `(node_id, escalation_ref)`. Consumed by the reference-integrity
+    /// validator (#851); escalation is not modelled for execution.
+    escalation_refs: Vec<(String, String)>,
+    /// `errorRef`s declared on `errorEventDefinition`s that are **not** on a
+    /// boundary event (i.e. on end/throw error events), as `(node_id,
+    /// error_ref)`. Boundary `errorRef`s are resolved in `build`; these are the
+    /// extra sites the reference-integrity validator (#851) generalises over.
+    error_refs_extra: Vec<(String, String)>,
+    /// Link names declared on `linkEventDefinition`s of intermediate *throw*
+    /// events (consumed by #851's throw↔catch pairing check).
+    link_throws: Vec<String>,
+    /// Link names declared on `linkEventDefinition`s of intermediate *catch*
+    /// events (consumed by #851's throw↔catch pairing check).
+    link_catches: Vec<String>,
+    /// Flow-element tags / event definitions the streaming parser does not
+    /// model, recorded as `(tag, element_id)` instead of being silently
+    /// dropped. Consumed by the unsupported-elements validator (#853).
+    unmodelled: Vec<(String, String)>,
     /// Stack of open embedded sub-process ids, used to scope nested nodes.
     scope_stack: Vec<String>,
 }
@@ -1467,6 +1762,11 @@ impl ProcessAcc {
             flows: Vec::new(),
             boundaries: Vec::new(),
             flow_refs: Vec::new(),
+            escalation_refs: Vec::new(),
+            error_refs_extra: Vec::new(),
+            link_throws: Vec::new(),
+            link_catches: Vec::new(),
+            unmodelled: Vec::new(),
             scope_stack: Vec::new(),
         }
     }
@@ -1525,6 +1825,142 @@ impl ProcessAcc {
         Some(self.flows.len() - 1)
     }
 
+    /// Snapshots the raw parse data a post-parse validator may need into a
+    /// [`ProcessCapture`](crate::validate::ProcessCapture), owning all of it so
+    /// the accumulator can then be consumed by [`build`](Self::build). Called
+    /// *before* `build` so reference sites are seen against the raw parsed flows
+    /// (before ad-hoc pruning), mirroring what Zeebe validates at deploy.
+    fn capture(
+        &self,
+        errors: &HashMap<String, String>,
+        messages: &HashMap<String, MessageDecl>,
+        signals: &HashMap<String, String>,
+        escalations: &HashMap<String, String>,
+    ) -> crate::validate::ProcessCapture {
+        use crate::validate::{FlowRefCapture, RefSite, TaskDefCapture, UnmodelledElement};
+
+        let flow_ids = self
+            .flows
+            .iter()
+            .filter_map(|f| f.id.clone())
+            .collect::<std::collections::HashSet<String>>();
+
+        let flow_refs = self
+            .flow_refs
+            .iter()
+            .map(|r| FlowRefCapture {
+                node_id: r.node_id.clone(),
+                direction: r.direction,
+                flow_id: r.flow_id.clone(),
+            })
+            .collect();
+
+        // Gather every non-`<incoming>`/`<outgoing>` reference site the parser
+        // recorded onto nodes, boundaries and the dedicated escalation/error
+        // vecs, keyed by the reference kind #851 resolves against.
+        let mut references: Vec<RefSite> = Vec::new();
+        for node in &self.nodes {
+            if let Some(id) = &node.message_ref {
+                references.push(RefSite {
+                    kind: "messageRef",
+                    id: id.clone(),
+                    from_node: node.id.clone(),
+                });
+            }
+            if let Some(id) = &node.signal_ref {
+                references.push(RefSite {
+                    kind: "signalRef",
+                    id: id.clone(),
+                    from_node: node.id.clone(),
+                });
+            }
+            if let Some(id) = &node.default_flow {
+                references.push(RefSite {
+                    kind: "default",
+                    id: id.clone(),
+                    from_node: node.id.clone(),
+                });
+            }
+        }
+        for boundary in &self.boundaries {
+            if let Some(id) = &boundary.attached_to {
+                references.push(RefSite {
+                    kind: "attachedToRef",
+                    id: id.clone(),
+                    from_node: boundary.id.clone(),
+                });
+            }
+            if let Some(id) = &boundary.error_ref {
+                references.push(RefSite {
+                    kind: "errorRef",
+                    id: id.clone(),
+                    from_node: boundary.id.clone(),
+                });
+            }
+            if let Some(id) = &boundary.message_ref {
+                references.push(RefSite {
+                    kind: "messageRef",
+                    id: id.clone(),
+                    from_node: boundary.id.clone(),
+                });
+            }
+            if let Some(id) = &boundary.signal_ref {
+                references.push(RefSite {
+                    kind: "signalRef",
+                    id: id.clone(),
+                    from_node: boundary.id.clone(),
+                });
+            }
+        }
+        for (node_id, escalation_ref) in &self.escalation_refs {
+            references.push(RefSite {
+                kind: "escalationRef",
+                id: escalation_ref.clone(),
+                from_node: node_id.clone(),
+            });
+        }
+        for (node_id, error_ref) in &self.error_refs_extra {
+            references.push(RefSite {
+                kind: "errorRef",
+                id: error_ref.clone(),
+                from_node: node_id.clone(),
+            });
+        }
+
+        let task_definitions = self
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Service))
+            .map(|n| TaskDefCapture {
+                task_id: n.id.clone(),
+                job_type: n.job_type.clone(),
+                retries: n.retries.clone(),
+            })
+            .collect();
+
+        crate::validate::ProcessCapture {
+            process_id: self.id.clone(),
+            flow_ids,
+            flow_refs,
+            references,
+            link_throws: self.link_throws.clone(),
+            link_catches: self.link_catches.clone(),
+            unmodelled: self
+                .unmodelled
+                .iter()
+                .map(|(tag, element_id)| UnmodelledElement {
+                    tag: tag.clone(),
+                    element_id: element_id.clone(),
+                })
+                .collect(),
+            declared_messages: messages.keys().cloned().collect(),
+            declared_errors: errors.keys().cloned().collect(),
+            declared_signals: signals.keys().cloned().collect(),
+            declared_escalations: escalations.keys().cloned().collect(),
+            task_definitions,
+        }
+    }
+
     /// Assembles the [`ProcessDefinition`] via [`ProcessBuilder`].
     ///
     /// `errors` maps definitions-level `<error>` ids to their codes, used to
@@ -1537,27 +1973,6 @@ impl ProcessAcc {
         messages: &HashMap<String, MessageDecl>,
         signals: &HashMap<String, String>,
     ) -> Result<ProcessDefinition, ParseError> {
-        // Resolve every flow node's `<incoming>`/`<outgoing>` QName reference
-        // against the declared `<sequenceFlow>` ids (parity with Zeebe's
-        // `qNameElementReferenceCollection(SequenceFlow.class)` resolution).
-        // Nano otherwise builds the graph solely from `sequenceFlow`
-        // `sourceRef`/`targetRef` and ignores these child references, so a
-        // dangling reference would be silently accepted where Zeebe rejects the
-        // deploy with `INVALID_ARGUMENT`. Checked here against the raw parsed
-        // flows, before any ad-hoc pruning below, to mirror what Zeebe sees.
-        let flow_ids: std::collections::HashSet<&str> =
-            self.flows.iter().filter_map(|f| f.id.as_deref()).collect();
-        for r in &self.flow_refs {
-            if !flow_ids.contains(r.flow_id.as_str()) {
-                return Err(ParseError::UnresolvedFlowReference {
-                    process_id: self.id.clone(),
-                    node_id: r.node_id.clone(),
-                    direction: r.direction,
-                    flow_id: r.flow_id.clone(),
-                });
-            }
-        }
-
         // Ad-hoc sub-processes are kept as a single Service job activity; the
         // elements they contain (agent "tools", invoked out-of-band rather than by
         // token flow) are pruned from the executable graph, along with any
@@ -2330,11 +2745,9 @@ mod tests {
         let err = parse_bpmn(xml).unwrap_err();
         assert_eq!(
             err,
-            ParseError::UnresolvedFlowReference {
-                process_id: "invalid-process".to_string(),
-                node_id: "Start".to_string(),
-                direction: "outgoing",
-                flow_id: "Flow_missing".to_string(),
+            ParseError::UnresolvedReference {
+                kind: "outgoing".to_string(),
+                id: "Flow_missing".to_string(),
             }
         );
     }
@@ -2356,11 +2769,9 @@ mod tests {
         let err = parse_bpmn(xml).unwrap_err();
         assert_eq!(
             err,
-            ParseError::UnresolvedFlowReference {
-                process_id: "invalid-in".to_string(),
-                node_id: "e".to_string(),
-                direction: "incoming",
-                flow_id: "Flow_missing".to_string(),
+            ParseError::UnresolvedReference {
+                kind: "incoming".to_string(),
+                id: "Flow_missing".to_string(),
             }
         );
     }
@@ -2391,32 +2802,99 @@ mod tests {
     #[test]
     fn should_attribute_container_flow_refs_to_the_container_not_a_nested_child() {
         // A container flow node (`subProcess`/`adHocSubProcess`) whose
-        // `<incoming>`/`<outgoing>` follow its nested elements must attribute the
-        // reference to the container itself, not the most recently *added* (now
-        // closed) child. Regression guard for the review finding on issue #849:
-        // a single "last added node" pointer misattributes the `node_id` here.
-        // The `<outgoing>` is placed after the nested (non-self-closing) child so
-        // the last-added node is `InnerStart`, yet the owner must be `Sub`.
+        // `<incoming>`/`<outgoing>` follow its nested elements must still have
+        // its reference captured and validated against the container, not the
+        // most recently *added* (now closed) child. Regression guard for the
+        // review finding on issue #849: a single "last added node" pointer would
+        // misattribute the reference to `InnerStart` and could mask it. The
+        // `<outgoing>` is placed after the nested (non-self-closing) child, and
+        // the dangling reference must still be rejected.
         let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
             <bpmn:process id="container-attr" isExecutable="true">
+              <bpmn:startEvent id="Start"><bpmn:outgoing>toSub</bpmn:outgoing></bpmn:startEvent>
               <bpmn:subProcess id="Sub">
-                <bpmn:startEvent id="InnerStart"></bpmn:startEvent>
+                <bpmn:startEvent id="InnerStart"><bpmn:outgoing>i1</bpmn:outgoing></bpmn:startEvent>
+                <bpmn:endEvent id="InnerEnd"><bpmn:incoming>i1</bpmn:incoming></bpmn:endEvent>
+                <bpmn:sequenceFlow id="i1" sourceRef="InnerStart" targetRef="InnerEnd" />
                 <bpmn:outgoing>Flow_missing</bpmn:outgoing>
               </bpmn:subProcess>
+              <bpmn:endEvent id="End"><bpmn:incoming>fromSub</bpmn:incoming></bpmn:endEvent>
+              <bpmn:sequenceFlow id="toSub" sourceRef="Start" targetRef="Sub" />
+              <bpmn:sequenceFlow id="fromSub" sourceRef="Sub" targetRef="End" />
             </bpmn:process>
           </bpmn:definitions>"#;
 
         let err = parse_bpmn(xml).unwrap_err();
         assert_eq!(
             err,
-            ParseError::UnresolvedFlowReference {
-                process_id: "container-attr".to_string(),
-                node_id: "Sub".to_string(),
-                direction: "outgoing",
-                flow_id: "Flow_missing".to_string(),
+            ParseError::UnresolvedReference {
+                kind: "outgoing".to_string(),
+                id: "Flow_missing".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn should_reject_the_whole_dangling_incoming_outgoing_reference_class() {
+        // Class-scoped guard (red on `main`, green here): assert the whole
+        // defect class — a dangling `<incoming>` or `<outgoing>` reference on any
+        // flow node is rejected as an `UnresolvedReference`, while a model whose
+        // references all resolve is accepted. Parametrised over direction and
+        // owning-node kind so a future regression on any single site fails here.
+        struct Case {
+            name: &'static str,
+            body: &'static str,
+            expect: Option<(&'static str, &'static str)>, // (kind, id) on reject
+        }
+        let cases = [
+            Case {
+                name: "dangling outgoing on a start event",
+                body: r#"<bpmn:startEvent id="s"><bpmn:outgoing>missing</bpmn:outgoing></bpmn:startEvent>"#,
+                expect: Some(("outgoing", "missing")),
+            },
+            Case {
+                name: "dangling incoming on an end event",
+                body: r#"<bpmn:startEvent id="s"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+                         <bpmn:endEvent id="e"><bpmn:incoming>missing</bpmn:incoming></bpmn:endEvent>
+                         <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="e" />"#,
+                expect: Some(("incoming", "missing")),
+            },
+            Case {
+                name: "dangling outgoing on a task",
+                body: r#"<bpmn:startEvent id="s" />
+                         <bpmn:task id="t"><bpmn:outgoing>missing</bpmn:outgoing></bpmn:task>
+                         <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="t" />"#,
+                expect: Some(("outgoing", "missing")),
+            },
+            Case {
+                name: "all references resolve",
+                body: r#"<bpmn:startEvent id="s"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+                         <bpmn:endEvent id="e"><bpmn:incoming>a</bpmn:incoming></bpmn:endEvent>
+                         <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="e" />"#,
+                expect: None,
+            },
+        ];
+        for case in cases {
+            let xml = format!(
+                r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+                     <bpmn:process id="p" isExecutable="true">{}</bpmn:process>
+                   </bpmn:definitions>"#,
+                case.body
+            );
+            match (parse_bpmn(&xml), case.expect) {
+                (Err(ParseError::UnresolvedReference { kind, id }), Some((ek, eid))) => {
+                    assert_eq!(
+                        (kind.as_str(), id.as_str()),
+                        (ek, eid),
+                        "case: {}",
+                        case.name
+                    );
+                }
+                (Ok(_), None) => {}
+                (other, _) => panic!("case {}: unexpected result {other:?}", case.name),
+            }
+        }
     }
 
     #[test]
