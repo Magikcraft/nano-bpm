@@ -24,6 +24,8 @@ pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
             return Err(ParseError::UnresolvedReference {
                 kind: reference.direction.to_string(),
                 id: reference.flow_id.clone(),
+                process_id: capture.process_id.clone(),
+                from_node: reference.node_id.clone(),
             });
         }
     }

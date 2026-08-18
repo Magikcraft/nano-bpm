@@ -94,8 +94,16 @@ pub enum ParseError {
     /// QName references eagerly and rejects an unresolved one at deploy with
     /// `INVALID_ARGUMENT`, so Nano does the same rather than silently accepting.
     /// Sibling validators reuse this variant; do **not** add per-ref bespoke
-    /// variants.
-    UnresolvedReference { kind: String, id: String },
+    /// variants. `process_id` names the owning `<process>` and `from_node` the
+    /// id of the element that *declared* the dangling reference, so a deploy
+    /// failure and its regression tests can attribute the reference to its
+    /// declaring element rather than losing that context.
+    UnresolvedReference {
+        kind: String,
+        id: String,
+        process_id: String,
+        from_node: String,
+    },
     /// An unmodelled flow-element tag or event definition that Nano's parser
     /// does not recognise (e.g. `complexGateway`, `transaction`,
     /// `compensateEventDefinition`). Zeebe only transforms known element types
@@ -173,9 +181,14 @@ impl std::fmt::Display for ParseError {
                     "linkedResource on '{task_id}' is missing required attribute '{attribute}'"
                 )
             }
-            ParseError::UnresolvedReference { kind, id } => write!(
+            ParseError::UnresolvedReference {
+                kind,
+                id,
+                process_id,
+                from_node,
+            } => write!(
                 f,
-                "unresolved {kind} reference to '{id}': the referenced element is not declared"
+                "process {process_id}: unresolved {kind} reference to '{id}' on element '{from_node}': the referenced element is not declared"
             ),
             ParseError::UnsupportedElement { tag, element_id } => write!(
                 f,
@@ -1227,7 +1240,23 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             // definitions Nano does model).
                             other => {
                                 if !is_ignorable_tag(other) {
-                                    let element_id = attr(attrs, "id").unwrap_or("").to_string();
+                                    // Prefer the tag's own `id`, but many
+                                    // unmodelled constructs (notably event
+                                    // definitions) carry no `id`; attribute those
+                                    // to the owning open flow node so the
+                                    // unsupported-elements error stays actionable
+                                    // instead of recording an empty id. Mirrors the
+                                    // `errorEventDefinition`/`escalationEventDefinition`
+                                    // owner-attribution above.
+                                    let element_id = match attr(attrs, "id") {
+                                        Some(id) => id.to_string(),
+                                        None => flow_node_stack
+                                            .iter()
+                                            .rev()
+                                            .find_map(|e| *e)
+                                            .map(|i| acc.nodes[i].id.clone())
+                                            .unwrap_or_default(),
+                                    };
                                     acc.unmodelled.push((other.to_string(), element_id));
                                 }
                             }
@@ -1747,7 +1776,10 @@ struct ProcessAcc {
     link_catches: Vec<String>,
     /// Flow-element tags / event definitions the streaming parser does not
     /// model, recorded as `(tag, element_id)` instead of being silently
-    /// dropped. Consumed by the unsupported-elements validator (#853).
+    /// dropped. `element_id` is the tag's own `id`, or — when the tag is
+    /// anonymous (event definitions commonly are) — the id of its owning open
+    /// flow node, so the unsupported-elements error stays actionable. Consumed
+    /// by the unsupported-elements validator (#853).
     unmodelled: Vec<(String, String)>,
     /// Stack of open embedded sub-process ids, used to scope nested nodes.
     scope_stack: Vec<String>,
@@ -2748,6 +2780,8 @@ mod tests {
             ParseError::UnresolvedReference {
                 kind: "outgoing".to_string(),
                 id: "Flow_missing".to_string(),
+                process_id: "invalid-process".to_string(),
+                from_node: "Start".to_string(),
             }
         );
     }
@@ -2772,6 +2806,8 @@ mod tests {
             ParseError::UnresolvedReference {
                 kind: "incoming".to_string(),
                 id: "Flow_missing".to_string(),
+                process_id: "invalid-in".to_string(),
+                from_node: "e".to_string(),
             }
         );
     }
@@ -2808,7 +2844,9 @@ mod tests {
         // review finding on issue #849: a single "last added node" pointer would
         // misattribute the reference to `InnerStart` and could mask it. The
         // `<outgoing>` is placed after the nested (non-self-closing) child, and
-        // the dangling reference must still be rejected.
+        // the dangling reference must still be rejected **and attributed to the
+        // container `Sub`** (not the nested `InnerStart`) — the `from_node`
+        // assertion below enforces that attribution claim directly.
         let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
             <bpmn:process id="container-attr" isExecutable="true">
@@ -2831,6 +2869,8 @@ mod tests {
             ParseError::UnresolvedReference {
                 kind: "outgoing".to_string(),
                 id: "Flow_missing".to_string(),
+                process_id: "container-attr".to_string(),
+                from_node: "Sub".to_string(),
             }
         );
     }
@@ -2845,27 +2885,27 @@ mod tests {
         struct Case {
             name: &'static str,
             body: &'static str,
-            expect: Option<(&'static str, &'static str)>, // (kind, id) on reject
+            expect: Option<(&'static str, &'static str, &'static str)>, // (kind, id, from_node) on reject
         }
         let cases = [
             Case {
                 name: "dangling outgoing on a start event",
                 body: r#"<bpmn:startEvent id="s"><bpmn:outgoing>missing</bpmn:outgoing></bpmn:startEvent>"#,
-                expect: Some(("outgoing", "missing")),
+                expect: Some(("outgoing", "missing", "s")),
             },
             Case {
                 name: "dangling incoming on an end event",
                 body: r#"<bpmn:startEvent id="s"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
                          <bpmn:endEvent id="e"><bpmn:incoming>missing</bpmn:incoming></bpmn:endEvent>
                          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="e" />"#,
-                expect: Some(("incoming", "missing")),
+                expect: Some(("incoming", "missing", "e")),
             },
             Case {
                 name: "dangling outgoing on a task",
                 body: r#"<bpmn:startEvent id="s" />
                          <bpmn:task id="t"><bpmn:outgoing>missing</bpmn:outgoing></bpmn:task>
                          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="t" />"#,
-                expect: Some(("outgoing", "missing")),
+                expect: Some(("outgoing", "missing", "t")),
             },
             Case {
                 name: "all references resolve",
@@ -2883,10 +2923,23 @@ mod tests {
                 case.body
             );
             match (parse_bpmn(&xml), case.expect) {
-                (Err(ParseError::UnresolvedReference { kind, id }), Some((ek, eid))) => {
+                (
+                    Err(ParseError::UnresolvedReference {
+                        kind,
+                        id,
+                        process_id,
+                        from_node,
+                    }),
+                    Some((ek, eid, efrom)),
+                ) => {
                     assert_eq!(
-                        (kind.as_str(), id.as_str()),
-                        (ek, eid),
+                        (
+                            kind.as_str(),
+                            id.as_str(),
+                            process_id.as_str(),
+                            from_node.as_str()
+                        ),
+                        (ek, eid, "p", efrom),
                         "case: {}",
                         case.name
                     );
