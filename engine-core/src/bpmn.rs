@@ -83,6 +83,17 @@ pub enum ParseError {
     /// deployment (`INVALID_ARGUMENT` → HTTP 400) rather than silently dropping
     /// the link, so Nano surfaces it as a hard parse error for parity.
     InvalidLinkedResource { task_id: String, attribute: String },
+    /// A flow node's `<incoming>`/`<outgoing>` child references a `sequenceFlow`
+    /// id that is not declared anywhere in the process. These are QName element
+    /// references to `SequenceFlow` (`FlowNodeImpl` `incoming`/`outgoing`
+    /// collections); Zeebe rejects an unresolved reference at deploy with
+    /// `INVALID_ARGUMENT`, so Nano does the same rather than silently accepting.
+    UnresolvedFlowReference {
+        process_id: String,
+        node_id: String,
+        direction: &'static str,
+        flow_id: String,
+    },
 }
 
 impl std::fmt::Display for ParseError {
@@ -113,6 +124,16 @@ impl std::fmt::Display for ParseError {
                     "linkedResource on '{task_id}' is missing required attribute '{attribute}'"
                 )
             }
+            ParseError::UnresolvedFlowReference {
+                process_id,
+                node_id,
+                direction,
+                flow_id,
+            } => write!(
+                f,
+                "process {process_id}: flow node '{node_id}' has an {direction} \
+                 reference to sequenceFlow '{flow_id}', which is not declared"
+            ),
         }
     }
 }
@@ -154,6 +175,12 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // A separate buffer for a conditional-event's nested `<condition>` FEEL text
     // (distinct from a sequence flow's `conditionExpression`).
     let mut event_condition_text: Option<String> = None;
+    // Buffer for the text content of a flow node's `<incoming>`/`<outgoing>`
+    // child (a QName reference to a sequenceFlow), plus the owning node id and
+    // reference direction so it can be resolved against declared flows later.
+    let mut flow_ref_text: Option<String> = None;
+    let mut flow_ref_owner: Option<String> = None;
+    let mut flow_ref_dir: &'static str = "outgoing";
     // A buffer for a multi-instance `<completionCondition>` FEEL text, and the
     // index of the activity whose `multiInstanceLoopCharacteristics` is open.
     let mut completion_condition_text: Option<String> = None;
@@ -187,6 +214,17 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // nested `zeebe:input`/`zeebe:output` attaches to the innermost open
     // activity. `in_io_mapping` gates input/output reads to a real ioMapping.
     let mut io_stack: Vec<usize> = Vec::new();
+    // Stack of currently-open elements, each recording the index of the flow
+    // node it opened (`Some`) or `None` for a non-flow-node element. A nested
+    // `<incoming>`/`<outgoing>` is attributed to the nearest enclosing flow node
+    // (the top-most `Some`), not merely the most recently *added* node: for a
+    // container flow node (`subProcess`/`adHocSubProcess`) whose
+    // `<incoming>`/`<outgoing>` follow its nested elements, the last-added node
+    // is an already-closed child, so a single pointer would misattribute the
+    // reference. One entry is pushed per non-self-closing start tag and popped
+    // per end tag (the tokenizer guarantees these balance), keeping the top in
+    // lockstep with the open element the reference is a direct child of.
+    let mut flow_node_stack: Vec<Option<usize>> = Vec::new();
     let mut in_io_mapping = false;
     // Gates `zeebe:executionListener` reads to a real `zeebe:executionListeners`
     // container; each listener attaches to the innermost open activity on the
@@ -206,12 +244,21 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     let mut in_linked_resources = false;
 
     for token in &tokens {
+        // An end tag closes an element: balance the open-element stack pushed on
+        // each non-self-closing start tag (see `flow_node_stack`). Done here so
+        // the per-tag `Token::End` arm below stays a plain match on the tag name.
+        if matches!(token, Token::End { .. }) {
+            flow_node_stack.pop();
+        }
         match token {
             Token::Start {
                 name,
                 attrs,
                 self_closing,
             } => {
+                // Number of flow nodes before dispatching this start tag, so we
+                // can tell whether it opened a new one (see `flow_node_stack`).
+                let nodes_before = current.as_ref().map(|acc| acc.nodes.len());
                 match local_name(name) {
                     "process" => {
                         let id = attr(attrs, "id").ok_or(ParseError::ProcessWithoutId)?;
@@ -655,6 +702,27 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             "conditionExpression" if cur_flow.is_some() => {
                                 condition_text = Some(String::new());
                             }
+                            // A flow node's `<incoming>`/`<outgoing>` QName
+                            // reference to a sequenceFlow. Its text content is the
+                            // referenced flow id; captured against the owning
+                            // (nearest enclosing) flow node so it can be resolved
+                            // against declared flows at build time (Zeebe rejects
+                            // an unresolved reference at deploy). The owner is the
+                            // top-most `Some` on `flow_node_stack` — the flow node
+                            // this element is a direct child of — which stays
+                            // correct even when a container's `<incoming>`/
+                            // `<outgoing>` follow its nested elements.
+                            "incoming" | "outgoing" if !self_closing => {
+                                if let Some(idx) = flow_node_stack.iter().rev().find_map(|e| *e) {
+                                    flow_ref_owner = Some(acc.nodes[idx].id.clone());
+                                    flow_ref_dir = if tag == "incoming" {
+                                        "incoming"
+                                    } else {
+                                        "outgoing"
+                                    };
+                                    flow_ref_text = Some(String::new());
+                                }
+                            }
                             // A conditional event's FEEL `<condition>` (nested in
                             // a `conditionalEventDefinition` on a catch or boundary
                             // event). Distinct from a sequence flow's
@@ -902,6 +970,18 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     }
                     _ => {}
                 }
+                // Track the open-element stack for `<incoming>`/`<outgoing>`
+                // attribution. A self-closing tag never contains children, so it
+                // is not pushed (and the tokenizer emits no matching end tag).
+                if !self_closing {
+                    let opened = match (nodes_before, current.as_ref()) {
+                        (Some(before), Some(acc)) if acc.nodes.len() > before => {
+                            Some(acc.nodes.len() - 1)
+                        }
+                        _ => None,
+                    };
+                    flow_node_stack.push(opened);
+                }
             }
             Token::Text(text) => {
                 if let Some(buf) = condition_text.as_mut() {
@@ -922,6 +1002,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 if let Some(buf) = completion_condition_text.as_mut() {
                     buf.push_str(text);
                 }
+                if let Some(buf) = flow_ref_text.as_mut() {
+                    buf.push_str(text);
+                }
             }
             Token::End { name } => match local_name(name) {
                 "process" => {
@@ -940,6 +1023,8 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     cur_user_task = None;
                     cur_call = None;
                     completion_condition_text = None;
+                    flow_ref_text = None;
+                    flow_ref_owner = None;
                     cur_multi_instance = None;
                     io_stack.clear();
                     in_io_mapping = false;
@@ -1011,6 +1096,22 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                         } else {
                             Some(trimmed.to_string())
                         };
+                    }
+                }
+                "incoming" | "outgoing" => {
+                    if let (Some(acc), Some(owner), Some(text)) = (
+                        current.as_mut(),
+                        flow_ref_owner.take(),
+                        flow_ref_text.take(),
+                    ) {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            acc.flow_refs.push(FlowRef {
+                                node_id: owner,
+                                direction: flow_ref_dir,
+                                flow_id: trimmed.to_string(),
+                            });
+                        }
                     }
                 }
                 "condition" => {
@@ -1333,6 +1434,15 @@ struct MessageDecl {
     correlation_key: Option<String>,
 }
 
+/// A `<incoming>`/`<outgoing>` QName reference from a flow node to a
+/// `sequenceFlow`, collected while scanning so it can be resolved against the
+/// declared flow ids at build time (parity with Zeebe's reference resolution).
+struct FlowRef {
+    node_id: String,
+    direction: &'static str,
+    flow_id: String,
+}
+
 /// Accumulates the nodes and flows of one `<process>` as it is scanned.
 struct ProcessAcc {
     id: String,
@@ -1341,6 +1451,9 @@ struct ProcessAcc {
     nodes: Vec<NodeAcc>,
     flows: Vec<FlowAcc>,
     boundaries: Vec<PendingBoundary>,
+    /// `<incoming>`/`<outgoing>` references declared on flow nodes, resolved
+    /// against `flows` at build time.
+    flow_refs: Vec<FlowRef>,
     /// Stack of open embedded sub-process ids, used to scope nested nodes.
     scope_stack: Vec<String>,
 }
@@ -1353,6 +1466,7 @@ impl ProcessAcc {
             nodes: Vec::new(),
             flows: Vec::new(),
             boundaries: Vec::new(),
+            flow_refs: Vec::new(),
             scope_stack: Vec::new(),
         }
     }
@@ -1396,7 +1510,8 @@ impl ProcessAcc {
             linked_resources: Vec::new(),
             start_form_id: None,
         });
-        Some(self.nodes.len() - 1)
+        let idx = self.nodes.len() - 1;
+        Some(idx)
     }
 
     /// Adds a sequence flow; returns its index.
@@ -1422,6 +1537,27 @@ impl ProcessAcc {
         messages: &HashMap<String, MessageDecl>,
         signals: &HashMap<String, String>,
     ) -> Result<ProcessDefinition, ParseError> {
+        // Resolve every flow node's `<incoming>`/`<outgoing>` QName reference
+        // against the declared `<sequenceFlow>` ids (parity with Zeebe's
+        // `qNameElementReferenceCollection(SequenceFlow.class)` resolution).
+        // Nano otherwise builds the graph solely from `sequenceFlow`
+        // `sourceRef`/`targetRef` and ignores these child references, so a
+        // dangling reference would be silently accepted where Zeebe rejects the
+        // deploy with `INVALID_ARGUMENT`. Checked here against the raw parsed
+        // flows, before any ad-hoc pruning below, to mirror what Zeebe sees.
+        let flow_ids: std::collections::HashSet<&str> =
+            self.flows.iter().filter_map(|f| f.id.as_deref()).collect();
+        for r in &self.flow_refs {
+            if !flow_ids.contains(r.flow_id.as_str()) {
+                return Err(ParseError::UnresolvedFlowReference {
+                    process_id: self.id.clone(),
+                    node_id: r.node_id.clone(),
+                    direction: r.direction,
+                    flow_id: r.flow_id.clone(),
+                });
+            }
+        }
+
         // Ad-hoc sub-processes are kept as a single Service job activity; the
         // elements they contain (agent "tools", invoked out-of-band rather than by
         // token flow) are pruned from the executable graph, along with any
@@ -2173,6 +2309,114 @@ mod tests {
         let def = &parse_bpmn(xml).unwrap()[0];
         assert_eq!(def.id, "simple-process");
         assert_eq!(def.name, None);
+    }
+
+    #[test]
+    fn should_reject_a_dangling_outgoing_flow_reference() {
+        // A flow node declaring an `<outgoing>` reference to a sequenceFlow that
+        // is not declared anywhere is an unresolved QName reference. Zeebe
+        // rejects such a model at deploy with `INVALID_ARGUMENT`; Nano must too,
+        // rather than silently accepting it because it builds the graph only
+        // from `<sequenceFlow>` elements. Regression guard for issue #849.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="invalid-process" isExecutable="true">
+              <bpmn:startEvent id="Start">
+                <bpmn:outgoing>Flow_missing</bpmn:outgoing>
+              </bpmn:startEvent>
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::UnresolvedFlowReference {
+                process_id: "invalid-process".to_string(),
+                node_id: "Start".to_string(),
+                direction: "outgoing",
+                flow_id: "Flow_missing".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn should_reject_a_dangling_incoming_flow_reference() {
+        // The `<incoming>` direction is validated the same way as `<outgoing>`.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="invalid-in" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:endEvent id="e">
+                <bpmn:incoming>Flow_missing</bpmn:incoming>
+              </bpmn:endEvent>
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::UnresolvedFlowReference {
+                process_id: "invalid-in".to_string(),
+                node_id: "e".to_string(),
+                direction: "incoming",
+                flow_id: "Flow_missing".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn should_accept_resolved_incoming_outgoing_flow_references() {
+        // A well-formed model — the modeller-exported `<incoming>`/`<outgoing>`
+        // references all resolve to declared `<sequenceFlow>` ids — is
+        // unaffected: it parses cleanly and the graph is built as before.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="valid-process" isExecutable="true">
+              <bpmn:startEvent id="s">
+                <bpmn:outgoing>a</bpmn:outgoing>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e">
+                <bpmn:incoming>a</bpmn:incoming>
+              </bpmn:endEvent>
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(def.id, "valid-process");
+        assert_eq!(def.element("s").unwrap().outgoing[0].to, "e");
+    }
+
+    #[test]
+    fn should_attribute_container_flow_refs_to_the_container_not_a_nested_child() {
+        // A container flow node (`subProcess`/`adHocSubProcess`) whose
+        // `<incoming>`/`<outgoing>` follow its nested elements must attribute the
+        // reference to the container itself, not the most recently *added* (now
+        // closed) child. Regression guard for the review finding on issue #849:
+        // a single "last added node" pointer misattributes the `node_id` here.
+        // The `<outgoing>` is placed after the nested (non-self-closing) child so
+        // the last-added node is `InnerStart`, yet the owner must be `Sub`.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="container-attr" isExecutable="true">
+              <bpmn:subProcess id="Sub">
+                <bpmn:startEvent id="InnerStart"></bpmn:startEvent>
+                <bpmn:outgoing>Flow_missing</bpmn:outgoing>
+              </bpmn:subProcess>
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::UnresolvedFlowReference {
+                process_id: "container-attr".to_string(),
+                node_id: "Sub".to_string(),
+                direction: "outgoing",
+                flow_id: "Flow_missing".to_string(),
+            }
+        );
     }
 
     #[test]
