@@ -185,7 +185,7 @@ export default function InstanceDetail({
                   <Td>{i.element_id}</Td>
                   <Td>{i.kind}</Td>
                   <Td>{i.state}</Td>
-                  <Td className="align-top">
+                  <Td className="align-top" title={i.reason}>
                     <IncidentReason reason={i.reason} />
                   </Td>
                   <Td className="text-right">
@@ -432,13 +432,15 @@ function Td({
   children,
   className = "",
   colSpan,
+  title,
 }: {
   children: ReactNode;
   className?: string;
   colSpan?: number;
+  title?: string;
 }) {
   return (
-    <td className={`py-2 pr-4 ${className}`} colSpan={colSpan}>
+    <td className={`py-2 pr-4 ${className}`} colSpan={colSpan} title={title}>
       {children}
     </td>
   );

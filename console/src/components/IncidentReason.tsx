@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 import { copyText, selectElementText } from "../lib/clipboard";
 import {
   REASON_COLLAPSE_LINES,
@@ -40,6 +46,19 @@ export function IncidentReason({ reason }: { reason: string }) {
     },
     [],
   );
+
+  useEffect(() => {
+    // Reset per-reason UI state when the row updates to a new reason (the
+    // parent refetches live), so a previously expanded / "Copied" state doesn't
+    // leak across reasons — the new reason must render clamped with an honest
+    // "Copy" label. Also clear any in-flight revert timer for the old reason.
+    setExpanded(false);
+    setCopied(false);
+    if (copiedTimer.current !== undefined) {
+      window.clearTimeout(copiedTimer.current);
+      copiedTimer.current = undefined;
+    }
+  }, [reason]);
 
   async function onCopy() {
     const ok = await copyText(reason);

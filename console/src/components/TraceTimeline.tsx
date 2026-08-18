@@ -109,7 +109,7 @@ export function TraceTimeline({
                 >
                   <td className="py-2 pr-4 font-mono">{inc.elementId}</td>
                   <td className="py-2 pr-4">{inc.kind}</td>
-                  <td className="py-2 pr-4 align-top">
+                  <td className="py-2 pr-4 align-top" title={inc.reason}>
                     <IncidentReason reason={inc.reason} />
                   </td>
                   <td className="py-2 pr-4 font-mono text-fg-faint">
