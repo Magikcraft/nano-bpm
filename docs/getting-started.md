@@ -12,11 +12,16 @@ and how to make the app your own.
 ## Prerequisites
 
 - **Node.js 22.18+** on the machine that runs Nano.
-- The **GitHub Copilot CLI** available on your `PATH` as `copilot` — this is the
-  default agent each worker runs.
-- **A GitHub identity for the agents.** Either `gh` authenticated on the machine
-  (`gh auth login`) **or** a `GITHUB_TOKEN` exported in the environment. The
-  agents use it to read issues and open, review, and merge pull requests.
+- **A coding-agent CLI** on your `PATH` — the harness each worker runs to do the
+  actual work. Any headless coding CLI works: GitHub Copilot CLI (`copilot`),
+  Claude Code (`claude`), Pi, OpenCoder, Qwen, Kimi, or your own. You just point
+  a worker at whichever command you have installed. This guide uses `copilot` as
+  the example; substitute your own throughout.
+- **Whatever credentials that agent needs.** Most coding CLIs need a signed-in
+  session or an API key of their own — for the Copilot CLI example, either `gh`
+  authenticated on the machine (`gh auth login`) or a `GITHUB_TOKEN` in the
+  environment, so the agent can read issues and open, review, and merge pull
+  requests. Set up your chosen agent per its own docs.
 
 ## Run it locally
 
@@ -64,14 +69,15 @@ you enrol workers and submit work.
 ### 6. Enrol a worker
 
 A *hire* is a persisted agent profile — a name, a rank, and the CLI command each
-job runs. Hire one Copilot worker:
+job runs. Hire one worker backed by your coding-agent CLI:
 
 ```bash
 c8ctl nano hire --name copilot --rank senior --command copilot
 ```
 
-Here `--command copilot` is the GitHub Copilot CLI you installed in the
-prerequisites; `--name` is how you refer to the profile from now on.
+Here `--command copilot` is the coding-agent CLI from the prerequisites (swap in
+`claude`, `pi`, or whatever you installed); `--name` is how you refer to the
+profile from now on.
 
 ### 7. Start the supervisor
 
@@ -82,9 +88,10 @@ from one terminal:
 c8ctl nano supervisor start
 ```
 
-### 8. Run three Copilot instances
+### 8. Run three worker instances
 
-Add three instances of the `copilot` profile in **auto** mode — `--auto` is
+Add three instances of the `copilot` profile you just hired in **auto** mode —
+`--auto` is
 zero-config job detection: each worker reads the deployed agent job types
 straight from the engine and serves them, with no wiring.
 
