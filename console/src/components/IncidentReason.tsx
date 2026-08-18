@@ -1,4 +1,4 @@
-import { useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { copyText, selectElementText } from "../lib/clipboard";
 import {
   REASON_COLLAPSE_LINES,
@@ -27,21 +27,41 @@ export function IncidentReason({ reason }: { reason: string }) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const preRef = useRef<HTMLPreElement>(null);
+  const copiedTimer = useRef<number | undefined>(undefined);
 
   const clamped = collapsible && !expanded;
+
+  useEffect(
+    () => () => {
+      if (copiedTimer.current !== undefined)
+        window.clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
 
   async function onCopy() {
     const ok = await copyText(reason);
     if (!ok) {
       // Insecure context with no clipboard access — expand so the whole reason
       // is laid out, then select it so the operator can copy by hand (mirrors
-      // Projects.tsx / tour runner).
+      // Projects.tsx / tour runner). Defer selection to the next frame so the
+      // expanded layout is applied before we select. Clear any stale "Copied"
+      // state from a prior successful copy so the button doesn't lie.
+      setCopied(false);
+      if (copiedTimer.current !== undefined)
+        window.clearTimeout(copiedTimer.current);
       setExpanded(true);
-      if (preRef.current) selectElementText(preRef.current);
+      requestAnimationFrame(() => {
+        if (preRef.current) selectElementText(preRef.current);
+      });
       return;
     }
+    // Reset any in-flight revert timer so rapid clicks don't stack timeouts
+    // (which could flip the label back to "Copy" while still showing success).
+    if (copiedTimer.current !== undefined)
+      window.clearTimeout(copiedTimer.current);
     setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
+    copiedTimer.current = window.setTimeout(() => setCopied(false), 1500);
   }
 
   return (
