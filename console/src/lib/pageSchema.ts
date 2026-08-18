@@ -30,10 +30,11 @@ export interface StartProcessAction {
   process: string;
 }
 
-/** An filter on a datasource column (whitelisted against the schema at runtime,
- * so it can never inject SQL). Either an equality (`eq`) or a set membership
- * (`in`) — set membership is what a tab like "Active = converging|waiting|escalated"
- * needs. Exactly one of `eq`/`in` should be set; `eq` wins if both are present. */
+/** A filter on a datasource column (whitelisted against the schema at runtime,
+ * so it can never inject SQL). An equality (`eq`), a set membership (`in` — what
+ * a tab like "Active = converging|waiting|escalated" needs), or a route-param
+ * binding (`eqParam`). At most one applies; parse-time precedence is a non-empty
+ * `in`, then `eqParam`, then `eq`. */
 export interface ColumnFilter {
   field: string;
   eq?: string;

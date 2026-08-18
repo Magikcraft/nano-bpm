@@ -13,8 +13,10 @@
 //     compile-time parity check binds it to the composer's `PageNode` union, so a
 //     type present here but unhandled by the composer (or vice versa) fails to
 //     compile;
-//   - the runtime asserts `Object.keys(RENDERERS)` equals this set in a guard
-//     test, so a type present here but unrendered fails the runtime build.
+//   - the runtime will assert `Object.keys(RENDERERS)` equals this set in a guard
+//     test, so a type present here but unrendered fails the runtime build (the
+//     runtime lives in another repo and consumes the published registry; that
+//     guard lands as issue #843 P2).
 //
 // Adding a node type is therefore a single edit here that forces both surfaces to
 // catch up — they can no longer silently disagree.
