@@ -12,6 +12,7 @@ import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import { usePaneResize } from "../lib/usePaneResize";
 import { ResizeHandle } from "../components/ResizeHandle";
 import BpmnViewer from "../components/BpmnViewer";
+import { IncidentReason } from "../components/IncidentReason";
 import { fmtClock, fmtDuration } from "../components/TraceTimeline";
 import { Badge, Button, Input, SectionLabel } from "../components/ui";
 
@@ -184,7 +185,9 @@ export default function InstanceDetail({
                   <Td>{i.element_id}</Td>
                   <Td>{i.kind}</Td>
                   <Td>{i.state}</Td>
-                  <Td className="text-danger">{i.reason}</Td>
+                  <Td className="align-top" title={i.reason}>
+                    <IncidentReason reason={i.reason} />
+                  </Td>
                   <Td className="text-right">
                     {i.state === "Active" && (
                       <Button
@@ -429,13 +432,15 @@ function Td({
   children,
   className = "",
   colSpan,
+  title,
 }: {
   children: ReactNode;
   className?: string;
   colSpan?: number;
+  title?: string;
 }) {
   return (
-    <td className={`py-2 pr-4 ${className}`} colSpan={colSpan}>
+    <td className={`py-2 pr-4 ${className}`} colSpan={colSpan} title={title}>
       {children}
     </td>
   );

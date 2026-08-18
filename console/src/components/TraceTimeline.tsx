@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import type { ReactNode } from "react";
 import type { InstanceTrace, TraceElement } from "../gen";
 import { SectionLabel } from "./ui";
+import { IncidentReason } from "./IncidentReason";
 
 /** Format a duration given in milliseconds. */
 export function fmtDuration(ms: number | null): string {
@@ -101,11 +102,16 @@ export function TraceTimeline({
               </tr>
             </thead>
             <tbody>
-              {trace.incidents.map((inc, i) => (
-                <tr key={i} className="border-b border-edge">
+              {trace.incidents.map((inc) => (
+                <tr
+                  key={`${inc.elementInstanceKey}:${inc.raisedAt}:${inc.kind}`}
+                  className="border-b border-edge"
+                >
                   <td className="py-2 pr-4 font-mono">{inc.elementId}</td>
                   <td className="py-2 pr-4">{inc.kind}</td>
-                  <td className="py-2 pr-4 text-danger">{inc.reason}</td>
+                  <td className="py-2 pr-4 align-top" title={inc.reason}>
+                    <IncidentReason reason={inc.reason} />
+                  </td>
                   <td className="py-2 pr-4 font-mono text-fg-faint">
                     {fmt.clock(inc.raisedAt)}
                   </td>
