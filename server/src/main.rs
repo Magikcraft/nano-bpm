@@ -15979,11 +15979,11 @@ fn wait_state_element_type(wire: &str) -> models::WaitStateElementTypeEnum {
 
 /// Projects an [`ElementInstanceRow`] into the generated `ElementInstanceResult`.
 /// `elementName` falls back to the element id when the deployed model carried no
-/// `name` attribute. `rootProcessInstanceKey` equals `processInstanceKey`: Nano
-/// expands call activities inline at deploy time (`inline_call_activities`) and
-/// never spawns a separate child process instance, so every element instance
-/// lives in a self-rooted tree — matching Camunda's `root == self` for a
-/// top-level instance.
+/// `name` attribute. `rootProcessInstanceKey` is reported as this element's own
+/// `processInstanceKey`. Call activities now execute natively as distinct child
+/// process instances (issue #808), so a child's elements are still projected
+/// self-rooted here; walking `parentProcessInstanceKey` up to the true top-level
+/// ancestor for nested call activities is a tracked follow-up.
 fn element_instance_result(row: &readstore::ElementInstanceRow) -> models::ElementInstanceResult {
     let start_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.start_date_ms as i64)

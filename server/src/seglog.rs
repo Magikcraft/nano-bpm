@@ -2600,6 +2600,8 @@ mod tests {
             business_id: None,
             process_definition_key: 0,
             version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
         };
         let done = Event::ProcessInstanceCompleted { instance_key: 999 };
         store

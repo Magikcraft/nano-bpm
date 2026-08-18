@@ -6729,6 +6729,209 @@ fn inline_call_activities_rejects_unknown_and_cyclic_callees() {
         .contains("cycle"));
 }
 
+/// Deploys an orchestrator with a raw (un-inlined) call activity `c1 -> phase`
+/// and returns the running engine. The call activity carries the given io
+/// mappings so tests can exercise cross-boundary variable propagation.
+fn deploy_native_call(io: crate::model::IoMapping, child: ProcessDefinition) -> Engine {
+    let mut orchestrator = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "phase")
+        .end_event("end")
+        .connect("start", "c1")
+        .connect("c1", "end");
+    if !io.is_empty() {
+        orchestrator = orchestrator.with_io("c1", io);
+    }
+    let orchestrator = orchestrator.build().unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(child))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(orchestrator))
+        .unwrap();
+    engine
+}
+
+#[test]
+fn a_call_activity_spawns_a_distinct_child_process_instance_with_parent_linkage() {
+    // Native execution (Zeebe parity): a call activity does NOT inline the
+    // callee — it spawns a distinct child process instance linked back to the
+    // calling instance and its call-activity element instance.
+    let mut engine = deploy_native_call(Default::default(), phase_process("phase", "work"));
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The call-activity element instance the child links back to.
+    let call_eik = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivated {
+                element_instance_key,
+                element_id,
+                ..
+            } if element_id == "c1" => Some(*element_instance_key),
+            _ => None,
+        })
+        .expect("c1 activated");
+
+    // A second, distinct process instance was created for the callee, carrying
+    // the parent linkage (C8 parentProcessInstanceKey / parentElementInstanceKey).
+    let (child_key, ppik, peik) = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_id,
+                parent_process_instance_key,
+                parent_element_instance_key,
+                ..
+            } if process_id == "phase" => Some((
+                *instance_key,
+                *parent_process_instance_key,
+                *parent_element_instance_key,
+            )),
+            _ => None,
+        })
+        .expect("a child instance of 'phase' was created");
+    assert_ne!(child_key, parent_key, "child is a distinct instance");
+    assert_eq!(ppik, Some(parent_key));
+    assert_eq!(peik, Some(call_eik));
+
+    // Both instances are live; the parent's call-activity token is parked on the
+    // child, and the child parks on its own (instance-scoped) job.
+    assert!(!engine.is_completed(parent_key));
+    assert!(!engine.is_completed(child_key));
+    assert_eq!(engine.pending_jobs().len(), 1);
+    assert_eq!(engine.pending_jobs()[0].instance_key, child_key);
+    assert_eq!(
+        engine.instance(child_key).unwrap().parent_process_instance_key,
+        Some(parent_key)
+    );
+
+    // Completing the child's job runs it to its (none) end; the parent's
+    // call-activity token then completes and routes out to the orchestrator end.
+    let events = complete_one(&mut engine, "work");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceCompleted { instance_key } if *instance_key == child_key
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "c1" && to == "end"
+    )));
+    assert!(engine.is_completed(child_key));
+    assert!(engine.is_completed(parent_key));
+}
+
+#[test]
+fn cancelling_a_call_activity_parent_cancels_its_child() {
+    let mut engine = deploy_native_call(Default::default(), phase_process("phase", "work"));
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let child_key = engine
+        .pending_jobs()
+        .first()
+        .expect("child parked on its job")
+        .instance_key;
+    assert_ne!(child_key, parent_key);
+
+    let cancel = engine
+        .apply_command(Command::cancel_instance(parent_key))
+        .unwrap();
+    // Cancelling the parent cascades to the in-flight child (Zeebe parity).
+    assert!(cancel.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceTerminated { instance_key } if *instance_key == parent_key
+    )));
+    assert!(cancel.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceTerminated { instance_key } if *instance_key == child_key
+    )));
+    assert_eq!(
+        engine.instance(parent_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    // The child's job was cancelled with it — no activatable jobs remain.
+    assert!(engine.pending_jobs().is_empty());
+}
+
+#[test]
+fn a_call_activity_propagates_variables_via_io_mappings_across_isolated_scopes() {
+    // The callee is a pass-through (pstart -> pend) so it completes on its seed
+    // variables, letting us observe both directions of the mapping in one command.
+    let child = ProcessBuilder::new("phase")
+        .start_event("pstart")
+        .end_event("pend")
+        .connect("pstart", "pend")
+        .build()
+        .unwrap();
+    let io = crate::model::IoMapping {
+        inputs: vec![crate::model::Mapping {
+            source: "=orderId".to_string(),
+            target: "childOrder".to_string(),
+        }],
+        outputs: vec![crate::model::Mapping {
+            source: "=childOrder".to_string(),
+            target: "parentEcho".to_string(),
+        }],
+    };
+    let mut engine = deploy_native_call(io, child);
+
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("orderId", Value::Int(42))]),
+        ))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The child is seeded ONLY through the input mapping (isolated scope): it
+    // sees `childOrder`, not the parent's other variable `orderId`.
+    let child_seed = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                process_id,
+                variables,
+                ..
+            } if process_id == "phase" => Some(variables.clone()),
+            _ => None,
+        })
+        .expect("child created");
+    assert_eq!(child_seed.get("childOrder"), Some(&Value::Int(42)));
+    assert!(
+        !child_seed.contains_key("orderId"),
+        "parent variables must not leak into the child's isolated scope"
+    );
+
+    // The whole orchestration ran to completion; the output mapping projected the
+    // child's variable back into the parent as `parentEcho`. The child's own
+    // `childOrder` did not leak wholesale into the parent.
+    assert!(engine.is_completed(parent_key));
+    assert!(created.iter().any(|e| matches!(
+        e,
+        Event::VariablesUpdated { instance_key, variables }
+            if *instance_key == parent_key && variables.get("parentEcho") == Some(&Value::Int(42))
+    )));
+    assert!(
+        !created.iter().any(|e| matches!(
+            e,
+            Event::VariablesUpdated { instance_key, variables }
+                if *instance_key == parent_key && variables.contains_key("childOrder")
+        )),
+        "only the mapped output crosses back, not the child's raw scope"
+    );
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {

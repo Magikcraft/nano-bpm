@@ -36,7 +36,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -46,7 +46,7 @@ const SCHEMA_VERSION: i64 = 1;
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = 7783537158940815705;
+const SCHEMA_FINGERPRINT: i64 = -1950486211382609378;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -110,7 +110,9 @@ CREATE TABLE process_instances (
     start_date_ms          INTEGER NOT NULL,
     has_incident           INTEGER NOT NULL,
     tags                   TEXT NOT NULL,
-    business_id            TEXT
+    business_id            TEXT,
+    parent_process_instance_key INTEGER,
+    parent_element_instance_key INTEGER
 );
 CREATE TABLE jobs (
     key                    INTEGER PRIMARY KEY,
@@ -854,6 +856,12 @@ pub struct ProcessInstanceRow {
     pub has_incident: bool,
     pub tags: Vec<String>,
     pub business_id: Option<String>,
+    /// C8 parent linkage for a call-activity **child** process instance: the
+    /// calling instance's key and the spawning call-activity element instance
+    /// key. Both `None` for a top-level instance. Surfaced so the C8
+    /// `parentProcessInstanceKey` field/filter return real data.
+    pub parent_process_instance_key: Option<Key>,
+    pub parent_element_instance_key: Option<Key>,
 }
 
 pub struct JobRow {
@@ -2009,7 +2017,7 @@ impl ReadStore {
         let mut stmt = conn
             .prepare(
                 "SELECT key, process_id, process_definition_id, process_definition_key, \
-                 version, state, start_date_ms, has_incident, tags, business_id FROM process_instances",
+                 version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, parent_element_instance_key FROM process_instances",
             )
             .expect("prepare process_instances");
         let rows = stmt
@@ -2036,7 +2044,8 @@ impl ReadStore {
         let mut stmt = conn
             .prepare(
                 "SELECT key, process_id, process_definition_id, process_definition_key, \
-                 version, state, start_date_ms, has_incident, tags, business_id \
+                 version, state, start_date_ms, has_incident, tags, business_id, \
+                 parent_process_instance_key, parent_element_instance_key \
                  FROM process_instances ORDER BY key DESC LIMIT ?1 OFFSET ?2",
             )
             .expect("prepare process_instances_page");
@@ -2050,7 +2059,7 @@ impl ReadStore {
         let conn = self.conn.lock().expect("read store poisoned");
         conn.query_row(
             "SELECT key, process_id, process_definition_id, process_definition_key, \
-             version, state, start_date_ms, has_incident, tags, business_id FROM process_instances WHERE key = ?1",
+             version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, parent_element_instance_key FROM process_instances WHERE key = ?1",
             params![key as i64],
             map_instance,
         )
@@ -2556,6 +2565,8 @@ fn map_instance(r: &rusqlite::Row) -> rusqlite::Result<ProcessInstanceRow> {
         has_incident: r.get::<_, i64>(7)? != 0,
         tags,
         business_id: r.get(9)?,
+        parent_process_instance_key: r.get::<_, Option<i64>>(10)?.map(|k| k as Key),
+        parent_element_instance_key: r.get::<_, Option<i64>>(11)?.map(|k| k as Key),
     })
 }
 
@@ -3175,8 +3186,9 @@ fn project_engine_state(
             .unwrap_or_else(|| ("-1".to_string(), 0));
         tx.cexecute(
             "INSERT INTO process_instances (key, process_id, process_definition_id, \
-             process_definition_key, version, state, start_date_ms, has_incident, tags, business_id) \
-             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8) \
+             process_definition_key, version, state, start_date_ms, has_incident, tags, business_id, \
+             parent_process_instance_key, parent_element_instance_key) \
+             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10) \
              ON CONFLICT(key) DO NOTHING",
             params![
                 inst.key as i64,
@@ -3187,6 +3199,8 @@ fn project_engine_state(
                 inst.created_at as i64,
                 inst.tags.join(","),
                 inst.business_id.as_ref(),
+                inst.parent_process_instance_key.map(|k| k as i64),
+                inst.parent_element_instance_key.map(|k| k as i64),
             ],
         )?;
         // Process-level variables (scope == instance key), then each nested scope.
@@ -3424,6 +3438,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             business_id,
             process_definition_key,
             version,
+            parent_process_instance_key,
+            parent_element_instance_key,
         } => {
             // Prefer the definition identity the event carries — it pins the
             // instance to the exact version it was created on (a by-key or
@@ -3455,8 +3471,9 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // exact under replay.
             let inserted = tx.cexecute(
                 "INSERT INTO process_instances (key, process_id, process_definition_id, \
-                 process_definition_key, version, state, start_date_ms, has_incident, tags, business_id) \
-                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8) \
+                 process_definition_key, version, state, start_date_ms, has_incident, tags, business_id, \
+                 parent_process_instance_key, parent_element_instance_key) \
+                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10) \
                  ON CONFLICT(key) DO NOTHING",
                 params![
                     *instance_key as i64,
@@ -3467,6 +3484,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     *created_at as i64,
                     tags_str,
                     business_id.as_ref(),
+                    parent_process_instance_key.map(|k| k as i64),
+                    parent_element_instance_key.map(|k| k as i64),
                 ],
             )? == 1;
             if inserted {
@@ -5355,6 +5374,8 @@ mod definition_xml_tests {
             business_id: None,
             process_definition_key: 0,
             version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
         }
     }
 
@@ -5376,6 +5397,8 @@ mod definition_xml_tests {
             business_id: None,
             process_definition_key,
             version,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
         }
     }
 
@@ -5936,6 +5959,8 @@ mod element_instance_tests {
             business_id: None,
             process_definition_key: 0,
             version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
         }
     }
 
@@ -6121,6 +6146,8 @@ mod element_instance_tests {
                     business_id: None,
                     process_definition_key: 0,
                     version: 0,
+                    parent_process_instance_key: None,
+                    parent_element_instance_key: None,
                 },
                 &Event::ElementActivated {
                     instance_key: INST + 100,
