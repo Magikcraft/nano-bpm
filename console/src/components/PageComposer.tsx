@@ -1,6 +1,8 @@
 // The Urban Page Composer (ADR 0042 §2) — a Craft.js WYSIWYG surface that authors a
-// screen from three data-aware components (text / actionForm / dataGrid) and emits
-// the owned `page.json` (the serializer + schema live in `../lib/pageComposer.ts`).
+// screen from the data-aware components (text / actionForm / dataGrid / prose /
+// button / nav) and emits the owned `page.json` (the serializer + schema live in
+// `../lib/pageComposer.ts`). The editable set is kept in lockstep with the runtime
+// renderer's `RENDERERS` (nano-ide urban) — see the drift-guard test (issue #843).
 //
 // Craft.js is the canvas only; nothing here is persisted in Craft.js's internal
 // format — `getPageJson()` serializes down to `page.json` and `setPageJson()` reflates
@@ -27,6 +29,9 @@ import {
   GRID_COLUMN_LINK_KINDS,
   asGridColumnLinkKind,
   type ActionFormField,
+  type ButtonModal,
+  type ButtonVariant,
+  type DatasourceBinding,
   type GridColumn,
   type GridColumnLink,
   type GridColumnLinkKind,
@@ -212,6 +217,69 @@ DataGridNode.craft = {
   },
 };
 
+const ProseNode: UserComponent<{
+  title: string;
+  data: DatasourceBinding;
+  header?: string;
+  body?: string;
+}> = ({ title, data, header, body }) => {
+  const ref = useSelectableRef();
+  return (
+    <div ref={ref} className="pc-node pc-card">
+      {title && <div className="pc-card-title">{title}</div>}
+      <div className="pc-prose-preview">
+        {header ? (
+          <div className="pc-prose-head opacity-60">{header}</div>
+        ) : null}
+        <div className="opacity-40">
+          {body ? (
+            <>
+              markdown from <code>{body}</code>
+            </>
+          ) : (
+            "(pick a body field)"
+          )}{" "}
+          · rows from <code>{data?.table || "(pick a table)"}</code>
+        </div>
+      </div>
+    </div>
+  );
+};
+ProseNode.craft = {
+  displayName: "ProseNode",
+  props: {
+    title: "Prose",
+    data: { kind: "datasource", source: "app", table: "" },
+    header: "",
+    body: "",
+  },
+};
+
+const ButtonNode: UserComponent<{
+  label: string;
+  variant?: ButtonVariant;
+  modal?: ButtonModal;
+}> = ({ label, variant, modal }) => {
+  const ref = useSelectableRef();
+  return (
+    <div ref={ref} className="pc-node pc-buttonrow">
+      <button
+        className={`pc-btn${variant === "ghost" ? " pc-btn-ghost" : ""}`}
+        disabled
+      >
+        {label || "Open"}
+      </button>
+      {modal ? (
+        <span className="pc-bind opacity-40">→ opens a copy modal</span>
+      ) : null}
+    </div>
+  );
+};
+ButtonNode.craft = {
+  displayName: "ButtonNode",
+  props: { label: "Open" },
+};
+
 // The root canvas that hosts the ordered node list.
 const PageCanvas: UserComponent<{ children?: React.ReactNode }> = ({
   children,
@@ -238,6 +306,8 @@ const RESOLVER = {
   NavNode,
   ActionFormNode,
   DataGridNode,
+  ProseNode,
+  ButtonNode,
 };
 
 // ── palette (click-to-add) ───────────────────────────────────────────────────
@@ -304,6 +374,28 @@ function Palette(): ReactElement {
         }
       >
         + Data grid
+      </button>
+      <button
+        className="pc-palette-item"
+        onClick={() =>
+          add(
+            <Element
+              is={ProseNode}
+              title="Prose"
+              data={{ kind: "datasource", source: "app", table: "" }}
+              header=""
+              body=""
+            />,
+          )
+        }
+      >
+        + Prose
+      </button>
+      <button
+        className="pc-palette-item"
+        onClick={() => add(<Element is={ButtonNode} label="Open" />)}
+      >
+        + Button
       </button>
     </div>
   );
@@ -566,7 +658,148 @@ function Settings({
             )}
             onChange={(cols) => set("columns", cols)}
           />
-          <GridAdvanced props={props} set={set} />
+          <GridAdvanced key={selectedId} props={props} set={set} />
+        </>
+      )}
+
+      {name === "ProseNode" && (
+        <>
+          <Row label="Title">
+            <input
+              value={String(props.title ?? "")}
+              onChange={(e) => set("title", e.target.value)}
+            />
+          </Row>
+          <Row label="Table">
+            <input
+              list="pc-tables"
+              value={qualifyTable(
+                props.data as { source?: string; table?: string },
+              )}
+              onChange={(e) => {
+                // Preserve the binding's filter/orderBy when the table changes;
+                // only the source/table split is edited here (matches dataGrid).
+                const prev =
+                  (props.data as Record<string, unknown> | undefined) ?? {};
+                set("data", {
+                  ...prev,
+                  kind: "datasource",
+                  ...splitQualifiedTable(e.target.value),
+                });
+              }}
+            />
+            <datalist id="pc-tables">
+              {tables.map((t) => (
+                <option key={t.id} value={t.id} />
+              ))}
+            </datalist>
+          </Row>
+          <Row label="Header template">
+            <input
+              value={String(props.header ?? "")}
+              placeholder="Round {{round}} · {{status}}"
+              onChange={(e) => set("header", e.target.value)}
+            />
+          </Row>
+          <Row label="Body field">
+            <input
+              list="pc-prose-fields"
+              value={String(props.body ?? "")}
+              placeholder="findings"
+              onChange={(e) => set("body", e.target.value)}
+            />
+            <datalist id="pc-prose-fields">
+              {tableFields(
+                qualifyTable(props.data as { source?: string; table?: string }),
+              ).map((f) => (
+                <option key={f} value={f} />
+              ))}
+            </datalist>
+          </Row>
+          <Row label="Empty text">
+            <input
+              value={String(props.empty ?? "")}
+              onChange={(e) =>
+                set("empty", e.target.value === "" ? undefined : e.target.value)
+              }
+            />
+          </Row>
+          <Row label="Measure (ch)">
+            <input
+              type="number"
+              min={40}
+              max={100}
+              value={props.measure === undefined ? "" : String(props.measure)}
+              onChange={(e) =>
+                set(
+                  "measure",
+                  e.target.value === "" ? undefined : Number(e.target.value),
+                )
+              }
+            />
+          </Row>
+          <Row label="Collapsible">
+            <input
+              type="checkbox"
+              checked={props.collapsible === true}
+              onChange={(e) =>
+                set("collapsible", e.target.checked ? true : undefined)
+              }
+            />
+          </Row>
+          {props.collapsible === true && (
+            <Row label="Start collapsed">
+              <input
+                type="checkbox"
+                checked={props.defaultCollapsed === true}
+                onChange={(e) =>
+                  set("defaultCollapsed", e.target.checked ? true : undefined)
+                }
+              />
+            </Row>
+          )}
+          <Row label="Refresh (ms)">
+            <input
+              type="number"
+              min={0}
+              value={
+                props.refreshMs === undefined ? "" : String(props.refreshMs)
+              }
+              onChange={(e) =>
+                set(
+                  "refreshMs",
+                  e.target.value === "" ? undefined : Number(e.target.value),
+                )
+              }
+            />
+          </Row>
+          <BindingAdvanced key={selectedId} props={props} set={set} />
+        </>
+      )}
+
+      {name === "ButtonNode" && (
+        <>
+          <Row label="Label">
+            <input
+              value={String(props.label ?? "")}
+              onChange={(e) => set("label", e.target.value)}
+            />
+          </Row>
+          <Row label="Variant">
+            <select
+              value={props.variant === "ghost" ? "ghost" : "default"}
+              onChange={(e) =>
+                set("variant", e.target.value === "ghost" ? "ghost" : undefined)
+              }
+            >
+              <option value="default">default</option>
+              <option value="ghost">ghost</option>
+            </select>
+          </Row>
+          <ButtonModalEditor
+            modal={props.modal as ButtonModal | undefined}
+            onChange={(m) => set("modal", m)}
+          />
         </>
       )}
 
@@ -662,6 +895,114 @@ function GridAdvanced({
         spellCheck={false}
       />
       {err && <div className="pc-advanced-err">Invalid JSON: {err}</div>}
+    </div>
+  );
+}
+
+/** A JSON escape-hatch for a `prose` node's data binding (filter + orderBy) — the
+ * same relational surface `GridAdvanced` exposes for a grid, so a param-scoped
+ * (`eqParam`) or filtered/ordered prose list is authorable without a bespoke
+ * widget. Parses on change and only commits valid JSON. */
+function BindingAdvanced({
+  props,
+  set,
+}: {
+  props: Record<string, unknown>;
+  set: (key: string, value: unknown) => void;
+}): ReactElement {
+  const current = () => {
+    const out: Record<string, unknown> = {};
+    const data = (props.data as Record<string, unknown>) ?? {};
+    if (data.filter) out.filter = data.filter;
+    if (data.orderBy) out.orderBy = data.orderBy;
+    return JSON.stringify(out, null, 2);
+  };
+  const [text, setText] = useState(current);
+  const [err, setErr] = useState<string | null>(null);
+  const commit = (value: string) => {
+    setText(value);
+    const data = { ...((props.data as Record<string, unknown>) ?? {}) };
+    if (!value.trim()) {
+      setErr(null);
+      delete data.filter;
+      delete data.orderBy;
+      set("data", data);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(value) as Record<string, unknown>;
+      setErr(null);
+      if (parsed.filter === undefined) delete data.filter;
+      else data.filter = parsed.filter;
+      if (parsed.orderBy === undefined) delete data.orderBy;
+      else data.orderBy = parsed.orderBy;
+      set("data", data);
+    } catch (e) {
+      setErr(String((e as Error).message));
+    }
+  };
+  return (
+    <div className="pc-list">
+      <div className="pc-row">
+        <span>Advanced (filter, orderBy)</span>
+      </div>
+      <textarea
+        className="pc-advanced"
+        rows={8}
+        value={text}
+        onChange={(e) => commit(e.target.value)}
+        spellCheck={false}
+      />
+      {err && <div className="pc-advanced-err">Invalid JSON: {err}</div>}
+    </div>
+  );
+}
+
+/** Edits a `button` node's optional copy modal. All four fields are optional; when
+ * every field is blank the modal is omitted entirely (a bare button — matching the
+ * schema, which drops an all-empty modal). */
+function ButtonModalEditor({
+  modal,
+  onChange,
+}: {
+  modal: ButtonModal | undefined;
+  onChange: (modal: ButtonModal | undefined) => void;
+}): ReactElement {
+  const fields: { key: keyof ButtonModal; label: string }[] = [
+    { key: "title", label: "Modal title" },
+    { key: "description", label: "Description" },
+    { key: "copyLabel", label: "Copy button label" },
+    { key: "copyText", label: "Copy text" },
+  ];
+  const update = (key: keyof ButtonModal, value: string) => {
+    const next: ButtonModal = { ...(modal ?? {}) };
+    if (value === "") delete next[key];
+    else next[key] = value;
+    onChange(Object.keys(next).length ? next : undefined);
+  };
+  return (
+    <div className="pc-list">
+      <div className="pc-row">
+        <span>Copy modal (optional)</span>
+      </div>
+      {fields.map((f) =>
+        f.key === "copyText" || f.key === "description" ? (
+          <Row key={f.key} label={f.label}>
+            <textarea
+              rows={3}
+              value={String(modal?.[f.key] ?? "")}
+              onChange={(e) => update(f.key, e.target.value)}
+            />
+          </Row>
+        ) : (
+          <Row key={f.key} label={f.label}>
+            <input
+              value={String(modal?.[f.key] ?? "")}
+              onChange={(e) => update(f.key, e.target.value)}
+            />
+          </Row>
+        ),
+      )}
     </div>
   );
 }
