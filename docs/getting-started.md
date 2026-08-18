@@ -72,12 +72,16 @@ A *hire* is a persisted agent profile — a name, a rank, and the CLI command ea
 job runs. Hire one worker backed by your coding-agent CLI:
 
 ```bash
-c8ctl nano hire --name copilot --rank senior --command copilot
+c8ctl nano hire --name copilot --rank senior --command copilot --arg --allow-all
 ```
 
 Here `--command copilot` is the coding-agent CLI from the prerequisites (swap in
 `claude`, `pi`, or whatever you installed); `--name` is how you refer to the
-profile from now on.
+profile from now on. Each `--arg` passes one token straight through to that CLI —
+`--arg --allow-all` starts the Copilot CLI with tool execution enabled, which a
+worker needs to actually run commands. Use the equivalent switch for your own
+harness (or `--env KEY=VALUE` to persist a startup env var such as
+`COPILOT_ENABLE_ALL_TOOLS=1`).
 
 ### 7. Start the supervisor
 
@@ -155,7 +159,7 @@ trusted LAN by default.
 3. **Enrol workers** and **start the supervisor** exactly as in steps 6–8:
 
    ```bash
-   c8ctl nano hire --name copilot --rank senior --command copilot
+   c8ctl nano hire --name copilot --rank senior --command copilot --arg --allow-all
    c8ctl nano supervisor start
    c8ctl nano supervisor add copilot --instances 3 --auto
    ```
