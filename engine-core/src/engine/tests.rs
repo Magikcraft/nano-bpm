@@ -14596,3 +14596,114 @@ fn nested_adhoc_completion_condition_cancels_remaining_and_feeds_parent() {
         .unwrap();
     assert!(engine.is_completed(inst), "instance completes");
 }
+
+/// #631 (parent cancels a nested tool): when the OUTER container completes with
+/// `cancelRemainingInstances=true` while a NESTED ad-hoc container tool is still
+/// active, the nested container must be torn down RECURSIVELY — its own active
+/// descendants (second-level tools + their jobs) cancelled, its element instance
+/// completed, and its `adhoc_instances` runtime state dropped (`AdHocCompleted`).
+/// Before the fix the outer cancel loop treated the nested container as a leaf
+/// tool (`cancel_mi_child_events`), orphaning the nested container's leaf job +
+/// element instance and leaking its ad-hoc state (no `AdHocCompleted`).
+#[test]
+fn nested_adhoc_parent_cancel_recursively_tears_down_nested_container() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(nested_adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    // Outer agent activates the nested `subagent` tool.
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("outer agent job");
+    let outer = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("subagent")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // Nested agent activates its `leaf` tool, which mints a leaf job left
+    // in-flight (never completed).
+    let sub_agent = engine
+        .activate_jobs("sub-agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "subagent")
+        .expect("nested agent job");
+    let nested = sub_agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            sub_agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("leaf")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let leaf_job = engine
+        .activate_jobs("leaf-tool", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "leaf")
+        .expect("leaf tool job in-flight inside the nested container");
+    let leaf = leaf_job.element_instance_key;
+    assert!(
+        engine.instance(inst).unwrap().adhoc_instances.contains_key(&nested),
+        "nested container active before the parent cancels"
+    );
+
+    // Cancel the OUTER container's remaining instances while the nested container
+    // (and its leaf) are still running.
+    let events = engine
+        .apply_command(Command::ActivateAdHocActivities {
+            ad_hoc_instance_key: outer,
+            activate_elements: Vec::new(),
+            cancel_remaining: true,
+        })
+        .expect("cancel-remaining completes the outer container");
+
+    // The nested container's ad-hoc runtime state was dropped (recursive
+    // teardown), not left dangling.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::AdHocCompleted { container_key, cancelled, .. }
+                if *container_key == nested && *cancelled
+        )),
+        "the nested container emitted AdHocCompleted (its ad-hoc state was dropped); events: {events:?}"
+    );
+    // The nested container's leaf descendant's job was cancelled — not orphaned.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::JobCanceled { job_key, .. } if *job_key == leaf_job.key
+        )),
+        "the nested container's in-flight leaf job was cancelled; events: {events:?}"
+    );
+    // The leaf descendant's element instance was completed — not left orphaned in
+    // the read-model element-instance tree.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_instance_key, element_id, .. }
+                if *element_instance_key == leaf && element_id == "leaf"
+        )),
+        "the nested container's leaf element instance was completed; events: {events:?}"
+    );
+    assert!(engine.is_completed(inst), "the whole instance completes");
+    assert!(
+        engine
+            .instance(inst)
+            .map(|i| i.adhoc_instances.is_empty())
+            .unwrap_or(true),
+        "no ad-hoc runtime state leaks after the recursive cancel"
+    );
+}

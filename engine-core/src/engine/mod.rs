@@ -5065,6 +5065,95 @@ impl Engine {
         events
     }
 
+    /// Tear down one active ad-hoc tool child during a cancel-remaining-instances
+    /// completion of its container, including the dedicated inner instance the
+    /// tool hangs off. A plain (leaf) tool is cancelled via
+    /// [`Self::cancel_mi_child_events`]; a NESTED ad-hoc container tool
+    /// (agent-of-agents, #631) also owns its OWN active descendants (second-level
+    /// tools/jobs), an agent job, and an `adhoc_instances` runtime entry — none of
+    /// which `cancel_mi_child_events` knows about. Cancelling such a child with
+    /// the leaf path alone would orphan the nested container's element
+    /// instances/jobs and leave its ad-hoc state behind (no `AdHocCompleted`). So
+    /// a nested container is torn down RECURSIVELY: its descendants are cancelled
+    /// (each via this same routine), its own agent job / timers / subscriptions
+    /// are disarmed, the container element instance is completed, and its ad-hoc
+    /// runtime state is dropped via `AdHocCompleted { cancelled: true }`. Returns
+    /// events (does not emit) so it composes inside a `process_step` result.
+    fn cancel_adhoc_active_child(
+        &self,
+        instance_key: Key,
+        container_key: Key,
+        child: Key,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        // Is this active child itself a nested ad-hoc container (#631)? If so it
+        // has its own runtime scope + active descendants to tear down first.
+        let nested = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&child))
+            .map(|a| {
+                (
+                    a.element_id.clone(),
+                    a.active.iter().copied().collect::<Vec<Key>>(),
+                )
+            });
+        if let Some((nested_element_id, nested_active)) = nested {
+            // Recursively cancel the nested container's own active tools (which
+            // may themselves be nested containers), then disarm the nested
+            // container's own agent job and any boundary state, complete its
+            // element instance, and drop its ad-hoc runtime state.
+            for grandchild in &nested_active {
+                events.extend(self.cancel_adhoc_active_child(instance_key, child, *grandchild));
+            }
+            if let Some(job_key) = self.active_job_on(child) {
+                events.push(Event::JobCanceled {
+                    job_key,
+                    instance_key,
+                });
+            }
+            events.extend(self.cancel_all_timers_on(child));
+            events.extend(self.cancel_all_subscriptions_on(child));
+            events.push(Event::ElementCompleting {
+                instance_key,
+                element_instance_key: child,
+                element_id: nested_element_id.clone(),
+            });
+            events.push(Event::ElementCompleted {
+                instance_key,
+                element_instance_key: child,
+                element_id: nested_element_id,
+            });
+            events.push(Event::AdHocCompleted {
+                instance_key,
+                container_key: child,
+                cancelled: true,
+            });
+        } else {
+            events.extend(self.cancel_mi_child_events(instance_key, child));
+        }
+        // Each tool child hangs off a dedicated inner instance; tear it down too
+        // so the read-model element-instance tree does not leak an orphan.
+        let inner = self.scope_of(instance_key, child);
+        if inner != 0 && inner != container_key {
+            let inner_element_id = self
+                .element_id_of_instance(instance_key, inner)
+                .unwrap_or_default();
+            events.push(Event::ElementCompleting {
+                instance_key,
+                element_instance_key: inner,
+                element_id: inner_element_id.clone(),
+            });
+            events.push(Event::ElementCompleted {
+                instance_key,
+                element_instance_key: inner,
+                element_id: inner_element_id,
+            });
+        }
+        events
+    }
+
     /// The ad-hoc catalog entry for `element_id` in `instance_key`'s definition,
     /// if that element is an ad-hoc sub-process container. Cloned so callers can
     /// hold it across the `&mut self` event emission that follows. This is the
@@ -5887,25 +5976,12 @@ impl Engine {
         // Each active tool child hangs off a dedicated inner instance, so tearing
         // the child down also tears down its inner instance — otherwise the
         // read-model element-instance tree would leak an orphaned inner instance.
+        // A nested ad-hoc container tool (#631) is torn down recursively (its own
+        // descendants + agent job + ad-hoc state), which `cancel_adhoc_active_child`
+        // handles — cancelling it as a leaf would orphan its internals.
         if cancel {
             for child in &active {
-                let inner = self.scope_of(instance_key, *child);
-                events.extend(self.cancel_mi_child_events(instance_key, *child));
-                if inner != 0 && inner != container_key {
-                    let inner_element_id = self
-                        .element_id_of_instance(instance_key, inner)
-                        .unwrap_or_default();
-                    events.push(Event::ElementCompleting {
-                        instance_key,
-                        element_instance_key: inner,
-                        element_id: inner_element_id.clone(),
-                    });
-                    events.push(Event::ElementCompleted {
-                        instance_key,
-                        element_instance_key: inner,
-                        element_id: inner_element_id,
-                    });
-                }
+                events.extend(self.cancel_adhoc_active_child(instance_key, container_key, *child));
             }
         }
         // The output collection propagates OUT of the container to its enclosing
