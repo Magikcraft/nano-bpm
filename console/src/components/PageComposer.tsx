@@ -658,7 +658,7 @@ function Settings({
             )}
             onChange={(cols) => set("columns", cols)}
           />
-          <GridAdvanced props={props} set={set} />
+          <GridAdvanced key={selectedId} props={props} set={set} />
         </>
       )}
 
@@ -773,7 +773,7 @@ function Settings({
               }
             />
           </Row>
-          <BindingAdvanced props={props} set={set} />
+          <BindingAdvanced key={selectedId} props={props} set={set} />
         </>
       )}
 

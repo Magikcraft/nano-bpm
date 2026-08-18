@@ -722,5 +722,75 @@ test("composer node types match the runtime renderer set (no drift)", () => {
     "prose",
     "text",
   ];
-  assert.deepEqual([...PAGE_NODE_TYPES].sort(), RUNTIME_RENDERER_TYPES);
+  assert.deepEqual(
+    [...PAGE_NODE_TYPES].sort(),
+    [...RUNTIME_RENDERER_TYPES].sort(),
+  );
+});
+
+// Regressions for the parse-canonicalization edge cases (issue #843 review):
+
+test("parseFilter: an empty `in` set falls through to a co-present eqParam", () => {
+  const r = parsePageDoc({
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "x",
+    nodes: [
+      {
+        type: "prose",
+        id: "p",
+        props: {
+          data: {
+            kind: "datasource",
+            source: "app",
+            table: "t",
+            // A malformed filter carrying both an empty IN and a param bind: the
+            // empty IN must not swallow the eqParam (would drop the filter, then
+            // silently read the whole table on save).
+            filter: [{ field: "k", in: [], eqParam: true }],
+          },
+        },
+      },
+    ],
+  });
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  const n = r.ok && r.doc.nodes[0];
+  assert.deepEqual(n && n.type === "prose" && n.props.data.filter, [
+    { field: "k", eqParam: true },
+  ]);
+});
+
+test("a button modal of only empty strings is dropped (no hollow modal)", () => {
+  const r = parsePageDoc({
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "x",
+    nodes: [
+      {
+        type: "button",
+        id: "b",
+        props: { label: "Open", modal: { title: "", copyText: "" } },
+      },
+    ],
+  });
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  const n = r.ok && r.doc.nodes[0];
+  assert.equal(n && n.type === "button" && n.props.modal, undefined);
+});
+
+test("a button modal keeps set fields and drops the empty ones", () => {
+  const r = parsePageDoc({
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "x",
+    nodes: [
+      {
+        type: "button",
+        id: "b",
+        props: { label: "Open", modal: { title: "", copyText: "Copy me" } },
+      },
+    ],
+  });
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  const n = r.ok && r.doc.nodes[0];
+  assert.deepEqual(n && n.type === "button" && n.props.modal, {
+    copyText: "Copy me",
+  });
 });

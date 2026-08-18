@@ -407,9 +407,14 @@ function parseFilter(raw: unknown): ColumnFilter[] {
   const out: ColumnFilter[] = [];
   for (const f of Array.isArray(raw) ? raw : []) {
     if (!isRecord(f) || typeof f.field !== "string" || !f.field) continue;
-    if (Array.isArray(f.in)) {
-      const values = f.in.filter((v): v is string => typeof v === "string");
-      if (values.length) out.push({ field: f.field, in: values });
+    // An `in` set only wins when it yields at least one string value (mirrors
+    // urban's dataUrl, which prioritises a non-empty IN). An empty/invalid `in`
+    // falls through so a co-present `eqParam`/`eq` isn't silently dropped.
+    const inValues = Array.isArray(f.in)
+      ? f.in.filter((v): v is string => typeof v === "string")
+      : null;
+    if (inValues && inValues.length) {
+      out.push({ field: f.field, in: inValues });
     } else if (f.eqParam === true) {
       // Route-param binding wins over a literal `eq` (mirrors urban's dataUrl,
       // which checks eqParam before eq). Preserve it so a param-scoped grid/prose
@@ -785,16 +790,18 @@ export function parsePageDoc(
       }
       case "button": {
         const rawModal = isRecord(props.modal) ? props.modal : undefined;
-        // Keep only the string modal fields that are set; a modal with none is
+        // Keep only the non-empty string modal fields; a modal with none left is
         // omitted entirely (a bare button just renders a label — no `openModal`).
+        // Dropping empty strings matches `ButtonModalEditor` and avoids
+        // persisting a hollow modal the runtime would still open on click.
         const modal: ButtonModal = {};
-        if (typeof rawModal?.title === "string") modal.title = rawModal.title;
-        if (typeof rawModal?.description === "string")
+        const nonEmpty = (v: unknown): v is string =>
+          typeof v === "string" && v !== "";
+        if (nonEmpty(rawModal?.title)) modal.title = rawModal.title;
+        if (nonEmpty(rawModal?.description))
           modal.description = rawModal.description;
-        if (typeof rawModal?.copyLabel === "string")
-          modal.copyLabel = rawModal.copyLabel;
-        if (typeof rawModal?.copyText === "string")
-          modal.copyText = rawModal.copyText;
+        if (nonEmpty(rawModal?.copyLabel)) modal.copyLabel = rawModal.copyLabel;
+        if (nonEmpty(rawModal?.copyText)) modal.copyText = rawModal.copyText;
         const hasModal = Object.keys(modal).length > 0;
         nodes.push({
           type: "button",
