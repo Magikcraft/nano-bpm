@@ -14420,7 +14420,7 @@ fn nested_adhoc_read_model_element_tree_nests_correctly() {
 }
 
 /// An outer JOB_WORKER container whose nested `subagent` declares a
-/// `<completionCondition>` (`=count(subResults) >= 1`) and holds TWO leaf tools.
+/// `<completionCondition>` (`=done = true`) and holds TWO leaf tools.
 /// Once the first leaf drains the nested container's condition fires and — with
 /// the default `cancelRemainingInstances=true` — cancels the still-running
 /// second leaf, then completes and feeds the OUTER container across the nesting
@@ -14561,6 +14561,21 @@ fn nested_adhoc_completion_condition_cancels_remaining_and_feeds_parent() {
         container_output_collection(&engine, inst, outer, "results"),
         Some(Value::List(vec![Value::Bool(true)])),
         "the cancelled nested container still fed the outer outputElement"
+    );
+    // The nested container's OWN `outputCollection` (`subResults`) is an internal
+    // detail of the nested scope — it must NOT leak across the nesting boundary
+    // into the enclosing scope. Its result crosses only via the parent's
+    // outputElement (`results`, asserted above). Before the fix, completing the
+    // nested container propagated `subResults` out of its scope, landing it in the
+    // root instance variables (no ancestor scope defines it).
+    assert!(
+        !engine.instance(inst).unwrap().variables.contains_key("subResults"),
+        "the nested container's internal outputCollection did not leak into the root scope"
+    );
+    assert_eq!(
+        container_output_collection(&engine, inst, outer, "subResults"),
+        None,
+        "the nested container's internal outputCollection did not leak into the outer scope"
     );
 
     // The outer agent job re-emitted; complete the run.

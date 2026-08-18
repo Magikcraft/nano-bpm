@@ -5861,6 +5861,27 @@ impl Engine {
         };
         let scope = self.scope_of(instance_key, container_key);
 
+        // Detect up front whether this container is itself an active tool of a
+        // PARENT ad-hoc container (nested agent-of-agents, #631). Detected exactly
+        // like the tool-completion routing in `complete`: walk the
+        // element-instance tree (inner instance → parent container) and confirm
+        // the parent still lists this container active. `scope` is this
+        // container's inner-instance wrapper, so it doubles as `inner_key`.
+        let inner_key = scope;
+        let parent_container = if inner_key != 0 {
+            self.scope_of(instance_key, inner_key)
+        } else {
+            0
+        };
+        let is_nested_tool = parent_container != 0
+            && self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.adhoc_instances.get(&parent_container))
+                .map(|a| a.active.contains(&container_key))
+                .unwrap_or(false);
+
         let mut events = Vec::new();
         // Cancel any tools still running (a cancel-remaining-instances request).
         // Each active tool child hangs off a dedicated inner instance, so tearing
@@ -5896,6 +5917,15 @@ impl Engine {
         // can only be a value the guard deliberately preserved, so coercing it to
         // `[]` would silently corrupt it. A never-seeded collection defaults to an
         // empty array.
+        //
+        // A NESTED container (agent-of-agents, #631) is the exception: its result
+        // must cross the nesting boundary ONLY via the parent's tool-completion
+        // path below (projected through the PARENT's `outputElement`). Propagating
+        // its own `outputCollection` (e.g. `subResults`) into the enclosing parent
+        // scope here would both leak the nested container's internal collection
+        // into the parent's variables and apply that update even when the boundary
+        // crossing is later DEFERRED (incident) by `complete_adhoc_tool`. So skip
+        // this propagation entirely when nested.
         let collection_map = output_collection.map(|name| {
             let value = self
                 .state
@@ -5908,7 +5938,9 @@ impl Engine {
             HashMap::from([(name, value)])
         });
         if let Some(map) = &collection_map {
-            events.extend(self.propagated_updates(instance_key, scope, map.clone(), false));
+            if !is_nested_tool {
+                events.extend(self.propagated_updates(instance_key, scope, map.clone(), false));
+            }
         }
 
         // Nested ad-hoc container completing (agent-of-agents, #631): this
@@ -5918,26 +5950,12 @@ impl Engine {
         // same path an ordinary tool completion takes — which projects this
         // container's result via the PARENT's `outputElement`, drops it from the
         // parent's active set (tearing down its wrapping inner instance), and
-        // re-emits the parent's agent job once the parent's tools drain. Detected
-        // exactly like the tool-completion routing in `complete`: walk the
-        // element-instance tree (inner instance → parent container) and confirm
-        // the parent still lists this container active. The end-listener gate
-        // below is intentionally skipped for a nested container — its completion
-        // is a tool completion, not a token-flow container completion.
-        let inner_key = self.scope_of(instance_key, container_key);
-        let parent_container = if inner_key != 0 {
-            self.scope_of(instance_key, inner_key)
-        } else {
-            0
-        };
-        let is_nested_tool = parent_container != 0
-            && self
-                .state
-                .instances
-                .get(&instance_key)
-                .and_then(|i| i.adhoc_instances.get(&parent_container))
-                .map(|a| a.active.contains(&container_key))
-                .unwrap_or(false);
+        // re-emits the parent's agent job once the parent's tools drain. The
+        // `is_nested_tool` detection was computed up front (above), so its own
+        // `outputCollection` was already withheld from the enclosing scope. The
+        // end-listener gate below is intentionally skipped for a nested container
+        // — its completion is a tool completion, not a token-flow container
+        // completion.
         if is_nested_tool {
             let (tool_events, tool_followups) = self.complete_adhoc_tool(
                 instance_key,
