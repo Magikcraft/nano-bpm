@@ -197,22 +197,24 @@ impl TestEngine {
             )
         })?;
         let resource_name = format!("{id}.form");
-        let events = self
-            .apply(Command::DeployForms(vec![FormResource {
-                id: id.clone(),
-                resource_name: resource_name.clone(),
-                schema: schema.to_string(),
-            }]))
-            .map_err(|e| js_err(&format!("deploy error: {e}")))?;
-        let (form_key, version) = events
-            .iter()
-            .find_map(|e| match e {
-                Event::FormDeployed {
-                    form_key, version, ..
-                } => Some((*form_key, *version)),
-                _ => None,
-            })
-            .ok_or_else(|| js_err("deploy error: no FormDeployed event emitted"))?;
+        self.apply(Command::DeployForms(vec![FormResource {
+            id: id.clone(),
+            resource_name: resource_name.clone(),
+            schema: schema.to_string(),
+        }]))
+        .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+        // Resolve from post-apply state rather than the emitted events: an
+        // idempotent redeploy of the identical latest form emits no
+        // `FormDeployed` event, but the deploy still succeeds and must return
+        // the existing identity (native parity — the server builds responses
+        // from resolved state, not events).
+        let (form_key, version) = self
+            .engine
+            .state()
+            .forms
+            .get(&id)
+            .map(|f| (f.key, f.version))
+            .ok_or_else(|| js_err("deploy error: form not found after deploy"))?;
         let snapshot = self.snapshot_value(None);
         to_json(&serde_json::json!({
             "formKey": form_key.to_string(),
@@ -241,24 +243,24 @@ impl TestEngine {
         content: &str,
     ) -> Result<String, JsValue> {
         self.guard_paused()?;
-        let events = self
-            .apply(Command::DeployGenericResources(vec![GenericResource {
-                resource_id: resource_name.to_string(),
-                resource_name: resource_name.to_string(),
-                content: content.to_string(),
-            }]))
-            .map_err(|e| js_err(&format!("deploy error: {e}")))?;
-        let (resource_key, version) = events
-            .iter()
-            .find_map(|e| match e {
-                Event::GenericResourceDeployed {
-                    resource_key,
-                    version,
-                    ..
-                } => Some((*resource_key, *version)),
-                _ => None,
-            })
-            .ok_or_else(|| js_err("deploy error: no GenericResourceDeployed event emitted"))?;
+        self.apply(Command::DeployGenericResources(vec![GenericResource {
+            resource_id: resource_name.to_string(),
+            resource_name: resource_name.to_string(),
+            content: content.to_string(),
+        }]))
+        .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+        // Resolve from post-apply state rather than the emitted events: an
+        // idempotent redeploy of the identical latest resource emits no
+        // `GenericResourceDeployed` event, but the deploy still succeeds as a
+        // no-op and must return the existing identity (native parity — the
+        // server builds responses from resolved state, not events).
+        let (resource_key, version) = self
+            .engine
+            .state()
+            .resources
+            .get(resource_name)
+            .map(|r| (r.key, r.version))
+            .ok_or_else(|| js_err("deploy error: resource not found after deploy"))?;
         let snapshot = self.snapshot_value(None);
         to_json(&serde_json::json!({
             "resourceKey": resource_key.to_string(),
@@ -3138,6 +3140,23 @@ mod read_channel_tests {
     }
 
     #[test]
+    fn deploy_form_is_idempotent_when_redeploying_the_identical_latest_form() {
+        // Redeploying the identical latest form emits no `FormDeployed` event
+        // (the engine dedupes it), but the deploy must still succeed and return
+        // the existing identity — resolved from post-apply state, not events.
+        let mut eng = TestEngine::new();
+        let schema = r#"{"id":"greeting","components":[],"v":1}"#;
+        let first = parse(&eng.deploy_form(schema).expect("first deployForm succeeds"));
+        let again = parse(
+            &eng.deploy_form(schema)
+                .expect("redeploying the identical latest form succeeds"),
+        );
+        assert_eq!(again["formKey"], first["formKey"]);
+        assert_eq!(again["version"], first["version"]);
+        assert_eq!(again["resourceName"], first["resourceName"]);
+    }
+
+    #[test]
     fn form_id_of_requires_a_non_empty_string_id() {
         assert_eq!(
             form_id_of(r#"{"id":"greeting","components":[]}"#),
@@ -3175,6 +3194,27 @@ mod read_channel_tests {
 
         // An unknown key is JSON null.
         assert_eq!(eng.get_resource_by_key("999999").unwrap(), "null");
+    }
+
+    #[test]
+    fn deploy_resource_is_idempotent_when_redeploying_the_identical_latest_resource() {
+        // Redeploying the identical latest resource (same name and content)
+        // emits no `GenericResourceDeployed` event, but the deploy is a
+        // successful no-op that must return the existing identity — resolved
+        // from post-apply state, not events.
+        let mut eng = TestEngine::new();
+        let content = "# Agent prompt\nBe helpful.";
+        let first = parse(
+            &eng.deploy_resource("agent-prompt.md", content)
+                .expect("first deployResource succeeds"),
+        );
+        let again = parse(
+            &eng.deploy_resource("agent-prompt.md", content)
+                .expect("redeploying the identical latest resource succeeds"),
+        );
+        assert_eq!(again["resourceKey"], first["resourceKey"]);
+        assert_eq!(again["version"], first["version"]);
+        assert_eq!(again["resourceName"], first["resourceName"]);
     }
 
     #[test]
