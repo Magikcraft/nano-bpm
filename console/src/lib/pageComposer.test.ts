@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   emptyPage,
   parsePageDoc,
+  PAGE_NODE_TYPES,
   PAGE_SCHEMA_VERSION,
   type PageDoc,
 } from "./pageSchema.ts";
@@ -328,19 +329,6 @@ test("toPageDoc skips unknown Craft components + preserves child order", () => {
   );
 });
 
-test("makeNode produces a validatable node of the requested type", () => {
-  for (const type of ["text", "nav", "actionForm", "dataGrid"] as const) {
-    const n = makeNode(type);
-    const r = parsePageDoc({
-      schemaVersion: PAGE_SCHEMA_VERSION,
-      title: "x",
-      nodes: [n],
-    });
-    assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
-    assert.equal(n.type, type);
-  }
-});
-
 // The full v2 witness: filtered/tabbed grid with row actions (cancel), a lazy
 // nested child grid, and a conditional escalation-answer form (ADR 0042 v2).
 const v2Grid: PageDoc = {
@@ -606,4 +594,133 @@ test("parsePageDoc omits an empty detail rather than storing a hollow object", (
     grid && grid.type === "dataGrid" && grid.props.detail,
     undefined,
   );
+});
+
+// ── prose + button (composer/runtime drift closure, issue #843 P0) ───────────
+// The runtime renderer (nano-ide urban `RENDERERS`) supports two node types the
+// composer historically didn't parse — `prose` (data-bound markdown list, #274)
+// and `button` (a label + optional copy modal). A page using either failed to
+// open with `type "prose" is not a known node type`. These tests pin that both
+// now parse and survive a Craft.js round-trip losslessly.
+
+const prosePage: PageDoc = {
+  schemaVersion: PAGE_SCHEMA_VERSION,
+  title: "Epic detail",
+  nodes: [
+    {
+      type: "prose",
+      id: "plan-reviews",
+      props: {
+        title: "Plan review trace",
+        data: {
+          kind: "datasource",
+          source: "app",
+          table: "plan_reviews",
+          orderBy: { field: "created_at", dir: "asc" },
+          filter: [{ field: "plan_key", eqParam: true }],
+        },
+        header: "Round {{round}} · approved {{approved}}",
+        body: "findings",
+        measure: 80,
+        empty: "No plan reviews recorded yet.",
+        collapsible: true,
+        defaultCollapsed: true,
+        refreshMs: 5000,
+      },
+    },
+  ],
+};
+
+test("parsePageDoc accepts a prose node unchanged (issue #843)", () => {
+  const r = parsePageDoc(prosePage);
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  assert.deepEqual(r.ok && r.doc.nodes, prosePage.nodes);
+});
+
+test("prose survives a Craft.js round-trip unchanged", () => {
+  const state = fromPageDoc(prosePage);
+  const back = toPageDoc(state, prosePage.title);
+  assert.deepEqual(back.nodes, prosePage.nodes);
+});
+
+test("prose preserves an eqParam filter (no data loss on save)", () => {
+  const back = toPageDoc(fromPageDoc(prosePage), prosePage.title);
+  const node = back.nodes[0];
+  assert.ok(node.type === "prose");
+  assert.deepEqual(node.type === "prose" && node.props.data.filter, [
+    { field: "plan_key", eqParam: true },
+  ]);
+});
+
+const buttonPage: PageDoc = {
+  schemaVersion: PAGE_SCHEMA_VERSION,
+  title: "Home",
+  nodes: [
+    {
+      type: "button",
+      id: "agent-instructions",
+      props: {
+        label: "🤖 Agent Instructions",
+        variant: "ghost",
+        modal: {
+          title: "Point your agent at Nano Workforce",
+          description: "Copy this prompt and paste it into your coding agent.",
+          copyLabel: "Copy prompt",
+          copyText: "You are helping me operate a running Nano Workforce.",
+        },
+      },
+    },
+  ],
+};
+
+test("parsePageDoc accepts a button node unchanged (issue #843)", () => {
+  const r = parsePageDoc(buttonPage);
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  assert.deepEqual(r.ok && r.doc.nodes, buttonPage.nodes);
+});
+
+test("button survives a Craft.js round-trip unchanged", () => {
+  const back = toPageDoc(fromPageDoc(buttonPage), buttonPage.title);
+  assert.deepEqual(back.nodes, buttonPage.nodes);
+});
+
+test("a bare button (no modal) parses and drops the empty modal", () => {
+  const r = parsePageDoc({
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "x",
+    nodes: [{ type: "button", id: "b", props: { label: "Open" } }],
+  });
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  const n = r.ok && r.doc.nodes[0];
+  assert.equal(n && n.type === "button" && n.props.modal, undefined);
+});
+
+test("makeNode produces a validatable node for every declared type", () => {
+  for (const type of PAGE_NODE_TYPES) {
+    const n = makeNode(type);
+    const r = parsePageDoc({
+      schemaVersion: PAGE_SCHEMA_VERSION,
+      title: "x",
+      nodes: [n],
+    });
+    assert.ok(r.ok, `${type}: ${r.ok ? "" : r.errors.join("; ")}`);
+    assert.equal(n.type, type);
+  }
+});
+
+// Drift guard (issue #843 P0): the composer's editable node-type set MUST equal
+// the runtime renderer's set. The runtime source of truth is `RENDERERS` in
+// nano-ide `packages/urban/src/runtime/core/modules/pages.ts`. If a type is added
+// to one surface and not the other, this fails loudly — until P1/P2 make both
+// derive from a single shared registry (`@nanobpm/nano-app-schema`).
+test("composer node types match the runtime renderer set (no drift)", () => {
+  const RUNTIME_RENDERER_TYPES = [
+    "actionForm",
+    "button",
+    "dataGrid",
+    "nav",
+    "prose",
+    "text",
+  ];
+  assert.deepEqual([...PAGE_NODE_TYPES].sort(), RUNTIME_RENDERER_TYPES);
 });

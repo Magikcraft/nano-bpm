@@ -33,6 +33,10 @@ export interface ColumnFilter {
   field: string;
   eq?: string;
   in?: string[];
+  /** Bind this column to the current route param ("show the selected entity's
+   * rows"). Mirrors urban's `dataUrl` `{ eqParam: true }` form; a param-scoped
+   * list renders nothing when no route param is present. */
+  eqParam?: true;
 }
 
 /** A grid's sort order (a single column, ascending or descending). */
@@ -257,14 +261,66 @@ export interface DataGridNode {
   };
 }
 
-export type PageNode = TextNode | NavNode | ActionFormNode | DataGridNode;
+export type PageNode =
+  TextNode | NavNode | ActionFormNode | DataGridNode | ProseNode | ButtonNode;
 export type PageNodeType = PageNode["type"];
+
+/** A data-bound prose/markdown list (#274). Binds a datasource like `dataGrid`,
+ * but renders each row as a stacked prose block — a header template over one body
+ * field rendered as sanitised markdown. Mirrors urban's `renderProse` contract. */
+export interface ProseNode {
+  type: "prose";
+  id: string;
+  props: {
+    title: string;
+    data: DatasourceBinding;
+    /** A `{{field}}` template for each row's small header line. */
+    header?: string;
+    /** The row field whose value is rendered as the markdown body. */
+    body?: string;
+    /** Reading measure in ch (clamped 40–100 at render; ~66 default). */
+    measure?: number;
+    /** Text shown when the datasource returns no rows. */
+    empty?: string;
+    /** Render inside a collapsible section. */
+    collapsible?: boolean;
+    /** Start collapsed (only meaningful with `collapsible`). */
+    defaultCollapsed?: boolean;
+    /** Auto-refresh interval in ms (0/omitted disables). */
+    refreshMs?: number;
+  };
+}
+
+/** The modal a `button` opens: a titled panel with a description and a
+ * copy-to-clipboard action. Mirrors urban's `renderButton`/`openModal`. */
+export interface ButtonModal {
+  title?: string;
+  description?: string;
+  copyLabel?: string;
+  copyText?: string;
+}
+
+export type ButtonVariant = "default" | "ghost";
+
+/** A standalone button that opens an optional copy modal (a label + prompt the
+ * operator can copy). Mirrors urban's `renderButton` contract. */
+export interface ButtonNode {
+  type: "button";
+  id: string;
+  props: {
+    label: string;
+    variant?: ButtonVariant;
+    modal?: ButtonModal;
+  };
+}
 
 export const PAGE_NODE_TYPES: PageNodeType[] = [
   "text",
   "nav",
   "actionForm",
   "dataGrid",
+  "prose",
+  "button",
 ];
 
 export interface PageDoc {
@@ -298,6 +354,15 @@ export function defaultProps(type: PageNodeType): PageNode["props"] {
         data: { kind: "datasource", source: "app", table: "" },
         columns: [],
       };
+    case "prose":
+      return {
+        title: "Prose",
+        data: { kind: "datasource", source: "app", table: "" },
+        header: "",
+        body: "",
+      };
+    case "button":
+      return { label: "Open" };
   }
 }
 
@@ -345,6 +410,11 @@ function parseFilter(raw: unknown): ColumnFilter[] {
     if (Array.isArray(f.in)) {
       const values = f.in.filter((v): v is string => typeof v === "string");
       if (values.length) out.push({ field: f.field, in: values });
+    } else if (f.eqParam === true) {
+      // Route-param binding wins over a literal `eq` (mirrors urban's dataUrl,
+      // which checks eqParam before eq). Preserve it so a param-scoped grid/prose
+      // list isn't silently downgraded to an unfiltered read on save.
+      out.push({ field: f.field, eqParam: true });
     } else if (typeof f.eq === "string") {
       out.push({ field: f.field, eq: f.eq });
     }
@@ -670,6 +740,69 @@ export function parsePageDoc(
             ...(rowActions.length ? { rowActions } : {}),
             ...(detail ? { detail } : {}),
             ...(refreshMs ? { refreshMs } : {}),
+          },
+        });
+        break;
+      }
+      case "prose": {
+        const data = isRecord(props.data) ? props.data : {};
+        const filter = parseFilter(data.filter);
+        const orderBy = parseOrder(data.orderBy);
+        const measure =
+          typeof props.measure === "number" && Number.isFinite(props.measure)
+            ? props.measure
+            : undefined;
+        const refreshMs =
+          typeof props.refreshMs === "number" && props.refreshMs > 0
+            ? props.refreshMs
+            : undefined;
+        nodes.push({
+          type: "prose",
+          id,
+          props: {
+            title: str(props.title),
+            data: {
+              kind: "datasource",
+              source: str(data.source, "app"),
+              table: str(data.table),
+              ...(filter.length ? { filter } : {}),
+              ...(orderBy ? { orderBy } : {}),
+            },
+            ...(typeof props.header === "string"
+              ? { header: props.header }
+              : {}),
+            ...(typeof props.body === "string" ? { body: props.body } : {}),
+            ...(measure !== undefined ? { measure } : {}),
+            ...(typeof props.empty === "string" ? { empty: props.empty } : {}),
+            ...(props.collapsible === true ? { collapsible: true } : {}),
+            ...(props.defaultCollapsed === true
+              ? { defaultCollapsed: true }
+              : {}),
+            ...(refreshMs ? { refreshMs } : {}),
+          },
+        });
+        break;
+      }
+      case "button": {
+        const rawModal = isRecord(props.modal) ? props.modal : undefined;
+        // Keep only the string modal fields that are set; a modal with none is
+        // omitted entirely (a bare button just renders a label — no `openModal`).
+        const modal: ButtonModal = {};
+        if (typeof rawModal?.title === "string") modal.title = rawModal.title;
+        if (typeof rawModal?.description === "string")
+          modal.description = rawModal.description;
+        if (typeof rawModal?.copyLabel === "string")
+          modal.copyLabel = rawModal.copyLabel;
+        if (typeof rawModal?.copyText === "string")
+          modal.copyText = rawModal.copyText;
+        const hasModal = Object.keys(modal).length > 0;
+        nodes.push({
+          type: "button",
+          id,
+          props: {
+            label: str(props.label, "Open"),
+            ...(props.variant === "ghost" ? { variant: "ghost" } : {}),
+            ...(hasModal ? { modal } : {}),
           },
         });
         break;
