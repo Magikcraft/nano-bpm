@@ -795,6 +795,13 @@ fn parse_with_captures(
                                     acc.nodes[idx].signal_ref = Some(signal_ref);
                                 } else if let Some(boundary) = cur_boundary.as_mut() {
                                     boundary.signal_ref = Some(signal_ref);
+                                } else if let Some(idx) = cur_start {
+                                    // On a start event, marks it a *signal* start
+                                    // (a typed start, distinct from a none start).
+                                    // Recorded so the start-event count rule (#855)
+                                    // does not mistake it for a second none start,
+                                    // and so #851 can resolve its `signalRef`.
+                                    acc.nodes[idx].signal_ref = Some(signal_ref);
                                 }
                             }
                             "taskDefinition" => {
@@ -2257,11 +2264,15 @@ impl ProcessAcc {
         // A process may declare more than one start event (e.g. a "refresh batch"
         // and a "manual intake" start that merge downstream). The engine begins an
         // instance at a single process-level start event, so designate one — a
-        // plain none start preferred, tie-broken by id — and demote the surplus
-        // process-level starts to inert throw events. They keep their outgoing
-        // flow (so it still has a valid source) but, lacking any incoming flow,
-        // are never activated; instances created via CreateInstance begin at the
-        // designated start.
+        // plain none start preferred, tie-broken by id. Zeebe permits several
+        // *typed* (message/timer/signal) starts alongside at most one none start,
+        // so the surplus *typed* process-level starts are demoted to inert throw
+        // events: they keep their outgoing flow (so it still has a valid source)
+        // but, lacking any incoming flow, are never activated; instances created
+        // via CreateInstance begin at the designated start. Surplus *none* starts
+        // are deliberately NOT demoted — multiple none starts are illegal, and
+        // keeping them lets the post-parse `start_events` validator (#855) see and
+        // reject them (`InvalidStartEvents`) rather than silently collapsing them.
         let proc_starts: Vec<usize> = self
             .nodes
             .iter()
@@ -2270,8 +2281,10 @@ impl ProcessAcc {
             .map(|(i, _)| i)
             .collect();
         if proc_starts.len() > 1 {
-            let is_none_start =
-                |n: &NodeAcc| n.message_ref.is_none() && n.timer_repeating.is_none();
+            // A none start carries no message/timer/signal event definition.
+            let is_none_start = |n: &NodeAcc| {
+                n.message_ref.is_none() && n.timer_repeating.is_none() && n.signal_ref.is_none()
+            };
             let designated = proc_starts
                 .iter()
                 .copied()
@@ -2285,7 +2298,9 @@ impl ProcessAcc {
                         .expect("non-empty")
                 });
             for &i in &proc_starts {
-                if i != designated {
+                // Demote only surplus *typed* starts; never a none start (see the
+                // note above — surplus none starts are kept for the validator).
+                if i != designated && !is_none_start(&self.nodes[i]) {
                     self.nodes[i].kind = NodeKind::IntermediateThrow;
                     self.nodes[i].message_ref = None;
                     self.nodes[i].timer_repeating = None;
