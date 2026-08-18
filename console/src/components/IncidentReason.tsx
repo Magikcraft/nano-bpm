@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { copyText, selectElementText } from "../lib/clipboard";
 import {
   REASON_COLLAPSE_LINES,
@@ -23,7 +23,9 @@ const clampStyle: CSSProperties = {
 };
 
 export function IncidentReason({ reason }: { reason: string }) {
-  const collapsible = shouldCollapseReason(reason);
+  // Memoize the collapse decision by `reason` so flipping local state (copied /
+  // expanded) doesn't repeatedly rescan large multiline stderr dumps.
+  const collapsible = useMemo(() => shouldCollapseReason(reason), [reason]);
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const preRef = useRef<HTMLPreElement>(null);
