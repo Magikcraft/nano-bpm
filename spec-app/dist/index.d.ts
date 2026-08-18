@@ -443,6 +443,18 @@ export interface PreResolvedForm {
  * breaks the whole preview.
  */
 export declare function preResolveFormSchema(schema: unknown, resolve: DataQueryResolver): Promise<PreResolvedForm>;
+export declare const PAGE_NODE_TYPES: readonly [
+	"text",
+	"nav",
+	"actionForm",
+	"dataGrid",
+	"prose",
+	"button"
+];
+/** A node type known to a composed page — one of {@link PAGE_NODE_TYPES}. */
+export type PageNodeType = (typeof PAGE_NODE_TYPES)[number];
+/** Narrowing guard: is `value` a known page node type? */
+export declare function isPageNodeType(value: unknown): value is PageNodeType;
 /**
  * GENERATED — do not edit by hand.
  *
