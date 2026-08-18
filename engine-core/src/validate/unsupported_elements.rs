@@ -54,6 +54,17 @@ use crate::bpmn::ParseError;
 /// metadata (which Zeebe ignores), not an unmodelled BPMN flow element, so the
 /// unsupported-element rule filters it out. Kept in lockstep with the
 /// `zeebe:`-prefixed local names the parser handles in `crate::bpmn`.
+///
+/// Only local names that would otherwise fall through to the flow-element
+/// catch-all (and so be over-recorded on `capture.unmodelled`) belong here. A
+/// `zeebe:` extension local name that *collides* with a modelled BPMN
+/// flow-element tag — e.g. `zeebe:userTask`, whose local name `userTask` is
+/// consumed by the same modelled `"userTask"` parser arm as `<bpmn:userTask>`
+/// (and, being id-less, is a no-op there) — is **not** listed: it never reaches
+/// the catch-all, so it is not noise this filter needs to suppress. Listing
+/// such a BPMN flow-element local name would be dead and, worse, would silently
+/// mask a genuinely unsupported `<bpmn:userTask>` capture should the parser's
+/// recording logic ever change.
 const EXTENSION_NOISE: &[&str] = &[
     "taskDefinition",
     "taskHeaders",
@@ -73,7 +84,6 @@ const EXTENSION_NOISE: &[&str] = &[
     "script",
     "linkedResources",
     "linkedResource",
-    "userTask",
     "executionListeners",
     "executionListener",
     "taskListeners",
