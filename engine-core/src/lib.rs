@@ -83,6 +83,8 @@ pub mod feel;
 
 pub mod xml;
 
+mod validate;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
