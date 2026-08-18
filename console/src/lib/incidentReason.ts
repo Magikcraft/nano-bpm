@@ -26,7 +26,14 @@ export const REASON_COLLAPSE_CHARS = 240;
 /** Count the newline-delimited lines in a string (an empty string is 0 lines). */
 export function countReasonLines(reason: string): number {
   if (reason.length === 0) return 0;
-  return reason.split("\n").length;
+  // Scan for newlines rather than `split("\n")`: an incident reason can be a
+  // large stderr dump, and we only need the count — no need to allocate an
+  // array proportional to the number of lines.
+  let lines = 1;
+  for (let i = reason.indexOf("\n"); i !== -1; i = reason.indexOf("\n", i + 1)) {
+    lines++;
+  }
+  return lines;
 }
 
 /** True when the reason spans more than one physical line. */
@@ -45,5 +52,7 @@ export function shouldCollapseReason(
   lines: number = REASON_COLLAPSE_LINES,
   chars: number = REASON_COLLAPSE_CHARS,
 ): boolean {
-  return countReasonLines(reason) > lines || reason.length > chars;
+  // Check the cheap character bound first: it short-circuits a long run-on
+  // single-line reason without scanning the whole string for newlines.
+  return reason.length > chars || countReasonLines(reason) > lines;
 }
