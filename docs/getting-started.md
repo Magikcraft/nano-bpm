@@ -1,4 +1,4 @@
-# Getting Started
+# Getting Started with Nano Workforce
 
 **Nano Workforce** turns a durable BPMN process into an agent graph that drives
 software delivery: it plans an issue, fans a fleet of coding agents out to

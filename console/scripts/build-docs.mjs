@@ -106,8 +106,8 @@ const pages = [
   // (below) is demoted to a sidebar page.
   {
     slug: "index",
-    title: "Getting Started",
-    heading: "Getting Started",
+    title: "Getting Started with Nano Workforce",
+    heading: "Getting Started with Nano Workforce",
     markdown: readFileSync(join(root, "..", "docs", "getting-started.md"), "utf8"),
     href: "/docs",
     linkBase: "docs",
