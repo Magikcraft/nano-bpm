@@ -97,6 +97,8 @@ const CRAFT_NAME: Record<PageNodeType, string> = {
   nav: "NavNode",
   actionForm: "ActionFormNode",
   dataGrid: "DataGridNode",
+  prose: "ProseNode",
+  button: "ButtonNode",
 };
 const TYPE_BY_CRAFT: Record<string, PageNodeType> = Object.fromEntries(
   PAGE_NODE_TYPES.map((t) => [CRAFT_NAME[t], t]),
