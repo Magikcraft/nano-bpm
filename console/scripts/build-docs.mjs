@@ -97,16 +97,28 @@ const visibleSections = sections.filter(
   (s) => !(s.heading && DOCS_EXCLUDE.has(s.heading.toLowerCase())),
 );
 
-// First section is the preamble (H1 + intro) -> the Overview / home page.
+// First section is the preamble (H1 + intro) -> the engine "Overview" page.
 const preamble = visibleSections.shift();
-const h1 = /^# (.+)$/m.exec(preamble.lines.join("\n"));
+const overviewH1 = /^# (.+)$/m.exec(preamble.lines.join("\n"));
 const pages = [
+  // Home page (/docs): the task-focused Nano Workforce Getting Started. Its own
+  // source file so product onboarding leads the docs; the engine User Guide
+  // (below) is demoted to a sidebar page.
   {
     slug: "index",
-    title: "Overview",
-    heading: h1 ? h1[1].trim() : "Overview",
-    markdown: preamble.lines.join("\n"),
+    title: "Getting Started with Nano Workforce",
+    heading: "Getting Started with Nano Workforce",
+    markdown: readFileSync(join(root, "..", "docs", "getting-started.md"), "utf8"),
     href: "/docs",
+    linkBase: "docs",
+  },
+  // The engine User Guide preamble, no longer the home page.
+  {
+    slug: "overview",
+    title: "Overview",
+    heading: overviewH1 ? overviewH1[1].trim() : "Overview",
+    markdown: preamble.lines.join("\n"),
+    href: "/docs/overview",
     linkBase: "",
   },
   ...visibleSections.map((s) => {
@@ -173,6 +185,9 @@ function repoRelative(base, path) {
 function rewriteHref(href, base) {
   if (!href) return href;
   if (/^(https?:|mailto:)/i.test(href)) return href;
+  // Site-absolute doc route (e.g. /docs/extensions) — already a working link on
+  // both the in-node /docs and nanobpm.io/docs. Leave it untouched.
+  if (href.startsWith("/")) return href;
   if (href.startsWith("#")) {
     const anchor = href.slice(1);
     const page = anchorToPage.get(anchor);
@@ -223,8 +238,9 @@ function shell(page) {
     <title>Nano BPM · ${esc(page.title)}</title>
     <style>
       :root {
-        --bg: #ffffff; --fg: #18181b; --muted: #71717a; --line: #e4e4e7;
-        --card: #fafafa; --accent: #0284c7; --code-bg: #f4f4f5;
+        color-scheme: dark;
+        --bg: #08080a; --fg: #e4e4e7; --muted: #a1a1aa; --line: rgba(120, 130, 150, 0.16);
+        --card: rgba(22, 24, 30, 0.55); --accent: #7dd3fc; --code-bg: #0d1117;
       }
       * { box-sizing: border-box; }
       html { scroll-behavior: smooth; }
@@ -233,7 +249,8 @@ function shell(page) {
       code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.86em; }
       a { color: var(--accent); }
       .nbpm-bar { display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 1rem;
-        background: #f4f4f5; border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10; }
+        background: rgba(16, 18, 24, 0.72); backdrop-filter: blur(8px);
+        border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10; }
       .nbpm-bar a.brand { display: flex; align-items: center; gap: 0.5rem; text-decoration: none; color: var(--fg); }
       .nbpm-bar strong { font-weight: 600; }
       .nbpm-bar .dot { width: 0.6rem; height: 0.6rem; border-radius: 9999px;
@@ -253,27 +270,29 @@ function shell(page) {
       .sidebar .nav-title { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em;
         color: var(--muted); font-weight: 700; padding: 0 0.6rem; margin-bottom: 0.4rem; }
       .nav-link { display: block; padding: 0.32rem 0.6rem; border-radius: 6px; text-decoration: none;
-        color: #3f3f46; font-size: 0.9rem; }
-      .nav-link:hover { background: #f4f4f5; color: var(--fg); }
-      .nav-link.active { background: #e0f2fe; color: #075985; font-weight: 600; }
+        color: var(--muted); font-size: 0.9rem; }
+      .nav-link:hover { background: rgba(255, 255, 255, 0.05); color: var(--fg); }
+      .nav-link.active { background: color-mix(in srgb, var(--accent) 16%, transparent);
+        color: var(--accent); font-weight: 600; }
       .content { min-width: 0; flex: 1; padding: 1.5rem 2rem 5rem; }
       .content h1 { font-size: 1.8rem; margin: 0.2rem 0 1rem; }
       .content h2 { font-size: 1.35rem; margin: 2rem 0 0.6rem; padding-bottom: 0.3rem;
         border-bottom: 1px solid var(--line); }
       .content h3 { font-size: 1.1rem; margin: 1.4rem 0 0.4rem; }
       .content h4 { font-size: 0.98rem; margin: 1.1rem 0 0.3rem; }
-      .content p, .content li { color: #27272a; }
+      .content p, .content li { color: #d4d4d8; }
       .content a { text-decoration: none; }
       .content a:hover { text-decoration: underline; }
       .content ul, .content ol { padding-left: 1.4rem; }
       .content li { margin: 0.25rem 0; }
       .content :not(pre) > code { background: var(--code-bg); border: 1px solid var(--line);
         border-radius: 4px; padding: 0.05rem 0.32rem; }
-      .content pre { background: #18181b; color: #f4f4f5; padding: 0.9rem 1rem; border-radius: 8px;
+      .content pre { background: var(--code-bg); color: #e6edf3; border: 1px solid var(--line);
+        padding: 0.9rem 1rem; border-radius: 8px;
         overflow-x: auto; font-size: 0.84rem; line-height: 1.5; }
       .content pre code { background: none; border: 0; padding: 0; color: inherit; }
       .content blockquote { margin: 1rem 0; padding: 0.3rem 1rem; border-left: 3px solid var(--accent);
-        background: #f8fafc; color: #3f3f46; }
+        background: rgba(255, 255, 255, 0.03); color: var(--muted); }
       .content table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.9rem; }
       .content th, .content td { border: 1px solid var(--line); padding: 0.4rem 0.6rem; text-align: left; vertical-align: top; }
       .content th { background: var(--card); }
