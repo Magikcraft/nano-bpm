@@ -1136,7 +1136,7 @@ fn parse_deploy_resources(
         // form-js document's `id` for versioning/lookup; a form without a string
         // `id` is a client error (mirrors Zeebe, which requires a form id).
         if lower.ends_with(".form") {
-            match form_id_of(xml) {
+            match nanobpmn_engine_core::form_id_of(xml) {
                 Some(id) => forms.push(nanobpmn_engine_core::FormResource {
                     id,
                     resource_name: resource_name.clone(),
@@ -1204,16 +1204,6 @@ fn parse_deploy_resources(
         forms,
         generic_resources,
     })
-}
-
-/// Extracts the form-js document `id` from a `.form` resource's JSON. Returns
-/// `None` when the body is not a JSON object or lacks a non-empty string `id`.
-fn form_id_of(schema: &str) -> Option<String> {
-    let doc: serde_json::Value = serde_json::from_str(schema).ok()?;
-    doc.get("id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
 }
 
 impl Default for ServerImpl {

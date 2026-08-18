@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use nanobpmn_engine_core::{
-    bpmn::parse_bpmn, ActivateElementInstruction, AdHocActivateElement, AdHocJobResult,
+    bpmn::parse_bpmn, form_id_of, ActivateElementInstruction, AdHocActivateElement, AdHocJobResult,
     BreakCondition, Command, DebugSession, Engine, Event, FormResource, GenericResource,
     IncidentKind, IncidentState, JobState, MessageSubscriptionKind, MessageSubscriptionState,
     ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState, Value,
@@ -2047,19 +2047,6 @@ fn js_err(msg: &str) -> JsValue {
 
 fn to_json<T: Serialize>(v: &T) -> Result<String, JsValue> {
     serde_json::to_string(v).map_err(|e| js_err(&format!("serialize error: {e}")))
-}
-
-/// Extracts the form-js document `id` from a `.form` resource's JSON, used by
-/// [`TestEngine::deploy_form`] to derive the form identifier for versioning /
-/// lookup. Returns `None` when the body is not a JSON object or lacks a
-/// non-empty string `id`. Mirrors the native `form_id_of` in the server's deploy
-/// decomposition (Zeebe requires a form id).
-fn form_id_of(schema: &str) -> Option<String> {
-    let doc: serde_json::Value = serde_json::from_str(schema).ok()?;
-    doc.get("id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
 }
 
 /// Parse a decimal key string into a `u64`.
