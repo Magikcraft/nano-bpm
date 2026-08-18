@@ -356,6 +356,29 @@ fn is_ignorable_tag(tag: &str) -> bool {
 /// assert_eq!(defs[0].start_event, "s");
 /// ```
 pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
+    parse_with_captures(xml)?
+        .into_iter()
+        .map(|(capture, def)| {
+            // Run the post-parse validators (deploy-validation parity, #850).
+            crate::validate::run(&crate::validate::ValidationInput {
+                def: &def,
+                capture: &capture,
+            })?;
+            Ok(def)
+        })
+        .collect()
+}
+
+/// Parses `xml` into `(raw capture, built definition)` pairs, one per
+/// `<process>`, *without* running the post-parse validators. This is the single
+/// source of truth for the streaming parse; [`parse_bpmn`] is a thin wrapper
+/// that runs validation over the pairs. Kept separate so tests can inspect the
+/// raw [`ProcessCapture`](crate::validate::ProcessCapture) a validator would see
+/// (e.g. unmodelled-element attribution) directly, before any validator either
+/// consumes it or rejects the definition.
+fn parse_with_captures(
+    xml: &str,
+) -> Result<Vec<(crate::validate::ProcessCapture, ProcessDefinition)>, ParseError> {
     let tokens = tokenize(xml).map_err(|e| ParseError::MalformedXml(e.0))?;
 
     let mut processes: Vec<ProcessAcc> = Vec::new();
@@ -1243,18 +1266,31 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     // Prefer the tag's own `id`, but many
                                     // unmodelled constructs (notably event
                                     // definitions) carry no `id`; attribute those
-                                    // to the owning open flow node so the
+                                    // to the owning element so the
                                     // unsupported-elements error stays actionable
                                     // instead of recording an empty id. Mirrors the
                                     // `errorEventDefinition`/`escalationEventDefinition`
-                                    // owner-attribution above.
+                                    // owner-attribution above: a boundary event is
+                                    // buffered in `cur_boundary` and never pushed
+                                    // onto `flow_node_stack`, so an anonymous event
+                                    // definition nested under one (e.g. an
+                                    // unsupported `<compensateEventDefinition>` on a
+                                    // `<boundaryEvent>`) must attribute to
+                                    // `cur_boundary` before falling back to the open
+                                    // flow-node stack — otherwise it would record a
+                                    // containing flow node or an empty id.
                                     let element_id = match attr(attrs, "id") {
                                         Some(id) => id.to_string(),
-                                        None => flow_node_stack
-                                            .iter()
-                                            .rev()
-                                            .find_map(|e| *e)
-                                            .map(|i| acc.nodes[i].id.clone())
+                                        None => cur_boundary
+                                            .as_ref()
+                                            .map(|b| b.id.clone())
+                                            .or_else(|| {
+                                                flow_node_stack
+                                                    .iter()
+                                                    .rev()
+                                                    .find_map(|e| *e)
+                                                    .map(|i| acc.nodes[i].id.clone())
+                                            })
                                             .unwrap_or_default(),
                                     };
                                     acc.unmodelled.push((other.to_string(), element_id));
@@ -1559,12 +1595,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 xml: xml.to_string(),
                 ..def
             };
-            // Run the post-parse validators (deploy-validation parity, #850).
-            crate::validate::run(&crate::validate::ValidationInput {
-                def: &def,
-                capture: &capture,
-            })?;
-            Ok(def)
+            Ok((capture, def))
         })
         .collect()
 }
@@ -2872,6 +2903,45 @@ mod tests {
                 process_id: "container-attr".to_string(),
                 from_node: "Sub".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn should_attribute_anonymous_unmodelled_event_def_under_a_boundary_to_the_boundary() {
+        // Regression guard for the suppressed review finding on PR #860: an
+        // unsupported event definition that carries no `id` and is nested under a
+        // `<boundaryEvent>` must be attributed to the boundary event, not to a
+        // containing flow node or an empty id. Boundary events are buffered in
+        // `cur_boundary` and are *never* pushed onto `flow_node_stack`, so a
+        // fallback that consulted only the stack would misattribute the element —
+        // making the future `UnsupportedElement { element_id }` report point at
+        // the wrong (or no) element. `<compensateEventDefinition>` is an
+        // unmodelled event def (Nano models none/error/timer/message/signal
+        // boundaries, not compensation), and it carries no `id`. We inspect the
+        // raw capture directly (the consuming #853 validator is still a stub),
+        // which is exactly the data that validator will see.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="boundary-attr" isExecutable="true">
+              <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+              <bpmn:serviceTask id="Task"><bpmn:incoming>f1</bpmn:incoming></bpmn:serviceTask>
+              <bpmn:boundaryEvent id="Boundary" attachedToRef="Task">
+                <bpmn:compensateEventDefinition />
+              </bpmn:boundaryEvent>
+              <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Task" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let capture = &parse_with_captures(xml).unwrap()[0].0;
+        let compensate = capture
+            .unmodelled
+            .iter()
+            .find(|u| u.tag == "compensateEventDefinition")
+            .expect("the anonymous compensateEventDefinition must be captured as unmodelled");
+        assert_eq!(
+            compensate.element_id, "Boundary",
+            "an anonymous unmodelled event def under a boundary event must attribute \
+             to the boundary event, not a containing flow node or an empty id"
         );
     }
 
