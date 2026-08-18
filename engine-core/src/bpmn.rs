@@ -214,6 +214,17 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // nested `zeebe:input`/`zeebe:output` attaches to the innermost open
     // activity. `in_io_mapping` gates input/output reads to a real ioMapping.
     let mut io_stack: Vec<usize> = Vec::new();
+    // Stack of currently-open elements, each recording the index of the flow
+    // node it opened (`Some`) or `None` for a non-flow-node element. A nested
+    // `<incoming>`/`<outgoing>` is attributed to the nearest enclosing flow node
+    // (the top-most `Some`), not merely the most recently *added* node: for a
+    // container flow node (`subProcess`/`adHocSubProcess`) whose
+    // `<incoming>`/`<outgoing>` follow its nested elements, the last-added node
+    // is an already-closed child, so a single pointer would misattribute the
+    // reference. One entry is pushed per non-self-closing start tag and popped
+    // per end tag (the tokenizer guarantees these balance), keeping the top in
+    // lockstep with the open element the reference is a direct child of.
+    let mut flow_node_stack: Vec<Option<usize>> = Vec::new();
     let mut in_io_mapping = false;
     // Gates `zeebe:executionListener` reads to a real `zeebe:executionListeners`
     // container; each listener attaches to the innermost open activity on the
@@ -233,12 +244,21 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     let mut in_linked_resources = false;
 
     for token in &tokens {
+        // An end tag closes an element: balance the open-element stack pushed on
+        // each non-self-closing start tag (see `flow_node_stack`). Done here so
+        // the per-tag `Token::End` arm below stays a plain match on the tag name.
+        if matches!(token, Token::End { .. }) {
+            flow_node_stack.pop();
+        }
         match token {
             Token::Start {
                 name,
                 attrs,
                 self_closing,
             } => {
+                // Number of flow nodes before dispatching this start tag, so we
+                // can tell whether it opened a new one (see `flow_node_stack`).
+                let nodes_before = current.as_ref().map(|acc| acc.nodes.len());
                 match local_name(name) {
                     "process" => {
                         let id = attr(attrs, "id").ok_or(ParseError::ProcessWithoutId)?;
@@ -685,11 +705,15 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             // A flow node's `<incoming>`/`<outgoing>` QName
                             // reference to a sequenceFlow. Its text content is the
                             // referenced flow id; captured against the owning
-                            // (most recently opened) flow node so it can be
-                            // resolved against declared flows at build time
-                            // (Zeebe rejects an unresolved reference at deploy).
+                            // (nearest enclosing) flow node so it can be resolved
+                            // against declared flows at build time (Zeebe rejects
+                            // an unresolved reference at deploy). The owner is the
+                            // top-most `Some` on `flow_node_stack` — the flow node
+                            // this element is a direct child of — which stays
+                            // correct even when a container's `<incoming>`/
+                            // `<outgoing>` follow its nested elements.
                             "incoming" | "outgoing" if !self_closing => {
-                                if let Some(idx) = acc.last_node {
+                                if let Some(idx) = flow_node_stack.iter().rev().find_map(|e| *e) {
                                     flow_ref_owner = Some(acc.nodes[idx].id.clone());
                                     flow_ref_dir = if tag == "incoming" {
                                         "incoming"
@@ -945,6 +969,18 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                         }
                     }
                     _ => {}
+                }
+                // Track the open-element stack for `<incoming>`/`<outgoing>`
+                // attribution. A self-closing tag never contains children, so it
+                // is not pushed (and the tokenizer emits no matching end tag).
+                if !self_closing {
+                    let opened = match (nodes_before, current.as_ref()) {
+                        (Some(before), Some(acc)) if acc.nodes.len() > before => {
+                            Some(acc.nodes.len() - 1)
+                        }
+                        _ => None,
+                    };
+                    flow_node_stack.push(opened);
                 }
             }
             Token::Text(text) => {
@@ -1418,9 +1454,6 @@ struct ProcessAcc {
     /// `<incoming>`/`<outgoing>` references declared on flow nodes, resolved
     /// against `flows` at build time.
     flow_refs: Vec<FlowRef>,
-    /// Index of the most recently opened flow node, so a nested
-    /// `<incoming>`/`<outgoing>` child can be attributed to its owner.
-    last_node: Option<usize>,
     /// Stack of open embedded sub-process ids, used to scope nested nodes.
     scope_stack: Vec<String>,
 }
@@ -1434,7 +1467,6 @@ impl ProcessAcc {
             flows: Vec::new(),
             boundaries: Vec::new(),
             flow_refs: Vec::new(),
-            last_node: None,
             scope_stack: Vec::new(),
         }
     }
@@ -1479,7 +1511,6 @@ impl ProcessAcc {
             start_form_id: None,
         });
         let idx = self.nodes.len() - 1;
-        self.last_node = Some(idx);
         Some(idx)
     }
 
@@ -2355,6 +2386,37 @@ mod tests {
         let def = &parse_bpmn(xml).unwrap()[0];
         assert_eq!(def.id, "valid-process");
         assert_eq!(def.element("s").unwrap().outgoing[0].to, "e");
+    }
+
+    #[test]
+    fn should_attribute_container_flow_refs_to_the_container_not_a_nested_child() {
+        // A container flow node (`subProcess`/`adHocSubProcess`) whose
+        // `<incoming>`/`<outgoing>` follow its nested elements must attribute the
+        // reference to the container itself, not the most recently *added* (now
+        // closed) child. Regression guard for the review finding on issue #849:
+        // a single "last added node" pointer misattributes the `node_id` here.
+        // The `<outgoing>` is placed after the nested (non-self-closing) child so
+        // the last-added node is `InnerStart`, yet the owner must be `Sub`.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="container-attr" isExecutable="true">
+              <bpmn:subProcess id="Sub">
+                <bpmn:startEvent id="InnerStart"></bpmn:startEvent>
+                <bpmn:outgoing>Flow_missing</bpmn:outgoing>
+              </bpmn:subProcess>
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::UnresolvedFlowReference {
+                process_id: "container-attr".to_string(),
+                node_id: "Sub".to_string(),
+                direction: "outgoing",
+                flow_id: "Flow_missing".to_string(),
+            }
+        );
     }
 
     #[test]
