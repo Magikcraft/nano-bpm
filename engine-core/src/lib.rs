@@ -86,6 +86,8 @@ pub mod xml;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
+#[cfg(feature = "serde")]
+pub use command::form_id_of;
 pub use command::{
     ActivateElementInstruction, Command, FormResource, GenericResource, UserTaskChangeset,
 };

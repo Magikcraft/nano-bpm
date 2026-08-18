@@ -16,10 +16,10 @@
 use std::collections::HashMap;
 
 use nanobpmn_engine_core::{
-    bpmn::parse_bpmn, ActivateElementInstruction, AdHocActivateElement, AdHocJobResult,
-    BreakCondition, Command, DebugSession, Engine, Event, IncidentKind, IncidentState, JobState,
-    MessageSubscriptionKind, MessageSubscriptionState, ProcessInstanceState, TimerState,
-    UserTaskChangeset, UserTaskState, Value,
+    bpmn::parse_bpmn, form_id_of, ActivateElementInstruction, AdHocActivateElement, AdHocJobResult,
+    BreakCondition, Command, DebugSession, Engine, Event, FormResource, GenericResource,
+    IncidentKind, IncidentState, JobState, MessageSubscriptionKind, MessageSubscriptionState,
+    ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState, Value,
 };
 /// The shared read-model surface, compiled with its in-memory wasm SQLite
 /// backend. Behind the off-by-default `read-model` feature so the baseline engine
@@ -172,6 +172,101 @@ impl TestEngine {
         let snapshot = self.snapshot_value(None);
         to_json(&serde_json::json!({
             "processIds": ids,
+            "snapshot": snapshot,
+        }))
+    }
+
+    /// Deploy a single `form-js` `.form` resource (the verbatim form-js JSON
+    /// document). Mirrors the native deploy decomposition, which registers a
+    /// `.form` resource as a [`Command::DeployForms`] (stored, not executed) so
+    /// `getFormByKey` can serve its schema. The form-js document's `id` is the
+    /// form identifier used for versioning/lookup — a body without a non-empty
+    /// string `id` is a client error (native parity). The deploy resource name is
+    /// derived as `<id>.form`.
+    ///
+    /// Returns a JSON object
+    /// `{ "formKey": "...", "formId": "...", "version": N, "resourceName": "...", "snapshot": {...} }`
+    /// on success, or throws a JS error carrying the parse/deploy failure message.
+    #[wasm_bindgen(js_name = deployForm)]
+    pub fn deploy_form(&mut self, schema: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let id = form_id_of(schema).ok_or_else(|| {
+            js_err(
+                "invalid form: not a valid form-js document (expected a JSON object \
+                 with a non-empty string \"id\")",
+            )
+        })?;
+        let resource_name = format!("{id}.form");
+        self.apply(Command::DeployForms(vec![FormResource {
+            id: id.clone(),
+            resource_name: resource_name.clone(),
+            schema: schema.to_string(),
+        }]))
+        .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+        // Resolve from post-apply state rather than the emitted events: an
+        // idempotent redeploy of the identical latest form emits no
+        // `FormDeployed` event, but the deploy still succeeds and must return
+        // the existing identity (native parity — the server builds responses
+        // from resolved state, not events).
+        let (form_key, version) = self
+            .engine
+            .state()
+            .forms
+            .get(&id)
+            .map(|f| (f.key, f.version))
+            .ok_or_else(|| js_err("deploy error: form not found after deploy"))?;
+        let snapshot = self.snapshot_value(None);
+        to_json(&serde_json::json!({
+            "formKey": form_key.to_string(),
+            "formId": id,
+            "version": version,
+            "resourceName": resource_name,
+            "snapshot": snapshot,
+        }))
+    }
+
+    /// Deploy a single generic resource (any deployed file that is not a
+    /// BPMN/DMN/form — e.g. a Markdown agent prompt) under `resource_name` with
+    /// the given verbatim `content`. Mirrors the native deploy decomposition,
+    /// which registers such a file as a [`Command::DeployGenericResources`]
+    /// (stored, not executed) so `getResourceByKey` can serve its content. The
+    /// `resource_id` is the filename (`resource_name`), matching Zeebe's default
+    /// resource transformer.
+    ///
+    /// Returns a JSON object
+    /// `{ "resourceKey": "...", "resourceId": "...", "version": N, "resourceName": "...", "snapshot": {...} }`
+    /// on success, or throws a JS error carrying the deploy failure message.
+    #[wasm_bindgen(js_name = deployResource)]
+    pub fn deploy_resource(
+        &mut self,
+        resource_name: &str,
+        content: &str,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        self.apply(Command::DeployGenericResources(vec![GenericResource {
+            resource_id: resource_name.to_string(),
+            resource_name: resource_name.to_string(),
+            content: content.to_string(),
+        }]))
+        .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+        // Resolve from post-apply state rather than the emitted events: an
+        // idempotent redeploy of the identical latest resource emits no
+        // `GenericResourceDeployed` event, but the deploy still succeeds as a
+        // no-op and must return the existing identity (native parity — the
+        // server builds responses from resolved state, not events).
+        let (resource_key, version) = self
+            .engine
+            .state()
+            .resources
+            .get(resource_name)
+            .map(|r| (r.key, r.version))
+            .ok_or_else(|| js_err("deploy error: resource not found after deploy"))?;
+        let snapshot = self.snapshot_value(None);
+        to_json(&serde_json::json!({
+            "resourceKey": resource_key.to_string(),
+            "resourceId": resource_name,
+            "version": version,
+            "resourceName": resource_name,
             "snapshot": snapshot,
         }))
     }
@@ -2998,6 +3093,115 @@ mod read_channel_tests {
 
         // An unknown key is JSON null (the gateway 404 has no body to mirror).
         assert_eq!(eng.get_form_by_key("999999").unwrap(), "null");
+    }
+
+    // Round-trip the JS deploy entry points added in #815: deploying a form /
+    // generic resource through the #[wasm_bindgen] `deployForm` / `deployResource`
+    // methods must populate the in-browser read model so `getFormByKey` /
+    // `getResourceByKey` resolve — the whole point of closing the write-side gap.
+    #[test]
+    fn deploy_form_js_entry_round_trips_through_get_form_by_key() {
+        let mut eng = TestEngine::new();
+
+        let schema = r#"{"id":"greeting","components":[],"v":1}"#;
+        let deployed = parse(&eng.deploy_form(schema).expect("deployForm succeeds"));
+        assert_eq!(deployed["formId"], "greeting");
+        assert_eq!(deployed["version"], 1);
+        assert_eq!(deployed["resourceName"], "greeting.form");
+        let form_key = deployed["formKey"].as_str().expect("a formKey string");
+
+        // getFormByKey now resolves the just-deployed form (non-null in-browser).
+        let got = parse(&eng.get_form_by_key(form_key).unwrap());
+        assert_eq!(got["formId"], "greeting");
+        assert_eq!(got["version"], 1);
+        assert_eq!(got["schema"], schema);
+        assert_eq!(got["formKey"], form_key);
+
+        // A second deploy of the same id bumps the version and gets its own key.
+        let v2 = parse(
+            &eng.deploy_form(r#"{"id":"greeting","components":[],"v":2}"#)
+                .expect("deployForm v2 succeeds"),
+        );
+        assert_eq!(v2["version"], 2);
+        assert_ne!(v2["formKey"], deployed["formKey"]);
+    }
+
+    #[test]
+    fn deploy_form_is_idempotent_when_redeploying_the_identical_latest_form() {
+        // Redeploying the identical latest form emits no `FormDeployed` event
+        // (the engine dedupes it), but the deploy must still succeed and return
+        // the existing identity — resolved from post-apply state, not events.
+        let mut eng = TestEngine::new();
+        let schema = r#"{"id":"greeting","components":[],"v":1}"#;
+        let first = parse(&eng.deploy_form(schema).expect("first deployForm succeeds"));
+        let again = parse(
+            &eng.deploy_form(schema)
+                .expect("redeploying the identical latest form succeeds"),
+        );
+        assert_eq!(again["formKey"], first["formKey"]);
+        assert_eq!(again["version"], first["version"]);
+        assert_eq!(again["resourceName"], first["resourceName"]);
+    }
+
+    #[test]
+    fn form_id_of_requires_a_non_empty_string_id() {
+        assert_eq!(
+            form_id_of(r#"{"id":"greeting","components":[]}"#),
+            Some("greeting".to_string())
+        );
+        // A body without a string `id`, an empty id, or non-JSON is rejected
+        // (native parity: Zeebe requires a form id).
+        assert_eq!(form_id_of(r#"{"components":[]}"#), None);
+        assert_eq!(form_id_of(r#"{"id":""}"#), None);
+        assert_eq!(form_id_of(r#"{"id":42}"#), None);
+        assert_eq!(form_id_of("not json"), None);
+    }
+
+    #[test]
+    fn deploy_resource_js_entry_round_trips_through_get_resource_by_key() {
+        let mut eng = TestEngine::new();
+
+        let content = "# Agent prompt\nBe helpful.";
+        let deployed = parse(
+            &eng.deploy_resource("agent-prompt.md", content)
+                .expect("deployResource succeeds"),
+        );
+        assert_eq!(deployed["resourceId"], "agent-prompt.md");
+        assert_eq!(deployed["resourceName"], "agent-prompt.md");
+        assert_eq!(deployed["version"], 1);
+        let resource_key = deployed["resourceKey"]
+            .as_str()
+            .expect("a resourceKey string");
+
+        // getResourceByKey now resolves the just-deployed generic resource.
+        let got = parse(&eng.get_resource_by_key(resource_key).unwrap());
+        assert_eq!(got["resourceId"], "agent-prompt.md");
+        assert_eq!(got["resourceName"], "agent-prompt.md");
+        assert_eq!(got["version"], 1);
+
+        // An unknown key is JSON null.
+        assert_eq!(eng.get_resource_by_key("999999").unwrap(), "null");
+    }
+
+    #[test]
+    fn deploy_resource_is_idempotent_when_redeploying_the_identical_latest_resource() {
+        // Redeploying the identical latest resource (same name and content)
+        // emits no `GenericResourceDeployed` event, but the deploy is a
+        // successful no-op that must return the existing identity — resolved
+        // from post-apply state, not events.
+        let mut eng = TestEngine::new();
+        let content = "# Agent prompt\nBe helpful.";
+        let first = parse(
+            &eng.deploy_resource("agent-prompt.md", content)
+                .expect("first deployResource succeeds"),
+        );
+        let again = parse(
+            &eng.deploy_resource("agent-prompt.md", content)
+                .expect("redeploying the identical latest resource succeeds"),
+        );
+        assert_eq!(again["resourceKey"], first["resourceKey"]);
+        assert_eq!(again["version"], first["version"]);
+        assert_eq!(again["resourceName"], first["resourceName"]);
     }
 
     #[test]

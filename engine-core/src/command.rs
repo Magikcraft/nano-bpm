@@ -386,6 +386,24 @@ pub struct FormResource {
     pub schema: String,
 }
 
+/// Extracts the form-js document `id` from a `.form` resource's JSON — the single
+/// canonical definition of "what counts as a valid form id" shared by every deploy
+/// boundary (the server's HTTP deploy decomposition and the wasm test-engine entry
+/// point), so the rule cannot drift between them. Returns `None` when the body is
+/// not a JSON object or lacks a non-empty string `id` (Zeebe requires a form id).
+///
+/// Gated behind the `serde` feature: JSON parsing is a host concern, so it lives
+/// with the other opt-in (de)serialization surface and keeps the default,
+/// dependency-free core std-only.
+#[cfg(feature = "serde")]
+pub fn form_id_of(schema: &str) -> Option<String> {
+    let doc: serde_json::Value = serde_json::from_str(schema).ok()?;
+    doc.get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// A generic resource (any deployed file that is not a BPMN process, DMN, or
 /// form — e.g. a Markdown agent prompt) to register in a
 /// [`Command::DeployGenericResources`]. The engine stores it verbatim; it does

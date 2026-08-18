@@ -16,9 +16,15 @@ license = "Apache-2.0"
 # `Arc`-shared `variables` payload on `ProcessInstance`; it has no effect when
 # the `serde` feature is off.
 serde = { version = "1", optional = true, features = ["derive", "rc"] }
+# Only pulled in under the `serde` feature (the JSON boundary a host opts into for
+# persistence/replay). It backs the canonical `form_id_of` helper so the server
+# and the wasm entry point derive a form's identity from one source of truth
+# rather than duplicating the parse rule. The default, feature-off build stays
+# dependency-free (std-only).
+serde_json = { version = "1", optional = true }
 
 [features]
-serde = ["dep:serde"]
+serde = ["dep:serde", "dep:serde_json"]
 # Exposes the coarse C-ABI surface in `ffi.rs` (paired with the `cdylib`
 # crate-type below) so a non-Rust host can embed the engine via FFI/wasm.
 ffi = []
@@ -30,11 +36,6 @@ path = "src/lib.rs"
 # Kotlin host or the `wasm32-unknown-unknown` target gets a loadable artifact
 # exporting the `ffi` functions (built with `--features ffi`).
 crate-type = ["lib", "cdylib"]
-
-[dev-dependencies]
-# Used only by the `serde`-gated snapshot round-trip test to exercise actual
-# (de)serialization (catches issues like non-string map keys).
-serde_json = "1"
 
 [lints.rust]
 # Project policy: warnings are banned. `cargo build`/`check` fail on any rustc

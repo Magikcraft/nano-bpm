@@ -136,6 +136,34 @@ export class TestEngine {
      */
     deploy(xml: string): string;
     /**
+     * Deploy a single `form-js` `.form` resource (the verbatim form-js JSON
+     * document). Mirrors the native deploy decomposition, which registers a
+     * `.form` resource as a [`Command::DeployForms`] (stored, not executed) so
+     * `getFormByKey` can serve its schema. The form-js document's `id` is the
+     * form identifier used for versioning/lookup — a body without a non-empty
+     * string `id` is a client error (native parity). The deploy resource name is
+     * derived as `<id>.form`.
+     *
+     * Returns a JSON object
+     * `{ "formKey": "...", "formId": "...", "version": N, "resourceName": "...", "snapshot": {...} }`
+     * on success, or throws a JS error carrying the parse/deploy failure message.
+     */
+    deployForm(schema: string): string;
+    /**
+     * Deploy a single generic resource (any deployed file that is not a
+     * BPMN/DMN/form — e.g. a Markdown agent prompt) under `resource_name` with
+     * the given verbatim `content`. Mirrors the native deploy decomposition,
+     * which registers such a file as a [`Command::DeployGenericResources`]
+     * (stored, not executed) so `getResourceByKey` can serve its content. The
+     * `resource_id` is the filename (`resource_name`), matching Zeebe's default
+     * resource transformer.
+     *
+     * Returns a JSON object
+     * `{ "resourceKey": "...", "resourceId": "...", "version": N, "resourceName": "...", "snapshot": {...} }`
+     * on success, or throws a JS error carrying the deploy failure message.
+     */
+    deployResource(resource_name: string, content: string): string;
+    /**
      * The full ordered event log emitted so far, as a JSON array of
      * `{ seq, now, type, ...payload }`. Useful for a step-through / trace view.
      */
@@ -260,6 +288,8 @@ export interface InitOutput {
     readonly testengine_debugResume: (a: number, b: number) => void;
     readonly testengine_debugStep: (a: number, b: number) => void;
     readonly testengine_deploy: (a: number, b: number, c: number, d: number) => void;
+    readonly testengine_deployForm: (a: number, b: number, c: number, d: number) => void;
+    readonly testengine_deployResource: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_events: (a: number, b: number) => void;
     readonly testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly testengine_migrate: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
