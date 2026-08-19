@@ -733,6 +733,40 @@ impl ElementKind {
         )
     }
 
+    /// Whether this element is an *activity* (task / sub-process / call
+    /// activity) — the only category a BPMN boundary event's `attachedToRef`
+    /// may legally resolve against. Gateways and events are not activities.
+    /// Kept exhaustive so a new [`ElementKind`] must be classified here rather
+    /// than silently defaulting into (or out of) the activity set.
+    pub fn is_activity(&self) -> bool {
+        match self {
+            ElementKind::ServiceTask { .. }
+            | ElementKind::BusinessRuleTask { .. }
+            | ElementKind::UserTask(_)
+            | ElementKind::ScriptTask { .. }
+            | ElementKind::Task
+            | ElementKind::SubProcess { .. }
+            | ElementKind::CallActivity { .. } => true,
+            ElementKind::StartEvent
+            | ElementKind::EndEvent
+            | ElementKind::MessageStartEvent { .. }
+            | ElementKind::TimerStartEvent { .. }
+            | ElementKind::IntermediateThrowEvent
+            | ElementKind::TimerIntermediateCatchEvent { .. }
+            | ElementKind::MessageIntermediateCatchEvent { .. }
+            | ElementKind::SignalIntermediateCatchEvent { .. }
+            | ElementKind::ConditionalIntermediateCatchEvent { .. }
+            | ElementKind::ErrorBoundaryEvent { .. }
+            | ElementKind::TimerBoundaryEvent { .. }
+            | ElementKind::MessageBoundaryEvent { .. }
+            | ElementKind::SignalBoundaryEvent { .. }
+            | ElementKind::ConditionalBoundaryEvent { .. }
+            | ElementKind::ExclusiveGateway
+            | ElementKind::ParallelGateway
+            | ElementKind::EventBasedGateway => false,
+        }
+    }
+
     /// Maps this element kind to the Camunda 8 element-instance `type` enum value
     /// (`ElementInstanceResult.type` / the search filter's `type`). Boundary and
     /// intermediate-catch variants collapse to the single BPMN category the REST
