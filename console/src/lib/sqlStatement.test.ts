@@ -67,3 +67,38 @@ test("PRAGMA is a read only in its argument-less query form", () => {
     "call-form PRAGMA",
   );
 });
+
+test("leading SQL comments don't hide the verb", () => {
+  // A read preceded by a comment must stay a read (the misclassification bug).
+  assert.equal(isReadStatement("-- note\nSELECT 1"), true, "line-comment read");
+  assert.equal(
+    isReadStatement("/* note */ SELECT 1"),
+    true,
+    "block-comment read",
+  );
+  assert.equal(
+    isReadStatement("  -- a\n  /* b */ select * from t"),
+    true,
+    "stacked-comment read",
+  );
+  assert.equal(
+    isReadStatement("/* x */ WITH c AS (SELECT 1) SELECT * FROM c"),
+    true,
+    "commented CTE read",
+  );
+  // The conservative direction still holds: a commented write stays a write.
+  assert.equal(
+    isReadStatement("-- note\nINSERT INTO t VALUES (1)"),
+    false,
+    "line-comment write",
+  );
+  assert.equal(
+    isReadStatement(
+      "/* note */ WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c",
+    ),
+    false,
+    "commented CTE write",
+  );
+  // An input that is only a comment is not a read.
+  assert.equal(isReadStatement("-- just a comment"), false, "comment-only");
+});

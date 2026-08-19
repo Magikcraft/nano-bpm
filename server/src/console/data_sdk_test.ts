@@ -198,3 +198,16 @@ Deno.test("isReadStatement: PRAGMA is a read only in its argument-less query for
   assertEquals(isReadStatement("PRAGMA foreign_keys = ON"), false, "assigning PRAGMA");
   assertEquals(isReadStatement("pragma table_info(t)"), false, "call-form PRAGMA");
 });
+
+Deno.test("isReadStatement: leading SQL comments don't hide the verb", () => {
+  // A read preceded by a comment must stay a read (the misclassification bug).
+  assertEquals(isReadStatement("-- note\nSELECT 1"), true, "line-comment read");
+  assertEquals(isReadStatement("/* note */ SELECT 1"), true, "block-comment read");
+  assertEquals(isReadStatement("  -- a\n  /* b */ select * from t"), true, "stacked-comment read");
+  assertEquals(isReadStatement("/* x */ WITH c AS (SELECT 1) SELECT * FROM c"), true, "commented CTE read");
+  // The conservative direction still holds: a commented write stays a write.
+  assertEquals(isReadStatement("-- note\nINSERT INTO t VALUES (1)"), false, "line-comment write");
+  assertEquals(isReadStatement("/* note */ WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c"), false, "commented CTE write");
+  // An input that is only a comment is not a read.
+  assertEquals(isReadStatement("-- just a comment"), false, "comment-only");
+});
