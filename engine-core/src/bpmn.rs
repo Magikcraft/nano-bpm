@@ -4691,6 +4691,53 @@ mod tests {
     }
 
     #[test]
+    fn should_decode_numeric_character_references_in_a_correlation_key() {
+        // Camunda Modeler emits `&#34;` (decimal) / `&#x22;` (hex) for the
+        // double-quotes of a FEEL string literal placed in an attribute value.
+        // The shared attribute-value decoder must expand those numeric character
+        // references to `"` before the value reaches FEEL — identical to
+        // `&quot;`. Regression guard for issue #885: previously the numeric forms
+        // round-tripped undecoded, so the correlation FEEL reached FEEL as the raw
+        // `=&#34;k&#34;` and either evaluated to `""` or raised `unexpected
+        // character '&'`.
+        for reference in ["&#34;", "&#x22;", "&#X22;", "&quot;"] {
+            let xml = format!(
+                r#"
+              <bpmn:definitions
+                  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+                <bpmn:process id="p">
+                  <bpmn:startEvent id="s" />
+                  <bpmn:intermediateCatchEvent id="await">
+                    <bpmn:messageEventDefinition messageRef="Message_1" />
+                  </bpmn:intermediateCatchEvent>
+                  <bpmn:endEvent id="e" />
+                  <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="await" />
+                  <bpmn:sequenceFlow id="f1" sourceRef="await" targetRef="e" />
+                </bpmn:process>
+                <bpmn:message id="Message_1" name="payment-received">
+                  <bpmn:extensionElements>
+                    <zeebe:subscription correlationKey="={ref}k{ref}" />
+                  </bpmn:extensionElements>
+                </bpmn:message>
+              </bpmn:definitions>"#,
+                ref = reference
+            );
+
+            let def = &parse_bpmn(&xml).unwrap()[0];
+
+            assert_eq!(
+                def.element("await").unwrap().kind,
+                ElementKind::MessageIntermediateCatchEvent {
+                    message_name: "payment-received".to_string(),
+                    correlation_key: "\"k\"".to_string(),
+                },
+                "correlation key FEEL for reference {reference} should decode to =\"k\""
+            );
+        }
+    }
+
+    #[test]
     fn should_parse_a_message_intermediate_catch_event() {
         // given
         let xml = r#"
