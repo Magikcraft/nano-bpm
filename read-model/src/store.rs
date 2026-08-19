@@ -2113,7 +2113,7 @@ impl ReadStore {
             "SELECT COUNT(*) FROM process_instances{}",
             filter.where_clause()
         );
-        conn.query_row(&sql, [], |r| r.get(0)).unwrap_or(0)
+        conn.cquery_row(&sql, [], |r| r.get(0)).unwrap_or(0)
     }
 
     /// One page of process instances matching `filter`, newest first. Orders by
