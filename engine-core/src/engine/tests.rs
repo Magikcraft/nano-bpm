@@ -14707,3 +14707,92 @@ fn nested_adhoc_parent_cancel_recursively_tears_down_nested_container() {
         "no ad-hoc runtime state leaks after the recursive cancel"
     );
 }
+
+/// #631 robustness (Copilot review, PR #863): the recursive cancel helper
+/// `cancel_adhoc_active_child` also tears down the dedicated inner wrapper
+/// instance each tool hangs off. That inner instance's `scopes` mapping can
+/// linger after it has already left `active` (been completed), in which case its
+/// element id no longer resolves. Emitting `ElementCompleting`/`ElementCompleted`
+/// with an EMPTY element_id in that case corrupts downstream element aggregates —
+/// so the teardown must be skipped when the id can't be resolved (mirroring the
+/// defensive skip on the `ModifyInstance` termination path). Before the fix the
+/// inner teardown used `element_id_of_instance(..).unwrap_or_default()`, emitting
+/// a completion for an id of `""`.
+#[test]
+fn nested_adhoc_cancel_child_skips_already_completed_inner_instance() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(nested_adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    // Outer agent activates the nested `subagent` tool (which hangs off a
+    // dedicated `agent#innerInstance` wrapper instance).
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("outer agent job");
+    let outer = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("subagent")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let sub_agent = engine
+        .activate_jobs("sub-agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "subagent")
+        .expect("nested agent job");
+    let nested = sub_agent.element_instance_key;
+
+    // The inner wrapper the nested tool hangs off.
+    let inner = engine.scope_of(inst, nested);
+    assert_ne!(inner, 0, "nested tool hangs off a dedicated inner instance");
+    assert_ne!(inner, outer, "the inner wrapper is distinct from the container");
+
+    // Simulate that inner wrapper having ALREADY been torn down: drop it from
+    // `active` (so its element id no longer resolves) while its `scopes` mapping
+    // still resolves it — the exact state the old `unwrap_or_default()` mishandled.
+    engine
+        .state
+        .instances
+        .get_mut(&inst)
+        .unwrap()
+        .active
+        .remove(&inner);
+    assert!(
+        engine.element_id_of_instance(inst, inner).is_none(),
+        "inner wrapper is no longer active"
+    );
+    assert_eq!(
+        engine.scope_of(inst, nested),
+        inner,
+        "but its scopes mapping still resolves it"
+    );
+
+    let events = engine.cancel_adhoc_active_child(inst, outer, nested);
+
+    // No element-completion event may carry an empty element_id.
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleting { element_id, .. } | Event::ElementCompleted { element_id, .. }
+                if element_id.is_empty()
+        )),
+        "no element-completion event carries an empty element_id; events: {events:?}"
+    );
+    // And it must not fabricate a completion for the already-gone inner instance.
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_instance_key, .. } if *element_instance_key == inner
+        )),
+        "the already-completed inner instance is not torn down again; events: {events:?}"
+    );
+}

@@ -5134,22 +5134,25 @@ impl Engine {
             events.extend(self.cancel_mi_child_events(instance_key, child));
         }
         // Each tool child hangs off a dedicated inner instance; tear it down too
-        // so the read-model element-instance tree does not leak an orphan.
+        // so the read-model element-instance tree does not leak an orphan. Only
+        // when the inner instance is still active does its element id resolve —
+        // if it is already gone there is nothing to tear down, and emitting a
+        // completion with an empty element_id would corrupt downstream element
+        // aggregates (mirrors the defensive skip in ModifyInstance termination).
         let inner = self.scope_of(instance_key, child);
         if inner != 0 && inner != container_key {
-            let inner_element_id = self
-                .element_id_of_instance(instance_key, inner)
-                .unwrap_or_default();
-            events.push(Event::ElementCompleting {
-                instance_key,
-                element_instance_key: inner,
-                element_id: inner_element_id.clone(),
-            });
-            events.push(Event::ElementCompleted {
-                instance_key,
-                element_instance_key: inner,
-                element_id: inner_element_id,
-            });
+            if let Some(inner_element_id) = self.element_id_of_instance(instance_key, inner) {
+                events.push(Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key: inner,
+                    element_id: inner_element_id.clone(),
+                });
+                events.push(Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key: inner,
+                    element_id: inner_element_id,
+                });
+            }
         }
         events
     }
