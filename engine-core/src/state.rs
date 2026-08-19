@@ -546,6 +546,15 @@ pub enum IncidentKind {
     /// violation, missing input). Recoverable once the definition/inputs are
     /// fixed and the incident is resolved.
     DecisionEvaluation,
+    /// A call activity could not spawn its child process: the resolved
+    /// `calledElement` process id is not deployed (unknown definition), or the
+    /// call-activity chain exceeded the recursion-depth cap. This is a
+    /// missing-definition / execution problem, not a FEEL/type failure, so it
+    /// maps to the C8 `CALLED_ELEMENT_ERROR` `errorType` (distinct from the
+    /// `EXTRACT_VALUE_ERROR` a failed `calledElement` *expression* raises).
+    /// Recoverable once the callee is deployed (or the recursion fixed) and the
+    /// incident is resolved.
+    CalledElementError,
 }
 
 /// Lifecycle state of an incident. Incidents are retained after resolution (as

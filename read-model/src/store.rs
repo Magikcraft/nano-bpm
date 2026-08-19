@@ -831,6 +831,7 @@ fn incident_kind_code(k: IncidentKind) -> i64 {
         IncidentKind::UnhandledError => 2,
         IncidentKind::ExpressionEvaluation => 3,
         IncidentKind::DecisionEvaluation => 4,
+        IncidentKind::CalledElementError => 5,
     }
 }
 fn incident_kind_from(code: i64) -> IncidentKind {
@@ -839,6 +840,7 @@ fn incident_kind_from(code: i64) -> IncidentKind {
         2 => IncidentKind::UnhandledError,
         3 => IncidentKind::ExpressionEvaluation,
         4 => IncidentKind::DecisionEvaluation,
+        5 => IncidentKind::CalledElementError,
         _ => IncidentKind::JobNoRetries,
     }
 }
@@ -5962,6 +5964,44 @@ mod element_instance_tests {
             parent_process_instance_key: None,
             parent_element_instance_key: None,
         }
+    }
+
+    #[test]
+    fn projects_call_activity_parent_linkage_into_the_process_instance_row() {
+        // The C8 `parentProcessInstanceKey` / `parentElementInstanceKey` surface is
+        // consumer-facing, so a regression that dropped these columns from the
+        // projection would be silent. Assert a `ProcessInstanceCreated` carrying
+        // parent linkage round-trips into the row (and that the default top-level
+        // create leaves both `None`).
+        let store = ReadStore::open(None).unwrap();
+        const CHILD: u64 = 2000;
+        const CALL_EI: u64 = 1002;
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &Event::ProcessInstanceCreated {
+                    instance_key: CHILD,
+                    process_id: "p".to_string(),
+                    variables: HashMap::new(),
+                    created_at: 2,
+                    tags: Vec::new(),
+                    business_id: None,
+                    process_definition_key: DEF_KEY,
+                    version: 1,
+                    parent_process_instance_key: Some(INST),
+                    parent_element_instance_key: Some(CALL_EI),
+                },
+            ])
+            .unwrap();
+
+        let child = store.process_instance(CHILD).expect("child row exists");
+        assert_eq!(child.parent_process_instance_key, Some(INST));
+        assert_eq!(child.parent_element_instance_key, Some(CALL_EI));
+
+        let parent = store.process_instance(INST).expect("parent row exists");
+        assert_eq!(parent.parent_process_instance_key, None);
+        assert_eq!(parent.parent_element_instance_key, None);
     }
 
     #[test]

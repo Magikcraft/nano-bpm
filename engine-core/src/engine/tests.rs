@@ -7046,6 +7046,46 @@ fn a_failing_called_element_expression_raises_an_expression_evaluation_incident(
 }
 
 #[test]
+fn an_unknown_called_process_raises_a_called_element_incident_not_expression_eval() {
+    // A call activity whose (literal) `calledElement` process id is not deployed
+    // is a missing-definition / execution problem, NOT a FEEL/type failure. It
+    // must be classified as `CalledElementError` (C8 `CALLED_ELEMENT_ERROR`), so
+    // clients filtering incidents by `errorType` can distinguish a missing callee
+    // from a genuine expression-evaluation failure (`EXTRACT_VALUE_ERROR`).
+    let orchestrator = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "definitely-not-deployed")
+        .end_event("end")
+        .connect("start", "c1")
+        .connect("c1", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(orchestrator))
+        .unwrap();
+
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "the unknown callee parks one incident");
+    assert_eq!(
+        active[0].kind,
+        state::IncidentKind::CalledElementError,
+        "an unknown called process must be a CalledElementError, not ExpressionEvaluation"
+    );
+    assert!(
+        active[0].reason.contains("unknown called process"),
+        "incident should name the missing callee, got: {}",
+        active[0].reason
+    );
+    assert!(!engine.is_completed(parent_key));
+}
+
+#[test]
 fn a_call_activity_propagates_variables_via_io_mappings_across_isolated_scopes() {
     // The callee is a pass-through (pstart -> pend) so it completes on its seed
     // variables, letting us observe both directions of the mapping in one command.

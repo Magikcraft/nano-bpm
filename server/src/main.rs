@@ -15468,6 +15468,7 @@ fn incident_error_type_enum(kind: IncidentKind) -> models::IncidentErrorTypeEnum
         IncidentKind::ExpressionEvaluation => models::IncidentErrorTypeEnum::ExtractValueError,
         IncidentKind::UnhandledError => models::IncidentErrorTypeEnum::UnhandledErrorEvent,
         IncidentKind::DecisionEvaluation => models::IncidentErrorTypeEnum::DecisionEvaluationError,
+        IncidentKind::CalledElementError => models::IncidentErrorTypeEnum::CalledElementError,
     }
 }
 

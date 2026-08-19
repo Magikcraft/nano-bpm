@@ -2122,7 +2122,8 @@ impl Engine {
                     // updated) variables.
                     state::IncidentKind::NoMatchingSequenceFlow
                     | state::IncidentKind::ExpressionEvaluation
-                    | state::IncidentKind::DecisionEvaluation => {
+                    | state::IncidentKind::DecisionEvaluation
+                    | state::IncidentKind::CalledElementError => {
                         // A message intermediate catch event whose correlation
                         // key failed to evaluate parks ACTIVATED with no
                         // subscription; re-driving `Complete` would advance the
@@ -7438,18 +7439,21 @@ impl Engine {
     /// call-activity element instance), if any. A call activity spawns exactly
     /// one child, found here by its `parentElementInstanceKey` back-link.
     /// Includes a `Terminating` child so an interrupt still reaps one already
-    /// mid-drain.
+    /// mid-drain. Selection is deterministic (lowest instance key) so that, even
+    /// if state ever held multiple matches (a bug or partial-replay artifact),
+    /// boundary-interrupt cancellation always targets the same child.
     fn call_activity_child_of(&self, call_eik: Key) -> Option<Key> {
         self.state
             .instances
             .values()
-            .find(|i| {
+            .filter(|i| {
                 matches!(
                     i.state,
                     ProcessInstanceState::Active | ProcessInstanceState::Terminating
                 ) && i.parent_element_instance_key == Some(call_eik)
             })
             .map(|i| i.key)
+            .min()
     }
 
     /// Depth of `instance_key` in the call-activity parent chain (0 for a
@@ -7535,7 +7539,7 @@ impl Engine {
                     instance_key: parent_instance,
                     element_instance_key: call_eik,
                     element_id: element_id.to_string(),
-                    kind: state::IncidentKind::ExpressionEvaluation,
+                    kind: state::IncidentKind::CalledElementError,
                     reason: format!(
                         "call activity '{element_id}' exceeded the maximum child-instance depth \
                          of {MAX_CALL_ACTIVITY_DEPTH} calling '{called}' (possible unbounded \
@@ -7562,7 +7566,7 @@ impl Engine {
                     instance_key: parent_instance,
                     element_instance_key: call_eik,
                     element_id: element_id.to_string(),
-                    kind: state::IncidentKind::ExpressionEvaluation,
+                    kind: state::IncidentKind::CalledElementError,
                     reason: format!(
                         "call activity '{element_id}' references unknown called process '{called}'"
                     ),
