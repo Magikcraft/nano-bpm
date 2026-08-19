@@ -271,6 +271,11 @@ console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine
 		rm -f $(PROJECT_ROOT)/engine-wasm/pkg/readmodel/.gitignore; \
 		cp $(PROJECT_ROOT)/engine-wasm/pkg.package.json $(PROJECT_ROOT)/engine-wasm/pkg/package.json; \
 		cp $(PROJECT_ROOT)/engine-wasm/README.md $(PROJECT_ROOT)/engine-wasm/pkg/README.md; \
+		echo "  -> readmodel-types (pkg/readmodel-types, derived DTO types)"; \
+		mkdir -p $(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types; \
+		cp $(PROJECT_ROOT)/engine-wasm/readmodel-types/types.gen.ts $(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types/types.gen.d.ts; \
+		cp $(PROJECT_ROOT)/engine-wasm/readmodel-types/index.d.ts $(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types/index.d.ts; \
+		cp $(PROJECT_ROOT)/engine-wasm/readmodel-types/index.js $(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types/index.js; \
 	else \
 		echo "wasm-pack not found; using the committed engine-wasm/pkg artifacts (run 'cargo install wasm-pack' to regenerate)."; \
 	fi

@@ -13,6 +13,7 @@ The package ships **two independent engines** from one install, selectable by
 | --- | --- | ---: | --- |
 | `@nanobpm/engine-wasm` | **lean** — primary state only | ~252 KB | demos, the modeler, debuggers, anything that reads via `snapshot()` / `events()` |
 | `@nanobpm/engine-wasm/readmodel` | **read-model** — lean surface **+** the gateway's C8-style REST read methods | ~561 KB | full-surface app testing in CI that wants gateway read parity |
+| `@nanobpm/engine-wasm/readmodel-types` | **types only** — the DTOs the read-model `search*` / `get*ByKey` methods return | 0 KB (erased) | typing read-model query results in a consumer (e.g. `@nanobpm/bojtos-kit`) without hand-mirroring the shapes |
 
 ## Why two binaries (not a runtime toggle)
 
@@ -95,6 +96,27 @@ cleared by `reset()`.
 - **`searchVariables(filterJson)`** → `{ items, page }`. Body is shape-validated;
   long values are truncated with `isTruncated: true`.
   Mirrors `POST /variables/search`.
+
+### Typing the results — `@nanobpm/engine-wasm/readmodel-types`
+
+The methods above hand off opaque JSON strings (the wasm boundary is strings), so
+the subpath `@nanobpm/engine-wasm/readmodel-types` ships the **DTO types** for
+those results — `UserTaskSearchQueryResult`, `ProcessInstanceSearchQueryResult`,
+`VariableSearchQueryResult`, `FormResult`, `ResourceResult` — so a consumer can
+type them without hand-mirroring the shapes:
+
+```ts
+import type { UserTaskSearchQueryResult } from "@nanobpm/engine-wasm/readmodel-types";
+
+const open = JSON.parse(
+  engine.searchUserTasks(JSON.stringify({ state: "CREATED" })),
+) as UserTaskSearchQueryResult;
+```
+
+These are **derived** from the single source of truth — the Camunda-parity REST
+OpenAPI in `spec/` — by `engine-wasm/readmodel-types` (`@hey-api/openapi-ts`); a
+CI drift guard regenerates and fails on any stale artifact. The subpath is
+types-only (its runtime module is empty), so importing it adds zero wire weight.
 
 ## Choosing a subpath
 

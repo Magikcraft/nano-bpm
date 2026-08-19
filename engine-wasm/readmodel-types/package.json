@@ -1,0 +1,15 @@
+{
+  "name": "@nanobpm/engine-wasm-readmodel-types-gen",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Generates the derived read-model DTO types shipped at @nanobpm/engine-wasm/readmodel-types from the Camunda-parity REST OpenAPI (spec/). Not published; a build + drift-guard helper only.",
+  "type": "module",
+  "scripts": {
+    "gen": "openapi-ts",
+    "check": "npm run gen && git diff --exit-code -- types.gen.ts"
+  },
+  "devDependencies": {
+    "@hey-api/openapi-ts": "0.99.0",
+    "typescript": "^5.6.3"
+  }
+}
