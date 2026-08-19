@@ -22,7 +22,7 @@ The DSL was originally introduced in
 [`@nanobpm/urban-testkit`](https://github.com/nanobpm/nano-ide/tree/main/packages/urban-testkit)
 (issue nanobpm/nano-ide#295), where it was only installable as a devDependency of
 **Urban apps**. But its matchers assert over
-[`@nanobpm/engine-wasm`](../../engine-wasm)'s derived **read model** — the single
+[`@nanobpm/engine-wasm`](https://github.com/Magikcraft/nano-bpm/tree/main/engine-wasm)'s derived **read model** — the single
 source of truth *every* Nano consumer already shares (Urban, bojtos-kit,
 web-demo-framework). This package lifts that engine-facing DSL out so it is
 reusable beyond Urban apps (issue Magikcraft/nano-bpm#894).
