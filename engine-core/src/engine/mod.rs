@@ -5175,6 +5175,30 @@ impl Engine {
         }
         events.extend(self.cancel_all_timers_on(child_eik));
         events.extend(self.cancel_all_subscriptions_on(child_eik));
+        // A human task parked on this element instance must be explicitly
+        // cancelled: completing the element instance alone leaves its
+        // `state.user_tasks` entry in `Created` (see `state::apply` — only
+        // `UserTaskCanceled` moves it to `Canceled`; `ElementCompleted` does
+        // not touch it), orphaning the task. This surfaces when an embedded
+        // subProcess tool body holds an open user task while its container is
+        // cancel-remaining'd (#872). A leaf (non-user-task) child has no such
+        // entry, so this is a no-op there.
+        if let Some(user_task_key) = self
+            .state
+            .user_tasks
+            .values()
+            .find(|t| {
+                t.instance_key == instance_key
+                    && t.element_instance_key == child_eik
+                    && t.state == state::UserTaskState::Created
+            })
+            .map(|t| t.key)
+        {
+            events.push(Event::UserTaskCanceled {
+                user_task_key,
+                instance_key,
+            });
+        }
         events.push(Event::ElementCompleting {
             instance_key,
             element_instance_key: child_eik,

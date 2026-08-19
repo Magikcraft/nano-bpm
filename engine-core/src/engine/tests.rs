@@ -11404,6 +11404,17 @@ fn adhoc_cancel_remaining_tears_down_an_open_subprocess_tool_body() {
             _ => None,
         })
         .expect("the body's `ask` user task element is active");
+    let ask_task = activated
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated {
+                user_task_key,
+                element_id,
+                ..
+            } if element_id == "ask" => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("the body's `ask` user task was created");
 
     // Cancel the container's remaining instances while the body's human task is
     // still open.
@@ -11422,6 +11433,22 @@ fn adhoc_cancel_remaining_tears_down_an_open_subprocess_tool_body() {
                 if *element_instance_key == ask && element_id == "ask"
         )),
         "the open body user-task element instance is torn down, not orphaned; events: {events:?}"
+    );
+    // The parked human task inside the body must be explicitly cancelled, not
+    // just its element instance completed — otherwise the `user_tasks` entry
+    // stays `Created`, surfacing as an orphaned/open user task after the
+    // container is cancelled (#872 cancel defect class).
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::UserTaskCanceled { user_task_key, .. } if *user_task_key == ask_task
+        )),
+        "the open body user task is cancelled, not left orphaned in Created; events: {events:?}"
+    );
+    assert_eq!(
+        engine.state().user_tasks[&ask_task].state,
+        crate::state::UserTaskState::Canceled,
+        "the body's user task ends Canceled after the container is cancelled (#872)"
     );
     assert!(engine.is_completed(inst), "the whole instance completes");
     assert!(
