@@ -106,6 +106,23 @@ const DEFAULT_AWAIT_COMPLETION_TIMEOUT_MS: u64 = 5_000;
 /// tick drains it. Aliased to keep the exporter/`ServerImpl` signatures readable.
 type RetirementBuffer = Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<Key>>>>;
 
+/// Wave-0 shared-surface scaffold (epic #903): per-feature state stores for the
+/// v2 REST parity slices. Each sub-struct is owned by exactly one sibling PR,
+/// which fills in its fields/methods without touching the `ServerImpl` struct or
+/// `Default` blocks. Empty and unread until then, so `#[allow(dead_code)]` keeps
+/// the crate compiling clean under `warnings = "deny"`.
+#[derive(Clone, Default)]
+#[allow(dead_code)] // #905 (batch-operations) fills this
+pub struct BatchOperationStore { /* #905 fills this */ }
+
+#[derive(Clone, Default)]
+#[allow(dead_code)] // #906 (cluster-variables) fills this
+pub struct ClusterVariableStore { /* #906 fills this */ }
+
+#[derive(Clone, Default)]
+#[allow(dead_code)] // #907 (jobs & job-statistics) fills this
+pub struct JobStatisticsState { /* #907 fills this */ }
+
 #[derive(Clone)]
 pub struct ServerImpl {
     engine: Partitions,
@@ -488,6 +505,15 @@ pub struct ServerImpl {
     /// exact round-robin and skewed loads spread smoothly (see
     /// [`crate::placement::swrr_pick`]). Only touched in `Balanced` mode.
     placement_swrr: Arc<std::sync::Mutex<Vec<i128>>>,
+    /// Batch-operations read model (#905). Empty until that slice fills it.
+    #[allow(dead_code)]
+    batch_operations: BatchOperationStore,
+    /// Cluster-variables store, global + per-tenant (#906). Empty until that slice fills it.
+    #[allow(dead_code)]
+    cluster_variables: ClusterVariableStore,
+    /// Job-statistics aggregation state (#907). Empty until that slice fills it.
+    #[allow(dead_code)]
+    job_statistics: JobStatisticsState,
     /// Tier-A execution-trace projection, folded off the engine event stream by
     /// the exporter thread (process-optimization design doc §3). In-memory and
     /// bounded; served under `/console/api/traces`. Console builds only.
@@ -1007,6 +1033,9 @@ impl ServerImpl {
             placement_mode,
             peer_pressure: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_swrr: Arc::new(std::sync::Mutex::new(Vec::new())),
+            batch_operations: BatchOperationStore::default(),
+            cluster_variables: ClusterVariableStore::default(),
+            job_statistics: JobStatisticsState::default(),
             #[cfg(feature = "console")]
             trace_store: Arc::new(console::trace::TraceStore::from_env()),
         }
