@@ -541,8 +541,10 @@ element_families! {
 /// Maps every modelled [`ElementKind`] to a coarse [`ElementFamily`]. The match
 /// is **exhaustive with no wildcard**: teaching the engine a new `ElementKind`
 /// (the canonical registry mirrored by `processos`' `ELEMENT_KIND_SPECS`) forces
-/// a new arm here, and the coverage ratchet then flags it if the corpus does not
-/// exercise it (ties into slice #853's derive-from-registry guard).
+/// a new arm here. The coverage ratchet then operates at *family* granularity —
+/// a new kind that maps to an already-covered family is not separately flagged;
+/// only a kind that introduces an *uncovered* family trips the ratchet (ties
+/// into slice #853's derive-from-registry guard).
 fn element_kind_family(kind: &ElementKind) -> ElementFamily {
     match kind {
         ElementKind::StartEvent => ElementFamily::StartEvent,
@@ -587,11 +589,11 @@ const BASELINE_UNCOVERED_FAMILIES: &[ElementFamily] = &[
     ElementFamily::CallActivity,
 ];
 
-/// Coverage ratchet #2 — every modelled element family is either exercised by an
-/// ACCEPT corpus entry or explicitly listed in [`BASELINE_UNCOVERED_FAMILIES`].
-/// Adding a new `ElementKind` (hence possibly a new family) without a corpus
-/// entry is therefore flagged here, mirroring #853's registry-derived guard for
-/// the accept side of parity.
+/// Coverage ratchet #2 — every modelled element *family* is either exercised by
+/// an ACCEPT corpus entry or explicitly listed in [`BASELINE_UNCOVERED_FAMILIES`].
+/// Adding a new `ElementKind` that introduces a new, uncovered family is
+/// therefore flagged here (a new kind mapped into an already-covered family is
+/// not), mirroring #853's registry-derived guard for the accept side of parity.
 #[test]
 fn every_element_family_is_covered_or_explicitly_baselined() {
     // Families actually produced by parsing the ACCEPT corpus.

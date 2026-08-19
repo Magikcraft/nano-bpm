@@ -145,10 +145,12 @@ The harness enforces two ratchets so parity coverage cannot silently erode:
    `mapping_covers_every_parse_error_category` guarantee the table covers the
    full shared `ParseError` enum. Adding a `ParseError` variant forces a mapping
    row and a corpus entry.
-2. **Element-kind coverage** — `element_kind_family` maps every modelled
+2. **Element-family coverage** — `element_kind_family` maps every modelled
    `ElementKind` (the canonical registry mirrored by `processos`'
    `ELEMENT_KIND_SPECS`) to a coarse family via an exhaustive, no-wildcard match.
    Every family must be exercised by an ACCEPT corpus entry or be explicitly
-   parked in `BASELINE_UNCOVERED_FAMILIES`. Teaching the engine a new element
-   kind therefore *flags* here (ties into slice #853's derive-from-registry
-   guard) until it is either covered by a fixture or deliberately baselined.
+   parked in `BASELINE_UNCOVERED_FAMILIES`. Enforcement is at *family*
+   granularity: teaching the engine a new element kind that introduces a new,
+   uncovered family *flags* here (ties into slice #853's derive-from-registry
+   guard) until it is either covered by a fixture or deliberately baselined — a
+   new kind that maps into an already-covered family is not separately flagged.
