@@ -810,7 +810,26 @@ fn parse_with_captures(
                                 } else if let Some(idx) =
                                     flow_node_stack.iter().rev().find_map(|e| *e)
                                 {
-                                    acc.nodes[idx].is_compensation_throw = true;
+                                    // A compensation *throw* is modelled only on an
+                                    // intermediateThrowEvent or endEvent — the two
+                                    // node kinds the build step interprets
+                                    // `is_compensation_throw` for. On any other node
+                                    // kind (e.g. a start/catch event) the flag would
+                                    // be silently dropped at build and never
+                                    // rejected, so record the placement as unmodelled
+                                    // and let the unsupported-elements validator
+                                    // (#853) reject it at deploy instead.
+                                    if matches!(
+                                        acc.nodes[idx].kind,
+                                        NodeKind::IntermediateThrow | NodeKind::End
+                                    ) {
+                                        acc.nodes[idx].is_compensation_throw = true;
+                                    } else {
+                                        acc.unmodelled.push((
+                                            "compensateEventDefinition".to_string(),
+                                            acc.nodes[idx].id.clone(),
+                                        ));
+                                    }
                                 }
                             }
                             // `<association sourceRef=… targetRef=…>` — wires a
@@ -1836,6 +1855,24 @@ enum NodeKind {
     Call,
 }
 
+impl NodeKind {
+    /// True for node kinds that represent a BPMN *activity* (a task-like node, a
+    /// subprocess, or a call activity) — the only kinds a compensation handler
+    /// (`isForCompensation="true"`) may legitimately be. Keeps boundary→handler
+    /// resolution from binding a compensation `<association>` to a non-activity
+    /// (e.g. a gateway or event) that stray-carries the attribute.
+    fn is_activity(&self) -> bool {
+        matches!(
+            self,
+            NodeKind::Service
+                | NodeKind::User
+                | NodeKind::Task
+                | NodeKind::SubProcess
+                | NodeKind::Call
+        )
+    }
+}
+
 /// A sequence flow collected while scanning.
 struct FlowAcc {
     id: Option<String>,
@@ -2573,7 +2610,7 @@ impl ProcessAcc {
         let compensation_handler_ids: std::collections::HashSet<String> = self
             .nodes
             .iter()
-            .filter(|n| n.is_for_compensation)
+            .filter(|n| n.is_for_compensation && n.kind.is_activity())
             .map(|n| n.id.clone())
             .collect();
         for node in self.nodes {
@@ -3404,6 +3441,71 @@ mod tests {
             }
             other => panic!("expected CompensationBoundaryEvent, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn should_not_treat_a_non_activity_as_a_compensation_handler() {
+        // Failure-mode guard (advisory): `isForCompensation="true"` is only
+        // meaningful on an *activity*. A non-activity node (e.g. a gateway) that
+        // stray-carries the attribute must NOT become an eligible handler, so an
+        // association pointing at it fails to resolve exactly as if no handler
+        // existed — rather than silently binding the boundary to a gateway.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="comp" isExecutable="true">
+              <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+              <bpmn:serviceTask id="Book"><bpmn:incoming>f1</bpmn:incoming></bpmn:serviceTask>
+              <bpmn:boundaryEvent id="BookComp" attachedToRef="Book">
+                <bpmn:compensateEventDefinition />
+              </bpmn:boundaryEvent>
+              <bpmn:exclusiveGateway id="NotAHandler" isForCompensation="true" />
+              <bpmn:association id="a1" sourceRef="BookComp" targetRef="NotAHandler" />
+              <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Book" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        match parse_bpmn(xml) {
+            Err(ParseError::InvalidBoundaryEvent { reason, .. }) => {
+                assert!(
+                    reason.contains("isForCompensation"),
+                    "expected a missing-handler error, got: {reason}"
+                );
+            }
+            other => panic!(
+                "a gateway carrying isForCompensation must not resolve as a handler, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn should_record_compensate_event_definition_on_an_unsupported_node_as_unmodelled() {
+        // Failure-mode guard (advisory): a `compensateEventDefinition` is only
+        // modelled as a compensation throw on an intermediateThrowEvent or an
+        // endEvent (the two kinds the build step interprets). On any other node
+        // kind the flag would be silently dropped at build, so instead the
+        // placement is recorded as an unmodelled element attributed to that node
+        // — exactly the data the #853 unsupported-elements validator (still a
+        // stub) will reject at deploy. We inspect the raw capture directly.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="comp" isExecutable="true">
+              <bpmn:startEvent id="Start">
+                <bpmn:outgoing>f1</bpmn:outgoing>
+                <bpmn:compensateEventDefinition />
+              </bpmn:startEvent>
+              <bpmn:endEvent id="End"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+              <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="End" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let capture = &parse_with_captures(xml).unwrap()[0].0;
+        let unmodelled = capture
+            .unmodelled
+            .iter()
+            .find(|u| u.tag == "compensateEventDefinition")
+            .expect("a compensateEventDefinition on a startEvent must be captured as unmodelled");
+        assert_eq!(
+            unmodelled.element_id, "Start",
+            "the invalid compensateEventDefinition placement must attribute to the startEvent"
+        );
     }
 
     #[test]
