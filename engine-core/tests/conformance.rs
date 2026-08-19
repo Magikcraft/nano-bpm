@@ -188,11 +188,9 @@ fn corpus_dir() -> PathBuf {
 fn parse_directive(name: &str, xml: &str) -> Expectation {
     let comment = xml
         .lines()
-        .find(|l| l.contains("verdict:"))
+        .find(|l| contains_keyword(l, "verdict:"))
         .unwrap_or_else(|| panic!("{name}: missing `<!-- verdict: … -->` directive"));
-    let after_verdict = comment
-        .split("verdict:")
-        .nth(1)
+    let after_verdict = after_keyword(comment, "verdict:")
         .expect("verdict token")
         .trim();
     let verdict = after_verdict
@@ -203,9 +201,7 @@ fn parse_directive(name: &str, xml: &str) -> Expectation {
     match verdict.as_str() {
         "accept" => Expectation::Accept,
         "reject" => {
-            let category = comment
-                .split("category:")
-                .nth(1)
+            let category = after_keyword(comment, "category:")
                 .unwrap_or_else(|| panic!("{name}: reject directive missing `category:`"))
                 .split(|c: char| c.is_whitespace() || c == '|' || c == '-' || c == '>')
                 .find(|t| !t.is_empty())
@@ -215,6 +211,21 @@ fn parse_directive(name: &str, xml: &str) -> Expectation {
         }
         other => panic!("{name}: unknown verdict `{other}` (expected accept|reject)"),
     }
+}
+
+/// Case-insensitive check for an ASCII `keyword` within `haystack`.
+fn contains_keyword(haystack: &str, keyword: &str) -> bool {
+    after_keyword(haystack, keyword).is_some()
+}
+
+/// Returns the slice of `haystack` following the first case-insensitive match of
+/// the ASCII `keyword`. ASCII-lowercasing preserves byte length, so indices from
+/// the lowercased copy align with the original string.
+fn after_keyword<'a>(haystack: &'a str, keyword: &str) -> Option<&'a str> {
+    haystack
+        .to_ascii_lowercase()
+        .find(keyword)
+        .map(|i| &haystack[i + keyword.len()..])
 }
 
 fn load_corpus() -> Vec<CorpusEntry> {
