@@ -359,32 +359,112 @@ fn every_mapped_category_has_a_reject_corpus_entry() {
     );
 }
 
-/// The mapping table must cover every [`ParseError`] category. `nano_category`'s
-/// match is exhaustive, so this asserts that each category key it can emit has a
-/// mapping row — i.e. no `ParseError` variant is added without a Zeebe mapping.
+/// One witness value per [`ParseError`] variant. This is the single source for
+/// "every category that can exist": the category strings are **derived** by
+/// running each witness through [`nano_category`] rather than re-typed into a
+/// parallel list that could drift.
+///
+/// The trailing `match` is exhaustive **with no wildcard**, so adding a
+/// `ParseError` variant fails to compile here until a witness is added above —
+/// which then flows automatically into the coverage assertions in
+/// [`mapping_covers_every_parse_error_category`].
+fn parse_error_witnesses() -> Vec<ParseError> {
+    let witnesses = vec![
+        ParseError::MalformedXml(String::new()),
+        ParseError::ProcessWithoutId,
+        ParseError::IncompleteSequenceFlow {
+            process_id: String::new(),
+        },
+        ParseError::NoProcess,
+        ParseError::InvalidProcess {
+            process_id: String::new(),
+            reason: String::new(),
+        },
+        ParseError::InvalidBoundaryEvent {
+            process_id: String::new(),
+            reason: String::new(),
+        },
+        ParseError::InvalidMessageEvent {
+            process_id: String::new(),
+            reason: String::new(),
+        },
+        ParseError::InvalidLinkedResource {
+            task_id: String::new(),
+            attribute: String::new(),
+        },
+        ParseError::UnresolvedReference {
+            kind: String::new(),
+            id: String::new(),
+            process_id: String::new(),
+            from_node: String::new(),
+        },
+        ParseError::UnsupportedElement {
+            tag: String::new(),
+            element_id: String::new(),
+        },
+        ParseError::InvalidGateway {
+            process_id: String::new(),
+            gateway_id: String::new(),
+            reason: String::new(),
+        },
+        ParseError::InvalidStartEvents {
+            process_id: String::new(),
+            reason: String::new(),
+        },
+        ParseError::InvalidEndEvent {
+            process_id: String::new(),
+            element_id: String::new(),
+            reason: String::new(),
+        },
+        ParseError::DuplicateStartEvent {
+            process_id: String::new(),
+            correlation_kind: String::new(),
+            reference: String::new(),
+            reason: String::new(),
+        },
+        ParseError::InvalidTaskDefinition {
+            process_id: String::new(),
+            task_id: String::new(),
+            attribute: String::new(),
+            reason: String::new(),
+        },
+    ];
+    // Compile-time completeness ratchet: this exhaustive, wildcard-free match
+    // will not compile if a `ParseError` variant is added without a witness
+    // above. It never changes behaviour — it purely forces the list to stay
+    // complete.
+    for w in &witnesses {
+        match w {
+            ParseError::MalformedXml(_)
+            | ParseError::ProcessWithoutId
+            | ParseError::IncompleteSequenceFlow { .. }
+            | ParseError::NoProcess
+            | ParseError::InvalidProcess { .. }
+            | ParseError::InvalidBoundaryEvent { .. }
+            | ParseError::InvalidMessageEvent { .. }
+            | ParseError::InvalidLinkedResource { .. }
+            | ParseError::UnresolvedReference { .. }
+            | ParseError::UnsupportedElement { .. }
+            | ParseError::InvalidGateway { .. }
+            | ParseError::InvalidStartEvents { .. }
+            | ParseError::InvalidEndEvent { .. }
+            | ParseError::DuplicateStartEvent { .. }
+            | ParseError::InvalidTaskDefinition { .. } => {}
+        }
+    }
+    witnesses
+}
+
+/// The mapping table must cover every [`ParseError`] category. The category set
+/// is derived from [`parse_error_witnesses`] (one witness per enum variant, kept
+/// complete by a compile-time exhaustiveness ratchet) rather than a
+/// hand-maintained string list, so a new `ParseError` variant forces both a
+/// witness and a [`NANO_ZEEBE_MAPPING`] row.
 #[test]
 fn mapping_covers_every_parse_error_category() {
-    // The full set of category keys `nano_category` can emit. Kept in lockstep
-    // with the enum by the exhaustive match in `nano_category`; if a variant is
-    // added there, add its key here and a `NANO_ZEEBE_MAPPING` row.
-    const ALL_CATEGORIES: &[&str] = &[
-        "MalformedXml",
-        "ProcessWithoutId",
-        "IncompleteSequenceFlow",
-        "NoProcess",
-        "InvalidProcess",
-        "InvalidBoundaryEvent",
-        "InvalidMessageEvent",
-        "InvalidLinkedResource",
-        "UnresolvedReference",
-        "UnsupportedElement",
-        "InvalidGateway",
-        "InvalidStartEvents",
-        "InvalidEndEvent",
-        "DuplicateStartEvent",
-        "InvalidTaskDefinition",
-    ];
-    for cat in ALL_CATEGORIES {
+    let all_categories: BTreeSet<&'static str> =
+        parse_error_witnesses().iter().map(nano_category).collect();
+    for cat in &all_categories {
         assert!(
             mapping_for(cat).is_some(),
             "ParseError category `{cat}` has no Nano↔Zeebe mapping row"
@@ -393,7 +473,7 @@ fn mapping_covers_every_parse_error_category() {
     // And no stale mapping rows for categories that no longer exist.
     for m in NANO_ZEEBE_MAPPING {
         assert!(
-            ALL_CATEGORIES.contains(&m.nano),
+            all_categories.contains(&m.nano),
             "mapping row `{}` names an unknown ParseError category",
             m.nano
         );
