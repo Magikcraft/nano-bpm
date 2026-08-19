@@ -3269,6 +3269,144 @@ fn should_create_a_user_task_with_resolved_attributes() {
 }
 
 #[test]
+fn should_create_a_user_task_unassigned_when_assignee_expression_is_null() {
+    use crate::model::UserTaskProps;
+    // Reproduces merlin instance 19153 (#900): a `=FEEL` assignee whose
+    // variable is null must create the task UNASSIGNED (assignee None) rather
+    // than storing the raw "=maybeNull" literal, which hides the task from
+    // assignee-aware operator views. candidateGroups must survive so the task
+    // stays claimable by the group.
+    let def = ProcessBuilder::new("escalation")
+        .start_event("start")
+        .user_task_with(
+            "review",
+            UserTaskProps {
+                assignee: Some("=maybeNull".to_string()),
+                candidate_groups: Some("operators".to_string()),
+                candidate_users: None,
+                due_date: Some("=maybeNull".to_string()),
+                follow_up_date: Some("=maybeNull".to_string()),
+                priority: None,
+                form_id: None,
+                external_form_reference: None,
+            },
+        )
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    // maybeNull is explicitly null (intent: escalate unassigned).
+    let vars = HashMap::from([("maybeNull".to_string(), Value::Null)]);
+    let created = engine
+        .apply_command(Command::CreateInstance {
+            process_id: "escalation".to_string(),
+            variables: vars,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: None,
+            version: None,
+        })
+        .unwrap();
+    let user_task_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("user task created");
+
+    let task = &engine.state().user_tasks[&user_task_key];
+    // The categorical fix: the null-resolving expressions are absent, never the
+    // raw "=maybeNull".
+    assert_eq!(
+        task.assignee, None,
+        "null assignee expression must be absent"
+    );
+    assert_eq!(
+        task.due_date, None,
+        "null dueDate expression must be absent"
+    );
+    assert_eq!(
+        task.follow_up_date, None,
+        "null followUpDate expression must be absent"
+    );
+    // The candidate group survives, so the unassigned task is still claimable.
+    assert_eq!(task.candidate_groups, vec!["operators"]);
+
+    // And it is claimable via assign_user_task (the manual unblock in #900).
+    engine
+        .apply_command(Command::assign_user_task(user_task_key, "operator-1"))
+        .unwrap();
+    assert_eq!(
+        engine.state().user_tasks[&user_task_key]
+            .assignee
+            .as_deref(),
+        Some("operator-1")
+    );
+}
+
+#[test]
+fn should_create_a_user_task_assigned_when_assignee_expression_is_a_string() {
+    use crate::model::UserTaskProps;
+    // The non-null counterpart: the same model with maybeNull = "alice" assigns
+    // the task to alice (expression results are unchanged by the null fix).
+    let def = ProcessBuilder::new("escalation")
+        .start_event("start")
+        .user_task_with(
+            "review",
+            UserTaskProps {
+                assignee: Some("=maybeNull".to_string()),
+                candidate_groups: Some("operators".to_string()),
+                candidate_users: None,
+                due_date: None,
+                follow_up_date: None,
+                priority: None,
+                form_id: None,
+                external_form_reference: None,
+            },
+        )
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let vars = HashMap::from([("maybeNull".to_string(), Value::Str("alice".to_string()))]);
+    let created = engine
+        .apply_command(Command::CreateInstance {
+            process_id: "escalation".to_string(),
+            variables: vars,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: None,
+            version: None,
+        })
+        .unwrap();
+    let user_task_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("user task created");
+
+    assert_eq!(
+        engine.state().user_tasks[&user_task_key]
+            .assignee
+            .as_deref(),
+        Some("alice")
+    );
+}
+
+#[test]
 fn should_link_a_user_task_to_its_deployed_form_key() {
     use crate::command::FormResource;
     // A user task declaring a zeebe:formDefinition formId, plus a start form on
