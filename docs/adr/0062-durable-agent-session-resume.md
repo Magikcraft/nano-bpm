@@ -150,7 +150,7 @@ agentic Urban app inherits durable resume the way it inherits the relay and blac
 
 ### 5. The harness seam is real, general, and already present
 
-Surveying seven current coding-agent harnesses shows the contract's primitives are **not** speculative —
+Surveying eight current coding-agent harnesses shows the contract's primitives are **not** speculative —
 each exposes the same trio, differing only in dialect:
 
 | Harness | Mind tap (streaming, non-interactive) | Restore (resume by id) | ACP |
@@ -162,12 +162,37 @@ each exposes the same trio, differing only in dialect:
 | pi / little-coder | `-p --mode json\|rpc` | `-r` / `--session-id <id>` (create-if-missing) / `--fork` | — |
 | opencode | `serve` (HTTP/SSE) / `acp` / `run` | `session` / `export`+`import` / `attach` | **native** |
 | DeepSeek Harness | `SessionEvent` live feed | `seed`/`restore` | — |
+| `fx` (vercel-labs) | `onEvent` (runtime/ACP/terminal) / `fx acp` `session/update` | host-owned `sessionStore` (`persist`/`restore`/`snapshot`/`openSession`) / `session/load` | **native** |
 
 Two universals underlie every column: **a non-interactive streaming mode** (the mind `emit`) and
 **resume-by-session-id** (the mind `restore`, where the harness rebuilds context from *its own*
-transcript — so Nano never reconstructs the message array itself). opencode goes furthest, already
-tackling the **world** half too (`snapshot/<sha>` git snapshots + `pr <n>` checkout) — a reference for
-the `c8ctl` side.
+transcript — so Nano never reconstructs the message array itself). opencode goes furthest on the
+**world** half (`snapshot/<sha>` git snapshots + `pr <n>` checkout) — a reference for the `c8ctl` side.
+
+**`fx` is the cleanest reference for the *seam itself*, and is worth cribbing structurally.** Where the
+other harnesses expose the trio as CLI flags or a bespoke SDK, `fx` (an embeddable Zig agent, native
+ACP, `fx-core.wasm`) **inverts ownership** across four independent, host-injectable seams:
+
+- **persistence** — the host supplies `sessionStore` (`persist`/`restore`/`snapshot`/`openSession`/
+  `listSessions`/`history`/`subscribe`). This *is* ADR 0062's "Nano is the store": the agent calls,
+  Nano owns the bytes. Crib the **interface shape** directly into §4's `@nanobpm/agentic/session`
+  contract — it is a validated reference for `emit`/`checkpoint`/`restore`.
+- **inference transport** — the host supplies an authenticated `fetch` / stream provider
+  (`host_stream_provider`), so provider auth/routing is the host's, not the agent's. This is the right
+  layering for a fleet: Nano owns provider policy (ADR 0056 §7), the agent just consumes a stream.
+  (Caveat: the wire is still the Vercel AI-SDK v4 data-stream, so a non-Vercel provider needs a small
+  shim — the transport seam is host-owned, but not protocol-free.)
+- **protocol** — ACP is `fx`'s *native* interface, not a bolt-on adapter, reinforcing the prefer-ACP
+  decision and making `fx` the cleanest reference for the ACP ingestion backend.
+- **runtime** — the agent core is `fx-core.wasm`, co-locatable in-process with Nano's own WASM engine.
+
+The takeaway is **not** "build our own harness" — the mind (context assembly, tool loop, per-provider
+streaming, reasoning capture, compaction) is differentiation-free complexity that drifts with every
+model and is already shipped by eight harnesses; rebuilding it is a treadmill with no moat. The takeaway
+is that `fx`'s four-seam inversion is the *shape* Nano's contract should take, and — because all four
+seams are already host-injectable — `fx` is the one harness worth keeping in view as a candidate for a
+**Nano-controlled embedded harness** (adopt/fork, not build-from-scratch) for the tier where Nano wants
+full ownership of store + transport + protocol and wasm co-location with the engine.
 
 **Protocol decision — prefer ACP, fall back to `stream-json`/native.** These two are not peers.
 `stream-json` is *one harness's event dump over stdio*: a transport with N vendor dialects, so adopting
