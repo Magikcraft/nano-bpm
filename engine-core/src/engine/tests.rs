@@ -11145,8 +11145,6 @@ fn adhoc_agent_with_embedded_subprocess_tool() -> ProcessDefinition {
 /// removes the `#[ignore]` to flip it green. This makes #872's done-state
 /// test-defined rather than issue-state-defined (see nano-workforce#313).
 #[test]
-#[ignore = "acceptance for Magikcraft/nano-bpm#872: embedded subProcess ad-hoc \
-            tool must run its body by token flow; remove #[ignore] when landed"]
 fn adhoc_agent_runs_an_embedded_subprocess_tool_body_by_token_flow() {
     let mut engine = Engine::new();
     engine
@@ -11247,6 +11245,279 @@ fn adhoc_agent_runs_an_embedded_subprocess_tool_body_by_token_flow() {
         adhoc.iterations, 1,
         "completing the subProcess tool re-emits the agent job for the next \
          turn (#872)"
+    );
+}
+
+/// #872 (headline shape): the camunda.com "Loan decision review" governance
+/// construct — an embedded subProcess tool whose body is a MULTI-element
+/// token-flow with a routing exclusive gateway (human review → gateway → one of
+/// two outcomes). Activating it must run the whole body (user task, then the
+/// gateway routing) and only complete the tool when the chosen branch reaches an
+/// end event — proving token flow past a single leaf, through a gateway.
+fn adhoc_agent_with_loan_decision_review_tool() -> ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=decision" />
+            </bpmn:extensionElements>
+            <bpmn:subProcess id="review">
+              <bpmn:startEvent id="r_s" />
+              <bpmn:userTask id="officer">
+                <bpmn:extensionElements>
+                  <zeebe:assignmentDefinition assignee="senior" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:exclusiveGateway id="r_gw" />
+              <bpmn:endEvent id="r_offer" />
+              <bpmn:endEvent id="r_decline" />
+              <bpmn:sequenceFlow id="rf1" sourceRef="r_s" targetRef="officer" />
+              <bpmn:sequenceFlow id="rf2" sourceRef="officer" targetRef="r_gw" />
+              <bpmn:sequenceFlow id="rf3" sourceRef="r_gw" targetRef="r_offer">
+                <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">=decision = "approve"</bpmn:conditionExpression>
+              </bpmn:sequenceFlow>
+              <bpmn:sequenceFlow id="rf4" sourceRef="r_gw" targetRef="r_decline">
+                <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">=decision != "approve"</bpmn:conditionExpression>
+              </bpmn:sequenceFlow>
+            </bpmn:subProcess>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+#[test]
+fn adhoc_subprocess_tool_body_routes_through_a_gateway_before_completing() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_with_loan_decision_review_tool(),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+    let container = agent.element_instance_key;
+
+    let activated = engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("review")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let officer_task = activated
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated {
+                user_task_key,
+                element_id,
+                ..
+            } if element_id == "officer" => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("the review body's human `officer` task is created (#872)");
+
+    // The reviewer approves: the body must route the gateway to the offer branch
+    // and drain to that end event, completing the tool.
+    let mut vars = HashMap::new();
+    vars.insert("decision".to_string(), Value::Str("approve".to_string()));
+    engine
+        .apply_command(Command::complete_user_task_with(officer_task, vars))
+        .unwrap();
+
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "results"),
+        Some(Value::List(vec![Value::Str("approve".to_string())])),
+        "the routed body's decision reaches the container's outputCollection (#872)"
+    );
+    let adhoc = engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .unwrap();
+    assert_eq!(
+        adhoc.active.len(),
+        0,
+        "the tool drains once the routed branch reaches its end event (#872)"
+    );
+    assert_eq!(
+        adhoc.iterations, 1,
+        "completing the routed tool body re-emits the agent job (#872)"
+    );
+}
+
+#[test]
+fn adhoc_cancel_remaining_tears_down_an_open_subprocess_tool_body() {
+    // Defect-class guard (#872): cancelling the container while an embedded
+    // subProcess tool's body is mid-flight (an open human task inside it) must
+    // tear the body down — the inner user-task element instance is completed, not
+    // orphaned in the read-model element-instance tree — mirroring the nested
+    // ad-hoc teardown #863 added.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_with_embedded_subprocess_tool(),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+    let container = agent.element_instance_key;
+    let activated = engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("review")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let ask = activated
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivated {
+                element_instance_key,
+                element_id,
+                ..
+            } if element_id == "ask" => Some(*element_instance_key),
+            _ => None,
+        })
+        .expect("the body's `ask` user task element is active");
+    let ask_task = activated
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated {
+                user_task_key,
+                element_id,
+                ..
+            } if element_id == "ask" => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("the body's `ask` user task was created");
+
+    // Cancel the container's remaining instances while the body's human task is
+    // still open.
+    let events = engine
+        .apply_command(Command::ActivateAdHocActivities {
+            ad_hoc_instance_key: container,
+            activate_elements: Vec::new(),
+            cancel_remaining: true,
+        })
+        .expect("cancel-remaining completes the container");
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_instance_key, element_id, .. }
+                if *element_instance_key == ask && element_id == "ask"
+        )),
+        "the open body user-task element instance is torn down, not orphaned; events: {events:?}"
+    );
+    // The parked human task inside the body must be explicitly cancelled, not
+    // just its element instance completed — otherwise the `user_tasks` entry
+    // stays `Created`, surfacing as an orphaned/open user task after the
+    // container is cancelled (#872 cancel defect class).
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::UserTaskCanceled { user_task_key, .. } if *user_task_key == ask_task
+        )),
+        "the open body user task is cancelled, not left orphaned in Created; events: {events:?}"
+    );
+    assert_eq!(
+        engine.state().user_tasks[&ask_task].state,
+        crate::state::UserTaskState::Canceled,
+        "the body's user task ends Canceled after the container is cancelled (#872)"
+    );
+    assert!(engine.is_completed(inst), "the whole instance completes");
+    assert!(
+        engine
+            .instance(inst)
+            .map(|i| i.adhoc_instances.is_empty())
+            .unwrap_or(true),
+        "no ad-hoc runtime state leaks after cancelling an open subProcess tool"
+    );
+}
+
+#[test]
+fn adhoc_subprocess_tool_read_model_tree_nests_container_inner_tool_and_body() {
+    // #872 read-model nesting: outer container -> inner instance -> subProcess
+    // tool -> its body's leaves. The body's `ask` task hangs off the subProcess
+    // tool, which hangs off the `#innerInstance`, which is scoped to the
+    // container.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_with_embedded_subprocess_tool(),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+    let container = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("review")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let instance = engine.instance(inst).unwrap();
+    let eik_of = |element_id: &str| -> Key {
+        *instance
+            .active
+            .iter()
+            .find(|(_, id)| id.as_str() == element_id)
+            .map(|(k, _)| k)
+            .unwrap_or_else(|| panic!("no active element instance for {element_id}"))
+    };
+    let scope_of = |eik: Key| -> Key { instance.scopes.get(&eik).copied().unwrap_or(0) };
+
+    let ask = eik_of("ask");
+    let review = eik_of("review");
+    let inner = eik_of("agent#innerInstance");
+    assert_eq!(
+        scope_of(ask),
+        review,
+        "the body task hangs off the subProcess tool"
+    );
+    assert_eq!(
+        scope_of(review),
+        inner,
+        "the subProcess tool hangs off its dedicated inner instance"
+    );
+    assert_eq!(
+        scope_of(inner),
+        container,
+        "the inner instance is scoped to the ad-hoc container"
     );
 }
 

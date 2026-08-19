@@ -53,10 +53,14 @@ orchestration, where the ad-hoc container is an ordinary job worker and its
   tool catalog and `outputCollection`, and its completion (natural or
   `cancelRemainingInstances`) propagates across the nesting boundary into the
   parent container's `outputElement`/loop, nesting correctly in the read-model
-  element-instance tree.
+  element-instance tree; **embedded `SUB_PROCESS` tools whose multi-element body
+  runs by token flow** — a plain `bpmn:subProcess` tool (an inner flow of tasks /
+  gateways / events) is retained in the executable graph and, on activation,
+  mints its inner instance, injects a token at the body's start event, and
+  completes only when the body reaches its end event, feeding the loop like any
+  other tool (cancel tears the body down across the tool boundary; #872).
 - **Deferred:** the `BPMN_TASK` `activeElementsCollection` declarative variant
-  (v1.1); embedded `SUB_PROCESS` tools whose multi-element body runs by token
-  flow; boundary events on tools; compensation inside ad-hoc; per-tool
+  (v1.1); boundary events on tools; compensation inside ad-hoc; per-tool
   retries/priority (currently defaulted).
 
 **Observability.** Every tool activation is a first-class **read-model element
