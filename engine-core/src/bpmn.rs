@@ -1811,6 +1811,11 @@ struct NodeAcc {
     /// `compensateEventDefinition`, making it a
     /// [`CompensationThrowEvent`](crate::model::ElementKind::CompensationThrowEvent).
     is_compensation_throw: bool,
+    /// True when this activity is marked `isForCompensation="true"` — i.e. it is
+    /// a compensation *handler*, reachable only via a compensation boundary's
+    /// `<association>`, never by ordinary token flow. Used to resolve (and
+    /// disambiguate) which association endpoint is the real handler.
+    is_for_compensation: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1986,6 +1991,7 @@ impl ProcessAcc {
             linked_resources: Vec::new(),
             start_form_id: None,
             is_compensation_throw: false,
+            is_for_compensation: attr(attrs, "isForCompensation") == Some("true"),
         });
         let idx = self.nodes.len() - 1;
         Some(idx)
@@ -2559,6 +2565,17 @@ impl ProcessAcc {
         // The process-level start event's form id (`zeebe:formDefinition formId`),
         // captured as nodes are consumed and set on the built definition below.
         let mut start_form_id: Option<String> = None;
+        // Ids of activities marked `isForCompensation="true"` — the only valid
+        // targets of a compensation boundary's `<association>`. Collected before
+        // `self.nodes` is consumed below so the boundary-handler resolution can
+        // reject associations that point at a non-handler node (e.g. a
+        // `textAnnotation`) and detect ambiguity.
+        let compensation_handler_ids: std::collections::HashSet<String> = self
+            .nodes
+            .iter()
+            .filter(|n| n.is_for_compensation)
+            .map(|n| n.id.clone())
+            .collect();
         for node in self.nodes {
             let node_id = node.id.clone();
             let io_id = node.id.clone();
@@ -2769,25 +2786,51 @@ impl ProcessAcc {
                     })?;
             // A compensation boundary marks its activity compensable; its
             // handler activity is the other end of the `<association>` wiring it.
+            // Resolve it by scanning every association touching the boundary and
+            // keeping only endpoints that are real `isForCompensation` handler
+            // activities — this rejects a stray association to a `textAnnotation`
+            // and rejects (rather than silently picking one of) an ambiguous set
+            // of multiple candidate handlers.
             if boundary.compensation {
-                let handler = associations
+                let mut candidates: Vec<String> = associations
                     .iter()
-                    .find_map(|(source, target)| {
-                        if source == &boundary.id {
-                            Some(target.clone())
+                    .filter_map(|(source, target)| {
+                        let other = if source == &boundary.id {
+                            target
                         } else if target == &boundary.id {
-                            Some(source.clone())
+                            source
                         } else {
-                            None
-                        }
+                            return None;
+                        };
+                        compensation_handler_ids
+                            .contains(other)
+                            .then(|| other.clone())
                     })
-                    .ok_or_else(|| ParseError::InvalidBoundaryEvent {
-                        process_id: self.id.clone(),
-                        reason: format!(
-                            "compensation boundary event {} has no associated handler activity (missing <association>)",
-                            boundary.id
-                        ),
-                    })?;
+                    .collect();
+                candidates.sort();
+                candidates.dedup();
+                let handler = match candidates.as_slice() {
+                    [single] => single.clone(),
+                    [] => {
+                        return Err(ParseError::InvalidBoundaryEvent {
+                            process_id: self.id.clone(),
+                            reason: format!(
+                                "compensation boundary event {} has no associated `isForCompensation` handler activity (missing or non-handler <association>)",
+                                boundary.id
+                            ),
+                        })
+                    }
+                    _ => {
+                        return Err(ParseError::InvalidBoundaryEvent {
+                            process_id: self.id.clone(),
+                            reason: format!(
+                                "compensation boundary event {} is associated with multiple handler activities ({}); exactly one is required",
+                                boundary.id,
+                                candidates.join(", ")
+                            ),
+                        })
+                    }
+                };
                 builder = builder.compensation_boundary_event(boundary.id, attached_to, handler);
                 continue;
             }
@@ -3277,6 +3320,86 @@ mod tests {
                 handler,
             } => {
                 assert_eq!(attached_to.as_str(), "Book");
+                assert_eq!(handler.as_str(), "CancelBook");
+            }
+            other => panic!("expected CompensationBoundaryEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_compensation_boundary_associations_that_do_not_resolve_to_a_single_handler() {
+        // Failure-mode guard: a compensation boundary's handler is resolved from
+        // its `<association>` wiring, but only `isForCompensation` activities are
+        // valid handlers. An association to a non-handler node (e.g. a
+        // `textAnnotation`) must NOT mis-bind, and multiple candidate handlers
+        // must be rejected rather than nondeterministically picking one.
+        let boundary = r#"
+              <bpmn:serviceTask id="Book"><bpmn:incoming>f1</bpmn:incoming></bpmn:serviceTask>
+              <bpmn:boundaryEvent id="BookComp" attachedToRef="Book">
+                <bpmn:compensateEventDefinition />
+              </bpmn:boundaryEvent>
+              <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+              <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Book" />"#;
+        let wrap = |body: &str| {
+            format!(
+                r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+                    <bpmn:process id="comp" isExecutable="true">{boundary}{body}</bpmn:process>
+                   </bpmn:definitions>"#
+            )
+        };
+
+        // (a) The only association points at a `textAnnotation`, not a handler.
+        let annotation = wrap(
+            r#"<bpmn:textAnnotation id="Note"><bpmn:text>hi</bpmn:text></bpmn:textAnnotation>
+               <bpmn:association id="a1" sourceRef="BookComp" targetRef="Note" />"#,
+        );
+        match parse_bpmn(&annotation) {
+            Err(ParseError::InvalidBoundaryEvent { reason, .. }) => {
+                assert!(
+                    reason.contains("isForCompensation"),
+                    "expected a missing-handler error, got: {reason}"
+                );
+            }
+            other => {
+                panic!("expected InvalidBoundaryEvent for a non-handler association, got {other:?}")
+            }
+        }
+
+        // (b) Two distinct `isForCompensation` handlers are associated — ambiguous.
+        let ambiguous = wrap(
+            r#"<bpmn:serviceTask id="CancelA" isForCompensation="true" />
+               <bpmn:serviceTask id="CancelB" isForCompensation="true" />
+               <bpmn:association id="a1" sourceRef="BookComp" targetRef="CancelA" />
+               <bpmn:association id="a2" sourceRef="BookComp" targetRef="CancelB" />"#,
+        );
+        match parse_bpmn(&ambiguous) {
+            Err(ParseError::InvalidBoundaryEvent { reason, .. }) => {
+                assert!(
+                    reason.contains("multiple handler activities"),
+                    "expected an ambiguous-handler error, got: {reason}"
+                );
+            }
+            other => {
+                panic!("expected InvalidBoundaryEvent for ambiguous associations, got {other:?}")
+            }
+        }
+
+        // (c) A handler association plus a harmless annotation association still
+        // resolves to the single real handler (the annotation is ignored).
+        let mixed = wrap(
+            r#"<bpmn:serviceTask id="CancelBook" isForCompensation="true" />
+               <bpmn:textAnnotation id="Note"><bpmn:text>hi</bpmn:text></bpmn:textAnnotation>
+               <bpmn:association id="a1" sourceRef="BookComp" targetRef="Note" />
+               <bpmn:association id="a2" sourceRef="BookComp" targetRef="CancelBook" />"#,
+        );
+        let defs = parse_bpmn(&mixed).expect("a single real handler must resolve");
+        match &defs[0]
+            .elements
+            .get(&ElementId::from("BookComp"))
+            .expect("boundary element")
+            .kind
+        {
+            ElementKind::CompensationBoundaryEvent { handler, .. } => {
                 assert_eq!(handler.as_str(), "CancelBook");
             }
             other => panic!("expected CompensationBoundaryEvent, got {other:?}"),

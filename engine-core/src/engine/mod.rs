@@ -6950,39 +6950,32 @@ impl Engine {
             .instances
             .get(&instance_key)
             .and_then(|i| i.compensation_waits.get(&throw_eik));
-        let (throw_element_id, throw_scope, last_handler) = match wait {
+        let (throw_element_id, last_handler) = match wait {
             Some(wait) => (
                 wait.throw_element_id.clone(),
-                wait.scope,
                 wait.pending_handlers.len() == 1,
             ),
             None => return (Vec::new(), Vec::new()),
         };
-        let mut events = vec![Event::CompensationHandlerCompleted {
+        let events = vec![Event::CompensationHandlerCompleted {
             instance_key,
             throw_element_instance_key: throw_eik,
             handler_element_id: handler_element_id.to_string(),
         }];
         let mut followups = Vec::new();
         if last_handler {
-            // The compensation throw event completes and routes onward.
-            events.push(Event::ElementCompleted {
+            // The throw's outstanding handlers are all done: complete it through
+            // the normal completion pipeline (`Step::Complete`), exactly like the
+            // nothing-to-compensate pass-through path (see `run_activation_body`).
+            // Completing inline here would bypass the throw's own end execution
+            // listeners, output mappings and boundary disarm; routing through
+            // `complete` keeps throw completion semantics consistent with every
+            // other element.
+            followups.push(Step::Complete {
                 instance_key,
                 element_instance_key: throw_eik,
-                element_id: throw_element_id.clone(),
+                element_id: throw_element_id,
             });
-            for flow in self.outgoing(instance_key, &throw_element_id) {
-                events.push(Event::SequenceFlowTaken {
-                    instance_key,
-                    from: throw_element_id.clone(),
-                    to: flow.to.clone(),
-                });
-                followups.push(Step::Activate {
-                    instance_key,
-                    element_id: flow.to,
-                    scope: throw_scope,
-                });
-            }
         }
         (events, followups)
     }

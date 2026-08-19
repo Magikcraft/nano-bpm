@@ -2387,11 +2387,19 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str("    </bpmn:boundaryEvent>\n");
         }
         ElementKind::CompensationThrowEvent => {
-            out.push_str(&format!(
-                "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}>\n"
-            ));
+            // A compensation throw parsed from an `endEvent` carries no outgoing
+            // sequence flow; one parsed from an `intermediateThrowEvent` does.
+            // Preserve that flavour on round-trip by emitting the matching tag —
+            // otherwise an end-event compensation throw would re-serialize as an
+            // intermediate throw event.
+            let tag = if el.outgoing.is_empty() {
+                "endEvent"
+            } else {
+                "intermediateThrowEvent"
+            };
+            out.push_str(&format!("    <bpmn:{tag} id=\"{eid}\"{na}>\n"));
             out.push_str("      <bpmn:compensateEventDefinition/>\n");
-            out.push_str("    </bpmn:intermediateThrowEvent>\n");
+            out.push_str(&format!("    </bpmn:{tag}>\n"));
         }
         ElementKind::CompensationBoundaryEvent {
             attached_to,
@@ -4087,6 +4095,59 @@ mod tests {
             .outgoing
             .iter()
             .any(|f| f.to == "Approve" && f.condition.is_some()));
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_compensation_throw_flavour_by_outgoing_flow() {
+        // A `CompensationThrowEvent` is parsed from either an
+        // `<intermediateThrowEvent>` (has an outgoing flow) or an `<endEvent>`
+        // (no outgoing flow). The serializer must preserve that flavour off the
+        // presence of an outgoing flow — otherwise an end-event compensation
+        // throw would re-serialize as an intermediate throw event and drift.
+        use nanobpmn_engine_core::ProcessBuilder;
+
+        // Intermediate flavour: the throw has an outgoing flow.
+        let mid = ProcessBuilder::new("mid")
+            .start_event("s")
+            .compensation_throw_event("throw")
+            .end_event("done")
+            .connect("s", "throw")
+            .connect("throw", "done")
+            .build()
+            .unwrap();
+        let mid_xml = definition_to_xml(&mid);
+        assert!(
+            mid_xml.contains("<bpmn:intermediateThrowEvent id=\"throw\""),
+            "a throw with an outgoing flow must emit intermediateThrowEvent, got:\n{mid_xml}"
+        );
+        assert_eq!(
+            parse_bpmn(&mid_xml).unwrap()[0].elements["throw"].kind,
+            ElementKind::CompensationThrowEvent
+        );
+
+        // End flavour: the throw is terminal (no outgoing flow).
+        let end = ProcessBuilder::new("end")
+            .start_event("s")
+            .compensation_throw_event("throw")
+            .connect("s", "throw")
+            .build()
+            .unwrap();
+        let end_xml = definition_to_xml(&end);
+        assert!(
+            end_xml.contains("<bpmn:endEvent id=\"throw\"")
+                && !end_xml.contains("<bpmn:intermediateThrowEvent id=\"throw\""),
+            "a terminal compensation throw must emit endEvent, got:\n{end_xml}"
+        );
+        let reparsed = parse_bpmn(&end_xml).unwrap();
+        assert_eq!(
+            reparsed[0].elements["throw"].kind,
+            ElementKind::CompensationThrowEvent,
+            "an end-event compensation throw must round-trip back to CompensationThrowEvent"
+        );
+        assert!(
+            reparsed[0].elements["throw"].outgoing.is_empty(),
+            "the end-flavour throw must stay terminal on round-trip"
+        );
     }
 
     #[test]
