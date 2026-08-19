@@ -224,10 +224,18 @@ pub fn unescape(s: &str) -> String {
             i += ch.len_utf8();
             continue;
         }
-        // Look for the terminating ';' of an entity reference.
-        let rest = &s[i..];
-        if let Some(semi) = rest.find(';') {
-            let entity = &rest[1..semi]; // between '&' and ';'
+        // Look for the terminating ';' of an entity reference, but only within a
+        // small bounded window. The longest reference we accept is a numeric
+        // character reference like `&#x10FFFF;` / `&#1114111;` — an 8-char body
+        // plus the leading `&` and trailing `;`. Capping the scan keeps the whole
+        // pass O(n): otherwise a pathological input (many `&` with no nearby `;`)
+        // scans to a far-away `;` on every `&`, which is O(n²). The `;` is ASCII,
+        // so scanning bytes cannot split a multi-byte character.
+        const MAX_REF_LEN: usize = 10; // '&' + up to 8 body chars + ';'
+        let rest = &bytes[i..];
+        let window = rest.len().min(MAX_REF_LEN);
+        if let Some(semi) = rest[..window].iter().position(|&b| b == b';') {
+            let entity = &s[i + 1..i + semi]; // between '&' and ';'
             let decoded = decode_entity(entity);
             if let Some(ch) = decoded {
                 out.push(ch);
@@ -454,5 +462,20 @@ mod tests {
         assert_eq!(unescape("&#9;"), "\t");
         assert_eq!(unescape("&#xA;"), "\n");
         assert_eq!(unescape("&#xD;"), "\r");
+    }
+
+    #[test]
+    fn should_bound_the_scan_for_the_terminating_semicolon() {
+        // The scan for a reference's `;` is capped at the longest reference we
+        // accept, so a far-away `;` is never treated as an entity terminator and
+        // the pass stays O(n) instead of O(n²) on pathological input.
+        // A `;` beyond that bound leaves the `&` verbatim:
+        assert_eq!(unescape("&aaaaaaaaaaa;"), "&aaaaaaaaaaa;");
+        // Many ampersands with no nearby `;` are all emitted literally:
+        assert_eq!(unescape("&&&&&&&&&&&&&&&"), "&&&&&&&&&&&&&&&");
+        // The longest valid reference (`&#x10FFFF;`, 10 chars) still decodes at the
+        // exact boundary of the window.
+        assert_eq!(unescape("&#x10FFFF;"), "\u{10FFFF}");
+        assert_eq!(unescape("&#1114111;"), "\u{10FFFF}");
     }
 }
