@@ -10670,6 +10670,138 @@ fn adhoc_agent_activates_a_user_task_tool_and_parks_until_completed() {
     );
 }
 
+fn adhoc_agent_with_embedded_subprocess_tool() -> ProcessDefinition {
+    // A JOB_WORKER ad-hoc container whose tool `review` is a plain embedded
+    // `bpmn:subProcess` with a MULTI-ELEMENT token-flow body
+    // (startEvent -> userTask `ask` -> endEvent). This is the camunda.com
+    // `/orchestrate/agents/` "Loan decision review" governance construct: a
+    // subprocess tool that runs a human review (and, in the full model, a
+    // routing gateway) as its own inner flow before the tool completes and
+    // feeds the agent loop.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:subProcess id="review">
+              <bpmn:startEvent id="r_s" />
+              <bpmn:userTask id="ask">
+                <bpmn:extensionElements>
+                  <zeebe:assignmentDefinition assignee="alice" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="r_e" />
+              <bpmn:sequenceFlow id="rf1" sourceRef="r_s" targetRef="ask" />
+              <bpmn:sequenceFlow id="rf2" sourceRef="ask" targetRef="r_e" />
+            </bpmn:subProcess>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+/// Acceptance guard for Magikcraft/nano-bpm#872 (the deferred remainder of #631,
+/// which PR #863 closed after delivering only the nested-ad-hoc / agent-of-agents
+/// half). Activating an embedded `subProcess` tool must run its multi-element
+/// body by token flow — creating the inner `ask` user task and parking the tool
+/// until the body reaches its end event — NOT complete the tool immediately.
+///
+/// Today the tool is classified `AdHocToolKind::Other` and `activate_adhoc_tool`
+/// passes it straight through (`Step::Complete`), so no user task is created and
+/// this test's `expect` fails. It is `#[ignore]`d so it never reports a failure
+/// on `main` while the capability is unimplemented; the engineer who lands #872
+/// removes the `#[ignore]` to flip it green. This makes #872's done-state
+/// test-defined rather than issue-state-defined (see nano-workforce#313).
+#[test]
+#[ignore = "acceptance for Magikcraft/nano-bpm#872: embedded subProcess ad-hoc \
+            tool must run its body by token flow; remove #[ignore] when landed"]
+fn adhoc_agent_runs_an_embedded_subprocess_tool_body_by_token_flow() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_with_embedded_subprocess_tool(),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    // Turn 1: the agent activates the embedded subProcess tool. Its body must
+    // run — creating the inner `ask` user task — and the tool must stay ACTIVE
+    // until the body completes, not auto-complete on activation.
+    let activated = engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("review")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let user_task_key = activated
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated {
+                user_task_key,
+                element_id,
+                ..
+            } if element_id == "ask" => Some(*user_task_key),
+            _ => None,
+        })
+        .expect(
+            "activating an embedded subProcess tool runs its body: the inner \
+             `ask` user task is created (#872)",
+        );
+
+    assert!(
+        !engine.is_completed(inst),
+        "container parks while the tool's inner human task is open (#872)"
+    );
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "the subProcess tool child stays active while its body runs (#872)"
+    );
+
+    // Completing the inner user task drains the tool body to its end event,
+    // which completes the tool — feeding the container's outputCollection and
+    // re-emitting the agent job for the next turn.
+    let mut vars = HashMap::new();
+    vars.insert("result".to_string(), Value::Str("approved".to_string()));
+    engine
+        .apply_command(Command::complete_user_task_with(user_task_key, vars))
+        .unwrap();
+    let results = container_output_collection(&engine, inst, container, "results");
+    assert_eq!(
+        results,
+        Some(Value::List(vec![Value::Str("approved".to_string())])),
+        "the subProcess tool body's output reaches the container's \
+         outputCollection once the body completes (#872)"
+    );
+}
+
 // Reads the ad-hoc container's local `outputCollection` variable (`results`)
 // straight off the container scope — the live value visible mid-run, before the
 // container completes and propagates it outward.
