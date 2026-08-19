@@ -48,10 +48,16 @@ orchestration, where the ad-hoc container is an ordinary job worker and its
   FEEL `<completionCondition>` (evaluated after each tool completes, and the
   agent's `isCompletionConditionFulfilled` flag); activated-tool `zeebe:ioMapping`
   (inputs on activation, outputs into the container scope); agent re-iteration
-  until completion.
+  until completion; **nested ad-hoc (agent-of-agents)** — a tool that is itself
+  an `adHocSubProcess` stands up a second-level container with its own agent job,
+  tool catalog and `outputCollection`, and its completion (natural or
+  `cancelRemainingInstances`) propagates across the nesting boundary into the
+  parent container's `outputElement`/loop, nesting correctly in the read-model
+  element-instance tree.
 - **Deferred:** the `BPMN_TASK` `activeElementsCollection` declarative variant
-  (v1.1); nested ad-hoc (agent-of-agents); boundary events on tools; compensation
-  inside ad-hoc; per-tool retries/priority (currently defaulted).
+  (v1.1); embedded `SUB_PROCESS` tools whose multi-element body runs by token
+  flow; boundary events on tools; compensation inside ad-hoc; per-tool
+  retries/priority (currently defaulted).
 
 **Observability.** Every tool activation is a first-class **read-model element
 instance** — the engine emits the standard `ElementActivated`/`ElementCompleted`

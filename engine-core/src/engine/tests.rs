@@ -14129,3 +14129,681 @@ fn snapshot_round_trip_retains_all_versions_and_instance_pins() {
         "the instance's pinned key survives the round-trip"
     );
 }
+
+// =====================================================================
+// Nested ad-hoc sub-process tools (agent-of-agents) — Magikcraft/nano-bpm#631
+// =====================================================================
+
+/// An outer JOB_WORKER ad-hoc container (`agent`) whose single tool `subagent`
+/// is itself a nested `adHocSubProcess` (a second-level agent) carrying its own
+/// `zeebe:taskDefinition`, `outputCollection`, and one leaf service-task tool
+/// `leaf`. This is the Zeebe "agent-of-agents" shape: `isAdHocActivity` admits a
+/// nested `AD_HOC_SUB_PROCESS` as an activatable tool (issue #631).
+fn nested_adhoc_agent_process() -> ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:adHocSubProcess id="subagent">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="sub-agent-worker" />
+                <zeebe:adHoc outputCollection="subResults" outputElement="=leafOut" />
+              </bpmn:extensionElements>
+              <bpmn:serviceTask id="leaf">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="leaf-tool" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+            </bpmn:adHocSubProcess>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+/// Red for #631: activating a nested `adHocSubProcess` tool must stand up a
+/// real second-level container — its own agent job (`sub-agent-worker`), its own
+/// registered ad-hoc scope, and its own seeded `outputCollection` — not a plain
+/// opaque job. The nested container's completion then feeds the outer
+/// container's `outputElement`/loop across the nesting boundary, and the outer
+/// container completes normally.
+#[test]
+fn nested_adhoc_tool_stands_up_a_second_level_container_and_propagates_completion() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(nested_adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    // Outer container's agent job.
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("outer agent job emitted");
+    let outer = agent.element_instance_key;
+
+    // Turn 1: outer agent activates the nested `subagent` tool.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("subagent")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // The nested container is now an active tool of the outer container.
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&outer)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "the nested container is active in the outer container"
+    );
+
+    // It must have minted its OWN agent job (second-level worker), and
+    // registered its own ad-hoc scope with a seeded outputCollection.
+    let sub_agent = engine
+        .activate_jobs("sub-agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "subagent")
+        .expect("nested container minted its own agent job (second level)");
+    let nested = sub_agent.element_instance_key;
+    assert!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .contains_key(&nested),
+        "the nested container registered its own ad-hoc runtime scope"
+    );
+    assert_eq!(
+        container_output_collection(&engine, inst, nested, "subResults"),
+        Some(Value::List(vec![])),
+        "the nested container seeded its own empty outputCollection"
+    );
+
+    // Second-level turn: the nested agent activates its `leaf` tool.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            sub_agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("leaf")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let leaf = engine
+        .activate_jobs("leaf-tool", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "leaf")
+        .expect("leaf tool job emitted inside the nested container");
+    let mut leaf_vars = HashMap::new();
+    leaf_vars.insert("leafOut".to_string(), Value::Str("deep".into()));
+    engine
+        .apply_command(Command::complete_job_with(leaf.key, leaf_vars))
+        .unwrap();
+
+    // The leaf output accumulated in the nested container's outputCollection.
+    assert_eq!(
+        container_output_collection(&engine, inst, nested, "subResults"),
+        Some(Value::List(vec![Value::Str("deep".into())])),
+        "leaf output accumulated in the nested container's collection"
+    );
+
+    // Second-level agent job re-emitted for the next turn; it signals done,
+    // completing the nested container, whose completion feeds the OUTER
+    // container's outputElement (=result) and loop.
+    let sub_agent2 = engine
+        .activate_jobs("sub-agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "subagent")
+        .expect("nested agent job re-emitted");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            sub_agent2.key,
+            {
+                let mut m = HashMap::new();
+                m.insert("result".to_string(), Value::Str("nested-done".into()));
+                m
+            },
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // The nested container drained out of the outer container's active set.
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&outer)
+            .unwrap()
+            .active
+            .len(),
+        0,
+        "the nested container completed and left the outer active set"
+    );
+    // The outer agent job re-emitted for its next turn.
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("outer agent job re-emitted after nested tool completed");
+    let final_events = engine
+        .apply_command(Command::complete_job_with_result(
+            agent2.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "outer container completed → instance done"
+    );
+    let results = final_events.iter().find_map(|e| match e {
+        Event::VariablesUpdated { variables, .. } => variables.get("results").cloned(),
+        _ => None,
+    });
+    assert_eq!(
+        results,
+        Some(Value::List(vec![Value::Str("nested-done".into())])),
+        "the nested container's result fed the outer outputCollection across the boundary"
+    );
+}
+
+/// #631 (read-model nesting): while a second-level tool runs, the element-
+/// instance tree must nest correctly — leaf tool → its inner instance → nested
+/// container → the nested container's inner instance → outer container. A flat
+/// or mis-parented tree would break the console trace and Operate-parity audit
+/// trail the ADR requires.
+#[test]
+fn nested_adhoc_read_model_element_tree_nests_correctly() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(nested_adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("outer agent job");
+    let outer = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("subagent")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let sub_agent = engine
+        .activate_jobs("sub-agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "subagent")
+        .expect("nested agent job");
+    let nested = sub_agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            sub_agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("leaf")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let instance = engine.instance(inst).unwrap();
+    let eik_of = |element_id: &str| -> Key {
+        *instance
+            .active
+            .iter()
+            .find(|(_, id)| id.as_str() == element_id)
+            .map(|(k, _)| k)
+            .unwrap_or_else(|| panic!("no active element instance for {element_id}"))
+    };
+    let scope_of = |eik: Key| -> Key { instance.scopes.get(&eik).copied().unwrap_or(0) };
+
+    let leaf = eik_of("leaf");
+    let nested_inner = eik_of("subagent#innerInstance");
+    let outer_inner = eik_of("agent#innerInstance");
+
+    assert_eq!(
+        scope_of(leaf),
+        nested_inner,
+        "leaf hangs off its inner instance"
+    );
+    assert_eq!(
+        scope_of(nested_inner),
+        nested,
+        "the leaf's inner instance is scoped to the nested container"
+    );
+    assert_eq!(
+        scope_of(nested),
+        outer_inner,
+        "the nested container hangs off its own inner instance in the outer container"
+    );
+    assert_eq!(
+        scope_of(outer_inner),
+        outer,
+        "the nested container's inner instance is scoped to the outer container"
+    );
+}
+
+/// An outer JOB_WORKER container whose nested `subagent` declares a
+/// `<completionCondition>` (`=done = true`) and holds TWO leaf tools.
+/// Once the first leaf drains the nested container's condition fires and — with
+/// the default `cancelRemainingInstances=true` — cancels the still-running
+/// second leaf, then completes and feeds the OUTER container across the nesting
+/// boundary.
+fn nested_adhoc_cancel_process() -> ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=done" />
+            </bpmn:extensionElements>
+            <bpmn:adHocSubProcess id="subagent">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="sub-agent-worker" />
+                <zeebe:adHoc outputCollection="subResults" outputElement="=leafOut" />
+              </bpmn:extensionElements>
+              <bpmn:completionCondition>=done = true</bpmn:completionCondition>
+              <bpmn:serviceTask id="leaf1">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="leaf-tool" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:serviceTask id="leaf2">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="leaf-tool" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+            </bpmn:adHocSubProcess>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+/// #631 (cancel propagation across the boundary): a nested container whose
+/// `<completionCondition>` fires cancels its remaining second-level tools, then
+/// completes and feeds the outer container's loop — its still-running tool is
+/// not orphaned and the outer container advances.
+#[test]
+fn nested_adhoc_completion_condition_cancels_remaining_and_feeds_parent() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(nested_adhoc_cancel_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("outer agent job");
+    let outer = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("subagent")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let sub_agent = engine
+        .activate_jobs("sub-agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "subagent")
+        .expect("nested agent job");
+    let nested = sub_agent.element_instance_key;
+
+    // Nested agent activates BOTH leaves in one turn.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            sub_agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("leaf1"), activate_element("leaf2")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&nested)
+            .unwrap()
+            .active
+            .len(),
+        2,
+        "both nested leaves active"
+    );
+
+    // Drain only leaf1: its output makes the nested completionCondition true, so
+    // the nested container cancels leaf2 and completes — crossing the boundary
+    // into the outer container.
+    let leaf_jobs = engine.activate_jobs("leaf-tool", "W", 10, 1_000, 0);
+    let leaf1 = leaf_jobs
+        .iter()
+        .find(|j| j.element_id == "leaf1")
+        .expect("leaf1 job");
+    let mut vars = HashMap::new();
+    vars.insert("leafOut".to_string(), Value::Str("x".into()));
+    vars.insert("done".to_string(), Value::Bool(true));
+    engine
+        .apply_command(Command::complete_job_with(leaf1.key, vars))
+        .unwrap();
+
+    // The nested container is gone (completed) and left the outer active set.
+    assert!(
+        !engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .contains_key(&nested),
+        "the nested container completed and dropped its runtime state"
+    );
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&outer)
+            .unwrap()
+            .active
+            .len(),
+        0,
+        "the nested container left the outer active set (cancel crossed the boundary)"
+    );
+    assert_eq!(
+        container_output_collection(&engine, inst, outer, "results"),
+        Some(Value::List(vec![Value::Bool(true)])),
+        "the cancelled nested container still fed the outer outputElement"
+    );
+    // The nested container's OWN `outputCollection` (`subResults`) is an internal
+    // detail of the nested scope — it must NOT leak across the nesting boundary
+    // into the enclosing scope. Its result crosses only via the parent's
+    // outputElement (`results`, asserted above). Before the fix, completing the
+    // nested container propagated `subResults` out of its scope, landing it in the
+    // root instance variables (no ancestor scope defines it).
+    assert!(
+        !engine
+            .instance(inst)
+            .unwrap()
+            .variables
+            .contains_key("subResults"),
+        "the nested container's internal outputCollection did not leak into the root scope"
+    );
+    assert_eq!(
+        container_output_collection(&engine, inst, outer, "subResults"),
+        None,
+        "the nested container's internal outputCollection did not leak into the outer scope"
+    );
+
+    // The outer agent job re-emitted; complete the run.
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("outer agent job re-emitted");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent2.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(engine.is_completed(inst), "instance completes");
+}
+
+/// #631 (parent cancels a nested tool): when the OUTER container completes with
+/// `cancelRemainingInstances=true` while a NESTED ad-hoc container tool is still
+/// active, the nested container must be torn down RECURSIVELY — its own active
+/// descendants (second-level tools + their jobs) cancelled, its element instance
+/// completed, and its `adhoc_instances` runtime state dropped (`AdHocCompleted`).
+/// Before the fix the outer cancel loop treated the nested container as a leaf
+/// tool (`cancel_mi_child_events`), orphaning the nested container's leaf job +
+/// element instance and leaking its ad-hoc state (no `AdHocCompleted`).
+#[test]
+fn nested_adhoc_parent_cancel_recursively_tears_down_nested_container() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(nested_adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    // Outer agent activates the nested `subagent` tool.
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("outer agent job");
+    let outer = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("subagent")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // Nested agent activates its `leaf` tool, which mints a leaf job left
+    // in-flight (never completed).
+    let sub_agent = engine
+        .activate_jobs("sub-agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "subagent")
+        .expect("nested agent job");
+    let nested = sub_agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            sub_agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("leaf")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let leaf_job = engine
+        .activate_jobs("leaf-tool", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "leaf")
+        .expect("leaf tool job in-flight inside the nested container");
+    let leaf = leaf_job.element_instance_key;
+    assert!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .contains_key(&nested),
+        "nested container active before the parent cancels"
+    );
+
+    // Cancel the OUTER container's remaining instances while the nested container
+    // (and its leaf) are still running.
+    let events = engine
+        .apply_command(Command::ActivateAdHocActivities {
+            ad_hoc_instance_key: outer,
+            activate_elements: Vec::new(),
+            cancel_remaining: true,
+        })
+        .expect("cancel-remaining completes the outer container");
+
+    // The nested container's ad-hoc runtime state was dropped (recursive
+    // teardown), not left dangling.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::AdHocCompleted { container_key, cancelled, .. }
+                if *container_key == nested && *cancelled
+        )),
+        "the nested container emitted AdHocCompleted (its ad-hoc state was dropped); events: {events:?}"
+    );
+    // The nested container's leaf descendant's job was cancelled — not orphaned.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::JobCanceled { job_key, .. } if *job_key == leaf_job.key
+        )),
+        "the nested container's in-flight leaf job was cancelled; events: {events:?}"
+    );
+    // The leaf descendant's element instance was completed — not left orphaned in
+    // the read-model element-instance tree.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_instance_key, element_id, .. }
+                if *element_instance_key == leaf && element_id == "leaf"
+        )),
+        "the nested container's leaf element instance was completed; events: {events:?}"
+    );
+    assert!(engine.is_completed(inst), "the whole instance completes");
+    assert!(
+        engine
+            .instance(inst)
+            .map(|i| i.adhoc_instances.is_empty())
+            .unwrap_or(true),
+        "no ad-hoc runtime state leaks after the recursive cancel"
+    );
+}
+
+/// #631 robustness (Copilot review, PR #863): the recursive cancel helper
+/// `cancel_adhoc_active_child` also tears down the dedicated inner wrapper
+/// instance each tool hangs off. That inner instance's `scopes` mapping can
+/// linger after it has already left `active` (been completed), in which case its
+/// element id no longer resolves. Emitting `ElementCompleting`/`ElementCompleted`
+/// with an EMPTY element_id in that case corrupts downstream element aggregates —
+/// so the teardown must be skipped when the id can't be resolved (mirroring the
+/// defensive skip on the `ModifyInstance` termination path). Before the fix the
+/// inner teardown used `element_id_of_instance(..).unwrap_or_default()`, emitting
+/// a completion for an id of `""`.
+#[test]
+fn nested_adhoc_cancel_child_skips_already_completed_inner_instance() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(nested_adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    // Outer agent activates the nested `subagent` tool (which hangs off a
+    // dedicated `agent#innerInstance` wrapper instance).
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("outer agent job");
+    let outer = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("subagent")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let sub_agent = engine
+        .activate_jobs("sub-agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "subagent")
+        .expect("nested agent job");
+    let nested = sub_agent.element_instance_key;
+
+    // The inner wrapper the nested tool hangs off.
+    let inner = engine.scope_of(inst, nested);
+    assert_ne!(inner, 0, "nested tool hangs off a dedicated inner instance");
+    assert_ne!(
+        inner, outer,
+        "the inner wrapper is distinct from the container"
+    );
+
+    // Simulate that inner wrapper having ALREADY been torn down: drop it from
+    // `active` (so its element id no longer resolves) while its `scopes` mapping
+    // still resolves it — the exact state the old `unwrap_or_default()` mishandled.
+    engine
+        .state
+        .instances
+        .get_mut(&inst)
+        .unwrap()
+        .active
+        .remove(&inner);
+    assert!(
+        engine.element_id_of_instance(inst, inner).is_none(),
+        "inner wrapper is no longer active"
+    );
+    assert_eq!(
+        engine.scope_of(inst, nested),
+        inner,
+        "but its scopes mapping still resolves it"
+    );
+
+    let events = engine.cancel_adhoc_active_child(inst, outer, nested);
+
+    // No element-completion event may carry an empty element_id.
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleting { element_id, .. } | Event::ElementCompleted { element_id, .. }
+                if element_id.is_empty()
+        )),
+        "no element-completion event carries an empty element_id; events: {events:?}"
+    );
+    // And it must not fabricate a completion for the already-gone inner instance.
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_instance_key, .. } if *element_instance_key == inner
+        )),
+        "the already-completed inner instance is not torn down again; events: {events:?}"
+    );
+}

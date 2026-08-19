@@ -4071,30 +4071,11 @@ impl Engine {
                     // without leaking to the parent instance. Per-tool
                     // documentation / `zeebe:properties` / `fromAi` parameter
                     // schema are not parsed by nano yet (deferred; see #614).
-                    let entries: Vec<Value> = def
-                        .tools
-                        .iter()
-                        .filter(|t| {
-                            // Only advertise activatable ad-hoc tools. The parser
-                            // captures known non-activatable inner nodes (e.g.
-                            // gateways) as `AdHocToolKind::Other`; excluding them
-                            // keeps the advertised catalog at Zeebe parity so the
-                            // agent never sees entries it cannot activate.
-                            !matches!(t.kind, crate::model::AdHocToolKind::Other)
-                        })
-                        .map(|t| {
-                            Value::Map(
-                                [
-                                    ("elementId".to_string(), Value::Str(t.element_id.clone())),
-                                    ("elementName".to_string(), Value::Str(t.name.clone())),
-                                ]
-                                .into_iter()
-                                .collect(),
-                            )
-                        })
-                        .collect();
                     let mut catalog_var = HashMap::new();
-                    catalog_var.insert("adHocSubProcessElements".to_string(), Value::List(entries));
+                    catalog_var.insert(
+                        "adHocSubProcessElements".to_string(),
+                        Value::List(Self::advertised_adhoc_catalog(def)),
+                    );
                     events.push(Event::ScopedVariablesUpdated {
                         instance_key,
                         scope_key: element_instance_key,
@@ -5084,6 +5065,98 @@ impl Engine {
         events
     }
 
+    /// Tear down one active ad-hoc tool child during a cancel-remaining-instances
+    /// completion of its container, including the dedicated inner instance the
+    /// tool hangs off. A plain (leaf) tool is cancelled via
+    /// [`Self::cancel_mi_child_events`]; a NESTED ad-hoc container tool
+    /// (agent-of-agents, #631) also owns its OWN active descendants (second-level
+    /// tools/jobs), an agent job, and an `adhoc_instances` runtime entry — none of
+    /// which `cancel_mi_child_events` knows about. Cancelling such a child with
+    /// the leaf path alone would orphan the nested container's element
+    /// instances/jobs and leave its ad-hoc state behind (no `AdHocCompleted`). So
+    /// a nested container is torn down RECURSIVELY: its descendants are cancelled
+    /// (each via this same routine), its own agent job / timers / subscriptions
+    /// are disarmed, the container element instance is completed, and its ad-hoc
+    /// runtime state is dropped via `AdHocCompleted { cancelled: true }`. Returns
+    /// events (does not emit) so it composes inside a `process_step` result.
+    fn cancel_adhoc_active_child(
+        &self,
+        instance_key: Key,
+        container_key: Key,
+        child: Key,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        // Is this active child itself a nested ad-hoc container (#631)? If so it
+        // has its own runtime scope + active descendants to tear down first.
+        let nested = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&child))
+            .map(|a| {
+                (
+                    a.element_id.clone(),
+                    a.active.iter().copied().collect::<Vec<Key>>(),
+                )
+            });
+        if let Some((nested_element_id, nested_active)) = nested {
+            // Recursively cancel the nested container's own active tools (which
+            // may themselves be nested containers), then disarm the nested
+            // container's own agent job and any boundary state, complete its
+            // element instance, and drop its ad-hoc runtime state.
+            for grandchild in &nested_active {
+                events.extend(self.cancel_adhoc_active_child(instance_key, child, *grandchild));
+            }
+            if let Some(job_key) = self.active_job_on(child) {
+                events.push(Event::JobCanceled {
+                    job_key,
+                    instance_key,
+                });
+            }
+            events.extend(self.cancel_all_timers_on(child));
+            events.extend(self.cancel_all_subscriptions_on(child));
+            events.push(Event::ElementCompleting {
+                instance_key,
+                element_instance_key: child,
+                element_id: nested_element_id.clone(),
+            });
+            events.push(Event::ElementCompleted {
+                instance_key,
+                element_instance_key: child,
+                element_id: nested_element_id,
+            });
+            events.push(Event::AdHocCompleted {
+                instance_key,
+                container_key: child,
+                cancelled: true,
+            });
+        } else {
+            events.extend(self.cancel_mi_child_events(instance_key, child));
+        }
+        // Each tool child hangs off a dedicated inner instance; tear it down too
+        // so the read-model element-instance tree does not leak an orphan. Only
+        // when the inner instance is still active does its element id resolve —
+        // if it is already gone there is nothing to tear down, and emitting a
+        // completion with an empty element_id would corrupt downstream element
+        // aggregates (mirrors the defensive skip in ModifyInstance termination).
+        let inner = self.scope_of(instance_key, child);
+        if inner != 0 && inner != container_key {
+            if let Some(inner_element_id) = self.element_id_of_instance(instance_key, inner) {
+                events.push(Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key: inner,
+                    element_id: inner_element_id.clone(),
+                });
+                events.push(Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key: inner,
+                    element_id: inner_element_id,
+                });
+            }
+        }
+        events
+    }
+
     /// The ad-hoc catalog entry for `element_id` in `instance_key`'s definition,
     /// if that element is an ad-hoc sub-process container. Cloned so callers can
     /// hold it across the `&mut self` event emission that follows. This is the
@@ -5099,6 +5172,32 @@ impl Engine {
             .iter()
             .find(|d| d.container_id == element_id)
             .cloned()
+    }
+
+    /// The advertised tool catalog an ad-hoc container writes to its local
+    /// `adHocSubProcessElements` variable on activation (Camunda
+    /// `AdHocSubProcessProcessor.onActivate`): one `{ elementId, elementName }`
+    /// map per activatable tool in document order, excluding known
+    /// non-activatable inner nodes (`AdHocToolKind::Other`, e.g. gateways) so the
+    /// agent never sees an entry it cannot activate. Shared by the token-flow
+    /// container activation (`run_activation_body`) and the nested-container tool
+    /// activation (`activate_adhoc_tool`, #631) so both stand up an identical
+    /// catalog.
+    fn advertised_adhoc_catalog(def: &crate::model::AdHocSubProcessDef) -> Vec<Value> {
+        def.tools
+            .iter()
+            .filter(|t| !matches!(t.kind, crate::model::AdHocToolKind::Other))
+            .map(|t| {
+                Value::Map(
+                    [
+                        ("elementId".to_string(), Value::Str(t.element_id.clone())),
+                        ("elementName".to_string(), Value::Str(t.name.clone())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+            })
+            .collect()
     }
 
     /// Validate that every activate-element instruction names one of the
@@ -5341,6 +5440,99 @@ impl Engine {
                     .find(|t| t.element_id == element_id)
                     .map(|t| t.kind.clone())
             });
+
+        // Nested ad-hoc sub-process tool (agent-of-agents, #631): the tool is
+        // itself an `adHocSubProcess` — Zeebe's `isAdHocActivity` admits a nested
+        // `AD_HOC_SUB_PROCESS` as an activatable tool. Instead of the opaque-job
+        // fall-through below (which would run it as one leaf activity), stand it
+        // up as a REAL second-level container: register its own ad-hoc runtime
+        // scope, seed its own `outputCollection`, and either mint its own agent
+        // job (JOB_WORKER) or run its declarative `activeElementsCollection`
+        // (BPMN_TASK). The child element instance created above is the nested
+        // container's scope; its own tools hang off it, so the read-model
+        // element-instance tree nests container → inner instance → nested
+        // container → its tools. Its completion propagates back through
+        // `complete_adhoc_tool` of THIS container (see `complete_adhoc_container`),
+        // feeding this container's `outputElement`/loop across the nesting
+        // boundary.
+        if let Some(nested_def) = self.adhoc_def_of(instance_key, &element_id) {
+            events.push(Event::AdHocActivated {
+                instance_key,
+                container_key: child_key,
+                element_id: element_id.clone(),
+                output_collection: nested_def.output_collection.clone(),
+                output_element: nested_def.output_element.clone(),
+            });
+            // Seed the nested container's `outputCollection` to an empty array as
+            // a local variable, exactly as a top-level container does on
+            // activation, so its agent can read the growing collection mid-run.
+            if let Some(name) = nested_def.output_collection.clone() {
+                events.push(Event::ScopedVariablesUpdated {
+                    instance_key,
+                    scope_key: child_key,
+                    variables: HashMap::from([(name, Value::List(Vec::new()))]),
+                });
+            }
+            if nested_def.impl_type == crate::model::AdHocImplementationType::BpmnTask {
+                // Declarative nested container: activate the ids named by its
+                // `activeElementsCollection` directly (no agent job), completing
+                // once they drain.
+                let ids = nested_def
+                    .active_elements_collection
+                    .as_deref()
+                    .map(|expr| self.eval_adhoc_active_elements(expr, &child_vars, &nested_def))
+                    .unwrap_or_default();
+                for id in &ids {
+                    followups.push(Step::ActivateAdHocTool {
+                        instance_key,
+                        container_key: child_key,
+                        element_id: id.clone(),
+                        variables: HashMap::new(),
+                    });
+                }
+                if ids.is_empty() {
+                    followups.push(Step::CompleteAdHoc {
+                        instance_key,
+                        container_key: child_key,
+                        cancel: false,
+                    });
+                }
+            } else {
+                // Agentic JOB_WORKER nested container: advertise its own tool
+                // catalog and mint its own agent job on the nested container
+                // instance. Its job type is the nested container's resolved
+                // `taskDefinition`, carried on this container's catalog as the
+                // tool's `ServiceTask { job_type }` kind.
+                events.push(Event::ScopedVariablesUpdated {
+                    instance_key,
+                    scope_key: child_key,
+                    variables: HashMap::from([(
+                        "adHocSubProcessElements".to_string(),
+                        Value::List(Self::advertised_adhoc_catalog(&nested_def)),
+                    )]),
+                });
+                let job_type = match &tool_kind {
+                    Some(crate::model::AdHocToolKind::ServiceTask { job_type }) => job_type.clone(),
+                    _ => element_id.clone(),
+                };
+                let job_key = self.mint_key();
+                let job_type = self.resolve_job_type(&child_vars, &job_type);
+                let priority = self.resolve_priority(&child_vars, None);
+                let retries = self.resolve_retries(&child_vars, None);
+                events.push(Event::JobCreated {
+                    job_key,
+                    instance_key,
+                    element_instance_key: child_key,
+                    element_id,
+                    job_type,
+                    created_at: self.now,
+                    priority,
+                    retries,
+                });
+            }
+            return (events, followups);
+        }
+
         match tool_kind {
             Some(crate::model::AdHocToolKind::ServiceTask { job_type }) => {
                 let job_key = self.mint_key();
@@ -5672,10 +5864,12 @@ impl Engine {
         container_key: Key,
         container_element_id: String,
     ) -> Vec<Event> {
-        let job_type = match self.element_kind(instance_key, &container_element_id) {
-            Some(ElementKind::ServiceTask { job_type, .. }) => job_type,
-            _ => return Vec::new(),
-        };
+        let job_type =
+            match self.adhoc_container_job_type(instance_key, container_key, &container_element_id)
+            {
+                Some(job_type) => job_type,
+                None => return Vec::new(),
+            };
         let container_vars = self.variables_for_element(instance_key, container_key);
         let job_type = self.resolve_job_type(&container_vars, &job_type);
         let retries = self.resolve_retries(
@@ -5695,6 +5889,43 @@ impl Engine {
             priority,
             retries,
         }]
+    }
+
+    /// Resolves the agent-job type of an ad-hoc container. A top-level container
+    /// carries it on its executable `ServiceTask` element. A NESTED container
+    /// (agent-of-agents, #631) is pruned from the executable graph, so its
+    /// `taskDefinition` is not readable by element id; it is instead carried on
+    /// the PARENT container's tool catalog as this tool's
+    /// `AdHocToolKind::ServiceTask { job_type }`. Falls back to the catalog when
+    /// the element graph has no entry.
+    fn adhoc_container_job_type(
+        &self,
+        instance_key: Key,
+        container_key: Key,
+        container_element_id: &str,
+    ) -> Option<String> {
+        if let Some(ElementKind::ServiceTask { job_type, .. }) =
+            self.element_kind(instance_key, container_element_id)
+        {
+            return Some(job_type);
+        }
+        // Nested container: walk the element-instance tree (inner instance →
+        // parent container) and read this tool's job type off the parent catalog.
+        let inner = self.scope_of(instance_key, container_key);
+        let parent = if inner != 0 {
+            self.scope_of(instance_key, inner)
+        } else {
+            0
+        };
+        let parent_element_id = self.element_id_of_instance(instance_key, parent)?;
+        self.adhoc_def_of(instance_key, &parent_element_id)?
+            .tools
+            .iter()
+            .find(|t| t.element_id == container_element_id)
+            .and_then(|t| match &t.kind {
+                crate::model::AdHocToolKind::ServiceTask { job_type } => Some(job_type.clone()),
+                _ => None,
+            })
     }
 
     /// Completes an ad-hoc container (ADR 0023 seam 2): when `cancel`, cancels any
@@ -5722,30 +5953,38 @@ impl Engine {
         };
         let scope = self.scope_of(instance_key, container_key);
 
+        // Detect up front whether this container is itself an active tool of a
+        // PARENT ad-hoc container (nested agent-of-agents, #631). Detected exactly
+        // like the tool-completion routing in `complete`: walk the
+        // element-instance tree (inner instance → parent container) and confirm
+        // the parent still lists this container active. `scope` is this
+        // container's inner-instance wrapper, so it doubles as `inner_key`.
+        let inner_key = scope;
+        let parent_container = if inner_key != 0 {
+            self.scope_of(instance_key, inner_key)
+        } else {
+            0
+        };
+        let is_nested_tool = parent_container != 0
+            && self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.adhoc_instances.get(&parent_container))
+                .map(|a| a.active.contains(&container_key))
+                .unwrap_or(false);
+
         let mut events = Vec::new();
         // Cancel any tools still running (a cancel-remaining-instances request).
         // Each active tool child hangs off a dedicated inner instance, so tearing
         // the child down also tears down its inner instance — otherwise the
         // read-model element-instance tree would leak an orphaned inner instance.
+        // A nested ad-hoc container tool (#631) is torn down recursively (its own
+        // descendants + agent job + ad-hoc state), which `cancel_adhoc_active_child`
+        // handles — cancelling it as a leaf would orphan its internals.
         if cancel {
             for child in &active {
-                let inner = self.scope_of(instance_key, *child);
-                events.extend(self.cancel_mi_child_events(instance_key, *child));
-                if inner != 0 && inner != container_key {
-                    let inner_element_id = self
-                        .element_id_of_instance(instance_key, inner)
-                        .unwrap_or_default();
-                    events.push(Event::ElementCompleting {
-                        instance_key,
-                        element_instance_key: inner,
-                        element_id: inner_element_id.clone(),
-                    });
-                    events.push(Event::ElementCompleted {
-                        instance_key,
-                        element_instance_key: inner,
-                        element_id: inner_element_id,
-                    });
-                }
+                events.extend(self.cancel_adhoc_active_child(instance_key, container_key, *child));
             }
         }
         // The output collection propagates OUT of the container to its enclosing
@@ -5757,6 +5996,15 @@ impl Engine {
         // can only be a value the guard deliberately preserved, so coercing it to
         // `[]` would silently corrupt it. A never-seeded collection defaults to an
         // empty array.
+        //
+        // A NESTED container (agent-of-agents, #631) is the exception: its result
+        // must cross the nesting boundary ONLY via the parent's tool-completion
+        // path below (projected through the PARENT's `outputElement`). Propagating
+        // its own `outputCollection` (e.g. `subResults`) into the enclosing parent
+        // scope here would both leak the nested container's internal collection
+        // into the parent's variables and apply that update even when the boundary
+        // crossing is later DEFERRED (incident) by `complete_adhoc_tool`. So skip
+        // this propagation entirely when nested.
         let collection_map = output_collection.map(|name| {
             let value = self
                 .state
@@ -5769,8 +6017,52 @@ impl Engine {
             HashMap::from([(name, value)])
         });
         if let Some(map) = &collection_map {
-            events.extend(self.propagated_updates(instance_key, scope, map.clone(), false));
+            if !is_nested_tool {
+                events.extend(self.propagated_updates(instance_key, scope, map.clone(), false));
+            }
         }
+
+        // Nested ad-hoc container completing (agent-of-agents, #631): this
+        // container is itself an active tool of a parent ad-hoc container. Rather
+        // than take a (pruned, non-existent) outgoing flow, its completion crosses
+        // the nesting boundary through the parent's `complete_adhoc_tool` — the
+        // same path an ordinary tool completion takes — which projects this
+        // container's result via the PARENT's `outputElement`, drops it from the
+        // parent's active set (tearing down its wrapping inner instance), and
+        // re-emits the parent's agent job once the parent's tools drain. The
+        // `is_nested_tool` detection was computed up front (above), so its own
+        // `outputCollection` was already withheld from the enclosing scope. The
+        // end-listener gate below is intentionally skipped for a nested container
+        // — its completion is a tool completion, not a token-flow container
+        // completion.
+        if is_nested_tool {
+            let (tool_events, tool_followups) = self.complete_adhoc_tool(
+                instance_key,
+                container_key,
+                element_id.clone(),
+                parent_container,
+                inner_key,
+            );
+            // `complete_adhoc_tool` DEFERS (raising an incident, no
+            // `AdHocToolCompleted`) if the parent's outputCollection is
+            // mis-typed; in that case leave this container's runtime state intact
+            // so resolving the incident re-drives the completion — mirroring the
+            // tool-level retry-on-resolve. Only tear the nested container's
+            // ad-hoc state down once the boundary crossing actually completed.
+            let completed = tool_events
+                .iter()
+                .any(|e| matches!(e, Event::AdHocToolCompleted { .. }));
+            events.extend(tool_events);
+            if completed {
+                events.push(Event::AdHocCompleted {
+                    instance_key,
+                    container_key,
+                    cancelled: cancel,
+                });
+            }
+            return (events, tool_followups);
+        }
+
         events.push(Event::ElementCompleting {
             instance_key,
             element_instance_key: container_key,
