@@ -8,6 +8,7 @@ import {
 } from "react";
 
 import CodeEditor from "./CodeEditor";
+import { isReadStatement } from "../lib/sqlStatement";
 import { Button, Input, inputClass } from "./ui";
 import {
   execData,
@@ -1668,10 +1669,6 @@ function EditStructureDialog({
 }
 
 // --- SQL --------------------------------------------------------------------
-function isReadStatement(sql: string): boolean {
-  return /^\s*(select|with|pragma|explain)\b/i.test(sql);
-}
-
 function SqlTab({
   name,
   source,
@@ -1690,8 +1687,9 @@ function SqlTab({
   sqlRef.current = sql;
 
   // While the app is running the server refuses mutating statements with 409
-  // `app_running` (issue #889); reads (SELECT/WITH/PRAGMA/EXPLAIN) stay allowed.
-  // Mirror that here so the UI never surfaces an avoidable error.
+  // `app_running` (issue #889); reads stay allowed. `isReadStatement` mirrors
+  // the server's read/write split (see ../lib/sqlStatement) so the UI never
+  // surfaces an avoidable error.
   const writeBlocked = appRunning && !isReadStatement(sql);
 
   const run = useCallback(async () => {

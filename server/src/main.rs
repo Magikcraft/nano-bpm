@@ -17382,7 +17382,17 @@ mod console_observe_guard_tests {
 /// that mutates a project's authored surface is gated. Pure, so the allowlist is
 /// unit-testable.
 #[cfg(feature = "console")]
-fn app_running_allows_mutation(tail: &str) -> bool {
+fn app_running_allows_mutation(tail: &str, method: &axum::http::Method) -> bool {
+    // The runtime/read allowlist is **POST-only**: every entry is an
+    // ingress/control/read endpoint invoked with `POST`. Any *other* non-GET
+    // method (`PUT`/`DELETE`/`PATCH`, …) on the same path is deliberately NOT
+    // allowlisted, so it stays gated — this preserves the "mutations are
+    // blocked by default" property for any future method added under these
+    // prefixes (e.g. a later `PUT /hooks/{id}` can't slip a live update
+    // through).
+    if *method != axum::http::Method::POST {
+        return false;
+    }
     let segs: Vec<&str> = tail.split('/').filter(|s| !s.is_empty()).collect();
     matches!(
         segs.as_slice(),
@@ -17431,7 +17441,7 @@ fn app_running_gate<'a>(path: &'a str, method: &axum::http::Method) -> Option<&'
         return None;
     }
     if let Some(tail) = tail
-        && app_running_allows_mutation(tail)
+        && app_running_allows_mutation(tail, method)
     {
         return None;
     }
@@ -17551,6 +17561,29 @@ mod console_app_running_guard_tests {
                 app_running_gate(path, method),
                 None,
                 "{method} {path} must stay allowed while running"
+            );
+        }
+    }
+
+    /// The runtime/read allowlist is POST-only: a *non-POST* mutating method on
+    /// an allowlisted path is NOT part of the allowlist and stays gated. Guards
+    /// the defect class where a future `PUT`/`DELETE` under a runtime prefix
+    /// (e.g. `PUT /hooks/{id}`) would otherwise bypass the "blocked by default"
+    /// guarantee.
+    #[test]
+    fn allowlisted_paths_are_gated_for_non_post_methods() {
+        let cases: &[(Method, &str)] = &[
+            (Method::PUT, "/console/api/projects/acme/hooks/abc123"),
+            (Method::DELETE, "/console/api/projects/acme/hooks/abc123"),
+            (Method::PUT, "/console/api/projects/acme/triggers/enqueue"),
+            (Method::DELETE, "/console/api/projects/acme/data/main/query"),
+            (Method::PATCH, "/console/api/projects/acme/run"),
+        ];
+        for (method, path) in cases {
+            assert_eq!(
+                app_running_gate(path, method),
+                Some("acme"),
+                "{method} {path} must be gated while running (allowlist is POST-only)"
             );
         }
     }
