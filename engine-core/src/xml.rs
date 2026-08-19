@@ -224,22 +224,26 @@ pub fn unescape(s: &str) -> String {
             i += ch.len_utf8();
             continue;
         }
-        // Look for the terminating ';' of an entity reference, but only within a
-        // small bounded window. The longest reference we accept is a numeric
-        // character reference like `&#x10FFFF;` / `&#1114111;` — an 8-char body
-        // plus the leading `&` and trailing `;`. Capping the scan keeps the whole
-        // pass O(n): otherwise a pathological input (many `&` with no nearby `;`)
-        // scans to a far-away `;` on every `&`, which is O(n²). The `;` is ASCII,
+        // Look for the terminating ';' of an entity reference. We only advance
+        // over bytes that can legitimately appear in a reference body — ASCII
+        // letters/digits (named entities and numeric digits) and the leading
+        // `#` — and stop at the first byte that cannot. This keeps the whole
+        // pass O(n): the scan from one `&` stops at the next `&` at the latest
+        // (a `&` is not a body byte), so the scanned spans never overlap and a
+        // pathological input (many `&` with no nearby `;`) can no longer be
+        // O(n²). Unlike a fixed byte cap it also decodes numeric references with
+        // arbitrary leading zeros (e.g. `&#x00000022;`). Body bytes are ASCII,
         // so scanning bytes cannot split a multi-byte character.
-        const MAX_REF_LEN: usize = 10; // '&' + up to 8 body chars + ';'
         let rest = &bytes[i..];
-        let window = rest.len().min(MAX_REF_LEN);
-        if let Some(semi) = rest[..window].iter().position(|&b| b == b';') {
-            let entity = &s[i + 1..i + semi]; // between '&' and ';'
-            let decoded = decode_entity(entity);
-            if let Some(ch) = decoded {
+        let mut j = 1; // skip the leading '&'
+        while j < rest.len() && is_entity_body_byte(rest[j]) {
+            j += 1;
+        }
+        if j < rest.len() && rest[j] == b';' {
+            let entity = &s[i + 1..i + j]; // between '&' and ';'
+            if let Some(ch) = decode_entity(entity) {
                 out.push(ch);
-                i += semi + 1; // consume through the ';'
+                i += j + 1; // consume through the ';'
                 continue;
             }
         }
@@ -248,6 +252,14 @@ pub fn unescape(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// Whether `b` can appear in the body of an entity reference (between `&` and
+/// `;`): an ASCII letter (named entities and the `x`/`X` hex marker), an ASCII
+/// digit (decimal/hex references), or the leading `#` of a numeric reference.
+/// Used to bound the terminating-`;` scan in [`unescape`] to O(n).
+fn is_entity_body_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'#'
 }
 
 /// Decodes the body of an entity reference (the text between `&` and `;`).
@@ -466,16 +478,20 @@ mod tests {
 
     #[test]
     fn should_bound_the_scan_for_the_terminating_semicolon() {
-        // The scan for a reference's `;` is capped at the longest reference we
-        // accept, so a far-away `;` is never treated as an entity terminator and
-        // the pass stays O(n) instead of O(n²) on pathological input.
-        // A `;` beyond that bound leaves the `&` verbatim:
+        // The scan for a reference's `;` only advances over valid body bytes and
+        // stops at the first non-body byte, so it stays O(n) instead of O(n²) on
+        // pathological input while still decoding any genuine reference.
+        // A long run that is not a known entity leaves the `&` verbatim:
         assert_eq!(unescape("&aaaaaaaaaaa;"), "&aaaaaaaaaaa;");
         // Many ampersands with no nearby `;` are all emitted literally:
         assert_eq!(unescape("&&&&&&&&&&&&&&&"), "&&&&&&&&&&&&&&&");
-        // The longest valid reference (`&#x10FFFF;`, 10 chars) still decodes at the
-        // exact boundary of the window.
+        // The longest un-padded reference (`&#x10FFFF;`) decodes:
         assert_eq!(unescape("&#x10FFFF;"), "\u{10FFFF}");
         assert_eq!(unescape("&#1114111;"), "\u{10FFFF}");
+        // Numeric references with arbitrary leading zeros — far longer than any
+        // fixed byte cap — still decode correctly (regression guard):
+        assert_eq!(unescape("&#x00000022;"), "\"");
+        assert_eq!(unescape("&#000000034;"), "\"");
+        assert_eq!(unescape("&#x0000000010FFFF;"), "\u{10FFFF}");
     }
 }
