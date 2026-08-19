@@ -156,6 +156,25 @@ agentic Urban app inherits durable resume the way it inherits the relay and blac
 A non-`durable-resume` harness at step 4 simply re-reviews the PR from scratch — correct, just not
 cheap.
 
+## Where this lands — repo split (this ADR vs its implementation)
+
+This decision follows the established precedent of ADR 0056: **the agentic-plane *decision* is
+nano-bpm canon even though the plane's *code* lives in `nanobpm/nano-ide` (`packages/agentic`).** So
+this ADR lives in **nano-bpm** — it is a protocol-level decision that crosses ADR 0056's
+advisory→authoritative boundary — while its implementation fans out across three repos plus the
+external harness. Each row below is a separate follow-up issue; **none is in scope for this ADR.**
+
+| Piece | Repo | Notes |
+|---|---|---|
+| **Decision — ADR 0062** | `Magikcraft/nano-bpm` | *this document*; extends nano-bpm ADR 0056, referenced by number from nwf/nano-ide the way 0056 already is |
+| Generic session substrate + `@nanobpm/agentic/session` contract (`emit` / `checkpoint` / `restore`), reusing the relay ring + incarnation fence | `nanobpm/nano-ide` — `packages/agentic` | same home as the relay it is promoted from (ADR 0056 §12); ships as the `@nanobpm/agentic` capability |
+| **World** restore: `c8ctl` reconstructs the working tree (invert push → `fetch`+`checkout <sha>`, replay the effect tail through the fence), convergence-loop resume semantics, the `durable-resume` **enrolment gate** on the app registry | `nanobpm/nano-workforce` | the app that leases `senior:pr-review`; consumer of the nano-ide contract |
+| **Mind** tap: emit the model-facing context (`SessionEvent` seed) and restore from it | external **harness** (reference impl: **DeepSeek Harness**); adapters per harness | not a Nano repo — the reason resume is capability-gated, not assumed |
+
+The dependency order is nano-ide (contract) → nano-workforce (consumer wiring) → harness adoption; a
+harness that already event-sources (DeepSeek) needs only an adapter to the nano-ide contract to
+advertise `durable-resume`.
+
 ## Consequences
 
 - Nano gains **durable agent-session resume** for participating harnesses, layered on the engine's
