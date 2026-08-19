@@ -373,7 +373,13 @@ function cell(v: unknown): { text: string; muted: boolean } {
   return { text: String(v), muted: false };
 }
 
-export default function DataPanel({ name }: { name: string }) {
+export default function DataPanel({
+  name,
+  appRunning,
+}: {
+  name: string;
+  appRunning: boolean;
+}) {
   const [sources, setSources] = useState<DataSourceInfo[]>([]);
   const [source, setSource] = useState<string>("");
   const [tab, setTab] = useState<SubTab>("tables");
@@ -472,7 +478,12 @@ export default function DataPanel({ name }: { name: string }) {
 
       <div className="min-h-0 flex-1 overflow-hidden">
         {source && tab === "tables" && (
-          <TablesTab key={`t-${source}`} name={name} source={source} />
+          <TablesTab
+            key={`t-${source}`}
+            name={name}
+            source={source}
+            appRunning={appRunning}
+          />
         )}
         {source && tab === "sql" && (
           <SqlTab key={`s-${source}`} name={name} source={source} />
@@ -487,7 +498,15 @@ export default function DataPanel({ name }: { name: string }) {
 
 // --- Tables -----------------------------------------------------------------
 
-function TablesTab({ name, source }: { name: string; source: string }) {
+function TablesTab({
+  name,
+  source,
+  appRunning,
+}: {
+  name: string;
+  source: string;
+  appRunning: boolean;
+}) {
   const [tables, setTables] = useState<DataTableMeta[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [rows, setRows] = useState<DataQueryResult | null>(null);
@@ -612,16 +631,25 @@ function TablesTab({ name, source }: { name: string; source: string }) {
           <div className="flex items-center gap-1">
             <button
               onClick={() => void regenTypes()}
-              disabled={regenBusy}
+              disabled={regenBusy || appRunning}
               className="rounded px-1.5 py-0.5 text-xs font-medium text-fg-muted hover:bg-hover disabled:opacity-40"
-              title="Regenerate the TypeScript domain types (nano-generated/domain-rows.d.ts) from every datasource"
+              title={
+                appRunning
+                  ? "Stop the app to regenerate domain types"
+                  : "Regenerate the TypeScript domain types (nano-generated/domain-rows.d.ts) from every datasource"
+              }
             >
               {regenBusy ? "…" : "⟳ Types"}
             </button>
             <button
               onClick={() => setShowNew(true)}
-              className="rounded px-1.5 py-0.5 text-xs font-medium text-accent hover:bg-accent/10"
-              title="Create a new table"
+              disabled={appRunning}
+              className="rounded px-1.5 py-0.5 text-xs font-medium text-accent hover:bg-accent/10 disabled:opacity-40"
+              title={
+                appRunning
+                  ? "Stop the app to create a table"
+                  : "Create a new table"
+              }
             >
               ＋ New
             </button>
@@ -660,20 +688,27 @@ function TablesTab({ name, source }: { name: string; source: string }) {
             <div className="flex-1" />
             <button
               onClick={() => setShowAddRow(true)}
-              disabled={!editable}
+              disabled={!editable || appRunning}
               className="rounded px-1.5 py-0.5 text-xs font-medium text-accent hover:bg-accent/10 disabled:opacity-40"
               title={
-                editable
-                  ? "Insert a row"
-                  : "This table has no rowid — add rows from the SQL tab"
+                appRunning
+                  ? "Stop the app to insert rows"
+                  : editable
+                    ? "Insert a row"
+                    : "This table has no rowid — add rows from the SQL tab"
               }
             >
               ＋ Add row
             </button>
             <button
               onClick={() => setShowStructure(true)}
-              className="rounded px-1.5 py-0.5 text-xs font-medium text-fg-muted hover:bg-hover"
-              title="Edit table structure"
+              disabled={appRunning}
+              className="rounded px-1.5 py-0.5 text-xs font-medium text-fg-muted hover:bg-hover disabled:opacity-40"
+              title={
+                appRunning
+                  ? "Stop the app to edit table structure"
+                  : "Edit table structure"
+              }
             >
               ✎ Structure
             </button>
@@ -694,9 +729,13 @@ function TablesTab({ name, source }: { name: string; source: string }) {
             <ResultGrid
               result={rows}
               rowKey={editable ? ROWID_COL : undefined}
-              onEditRow={editable ? (row) => setEditRow(row) : undefined}
+              onEditRow={
+                editable && !appRunning ? (row) => setEditRow(row) : undefined
+              }
               onDeleteRow={
-                editable ? (rowid) => void deleteRow(rowid) : undefined
+                editable && !appRunning
+                  ? (rowid) => void deleteRow(rowid)
+                  : undefined
               }
             />
           ) : (
