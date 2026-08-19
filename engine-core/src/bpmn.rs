@@ -2813,6 +2813,15 @@ impl ProcessAcc {
             }
         }
         let associations = self.associations;
+        // Ids of the compensation boundary events. A compensation boundary is a
+        // structural marker armed implicitly when its activity completes; it is
+        // never reached by ordinary token flow (see the flow validation below).
+        let compensation_boundary_ids: std::collections::HashSet<String> = self
+            .boundaries
+            .iter()
+            .filter(|b| b.compensation)
+            .map(|b| b.id.clone())
+            .collect();
         for boundary in self.boundaries {
             let attached_to =
                 boundary
@@ -2971,6 +2980,42 @@ impl ProcessAcc {
                     }
                 })?;
                 builder = builder.error_boundary_event(boundary.id, attached_to, error_code);
+            }
+        }
+        // Compensation boundary events and their `isForCompensation` handlers are
+        // structural markers, NOT part of ordinary token flow: a compensation
+        // boundary is armed implicitly when its activity completes (never reached
+        // by a sequenceFlow), and a handler runs only when a compensation throw
+        // triggers it (never entered by an incoming token, and its completion is
+        // routed back to the waiting throw rather than onward). If a model wires a
+        // sequenceFlow to or from either, `run_activation_body` would treat the
+        // element as an ordinary pass-through and route tokens through something
+        // the engine never arms — corrupting execution. Reject such models at
+        // deploy with a clear error rather than mis-executing them. (Handlers are
+        // checked against every `isForCompensation` activity, not just the
+        // resolved one, so an orphaned handler dragged into normal flow is caught
+        // too.)
+        for flow in self.flows.iter() {
+            for endpoint in [flow.source.as_deref(), flow.target.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if compensation_boundary_ids.contains(endpoint) {
+                    return Err(ParseError::InvalidProcess {
+                        process_id: self.id.clone(),
+                        reason: format!(
+                            "compensation boundary event {endpoint} must not be the source or target of a sequenceFlow"
+                        ),
+                    });
+                }
+                if compensation_handler_ids.contains(endpoint) {
+                    return Err(ParseError::InvalidProcess {
+                        process_id: self.id.clone(),
+                        reason: format!(
+                            "compensation handler activity {endpoint} (isForCompensation) must not be the source or target of a sequenceFlow"
+                        ),
+                    });
+                }
             }
         }
         for flow in self.flows {
@@ -3474,6 +3519,94 @@ mod tests {
                 "a gateway carrying isForCompensation must not resolve as a handler, got {other:?}"
             ),
         }
+    }
+
+    #[test]
+    fn should_reject_sequence_flows_touching_a_compensation_boundary_or_handler() {
+        // Failure-mode guard: compensation boundary events and their
+        // `isForCompensation` handlers are structural markers outside ordinary
+        // token flow. A model that wires a sequenceFlow to/from either would let
+        // the engine route tokens through an element it never arms, so deploy
+        // must reject it rather than mis-execute.
+        let wrap = |body: &str| {
+            format!(
+                r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+                    <bpmn:process id="comp" isExecutable="true">
+                      <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+                      <bpmn:serviceTask id="Book"><bpmn:incoming>f1</bpmn:incoming></bpmn:serviceTask>
+                      <bpmn:boundaryEvent id="BookComp" attachedToRef="Book">
+                        <bpmn:compensateEventDefinition />
+                      </bpmn:boundaryEvent>
+                      <bpmn:serviceTask id="CancelBook" isForCompensation="true" />
+                      <bpmn:association id="a1" sourceRef="BookComp" targetRef="CancelBook" />
+                      <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Book" />
+                      {body}
+                    </bpmn:process>
+                   </bpmn:definitions>"#
+            )
+        };
+
+        // (a) A sequenceFlow whose target is the compensation boundary.
+        let into_boundary = wrap(
+            r#"<bpmn:endEvent id="E" /><bpmn:sequenceFlow id="bad" sourceRef="Book" targetRef="BookComp" />"#,
+        );
+        match parse_bpmn(&into_boundary) {
+            Err(ParseError::InvalidProcess { reason, .. }) => assert!(
+                reason.contains("compensation boundary event") && reason.contains("sequenceFlow"),
+                "expected a boundary flow rejection, got: {reason}"
+            ),
+            other => panic!(
+                "expected InvalidProcess for a flow into a compensation boundary, got {other:?}"
+            ),
+        }
+
+        // (b) A sequenceFlow whose source is the compensation boundary.
+        let out_of_boundary = wrap(
+            r#"<bpmn:endEvent id="E"><bpmn:incoming>bad</bpmn:incoming></bpmn:endEvent>
+               <bpmn:sequenceFlow id="bad" sourceRef="BookComp" targetRef="E" />"#,
+        );
+        match parse_bpmn(&out_of_boundary) {
+            Err(ParseError::InvalidProcess { reason, .. }) => assert!(
+                reason.contains("compensation boundary event"),
+                "expected a boundary flow rejection, got: {reason}"
+            ),
+            other => panic!(
+                "expected InvalidProcess for a flow out of a compensation boundary, got {other:?}"
+            ),
+        }
+
+        // (c) A sequenceFlow into the `isForCompensation` handler.
+        let into_handler =
+            wrap(r#"<bpmn:sequenceFlow id="bad" sourceRef="Book" targetRef="CancelBook" />"#);
+        match parse_bpmn(&into_handler) {
+            Err(ParseError::InvalidProcess { reason, .. }) => assert!(
+                reason.contains("compensation handler activity")
+                    && reason.contains("isForCompensation"),
+                "expected a handler flow rejection, got: {reason}"
+            ),
+            other => panic!(
+                "expected InvalidProcess for a flow into a compensation handler, got {other:?}"
+            ),
+        }
+
+        // (d) A sequenceFlow out of the handler.
+        let out_of_handler = wrap(
+            r#"<bpmn:endEvent id="E"><bpmn:incoming>bad</bpmn:incoming></bpmn:endEvent>
+               <bpmn:sequenceFlow id="bad" sourceRef="CancelBook" targetRef="E" />"#,
+        );
+        match parse_bpmn(&out_of_handler) {
+            Err(ParseError::InvalidProcess { reason, .. }) => assert!(
+                reason.contains("compensation handler activity"),
+                "expected a handler flow rejection, got: {reason}"
+            ),
+            other => panic!(
+                "expected InvalidProcess for a flow out of a compensation handler, got {other:?}"
+            ),
+        }
+
+        // (e) The well-formed model (no stray flows) still parses.
+        let ok = wrap("");
+        parse_bpmn(&ok).expect("a compensation model with no stray flows must parse");
     }
 
     #[test]
