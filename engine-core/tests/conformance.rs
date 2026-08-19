@@ -182,10 +182,13 @@ fn corpus_dir() -> PathBuf {
 
 /// Extracts the leading `<!-- verdict: … -->` directive from a fixture.
 ///
-/// Scans for the first XML *comment* line carrying the `verdict:` keyword, so
-/// unrelated element/attribute text that merely contains the word cannot be
-/// mistaken for the directive (matching the leading-comment contract documented
-/// in `tests/conformance/README.md`).
+/// Scans only the fixture's *prolog* — the run of leading blank lines, XML
+/// declarations, and `<!-- … -->` comment lines before the first element
+/// content — for the comment line carrying the `verdict:` keyword. Stopping at
+/// the first content line means an in-model BPMN comment later in the document
+/// (e.g. modeller-exported documentation) cannot be mistaken for the directive,
+/// enforcing the leading-comment contract documented in
+/// `tests/conformance/README.md`.
 ///
 /// Grammar (case-insensitive on the keywords):
 ///   * `<!-- verdict: accept -->`
@@ -193,8 +196,9 @@ fn corpus_dir() -> PathBuf {
 fn parse_directive(name: &str, xml: &str) -> Expectation {
     let comment = xml
         .lines()
+        .take_while(|l| is_prolog_line(l))
         .find(|l| l.contains("<!--") && contains_keyword(l, "verdict:"))
-        .unwrap_or_else(|| panic!("{name}: missing `<!-- verdict: … -->` directive"));
+        .unwrap_or_else(|| panic!("{name}: missing leading `<!-- verdict: … -->` directive"));
     let after_verdict = after_keyword(comment, "verdict:")
         .expect("verdict token")
         .trim();
@@ -221,6 +225,15 @@ fn parse_directive(name: &str, xml: &str) -> Expectation {
 /// Case-insensitive check for an ASCII `keyword` within `haystack`.
 fn contains_keyword(haystack: &str, keyword: &str) -> bool {
     after_keyword(haystack, keyword).is_some()
+}
+
+/// Whether `line` belongs to a fixture's leading prolog: a blank line, an XML
+/// declaration (`<?xml … ?>`), or an XML comment line (`<!-- … -->`). The first
+/// line that is none of these marks the start of element content, bounding the
+/// directive search in [`parse_directive`] to the leading comment block.
+fn is_prolog_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.is_empty() || trimmed.starts_with("<?") || trimmed.starts_with("<!--")
 }
 
 /// Returns the slice of `haystack` following the first case-insensitive match of
