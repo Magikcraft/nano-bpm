@@ -259,6 +259,14 @@ jobs:
         # that wasm32 type-checks can't see.
         run: npm install && npm test
         working-directory: engine-wasm/tests/bundle-split
+      - name: Read-model DTO types are derived, not hand-written (drift guard)
+        # `@nanobpm/engine-wasm/readmodel-types` ships DTO types for the engine's
+        # read-model query results (searchUserTasks, …). They are DERIVED from the
+        # single source of truth — the Camunda-parity REST OpenAPI in spec/ — via
+        # `@hey-api/openapi-ts`, not hand-mirrored. Regenerate and fail if the
+        # committed artifact is stale (mirrors the console `src/gen` drift guard).
+        run: npm ci && npm run check
+        working-directory: engine-wasm/readmodel-types
       - name: Show manifest
         run: cat dist/engine-wasm-ffi/manifest.json
       - name: Upload dist artifact
