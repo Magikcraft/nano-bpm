@@ -18,8 +18,10 @@
  * - A CTE (`WITH …`) is a read only when it terminates in a `SELECT`, i.e. it
  *   carries no mutating verb; `WITH … INSERT/UPDATE/DELETE/REPLACE …` mutates
  *   and must not be classified as a read.
- * - `PRAGMA name` reads a setting, but `PRAGMA name = value` / `PRAGMA name(x)`
- *   sets one, so only the argument-less form stays on the read path.
+ * - `PRAGMA name` reads a setting, but `PRAGMA name = value` mutates. The call
+ *   form `PRAGMA name(x)` is often a read (e.g. `table_info(t)`); we still treat
+ *   any `=`/`(` as a write, conservatively erring toward the safe classification
+ *   rather than enumerating the read-only call-form pragmas.
  * - Everything else (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, …) is a
  *   write.
  */

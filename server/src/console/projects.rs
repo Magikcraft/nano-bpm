@@ -6624,8 +6624,16 @@ impl ProjectSupervisor {
     }
 
     pub async fn is_running(&self, name: &str) -> bool {
-        let inner = self.entry(name).await;
-        matches!(*inner.phase.lock().await, Phase::Starting | Phase::Running)
+        // Read-only probe: use `existing_entry` rather than `entry` so gating an
+        // arbitrary/nonexistent project name (e.g. via `console_app_running_guard`)
+        // can't grow the supervisor map. An untracked project is, by definition,
+        // not running.
+        match self.existing_entry(name).await {
+            Some(inner) => {
+                matches!(*inner.phase.lock().await, Phase::Starting | Phase::Running)
+            }
+            None => false,
+        }
     }
 
     pub async fn log_history(&self, name: &str) -> Vec<LogLine> {
@@ -8417,6 +8425,36 @@ mod tests {
         assert!(
             sup.projects.lock().await.is_empty(),
             "app_ui must not insert a supervisor entry for an untracked project"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn is_running_does_not_insert_supervisor_entry() {
+        let _g = lock();
+
+        let sup = ProjectSupervisor {
+            projects: tokio::sync::Mutex::new(HashMap::new()),
+        };
+
+        // Probing run-state for an untracked/stopped project must report
+        // not-running WITHOUT growing the supervisor map — otherwise gating an
+        // arbitrary name (e.g. repeated `console_app_running_guard` requests for
+        // nonexistent projects) could balloon it unbounded (DoS).
+        assert!(
+            !sup.is_running("ghost").await,
+            "an untracked project is not running"
+        );
+        assert!(
+            sup.projects.lock().await.is_empty(),
+            "is_running must not insert a supervisor entry for an untracked project"
+        );
+
+        // A genuinely tracked+running project still reports running.
+        *sup.entry("live").await.phase.lock().await = Phase::Running;
+        assert!(
+            sup.is_running("live").await,
+            "a running project reports running"
         );
     }
 
