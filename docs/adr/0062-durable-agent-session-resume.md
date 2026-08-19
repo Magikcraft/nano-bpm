@@ -16,9 +16,13 @@ round is the reference consumer),
 ADR 0060 (`0060-institutional-memory-context-grounding.md`, model-grounded context for agent sessions —
 the *inbound* context this ADR's *outbound* session capture is the mirror of),
 `@nanobpm/agentic` (the app-tier plane that owns the session contract; not any one app),
-and the prior art it cribs from: `@deepseek-ai/dsh` (**DeepSeek Harness**) — whose event-sourced
-session (`packages/core/session/`, append-only `SessionEvent` + `seed`/`restore`, where replaying the
-log *rehydrates the agent itself*) is the reference implementation of the harness half of this contract.
+and the prior art it draws on: the current fleet of coding-agent harnesses **already exposes the seam
+this contract needs** (see §5) — `@deepseek-ai/dsh` (**DeepSeek Harness**) whose event-sourced session
+(`SessionEvent` + `seed`/`restore`, where replay *rehydrates the agent itself*) is the clearest
+reference, and, more importantly, **ACP** (the **Agent Client Protocol**, `agentclientprotocol.com`) —
+the versioned editor↔agent JSON-RPC spec (`session/update`, `session/load`,
+`agentCapabilities.loadSession`) that standardizes emit + restore + capability-probe in one place, and
+which `opencode` (and, via adapters, Claude Code / Gemini) already speak.
 
 ## Context
 
@@ -71,7 +75,9 @@ than restart, two independent kinds of state must be reconstructed to the *same*
 
 The consequence is the load-bearing constraint of this ADR: **durable resume is impossible for a
 harness that does not expose its model context.** Nano supplies the world half; the harness must supply
-the mind half. Only DeepSeek Harness does today.
+the mind half. The encouraging finding (§5) is that **essentially the entire current fleet already
+exposes exactly this** — a streaming session-event mode plus resume-by-id — so the constraint is a
+capability *probe*, not a wall.
 
 ## Decision
 
@@ -118,31 +124,74 @@ write/restore contract (§4). The app-tier registry gates on it:
   scratch on re-lease. Nothing regresses; resume is purely additive.
 
 The routing token (`network.role#seat`) is unchanged; `durable-resume` is an attribute, so no BPMN and
-no job type changes. **DeepSeek Harness is the reference implementation** of the harness side; other
-harnesses adopt the contract (or a thin adapter wraps their session stream into it) to opt in.
+no job type changes. The probe is concrete (§5): a harness advertises `durable-resume` iff it exposes
+**(a)** a non-interactive streaming session-event mode and **(b)** resume-by-session-id — which the
+current fleet already does. Harnesses that don't are not broken; they simply degrade.
 
-### 4. The `@nanobpm/agentic/session` contract
+### 4. The `@nanobpm/agentic/session` contract — Nano-canonical, harness-normalized
 
-A harness participating in durable resume implements a small contract over the existing agentic channel:
+The contract is a small, three-method interface over the existing agentic channel, defined in terms of
+**Nano's own canonical `SessionEvent`** — external harness formats are normalized *into* it, never
+adopted as Nano's schema:
 
 - **`emit(sessionEvent)`** — append a model-facing turn event (prompt, model output, tool-call,
-  tool-result) to the authoritative session log at the current offset. This is the **mind tap**; it is
-  what today's relay does *not* provide (relay = rendered bytes; this = structured context).
+  tool-result, reasoning) to the authoritative session log at the current offset. This is the **mind
+  tap**; it is what today's relay does *not* provide (relay = rendered bytes; this = structured
+  context).
 - **`checkpoint(commitSha, effectLedger)`** — mark a mind/world join at a push boundary (§2).
 - **`restore(fromCheckpoint) -> seed`** — on re-lease, the harness is handed the last checkpoint's mind
   seed to re-enter the conversation; Nano's `c8ctl` worker has already reconstructed the world (pull the
   SHA, fence the effect tail) before the harness is resumed.
 
 The contract lives in `@nanobpm/agentic` (the generic Urban capability), not in any single app, so any
-agentic Urban app inherits durable resume the way it inherits the relay and blackboard today.
+agentic Urban app inherits durable resume the way it inherits the relay and blackboard today. It ships
+**two ingestion backends** (§5) selected by the capability probe: an ACP client (preferred) and a
+`stream-json`/native-transcript normalizer (fallback).
+
+### 5. The harness seam is real, general, and already present
+
+Surveying seven current coding-agent harnesses shows the contract's primitives are **not** speculative —
+each exposes the same trio, differing only in dialect:
+
+| Harness | Mind tap (streaming, non-interactive) | Restore (resume by id) | ACP |
+|---|---|---|---|
+| `@github/copilot` | `copilot-sdk` `SessionEvent` stream (`session.on`) / `events.jsonl` | `resumeSession(id)`, `sessionFsProvider` seam | — |
+| Claude Code | `-p --output-format stream-json` (+`--input-format`) | `--resume` / `-c` / `--from-pr` | via `claude-code-acp` |
+| Qwen Code | `-p -o stream-json` | `-r <id>` / `-c` / `qwen sessions` | (Gemini lineage) |
+| Kimi | `-p --output-format stream-json` | `-S [id]` / `-c` | — |
+| pi / little-coder | `-p --mode json\|rpc` | `-r` / `--session-id <id>` (create-if-missing) / `--fork` | — |
+| opencode | `serve` (HTTP/SSE) / `acp` / `run` | `session` / `export`+`import` / `attach` | **native** |
+| DeepSeek Harness | `SessionEvent` live feed | `seed`/`restore` | — |
+
+Two universals underlie every column: **a non-interactive streaming mode** (the mind `emit`) and
+**resume-by-session-id** (the mind `restore`, where the harness rebuilds context from *its own*
+transcript — so Nano never reconstructs the message array itself). opencode goes furthest, already
+tackling the **world** half too (`snapshot/<sha>` git snapshots + `pr <n>` checkout) — a reference for
+the `c8ctl` side.
+
+**Protocol decision — prefer ACP, fall back to `stream-json`/native.** These two are not peers.
+`stream-json` is *one harness's event dump over stdio*: a transport with N vendor dialects, so adopting
+it still needs N normalizers. **ACP is one versioned bidirectional JSON-RPC session spec**, so it is a
+*single* normalizer for every ACP harness, and it standardizes all three of our primitives in-band —
+`session/update` = `emit`, **`session/load` = `restore`** (replays prior history as `session/update`s),
+and **`agentCapabilities.loadSession` = the `durable-resume` probe** (capability negotiation in the
+`initialize` handshake, not flag-sniffing); its `tool_call` lifecycle gives harness-agnostic checkpoint
+boundaries for the world half. So the adapter **prefers ACP where the harness speaks it, and falls back
+to a thin per-harness `stream-json`/native-transcript normalizer** otherwise — normalizing both into
+Nano's canonical `SessionEvent`. It is *prefer*, not *mandate*, for two reasons: coverage today is
+partial (opencode native; Claude/Gemini via adapters; Copilot/Kimi/pi not yet), and some native
+transcripts carry resume-critical richness ACP may not model — e.g. Copilot's `reasoningOpaque` (the
+provider's opaque reasoning-continuation blob) — so where native fidelity exceeds ACP's, the adapter may
+prefer the native transcript for `restore`.
 
 ## Worked example — a `senior:pr-review` round that survives a crash
 
-1. `convergence-loop` dispatches round *N* as `implementation.review` (`senior:pr-review`); a
-   DeepSeek-Harness worker (advertising `durable-resume`) leases it.
+1. `convergence-loop` dispatches round *N* as `implementation.review` (`senior:pr-review`); a worker
+   whose harness advertises `durable-resume` (say opencode over ACP, or Copilot via its SDK) leases it.
 2. The harness works: reads the diff, edits files, and at a natural boundary **commits and pushes**
    `sha=abc123`. Nano's `c8ctl` worker records a **checkpoint**: world marker `{commitSha: abc123,
-   effects: [push#abc123]}`, mind marker = the harness's `SessionEvent` seed up to that turn.
+   effects: [push#abc123]}`, mind marker = the harness's `SessionEvent` seed up to that turn (an ACP
+   `session/load` point, or the harness's resume-by-id).
 3. The harness continues into the next turn and the **box dies** (redeploy, OOM). The C8 lease expires;
    the engine **redrives** the job (ADR 0002).
 4. A replacement worker leases the redriven job on a **fresh worktree**. `c8ctl` restores **world**:
@@ -167,13 +216,13 @@ external harness. Each row below is a separate follow-up issue; **none is in sco
 | Piece | Repo | Notes |
 |---|---|---|
 | **Decision — ADR 0062** | `Magikcraft/nano-bpm` | *this document*; extends nano-bpm ADR 0056, referenced by number from nwf/nano-ide the way 0056 already is |
-| Generic session substrate + `@nanobpm/agentic/session` contract (`emit` / `checkpoint` / `restore`), reusing the relay ring + incarnation fence | `nanobpm/nano-ide` — `packages/agentic` | same home as the relay it is promoted from (ADR 0056 §12); ships as the `@nanobpm/agentic` capability |
+| Generic session substrate + `@nanobpm/agentic/session` contract (`emit` / `checkpoint` / `restore`) + the two ingestion backends (ACP client, `stream-json`/native normalizer), reusing the relay ring + incarnation fence | `nanobpm/nano-ide` — `packages/agentic` | same home as the relay it is promoted from (ADR 0056 §12); ships as the `@nanobpm/agentic` capability |
 | **World** restore: `c8ctl` reconstructs the working tree (invert push → `fetch`+`checkout <sha>`, replay the effect tail through the fence), convergence-loop resume semantics, the `durable-resume` **enrolment gate** on the app registry | `nanobpm/nano-workforce` | the app that leases `senior:pr-review`; consumer of the nano-ide contract |
-| **Mind** tap: emit the model-facing context (`SessionEvent` seed) and restore from it | external **harness** (reference impl: **DeepSeek Harness**); adapters per harness | not a Nano repo — the reason resume is capability-gated, not assumed |
+| **Mind** tap: the harness's streaming session-event mode + resume-by-id (§5) — normalized via the ACP client where the harness speaks ACP, else a per-harness `stream-json`/native normalizer | external **harness** (opencode = native ACP + world snapshots; DeepSeek/Copilot/Claude/Qwen/Kimi/pi via stream-json/adapters) | not a Nano repo — but the fleet already exposes the seam, so this is normalization, not net-new harness work |
 
-The dependency order is nano-ide (contract) → nano-workforce (consumer wiring) → harness adoption; a
-harness that already event-sources (DeepSeek) needs only an adapter to the nano-ide contract to
-advertise `durable-resume`.
+The dependency order is nano-ide (contract + ingestion backends) → nano-workforce (consumer wiring) →
+harness onboarding; because every surveyed harness already exposes a streaming mode + resume-by-id
+(§5), onboarding is writing/selecting a normalizer, not adding a capability to the harness.
 
 ## Consequences
 
@@ -190,7 +239,8 @@ advertise `durable-resume`.
   resumable and non-resumable harnesses is well-defined.
 - New app-tier surface to own in `@nanobpm/agentic`: the authoritative session log (schema + retention),
   the effect ledger + fence, the `checkpoint`/`restore` join, and the `session` contract. De-risked by
-  DeepSeek Harness on the mind side and by the existing relay ring on the substrate side.
+  the fleet already exposing the seam on the mind side (§5) and by the existing relay ring on the
+  substrate side.
 - Payoff scales with round length: long implement/review rounds (many tool calls, minutes of work)
   benefit greatly from push-boundary resume; short rounds do not justify the capture cost, so retention
   is bounded by lifecycle like the transcript already is.
@@ -207,9 +257,11 @@ advertise `durable-resume`.
   provider-proprietary framing. Do we store the exact request payload, or a harness-normalized
   `SessionEvent` form (DeepSeek's shape) — and how does that interact with provider/tool-schema drift
   between the original and replacement harness versions?
-- **Adapter vs native.** For harnesses that event-source internally but not to our contract (only
-  DeepSeek does even that today), is a wrapping adapter sufficient, or must the contract be native to
-  claim `durable-resume`?
+- **Harness-facing protocol — resolved: prefer ACP, fall back to `stream-json`/native (§5).** ACP is
+  the preferred adapter target (one versioned spec standardizing `emit`/`restore`/capability-probe),
+  with a per-harness `stream-json`/native normalizer as fallback; both normalize into Nano's canonical
+  `SessionEvent`. Residual: as ACP coverage grows, do we ever *require* ACP for `durable-resume`, or
+  keep the fallback path indefinitely?
 - **Relationship to ADR 0060.** 0060 grounds the *inbound* context (institutional memory) a session
   starts from; this ADR captures the *outbound/evolving* context a session must be restored to. Is
   there one session-state spine that both should share, rather than two stores?
