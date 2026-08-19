@@ -47,13 +47,27 @@
 use super::ValidationInput;
 use crate::bpmn::ParseError;
 
-/// Local names of the Zeebe extension-element children the streaming parser
-/// consumes *positionally* (inside their designated container / owner). When one
-/// appears misplaced it falls through to the flow-element catch-all and is
-/// over-recorded on `capture.unmodelled`; it is foreign-namespace extension
-/// metadata (which Zeebe ignores), not an unmodelled BPMN flow element, so the
-/// unsupported-element rule filters it out. Kept in lockstep with the
-/// `zeebe:`-prefixed local names the parser handles in `crate::bpmn`.
+/// Local names of the Zeebe extension-element tags that reach the flow-element
+/// catch-all as foreign-namespace extension metadata (which Zeebe ignores),
+/// rather than as an unmodelled BPMN flow element — so the unsupported-element
+/// rule filters them out. There are two ways such a tag reaches the catch-all,
+/// and both belong here:
+///
+/// - **Consumed positionally, but misplaced.** Most entries are children the
+///   parser consumes inside their designated container / owner in `crate::bpmn`
+///   (e.g. `zeebe:header` inside `zeebe:taskHeaders`, `zeebe:input` inside
+///   `zeebe:ioMapping`). Correctly placed they never reach the catch-all; only
+///   when *misplaced* does the container guard fail and the tag fall through and
+///   get over-recorded on `capture.unmodelled`.
+/// - **Not modelled at all.** A few are Zeebe extension containers the parser
+///   does not handle anywhere (e.g. the `zeebe:properties` container — Nano does
+///   not model element/process properties). These are *never* consumed, so they
+///   *always* reach the catch-all, misplaced or not, and would be over-recorded
+///   without this filter.
+///
+/// This is therefore **not** simply "the `zeebe:` local names the parser
+/// handles": it is the set that must be suppressed at the catch-all, which is
+/// neither a subset nor a superset of the handled set.
 ///
 /// Only local names that would otherwise fall through to the flow-element
 /// catch-all (and so be over-recorded on `capture.unmodelled`) belong here. A
@@ -73,6 +87,13 @@ use crate::bpmn::ParseError;
 /// never be recorded on `capture.unmodelled`, so listing it is dead and, worse,
 /// would silently mask a genuinely unsupported element named `versionTag`
 /// should one ever appear.
+///
+/// Finally, a name already covered by `is_ignorable_tag` (in `crate::bpmn`) must
+/// **not** be duplicated here. That noise filter runs *first* at the catch-all,
+/// so such a tag never reaches this filter — e.g. `property`, listed there as
+/// structural BPMN, also captures a namespace-stripped `zeebe:property`. Listing
+/// it here too would be dead and duplicate a second source of truth for the same
+/// tag.
 const EXTENSION_NOISE: &[&str] = &[
     "taskDefinition",
     "taskHeaders",
@@ -88,7 +109,6 @@ const EXTENSION_NOISE: &[&str] = &[
     "taskSchedule",
     "priorityDefinition",
     "properties",
-    "property",
     "script",
     "linkedResources",
     "linkedResource",
@@ -353,6 +373,33 @@ mod tests {
             "a misplaced <zeebe:header> is extension noise Zeebe ignores, not an \
              unsupported element: {:?}",
             parse_bpmn(&stray_header).err(),
+        );
+
+        // The `zeebe:properties` container is a distinct sub-case: the parser
+        // models it *nowhere*, so it always reaches the flow-element catch-all
+        // (not only when misplaced) and would be over-recorded without the
+        // `EXTENSION_NOISE` entry. Its `zeebe:property` children are absorbed by
+        // `is_ignorable_tag` upstream. A service task carrying element
+        // properties must still deploy clean.
+        let element_properties = defs_xml(
+            r#"<bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+               <bpmn:serviceTask id="t"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+                 <bpmn:extensionElements>
+                   <zeebe:taskDefinition type="w" />
+                   <zeebe:properties>
+                     <zeebe:property name="k" value="v" />
+                   </zeebe:properties>
+                 </bpmn:extensionElements>
+               </bpmn:serviceTask>
+               <bpmn:endEvent id="e"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+               <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+               <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />"#,
+        );
+        assert!(
+            parse_bpmn(&element_properties).is_ok(),
+            "a <zeebe:properties> container is extension metadata Zeebe ignores, not \
+             an unsupported element: {:?}",
+            parse_bpmn(&element_properties).err(),
         );
 
         // A genuine unsupported element sitting alongside extension noise must
