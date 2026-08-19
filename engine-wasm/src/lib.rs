@@ -1985,6 +1985,7 @@ fn incident_kind_tag(kind: &IncidentKind) -> &'static str {
         IncidentKind::ExpressionEvaluation => "expressionEvaluation",
         IncidentKind::UnhandledError => "unhandledError",
         IncidentKind::DecisionEvaluation => "decisionEvaluation",
+        IncidentKind::CalledElementError => "calledElementError",
     }
 }
 

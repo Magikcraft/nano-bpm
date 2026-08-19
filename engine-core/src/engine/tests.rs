@@ -6890,6 +6890,430 @@ fn inline_call_activities_rejects_unknown_and_cyclic_callees() {
         .contains("cycle"));
 }
 
+/// Deploys an orchestrator with a raw (un-inlined) call activity `c1 -> phase`
+/// and returns the running engine. The call activity carries the given io
+/// mappings so tests can exercise cross-boundary variable propagation.
+fn deploy_native_call(io: crate::model::IoMapping, child: ProcessDefinition) -> Engine {
+    let mut orchestrator = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "phase")
+        .end_event("end")
+        .connect("start", "c1")
+        .connect("c1", "end");
+    if !io.is_empty() {
+        orchestrator = orchestrator.with_io("c1", io);
+    }
+    let orchestrator = orchestrator.build().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(child)).unwrap();
+    engine
+        .apply_command(Command::DeployProcess(orchestrator))
+        .unwrap();
+    engine
+}
+
+#[test]
+fn a_call_activity_spawns_a_distinct_child_process_instance_with_parent_linkage() {
+    // Native execution (Zeebe parity): a call activity does NOT inline the
+    // callee — it spawns a distinct child process instance linked back to the
+    // calling instance and its call-activity element instance.
+    let mut engine = deploy_native_call(Default::default(), phase_process("phase", "work"));
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The call-activity element instance the child links back to.
+    let call_eik = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivated {
+                element_instance_key,
+                element_id,
+                ..
+            } if element_id == "c1" => Some(*element_instance_key),
+            _ => None,
+        })
+        .expect("c1 activated");
+
+    // A second, distinct process instance was created for the callee, carrying
+    // the parent linkage (C8 parentProcessInstanceKey / parentElementInstanceKey).
+    let (child_key, ppik, peik) = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_id,
+                parent_process_instance_key,
+                parent_element_instance_key,
+                ..
+            } if process_id == "phase" => Some((
+                *instance_key,
+                *parent_process_instance_key,
+                *parent_element_instance_key,
+            )),
+            _ => None,
+        })
+        .expect("a child instance of 'phase' was created");
+    assert_ne!(child_key, parent_key, "child is a distinct instance");
+    assert_eq!(ppik, Some(parent_key));
+    assert_eq!(peik, Some(call_eik));
+
+    // Both instances are live; the parent's call-activity token is parked on the
+    // child, and the child parks on its own (instance-scoped) job.
+    assert!(!engine.is_completed(parent_key));
+    assert!(!engine.is_completed(child_key));
+    assert_eq!(engine.pending_jobs().len(), 1);
+    assert_eq!(engine.pending_jobs()[0].instance_key, child_key);
+    assert_eq!(
+        engine
+            .instance(child_key)
+            .unwrap()
+            .parent_process_instance_key,
+        Some(parent_key)
+    );
+
+    // Completing the child's job runs it to its (none) end; the parent's
+    // call-activity token then completes and routes out to the orchestrator end.
+    let events = complete_one(&mut engine, "work");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceCompleted { instance_key } if *instance_key == child_key
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "c1" && to == "end"
+    )));
+    assert!(engine.is_completed(child_key));
+    assert!(engine.is_completed(parent_key));
+}
+
+#[test]
+fn cancelling_a_call_activity_parent_cancels_its_child() {
+    let mut engine = deploy_native_call(Default::default(), phase_process("phase", "work"));
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let child_key = engine
+        .pending_jobs()
+        .first()
+        .expect("child parked on its job")
+        .instance_key;
+    assert_ne!(child_key, parent_key);
+
+    let cancel = engine
+        .apply_command(Command::cancel_instance(parent_key))
+        .unwrap();
+    // Cancelling the parent cascades to the in-flight child (Zeebe parity).
+    assert!(cancel.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceTerminated { instance_key } if *instance_key == parent_key
+    )));
+    assert!(cancel.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceTerminated { instance_key } if *instance_key == child_key
+    )));
+    assert_eq!(
+        engine.instance(parent_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    // The child's job was cancelled with it — no activatable jobs remain.
+    assert!(engine.pending_jobs().is_empty());
+}
+
+#[test]
+fn interrupting_a_call_activity_via_a_boundary_cancels_its_child() {
+    // A boundary event that interrupts a call activity must also cancel the
+    // child process instance it spawned. Otherwise the parent token leaves via
+    // the boundary flow while the child keeps running — an orphan with no
+    // parent token left to complete it. The parent instance itself is NOT
+    // terminated; it routes out the interrupting boundary's flow.
+    let orchestrator = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "phase")
+        .timer_boundary_event("timeout", "c1", 5_000)
+        .end_event("end")
+        .end_event("escalated")
+        .connect("start", "c1")
+        .connect("c1", "end")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(phase_process("phase", "work")))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(orchestrator))
+        .unwrap();
+
+    let created = engine
+        .apply_command_at(Command::create_instance("orch"), 1_000)
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let child_key = engine
+        .pending_jobs()
+        .first()
+        .expect("child parked on its job")
+        .instance_key;
+    assert_ne!(child_key, parent_key);
+
+    // At the boundary timer's due instant it interrupts the call activity,
+    // cancels the child instance, and routes the parent to "escalated".
+    let fired = engine.trigger_timers(6_000);
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::ProcessInstanceTerminated { instance_key } if *instance_key == child_key
+        )),
+        "the boundary interrupt cancels the spawned child instead of orphaning it"
+    );
+    assert!(fired.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+    )));
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    // The parent was not terminated — it completed via the boundary path.
+    assert_ne!(
+        engine.instance(parent_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    assert!(engine.is_completed(parent_key));
+    // No orphaned job survives.
+    assert!(engine.pending_jobs().is_empty());
+}
+
+#[test]
+fn cancelling_a_parent_reaps_a_child_already_mid_termination() {
+    // A cascade cancel is not interruptible, so it must also sweep a child that
+    // is already `Terminating` — e.g. a child whose own cancel deferred on a
+    // user-task canceling listener. If the parent terminates while the child is
+    // mid-drain, sweeping only `Active` children would leave the child stuck in
+    // `Terminating` forever (orphaned).
+    let child_def = ProcessBuilder::new("phase")
+        .start_event("pstart")
+        .user_task("review")
+        .end_event("pend")
+        .connect("pstart", "review")
+        .connect("review", "pend")
+        .with_task_listeners(
+            "review",
+            vec![crate::model::TaskListener {
+                event_type: crate::model::TaskListenerEventType::Canceling,
+                job_type: "onCancel".to_string(),
+                retries: None,
+            }],
+        )
+        .build()
+        .unwrap();
+    let mut engine = deploy_native_call(Default::default(), child_def);
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let child_key = engine
+        .state()
+        .instances
+        .values()
+        .find(|i| i.parent_process_instance_key == Some(parent_key))
+        .map(|i| i.key)
+        .expect("a child instance was spawned");
+
+    // Cancel the child directly: its canceling listener defers termination, so
+    // it parks in `Terminating` waiting for the listener job to drain.
+    engine
+        .apply_command(Command::cancel_instance(child_key))
+        .unwrap();
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminating
+    );
+
+    // Now cancel the parent. The cascade must force-complete the child's
+    // deferred drain rather than leave it orphaned in `Terminating`.
+    let cancel = engine
+        .apply_command(Command::cancel_instance(parent_key))
+        .unwrap();
+    assert!(
+        cancel.iter().any(|e| matches!(
+            e,
+            Event::ProcessInstanceTerminated { instance_key } if *instance_key == child_key
+        )),
+        "the cascade reaps the still-Terminating child"
+    );
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    assert!(engine.pending_jobs().is_empty());
+}
+
+#[test]
+fn a_failing_called_element_expression_raises_an_expression_evaluation_incident() {
+    // When `zeebe:calledElement` is a FEEL expression (leading `=`) that cannot
+    // be evaluated (missing var, parse error, non-string result), the incident
+    // must describe the *expression* failure — not masquerade as an "unknown
+    // called process '=…'" lookup miss, which points diagnosis at the wrong
+    // thing. Here `=calleeName` references an unbound variable, so evaluation
+    // fails and no callee id is ever resolved.
+    let orchestrator = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "=calleeName")
+        .end_event("end")
+        .connect("start", "c1")
+        .connect("c1", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(phase_process("phase", "work")))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(orchestrator))
+        .unwrap();
+
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "the failed expression parks one incident");
+    assert_eq!(active[0].kind, state::IncidentKind::ExpressionEvaluation);
+    let reason = &active[0].reason;
+    assert!(
+        reason.contains("calledElement") && reason.contains("=calleeName"),
+        "incident should name the failing calledElement expression, got: {reason}"
+    );
+    assert!(
+        !reason.contains("unknown called process"),
+        "expression failure must not be reported as an unknown-process lookup, got: {reason}"
+    );
+    // No child instance was spawned and the parent did not complete.
+    assert!(!engine.is_completed(parent_key));
+    assert!(engine
+        .state()
+        .instances
+        .values()
+        .all(|i| i.parent_process_instance_key != Some(parent_key)));
+}
+
+#[test]
+fn an_unknown_called_process_raises_a_called_element_incident_not_expression_eval() {
+    // A call activity whose (literal) `calledElement` process id is not deployed
+    // is a missing-definition / execution problem, NOT a FEEL/type failure. It
+    // must be classified as `CalledElementError` (C8 `CALLED_ELEMENT_ERROR`), so
+    // clients filtering incidents by `errorType` can distinguish a missing callee
+    // from a genuine expression-evaluation failure (`EXTRACT_VALUE_ERROR`).
+    let orchestrator = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "definitely-not-deployed")
+        .end_event("end")
+        .connect("start", "c1")
+        .connect("c1", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(orchestrator))
+        .unwrap();
+
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "the unknown callee parks one incident");
+    assert_eq!(
+        active[0].kind,
+        state::IncidentKind::CalledElementError,
+        "an unknown called process must be a CalledElementError, not ExpressionEvaluation"
+    );
+    assert!(
+        active[0].reason.contains("unknown called process"),
+        "incident should name the missing callee, got: {}",
+        active[0].reason
+    );
+    assert!(!engine.is_completed(parent_key));
+}
+
+#[test]
+fn a_call_activity_propagates_variables_via_io_mappings_across_isolated_scopes() {
+    // The callee is a pass-through (pstart -> pend) so it completes on its seed
+    // variables, letting us observe both directions of the mapping in one command.
+    let child = ProcessBuilder::new("phase")
+        .start_event("pstart")
+        .end_event("pend")
+        .connect("pstart", "pend")
+        .build()
+        .unwrap();
+    let io = crate::model::IoMapping {
+        inputs: vec![crate::model::Mapping {
+            source: "=orderId".to_string(),
+            target: "childOrder".to_string(),
+        }],
+        outputs: vec![crate::model::Mapping {
+            source: "=childOrder".to_string(),
+            target: "parentEcho".to_string(),
+        }],
+    };
+    let mut engine = deploy_native_call(io, child);
+
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("orderId", Value::Int(42))]),
+        ))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The child is seeded ONLY through the input mapping (isolated scope): it
+    // sees `childOrder`, not the parent's other variable `orderId`.
+    let child_seed = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                process_id,
+                variables,
+                ..
+            } if process_id == "phase" => Some(variables.clone()),
+            _ => None,
+        })
+        .expect("child created");
+    assert_eq!(child_seed.get("childOrder"), Some(&Value::Int(42)));
+    assert!(
+        !child_seed.contains_key("orderId"),
+        "parent variables must not leak into the child's isolated scope"
+    );
+
+    // The whole orchestration ran to completion; the output mapping projected the
+    // child's variable back into the parent as `parentEcho`. The child's own
+    // `childOrder` did not leak wholesale into the parent.
+    assert!(engine.is_completed(parent_key));
+    assert!(created.iter().any(|e| matches!(
+        e,
+        Event::VariablesUpdated { instance_key, variables }
+            if *instance_key == parent_key && variables.get("parentEcho") == Some(&Value::Int(42))
+    )));
+    assert!(
+        !created.iter().any(|e| matches!(
+            e,
+            Event::VariablesUpdated { instance_key, variables }
+                if *instance_key == parent_key && variables.contains_key("childOrder")
+        )),
+        "only the mapped output crosses back, not the child's raw scope"
+    );
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {

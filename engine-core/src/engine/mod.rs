@@ -257,7 +257,24 @@ enum Step {
         /// listener that just completed.
         index: usize,
     },
+    /// Complete a call-activity token once its spawned child process instance
+    /// has finished. The parent's call-activity element instance parked in
+    /// ACTIVATED while the child ran; this projects the child's final variables
+    /// through the call activity's output mappings, completes the element and
+    /// takes its outgoing flow. `child_variables` is captured at the moment the
+    /// child completes (before the terminal instance drops its variables).
+    CompleteCallActivity {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        child_variables: HashMap<String, Value>,
+    },
 }
+
+/// Maximum depth of the call-activity parent-child chain before a spawning call
+/// activity parks on an incident instead of recursing further. Guards against
+/// self / mutually-recursive callees that never terminate.
+const MAX_CALL_ACTIVITY_DEPTH: usize = 1000;
 
 impl Engine {
     /// Creates an empty engine for the single-partition (id `0`) namespace.
@@ -513,6 +530,8 @@ impl Engine {
                 business_id,
                 process_definition_key,
                 version,
+                parent_process_instance_key: None,
+                parent_element_instance_key: None,
             },
         );
         queue.push_back(Step::Activate {
@@ -959,6 +978,7 @@ impl Engine {
     ) -> Result<Vec<Event>, EngineError> {
         let (mut log, queue) = self.plan_command_at(command, now)?;
         self.run(&mut log, queue);
+        self.cascade_cancel_children(&mut log);
         self.finish_command(&log);
         Ok(log)
     }
@@ -2120,7 +2140,8 @@ impl Engine {
                     // updated) variables.
                     state::IncidentKind::NoMatchingSequenceFlow
                     | state::IncidentKind::ExpressionEvaluation
-                    | state::IncidentKind::DecisionEvaluation => {
+                    | state::IncidentKind::DecisionEvaluation
+                    | state::IncidentKind::CalledElementError => {
                         // A message intermediate catch event whose correlation
                         // key failed to evaluate parks ACTIVATED with no
                         // subscription; re-driving `Complete` would advance the
@@ -3202,11 +3223,17 @@ impl Engine {
             // the production (`RunToCompletion`) log is byte-identical — completion
             // is still emitted once, at the same quiescence point.
             let completed_from = log.len();
-            self.complete_finished_instances(log);
+            let followups = self.complete_finished_instances(log);
             if log.len() > completed_from {
                 if let Drive::Pause = driver.after_step(&log[completed_from..]) {
                     return Some(Paused { queue, cursor });
                 }
+            }
+            // A completion may have released a parked call-activity token; run its
+            // completion (and any cascade up the parent chain) before quiescing.
+            if !followups.is_empty() {
+                queue.extend(followups);
+                continue;
             }
             return None;
         }
@@ -3802,6 +3829,17 @@ impl Engine {
                 event_type,
                 index,
             } => self.advance_task_listener(user_task_key, event_type, index),
+            Step::CompleteCallActivity {
+                instance_key,
+                element_instance_key,
+                element_id,
+                child_variables,
+            } => self.complete_call_activity(
+                instance_key,
+                element_instance_key,
+                element_id,
+                child_variables,
+            ),
         }
     }
 
@@ -4377,6 +4415,35 @@ impl Engine {
                     element_id: start_event,
                     scope: element_instance_key,
                 });
+            }
+            // A call activity spawns a distinct **child process instance** of its
+            // `calledElement` (Zeebe parity) and parks its own token in ACTIVATED
+            // while the child runs. The child carries `parentProcessInstanceKey`/
+            // `parentElementInstanceKey` back to this element instance so tooling
+            // can draw the parent↔child tree. Variables cross the instance
+            // boundary through the call activity's input mappings (seeding the
+            // child, isolated scope) and, on child completion, its output mappings
+            // (see `complete_call_activity`). The parent token completes when the
+            // child finishes (see `complete_finished_instances`); cancelling the
+            // parent cancels the in-flight child (see `cascade_cancel_children`).
+            Some(ElementKind::CallActivity { called_process_id }) => {
+                // Boundary events on the call activity are armed like any other
+                // activity (timers/messages interrupt the wait for the child).
+                events.extend(self.arm_boundary_events(
+                    instance_key,
+                    element_instance_key,
+                    scope,
+                    &element_id,
+                ));
+                let (spawn_events, spawn_followups) = self.spawn_call_activity_child(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                    &called_process_id,
+                    &element_vars,
+                );
+                events.extend(spawn_events);
+                followups.extend(spawn_followups);
             }
             // An inline-FEEL script task is a synchronous activity: it activates
             // and immediately completes (no job). Its FEEL expression is
@@ -5611,8 +5678,15 @@ impl Engine {
                     external_form_reference,
                 });
             }
-            // CallActivity / Other / an unlisted id: no job or task to run, so the
-            // child passes straight through to completion, feeding the loop.
+            // Other / an unlisted id: no job or task to run, so the child passes
+            // straight through to completion, feeding the loop.
+            //
+            // NOTE (issue #808 ↔ #631 coordination): a `callActivity` used *as* an
+            // ad-hoc tool still takes this pass-through arm rather than spawning a
+            // real child process instance via this issue's call-activity
+            // machinery. Per the coordination note, whichever of #631/#808 lands
+            // second owns wiring this arm to `spawn_call_activity_child`; #808
+            // (this change) leaves it as the current pass-through and flags it.
             _ => {
                 followups.push(Step::Complete {
                     instance_key,
@@ -7618,10 +7692,12 @@ impl Engine {
     }
 
     /// After a command settles, any active instance with no remaining tokens has
-    /// completed.
-    fn complete_finished_instances(&mut self, log: &mut Vec<Event>) {
+    /// completed. Returns any follow-up steps that must run because of a
+    /// completion — currently the [`Step::CompleteCallActivity`] that releases a
+    /// parent's parked call-activity token when its spawned child finishes.
+    fn complete_finished_instances(&mut self, log: &mut Vec<Event>) -> Vec<Step> {
         let touched: HashSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
-        let finished: Vec<Key> = touched
+        let mut finished: Vec<Key> = touched
             .into_iter()
             .filter(|k| {
                 self.state
@@ -7631,13 +7707,438 @@ impl Engine {
                     .unwrap_or(false)
             })
             .collect();
+        // Deterministic completion order (a set iteration is unordered).
+        finished.sort_unstable();
 
+        let mut followups = Vec::new();
         for instance_key in finished {
+            // A completing call-activity child releases its parent's parked token.
+            // Captured before `ProcessInstanceCompleted` drops the child's
+            // variables so the call activity's output mappings still see them.
+            if let Some(step) = self.call_activity_completion_step(instance_key) {
+                followups.push(step);
+            }
             self.emit(log, Event::ProcessInstanceCompleted { instance_key });
+        }
+        followups
+    }
+
+    /// Builds the [`Step::CompleteCallActivity`] that releases a parent's parked
+    /// call-activity token when `child_instance_key` (a call-activity child)
+    /// completes, or `None` when the instance is not a call-activity child or its
+    /// parent's call-activity element instance is no longer active (interrupted /
+    /// cancelled). The child's final variables are captured here so the call
+    /// activity's output mappings can project them after the terminal
+    /// `ProcessInstanceCompleted` drops them.
+    fn call_activity_completion_step(&self, child_instance_key: Key) -> Option<Step> {
+        let child = self.state.instances.get(&child_instance_key)?;
+        let parent = child.parent_process_instance_key?;
+        let call_eik = child.parent_element_instance_key?;
+        let parent_instance = self.state.instances.get(&parent)?;
+        let element_id = parent_instance.active.get(&call_eik)?.clone();
+        let child_variables = (*child.variables).clone();
+        Some(Step::CompleteCallActivity {
+            instance_key: parent,
+            element_instance_key: call_eik,
+            element_id,
+            child_variables,
+        })
+    }
+
+    /// The live call-activity child instance parked on `call_eik` (a parent's
+    /// call-activity element instance), if any. A call activity spawns exactly
+    /// one child, found here by its `parentElementInstanceKey` back-link.
+    /// Includes a `Terminating` child so an interrupt still reaps one already
+    /// mid-drain. Selection is deterministic (lowest instance key) so that, even
+    /// if state ever held multiple matches (a bug or partial-replay artifact),
+    /// boundary-interrupt cancellation always targets the same child.
+    fn call_activity_child_of(&self, call_eik: Key) -> Option<Key> {
+        self.state
+            .instances
+            .values()
+            .filter(|i| {
+                matches!(
+                    i.state,
+                    ProcessInstanceState::Active | ProcessInstanceState::Terminating
+                ) && i.parent_element_instance_key == Some(call_eik)
+            })
+            .map(|i| i.key)
+            .min()
+    }
+
+    /// Depth of `instance_key` in the call-activity parent chain (0 for a
+    /// top-level instance). Used to cap runaway recursion.
+    fn call_activity_depth(&self, instance_key: Key) -> usize {
+        let mut depth = 0;
+        let mut cursor = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.parent_process_instance_key);
+        while let Some(parent) = cursor {
+            depth += 1;
+            if depth >= MAX_CALL_ACTIVITY_DEPTH {
+                break;
+            }
+            cursor = self
+                .state
+                .instances
+                .get(&parent)
+                .and_then(|i| i.parent_process_instance_key);
+        }
+        depth
+    }
+
+    /// Spawns the child process instance for an activating call activity and
+    /// links it back to the parent (`parentProcessInstanceKey` /
+    /// `parentElementInstanceKey`). The parent's call-activity element instance
+    /// stays ACTIVATED (its token parked) until the child finishes. Variables
+    /// cross the boundary through the call activity's input mappings only
+    /// (isolated child scope), matching the issue's parity target. An unknown
+    /// callee, or exceeding the recursion depth cap, parks the token on a
+    /// recoverable incident instead.
+    fn spawn_call_activity_child(
+        &mut self,
+        parent_instance: Key,
+        call_eik: Key,
+        element_id: &str,
+        called_process_id: &str,
+        element_vars: &HashMap<String, Value>,
+    ) -> (Vec<Event>, Vec<Step>) {
+        // The callee id may be a literal or a FEEL `=` expression (C8
+        // `zeebe:calledElement processId`), resolved against the activating view.
+        // A failing expression must surface as an expression-evaluation incident
+        // that names the expression — not fall back to the raw `=…` text, which
+        // would masquerade as an "unknown called process '=…'" lookup miss and
+        // point diagnosis at the wrong thing.
+        let called = {
+            let trimmed = called_process_id.trim();
+            if trimmed.starts_with('=') {
+                match crate::feel::eval_string(trimmed, element_vars) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        let incident_key = self.mint_key();
+                        return (
+                            vec![Event::IncidentRaised {
+                                incident_key,
+                                instance_key: parent_instance,
+                                element_instance_key: call_eik,
+                                element_id: element_id.to_string(),
+                                kind: state::IncidentKind::ExpressionEvaluation,
+                                reason: format!(
+                                    "call activity '{element_id}' could not evaluate \
+                                     calledElement expression '{called_process_id}': {err}"
+                                ),
+                                job_key: None,
+                                created_at: self.now,
+                            }],
+                            Vec::new(),
+                        );
+                    }
+                }
+            } else {
+                called_process_id.to_string()
+            }
+        };
+        // Guard runaway recursion (self / mutually-recursive callees).
+        if self.call_activity_depth(parent_instance) >= MAX_CALL_ACTIVITY_DEPTH {
+            let incident_key = self.mint_key();
+            return (
+                vec![Event::IncidentRaised {
+                    incident_key,
+                    instance_key: parent_instance,
+                    element_instance_key: call_eik,
+                    element_id: element_id.to_string(),
+                    kind: state::IncidentKind::CalledElementError,
+                    reason: format!(
+                        "call activity '{element_id}' exceeded the maximum child-instance depth \
+                         of {MAX_CALL_ACTIVITY_DEPTH} calling '{called}' (possible unbounded \
+                         recursion)"
+                    ),
+                    job_key: None,
+                    created_at: self.now,
+                }],
+                Vec::new(),
+            );
+        }
+        // Resolve the called definition (latest deployed version by id); copy the
+        // fields we need so the immutable `state` borrow ends before we mint keys.
+        let resolved = self
+            .state
+            .processes
+            .get(&called)
+            .map(|d| (d.key, d.version, d.definition.start_event.clone()));
+        let Some((process_definition_key, version, start_event)) = resolved else {
+            let incident_key = self.mint_key();
+            return (
+                vec![Event::IncidentRaised {
+                    incident_key,
+                    instance_key: parent_instance,
+                    element_instance_key: call_eik,
+                    element_id: element_id.to_string(),
+                    kind: state::IncidentKind::CalledElementError,
+                    reason: format!(
+                        "call activity '{element_id}' references unknown called process '{called}'"
+                    ),
+                    job_key: None,
+                    created_at: self.now,
+                }],
+                Vec::new(),
+            );
+        };
+        // Input mappings seed the (isolated) child variables; nothing else of the
+        // parent's scope crosses the boundary.
+        let inputs = self.io_inputs(parent_instance, element_id);
+        let child_vars = if inputs.is_empty() {
+            HashMap::new()
+        } else {
+            self.eval_io_mappings_in(element_vars, &inputs)
+        };
+        let child_key = self.mint_key();
+        (
+            vec![Event::ProcessInstanceCreated {
+                instance_key: child_key,
+                process_id: called,
+                variables: child_vars,
+                created_at: self.now,
+                tags: Vec::new(),
+                business_id: None,
+                process_definition_key,
+                version,
+                parent_process_instance_key: Some(parent_instance),
+                parent_element_instance_key: Some(call_eik),
+            }],
+            vec![Step::Activate {
+                instance_key: child_key,
+                element_id: start_event,
+                scope: 0,
+            }],
+        )
+    }
+
+    /// Completes a call-activity token once its child process instance finished.
+    /// Projects the child's final variables through the call activity's output
+    /// mappings (isolated scopes), completes the element, disarms its boundary
+    /// events and takes its outgoing flow. A no-op if the element instance is no
+    /// longer active (a boundary event interrupted the wait before the child
+    /// finished).
+    fn complete_call_activity(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        child_variables: HashMap<String, Value>,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let still_active = self
+            .state
+            .instances
+            .get(&instance_key)
+            .map(|i| i.active.contains_key(&element_instance_key))
+            .unwrap_or(false);
+        if !still_active {
+            return (Vec::new(), Vec::new());
+        }
+        let scope = self.scope_of(instance_key, element_instance_key);
+        let mut events = vec![
+            Event::ElementCompleting {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+            },
+            Event::ElementCompleted {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+            },
+        ];
+        events.extend(self.cancel_boundary_timers_on(element_instance_key));
+        events.extend(self.cancel_boundary_message_subscriptions_on(element_instance_key));
+        events.extend(self.cancel_boundary_signal_subscriptions_on(element_instance_key));
+        events.extend(self.cancel_boundary_conditional_subscriptions_on(element_instance_key));
+        let outputs = self.io_outputs(instance_key, &element_id);
+        if !outputs.is_empty() {
+            let updates = self.eval_io_mappings_in(&child_variables, &outputs);
+            if !updates.is_empty() {
+                events.extend(self.propagated_updates(instance_key, scope, updates, false));
+            }
+        }
+        let mut followups = Vec::new();
+        for flow in self.outgoing(instance_key, &element_id) {
+            events.push(Event::SequenceFlowTaken {
+                instance_key,
+                from: element_id.clone(),
+                to: flow.to.clone(),
+            });
+            followups.push(Step::Activate {
+                instance_key,
+                element_id: flow.to,
+                scope,
+            });
+        }
+        (events, followups)
+    }
+
+    /// Cancels the in-flight call-activity children of every instance terminated
+    /// by the current command (Zeebe parity: cancelling the parent cancels the
+    /// child), transitively down the parent-child tree. Called after the command
+    /// drains, so it sees every `ProcessInstanceTerminated` the command produced
+    /// (a direct `CancelInstance`, a terminate end event, or a scope
+    /// interruption).
+    fn cascade_cancel_children(&mut self, log: &mut Vec<Event>) {
+        let mut terminated: HashSet<Key> = log
+            .iter()
+            .filter_map(|e| match e {
+                Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
+                _ => None,
+            })
+            .collect();
+        if terminated.is_empty() {
+            return;
+        }
+        loop {
+            let mut children: Vec<Key> = self
+                .state
+                .instances
+                .values()
+                .filter(|i| {
+                    // A cascade cancel is not interruptible, so it must also
+                    // sweep children already mid-drain (`Terminating`, e.g. a
+                    // child whose own cancel deferred on a user-task canceling
+                    // listener) — otherwise the parent's termination orphans
+                    // them. `discard_and_terminate_instance` force-completes
+                    // that deferred drain.
+                    matches!(
+                        i.state,
+                        ProcessInstanceState::Active | ProcessInstanceState::Terminating
+                    ) && i
+                        .parent_process_instance_key
+                        .map(|p| terminated.contains(&p))
+                        .unwrap_or(false)
+                })
+                .map(|i| i.key)
+                .collect();
+            if children.is_empty() {
+                break;
+            }
+            children.sort_unstable();
+            for child in children {
+                self.discard_and_terminate_instance(log, child);
+                terminated.insert(child);
+            }
         }
     }
 
-    /// Applies an event and records it in the command's event log.
+    /// Immediately discards every token of `instance_key` (its in-play jobs,
+    /// armed timers, open subscriptions and user tasks) and terminates it. This
+    /// is the forced-cancel path used to cascade a parent cancellation to a
+    /// call-activity child — unlike [`Command::CancelInstance`] it never defers on
+    /// user-task `canceling` listeners (a cascade cancel is not interruptible).
+    fn discard_and_terminate_instance(&mut self, log: &mut Vec<Event>, instance_key: Key) {
+        let mut cancels: Vec<Event> = Vec::new();
+
+        let mut jobs: Vec<&state::Job> = self
+            .state
+            .jobs
+            .values()
+            .filter(|j| {
+                j.instance_key == instance_key
+                    && matches!(
+                        j.state,
+                        state::JobState::Created
+                            | state::JobState::Activated
+                            | state::JobState::Failed
+                    )
+            })
+            .collect();
+        jobs.sort_unstable_by_key(|j| j.key);
+        cancels.extend(jobs.iter().map(|j| Event::JobCanceled {
+            job_key: j.key,
+            instance_key,
+        }));
+
+        let mut timers: Vec<&state::Timer> = self
+            .state
+            .timers
+            .values()
+            .filter(|t| t.instance_key == instance_key && t.state == state::TimerState::Created)
+            .collect();
+        timers.sort_unstable_by_key(|t| t.key);
+        cancels.extend(timers.iter().map(|t| Event::TimerCanceled {
+            timer_key: t.key,
+            instance_key,
+            element_instance_key: t.element_instance_key,
+            element_id: t.element_id.clone(),
+        }));
+
+        let mut subs: Vec<&state::MessageSubscription> = self
+            .state
+            .message_subscriptions
+            .values()
+            .filter(|s| {
+                s.instance_key == instance_key
+                    && matches!(
+                        s.state,
+                        state::MessageSubscriptionState::Open
+                            | state::MessageSubscriptionState::Opening
+                    )
+            })
+            .collect();
+        subs.sort_unstable_by_key(|s| s.key);
+        cancels.extend(subs.iter().map(|s| Self::disarm_subscription_event(s)));
+
+        let mut sig_subs: Vec<&state::SignalSubscription> = self
+            .state
+            .signal_subscriptions
+            .values()
+            .filter(|s| {
+                s.instance_key == instance_key && s.state == state::MessageSubscriptionState::Open
+            })
+            .collect();
+        sig_subs.sort_unstable_by_key(|s| s.key);
+        cancels.extend(sig_subs.iter().map(|s| Event::SignalSubscriptionCanceled {
+            subscription_key: s.key,
+            instance_key,
+            element_instance_key: s.element_instance_key,
+            element_id: s.element_id.clone(),
+        }));
+
+        let mut cond_subs: Vec<&state::ConditionalSubscription> = self
+            .state
+            .conditional_subscriptions
+            .values()
+            .filter(|s| {
+                s.instance_key == instance_key && s.state == state::MessageSubscriptionState::Open
+            })
+            .collect();
+        cond_subs.sort_unstable_by_key(|s| s.key);
+        cancels.extend(
+            cond_subs
+                .iter()
+                .map(|s| Event::ConditionalSubscriptionCanceled {
+                    subscription_key: s.key,
+                    instance_key,
+                    element_instance_key: s.element_instance_key,
+                    element_id: s.element_id.clone(),
+                }),
+        );
+
+        let mut user_tasks: Vec<&state::UserTask> = self
+            .state
+            .user_tasks
+            .values()
+            .filter(|t| t.instance_key == instance_key && t.state == state::UserTaskState::Created)
+            .collect();
+        user_tasks.sort_unstable_by_key(|t| t.key);
+        cancels.extend(user_tasks.iter().map(|t| Event::UserTaskCanceled {
+            user_task_key: t.key,
+            instance_key,
+        }));
+
+        for event in cancels {
+            self.emit(log, event);
+        }
+        self.emit(log, Event::ProcessInstanceTerminated { instance_key });
+    }
     fn emit(&mut self, log: &mut Vec<Event>, event: Event) {
         if self.track_dirty_vars {
             match &event {

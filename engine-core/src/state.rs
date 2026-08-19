@@ -375,6 +375,16 @@ pub struct ProcessInstance {
     /// supported.
     #[cfg_attr(feature = "serde", serde(default))]
     pub business_id: Option<String>,
+    /// When this instance is a **child process instance** spawned by a call
+    /// activity, the `processInstanceKey` of the calling (parent) instance and
+    /// the element instance key of the spawning call-activity element (C8
+    /// `parentProcessInstanceKey` / `parentElementInstanceKey`). Both `None` for
+    /// a top-level instance (API/message/timer/signal start) and for instances
+    /// created before native call activities existed (`serde(default)`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub parent_process_instance_key: Option<Key>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub parent_element_instance_key: Option<Key>,
     /// Currently-active element instances, keyed by element-instance key. An
     /// element instance is "active" from `ACTIVATED` until `COMPLETED`; a service
     /// task therefore stays here while its job is pending, as does a token parked
@@ -536,6 +546,15 @@ pub enum IncidentKind {
     /// violation, missing input). Recoverable once the definition/inputs are
     /// fixed and the incident is resolved.
     DecisionEvaluation,
+    /// A call activity could not spawn its child process: the resolved
+    /// `calledElement` process id is not deployed (unknown definition), or the
+    /// call-activity chain exceeded the recursion-depth cap. This is a
+    /// missing-definition / execution problem, not a FEEL/type failure, so it
+    /// maps to the C8 `CALLED_ELEMENT_ERROR` `errorType` (distinct from the
+    /// `EXTRACT_VALUE_ERROR` a failed `calledElement` *expression* raises).
+    /// Recoverable once the callee is deployed (or the recursion fixed) and the
+    /// incident is resolved.
+    CalledElementError,
 }
 
 /// Lifecycle state of an incident. Incidents are retained after resolution (as
@@ -1540,6 +1559,8 @@ pub fn apply(state: &mut State, event: &Event) {
             tags,
             business_id,
             process_definition_key,
+            parent_process_instance_key,
+            parent_element_instance_key,
             ..
         } => {
             *state
@@ -1567,6 +1588,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     created_at: *created_at,
                     tags: tags.clone(),
                     business_id: business_id.clone(),
+                    parent_process_instance_key: *parent_process_instance_key,
+                    parent_element_instance_key: *parent_element_instance_key,
                     active: HashMap::new(),
                     scopes: HashMap::new(),
                     variables: Arc::new(variables.clone()),
