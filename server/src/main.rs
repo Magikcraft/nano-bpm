@@ -18684,6 +18684,18 @@ async fn main() {
                     }),
                 );
             }
+            // "Stop the app before updating it" gate (issue #889): a single
+            // server-side chokepoint that refuses project-mutating requests with
+            // 409 `app_running` while the project is running. Layered over the
+            // console router so it covers every current *and future*
+            // `/console/api/projects/{name}/…` mutation from one place; read and
+            // runtime endpoints pass through (see `app_running_gate`). Applied
+            // *before* the observe guard below so that, when observe mode is also
+            // enabled, its read-only guard wraps outermost: a mutation to a
+            // running project is then refused with observe's documented 403
+            // first, keeping observe mode consistently read-only regardless of
+            // the project's run state (rather than leaking a 409 `app_running`).
+            console = console.layer(axum::middleware::from_fn(console_app_running_guard));
             if obs_config.console_read_only() {
                 // Runtime read-only gate: refuse authoring (mutating) API
                 // requests while still serving the observability views.
@@ -18695,13 +18707,6 @@ async fn main() {
             } else {
                 tracing::info!("console enabled: web UI at /console, API under /console/api");
             }
-            // "Stop the app before updating it" gate (issue #889): a single
-            // server-side chokepoint that refuses project-mutating requests with
-            // 409 `app_running` while the project is running. Layered outermost
-            // over the console router so it covers every current *and future*
-            // `/console/api/projects/{name}/…` mutation from one place; read and
-            // runtime endpoints pass through (see `app_running_gate`).
-            console = console.layer(axum::middleware::from_fn(console_app_running_guard));
             app = app.merge(console);
         }
     }

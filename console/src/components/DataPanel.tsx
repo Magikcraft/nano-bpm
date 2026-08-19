@@ -486,10 +486,20 @@ export default function DataPanel({
           />
         )}
         {source && tab === "sql" && (
-          <SqlTab key={`s-${source}`} name={name} source={source} />
+          <SqlTab
+            key={`s-${source}`}
+            name={name}
+            source={source}
+            appRunning={appRunning}
+          />
         )}
         {source && tab === "migrations" && (
-          <MigrationsTab key={`m-${source}`} name={name} source={source} />
+          <MigrationsTab
+            key={`m-${source}`}
+            name={name}
+            source={source}
+            appRunning={appRunning}
+          />
         )}
       </div>
     </div>
@@ -1662,7 +1672,15 @@ function isReadStatement(sql: string): boolean {
   return /^\s*(select|with|pragma|explain)\b/i.test(sql);
 }
 
-function SqlTab({ name, source }: { name: string; source: string }) {
+function SqlTab({
+  name,
+  source,
+  appRunning,
+}: {
+  name: string;
+  source: string;
+  appRunning: boolean;
+}) {
   const [sql, setSql] = useState("SELECT 1;");
   const [result, setResult] = useState<DataQueryResult | null>(null);
   const [status, setStatus] = useState<string | null>(null);
@@ -1671,9 +1689,18 @@ function SqlTab({ name, source }: { name: string; source: string }) {
   const sqlRef = useRef(sql);
   sqlRef.current = sql;
 
+  // While the app is running the server refuses mutating statements with 409
+  // `app_running` (issue #889); reads (SELECT/WITH/PRAGMA/EXPLAIN) stay allowed.
+  // Mirror that here so the UI never surfaces an avoidable error.
+  const writeBlocked = appRunning && !isReadStatement(sql);
+
   const run = useCallback(async () => {
     const text = sqlRef.current.trim().replace(/;\s*$/, "");
     if (!text) return;
+    if (appRunning && !isReadStatement(text)) {
+      setError("Stop the app before running mutating statements.");
+      return;
+    }
     setRunning(true);
     setError(null);
     setStatus(null);
@@ -1707,7 +1734,7 @@ function SqlTab({ name, source }: { name: string; source: string }) {
     } finally {
       setRunning(false);
     }
-  }, [name, source]);
+  }, [name, source, appRunning]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -1720,10 +1747,23 @@ function SqlTab({ name, source }: { name: string; source: string }) {
         />
       </div>
       <div className="flex items-center gap-3 border-b border-edge bg-panel px-4 py-2">
-        <Button onClick={() => void run()} disabled={running}>
+        <Button
+          onClick={() => void run()}
+          disabled={running || writeBlocked}
+          title={
+            writeBlocked
+              ? "Stop the app before running mutating statements"
+              : undefined
+          }
+        >
           {running ? "Running…" : "▶ Run"}
         </Button>
         <span className="text-xs text-fg-faint">⌘/Ctrl+S runs</span>
+        {writeBlocked && (
+          <span className="text-xs text-warn">
+            Stop the app to run mutating statements
+          </span>
+        )}
         {status && <span className="text-xs text-ok">{status}</span>}
         {error && <span className="truncate text-xs text-danger">{error}</span>}
       </div>
@@ -1743,7 +1783,15 @@ function SqlTab({ name, source }: { name: string; source: string }) {
 
 // --- Migrations -------------------------------------------------------------
 
-function MigrationsTab({ name, source }: { name: string; source: string }) {
+function MigrationsTab({
+  name,
+  source,
+  appRunning,
+}: {
+  name: string;
+  source: string;
+  appRunning: boolean;
+}) {
   const [entries, setEntries] = useState<DataMigrationEntry[]>([]);
   const [dir, setDir] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -1771,6 +1819,10 @@ function MigrationsTab({ name, source }: { name: string; source: string }) {
   const pending = entries.filter((e) => !e.applied).length;
 
   const apply = useCallback(async () => {
+    if (appRunning) {
+      setError("Stop the app before applying migrations.");
+      return;
+    }
     setBusy(true);
     setError(null);
     setNote(null);
@@ -1790,12 +1842,18 @@ function MigrationsTab({ name, source }: { name: string; source: string }) {
     } finally {
       setBusy(false);
     }
-  }, [name, source, load]);
+  }, [name, source, load, appRunning]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center gap-3 border-b border-edge bg-panel px-4 py-2">
-        <Button onClick={() => void apply()} disabled={busy || pending === 0}>
+        <Button
+          onClick={() => void apply()}
+          disabled={busy || pending === 0 || appRunning}
+          title={
+            appRunning ? "Stop the app before applying migrations" : undefined
+          }
+        >
           {busy
             ? "Applying…"
             : pending > 0
@@ -1806,6 +1864,9 @@ function MigrationsTab({ name, source }: { name: string; source: string }) {
           {dir || "db/migrations"} · {entries.length} file
           {entries.length === 1 ? "" : "s"}
         </span>
+        {appRunning && (
+          <span className="text-xs text-warn">Stop the app to migrate</span>
+        )}
         {note && <span className="text-xs text-ok">{note}</span>}
         {error && <span className="truncate text-xs text-danger">{error}</span>}
       </div>
