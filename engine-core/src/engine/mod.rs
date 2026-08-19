@@ -644,18 +644,20 @@ impl Engine {
             // are wired. So scan all process-level (`parent.is_none()`) typed
             // starts, deterministically ordered by element id so key minting
             // and replay stay in lock-step.
-            let mut typed_starts: Vec<(ElementId, ElementKind, Option<crate::model::TimerDef>)> = process
-                .elements
-                .values()
-                .filter(|e| e.parent.is_none())
-                .filter(|e| {
-                    matches!(
-                        e.kind,
-                        ElementKind::MessageStartEvent { .. } | ElementKind::TimerStartEvent { .. }
-                    )
-                })
-                .map(|e| (e.id.clone(), e.kind.clone(), e.timer.clone()))
-                .collect();
+            let mut typed_starts: Vec<(ElementId, ElementKind, Option<crate::model::TimerDef>)> =
+                process
+                    .elements
+                    .values()
+                    .filter(|e| e.parent.is_none())
+                    .filter(|e| {
+                        matches!(
+                            e.kind,
+                            ElementKind::MessageStartEvent { .. }
+                                | ElementKind::TimerStartEvent { .. }
+                        )
+                    })
+                    .map(|e| (e.id.clone(), e.kind.clone(), e.timer.clone()))
+                    .collect();
             typed_starts.sort_by(|a, b| a.0.cmp(&b.0));
             self.emit(
                 log,
