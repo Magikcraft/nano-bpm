@@ -3532,12 +3532,16 @@ fn apply_edit_op(
                 is_default: false,
             });
             let parent = anchor.parent.clone();
-            for f in original {
-                // Carried as default branches (conditions dropped: the gateway now decides).
+            for (i, f) in original.into_iter().enumerate() {
+                // Carried as the default branch (conditions dropped: the gateway now decides). A
+                // diverging exclusive gateway may name only one default flow, so the first preserved
+                // path becomes the default; any others fall back to conditionless branches, which the
+                // gateway validation will reject — the anchor is spliced on its single outgoing edge,
+                // so in practice there is exactly one preserved path.
                 outgoing.push(SequenceFlow {
                     to: f.to,
                     condition: None,
-                    is_default: false,
+                    is_default: i == 0,
                 });
             }
             def.elements.insert(

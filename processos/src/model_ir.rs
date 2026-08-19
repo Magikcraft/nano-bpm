@@ -1716,10 +1716,10 @@ mod tests {
 
     #[test]
     fn write_model_ir_can_add_a_gateway_default_flow() {
-        // THE motivating case: the imperative edit_model verbs cannot add a gateway `default`
-        // fallback, but the IR can. Start from a gateway whose second branch is a plain flow, add
-        // `default` in the IR text, write it back, and confirm the compiled model flags that branch
-        // as the exclusive gateway's default.
+        // THE motivating case: the imperative edit_model verbs cannot switch a gateway branch to the
+        // `default` fallback, but the IR can. Start from a gateway whose second branch is a plain
+        // conditional flow, replace its guard with `default` in the IR text, write it back, and
+        // confirm the compiled model flags that branch as the exclusive gateway's default.
         let ir = "process \"router\" {\n  \
              start Start\n  \
              endEvent Hit\n  \
@@ -1728,8 +1728,8 @@ mod tests {
              startEvent Start\n  \
              Start -> Gate\n  \
              Gate -> Hit when \"= score >= 700\"\n  \
-             Gate -> Miss\n}";
-        // Sanity: without `default`, the Miss branch is a plain flow.
+             Gate -> Miss when \"= score < 700\"\n}";
+        // Sanity: with a guard rather than `default`, the Miss branch is a plain conditional flow.
         let before = write_model_ir(ir, None, None, None).expect("write baseline");
         let before_model = before["model"].as_str().unwrap();
         let before_def = parse_bpmn(before_model).expect("parse baseline");
@@ -1740,8 +1740,8 @@ mod tests {
                 .any(|f| f.is_default),
             "baseline has no default flow"
         );
-        // Now the edit an LLM would make: append ` default` to the Miss branch.
-        let edited = ir.replace("Gate -> Miss\n", "Gate -> Miss default\n");
+        // Now the edit an LLM would make: switch the Miss branch's guard to ` default`.
+        let edited = ir.replace("Gate -> Miss when \"= score < 700\"\n", "Gate -> Miss default\n");
         let after = write_model_ir(&edited, None, None, None).expect("write with default");
         let after_model = after["model"].as_str().unwrap();
         let after_def = parse_bpmn(after_model).expect("parse edited");
@@ -1924,7 +1924,7 @@ mod tests {
     <bpmn:endEvent id="Miss"><bpmn:incoming>f_miss</bpmn:incoming></bpmn:endEvent>
     <bpmn:sequenceFlow id="f_sg" sourceRef="Start" targetRef="Gate" />
     <bpmn:sequenceFlow id="f_hit" sourceRef="Gate" targetRef="Hit"><bpmn:conditionExpression>= score &gt;= 700</bpmn:conditionExpression></bpmn:sequenceFlow>
-    <bpmn:sequenceFlow id="f_miss" sourceRef="Gate" targetRef="Miss" />
+    <bpmn:sequenceFlow id="f_miss" sourceRef="Gate" targetRef="Miss"><bpmn:conditionExpression>= score &lt; 700</bpmn:conditionExpression></bpmn:sequenceFlow>
   </bpmn:process>
   <bpmndi:BPMNDiagram id="Diag">
     <bpmndi:BPMNPlane id="Plane" bpmnElement="router">
@@ -1941,14 +1941,15 @@ mod tests {
 
     #[test]
     fn write_model_ir_preserves_hand_layout_on_an_unchanged_topology_edit() {
-        // ADR 0001 Phase 5: an attribute-only edit (add a gateway default flow) must NOT re-lay the
-        // customer's diagram. Read -> edit the IR -> write with the original as the DI source, and
-        // confirm the exact hand-laid bounds AND the original flow ids survive verbatim.
+        // ADR 0001 Phase 5: an attribute-only edit (switch the gateway's fallback to a default flow)
+        // must NOT re-lay the customer's diagram. Read -> edit the IR -> write with the original as
+        // the DI source, and confirm the exact hand-laid bounds AND the original flow ids survive
+        // verbatim.
         let ir = read_model_ir(HAND_LAID_BPMN, None).expect("read ir")["ir"]
             .as_str()
             .expect("ir string")
             .to_string();
-        let edited = ir.replace("Gate -> Miss\n", "Gate -> Miss default\n");
+        let edited = ir.replace("Gate -> Miss when \"= score < 700\"\n", "Gate -> Miss default\n");
         assert_ne!(edited, ir, "the edit must actually change the IR");
         let v = write_model_ir(&edited, None, None, Some(HAND_LAID_BPMN)).expect("write");
         let model = v["model"].as_str().expect("model xml");
@@ -1999,9 +2000,13 @@ mod tests {
             .as_str()
             .expect("ir string")
             .to_string();
-        // Reroute Miss through a new task, adding a node + flow.
+        // Reroute Miss through a new task, adding a node + flow. The new gateway fallback (to the
+        // task) becomes the default so the diverging gateway stays valid.
         let edited = ir
-            .replace("Gate -> Miss\n", "Gate -> Extra\n  Extra -> Miss\n")
+            .replace(
+                "Gate -> Miss when \"= score < 700\"\n",
+                "Gate -> Extra default\n  Extra -> Miss\n",
+            )
             .replace(
                 "exclusiveGateway Gate\n",
                 "exclusiveGateway Gate\n  serviceTask Extra {\n    jobType \"extra\"\n  }\n",
