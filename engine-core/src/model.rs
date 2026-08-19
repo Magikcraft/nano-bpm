@@ -723,7 +723,10 @@ pub enum ElementKind {
 
 impl ElementKind {
     /// Whether this is a start-event kind (none, message or timer start). A
-    /// process has exactly one such element — its [`ProcessDefinition::start_event`].
+    /// process has exactly one process-entry start ([`ProcessDefinition::start_event`],
+    /// where a CreateInstance begins) but may declare several process-level starts
+    /// — a none start alongside any number of message/timer starts, each wired to
+    /// its own deploy-time trigger (#855).
     pub fn is_start_event(&self) -> bool {
         matches!(
             self,
@@ -2166,11 +2169,13 @@ impl ProcessBuilder {
         // Zeebe permits a process to declare more than one start event — a none
         // start alongside any number of *typed* (message/timer/signal) starts —
         // and forbids only *multiple none* starts (rejected by the post-parse
-        // `start_events` validator, #855). The engine begins a CreateInstance at a
-        // single process-entry start, so designate one deterministically: prefer
-        // the none start, else fall back to a typed start, tie-broken by id.
+        // `start_events` validator, #855). Every message and timer start is wired
+        // to its own deploy-time trigger by `crate::engine::Engine::deploy`; this
+        // designation picks only the single process-entry start a CreateInstance
+        // begins at, so choose one deterministically: prefer the none start, else
+        // fall back to a typed start, tie-broken by id.
         //
-        // Only message and timer starts survive here as distinct typed kinds
+        // Message and timer starts survive here as distinct typed kinds
         // (`ElementKind::is_start_event`). A signal start carries no dedicated
         // element kind: a surviving signal start is modelled as a plain
         // `ElementKind::StartEvent`, so the `find(StartEvent)` preference below

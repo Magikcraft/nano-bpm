@@ -15,18 +15,22 @@
 //!   start). It keeps returning `NoStartEvent` when a process declares none, so
 //!   the "at least one start event" rule is enforced there (a zero-start process
 //!   never builds and thus never reaches this validator).
-//! * The streaming parser demotes surplus *typed* process-level starts to inert
-//!   throw events but deliberately keeps *every none* start, so a model with two
-//!   none starts reaches this validator with both present.
+//! * The streaming parser keeps *every* none, message and timer process-level
+//!   start (message and timer starts are each wired to their own deploy-time
+//!   trigger by `crate::engine`), and demotes only surplus *signal* starts to
+//!   inert throw events — nano has no dedicated signal-start element kind, so a
+//!   surviving signal start would be indistinguishable from a none start here. A
+//!   model with two none starts therefore reaches this validator with both
+//!   present.
 //! * This validator rejects a definition that still carries more than one none
 //!   start with
 //!   [`ParseError::InvalidStartEvents`](crate::bpmn::ParseError::InvalidStartEvents).
 //!
 //! A none start is an untyped process-level `ElementKind::StartEvent`; message
-//! and timer starts are their own element kinds, and a signal start is demoted
-//! (surviving only as the sole entry when there is no none start). So a
-//! definition whose process-level `StartEvent`-kind count exceeds one genuinely
-//! declares multiple none starts.
+//! and timer starts are their own element kinds, and a surplus signal start is
+//! demoted (a lone signal start survives as the sole entry `StartEvent` when
+//! there is no none start). So a definition whose process-level `StartEvent`-kind
+//! count exceeds one genuinely declares multiple none starts.
 
 use super::ValidationInput;
 use crate::bpmn::ParseError;

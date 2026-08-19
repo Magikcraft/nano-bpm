@@ -5511,6 +5511,167 @@ fn should_recover_an_armed_start_timer_via_replay() {
     assert!(recovered.is_completed(instance_key));
 }
 
+// ---- multi-start processes (Zeebe parity, #855) ----
+//
+// Zeebe permits a process to declare several start events — a none start
+// alongside any number of message/timer starts — and every one is *live*: the
+// none start accepts CreateInstance, and each typed start opens its own
+// deploy-time trigger (subscription / armed timer) that fires an independent
+// instance at its own start element.
+
+/// none-start "a_none" -> a_end ; message-start "b_msg"(order-placed) -> b_end
+fn process_none_plus_message() -> ProcessDefinition {
+    ProcessBuilder::new("dual-start")
+        .start_event("a_none")
+        .message_start_event("b_msg", "order-placed")
+        .end_event("a_end")
+        .end_event("b_end")
+        .connect("a_none", "a_end")
+        .connect("b_msg", "b_end")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn none_plus_message_start_both_function() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_none_plus_message()))
+        .unwrap();
+
+    // Deploy wires the message start's subscription (the none start opens none),
+    // and creates no instance yet.
+    assert_eq!(engine.state().message_start_subscriptions.len(), 1);
+    let sub = &engine.state().message_start_subscriptions["order-placed"];
+    assert_eq!(sub.process_id, "dual-start");
+    assert_eq!(sub.start_element_id, "b_msg");
+    assert!(engine.state().instances.is_empty());
+
+    // The none start accepts a CreateInstance and runs to completion.
+    let created = engine
+        .apply_command(Command::create_instance("dual-start"))
+        .unwrap();
+    let none_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(engine.is_completed(none_key));
+
+    // The message start ALSO functions: a matching message creates a distinct
+    // instance (seeded with the message variables) that runs to completion.
+    let fired = engine.correlate_message("order-placed", "", vars(&[("amount", Value::Int(9))]), 0);
+    let (msg_key, seeded) = fired
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                variables,
+                ..
+            } => Some((*instance_key, variables.get("amount").cloned())),
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(msg_key, none_key);
+    assert_eq!(seeded, Some(Value::Int(9)));
+    assert!(engine.is_completed(msg_key));
+    assert_eq!(engine.state().instances.len(), 2);
+}
+
+/// none-start "a_none" -> a_end ; timer-start "b_timer"(once PT10S) -> b_end
+fn process_none_plus_timer() -> ProcessDefinition {
+    ProcessBuilder::new("dual-timer")
+        .start_event("a_none")
+        .timer_start_event_once("b_timer", 10_000)
+        .end_event("a_end")
+        .end_event("b_end")
+        .connect("a_none", "a_end")
+        .connect("b_timer", "b_end")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn none_plus_timer_start_both_function() {
+    let mut engine = Engine::new();
+    // Deploy at t=1000: the timer start is armed for 11000.
+    engine
+        .apply_command_at(Command::DeployProcess(process_none_plus_timer()), 1_000)
+        .unwrap();
+    assert_eq!(engine.state().start_timers.len(), 1);
+    let timer = engine.state().start_timers.values().next().unwrap();
+    assert_eq!(timer.start_element_id, "b_timer");
+    assert_eq!(timer.due_at, Some(11_000));
+    assert!(engine.state().instances.is_empty());
+
+    // The none start accepts a CreateInstance.
+    let created = engine
+        .apply_command_at(Command::create_instance("dual-timer"), 2_000)
+        .unwrap();
+    let none_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(engine.is_completed(none_key));
+
+    // The timer start ALSO fires when due, creating a distinct instance.
+    let fired = engine.trigger_timers(11_000);
+    let timer_key = fired.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_ne!(timer_key, none_key);
+    assert!(engine.is_completed(timer_key));
+    assert_eq!(engine.state().instances.len(), 2);
+}
+
+#[test]
+fn two_message_starts_open_two_subscriptions() {
+    // Two message starts (distinct names) each open their own subscription and
+    // fire at their own start element — no none start required.
+    let def = ProcessBuilder::new("two-msg")
+        .message_start_event("s_a", "msg-a")
+        .message_start_event("s_b", "msg-b")
+        .end_event("e_a")
+        .end_event("e_b")
+        .connect("s_a", "e_a")
+        .connect("s_b", "e_b")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    assert_eq!(engine.state().message_start_subscriptions.len(), 2);
+    assert_eq!(
+        engine.state().message_start_subscriptions["msg-a"].start_element_id,
+        "s_a"
+    );
+    assert_eq!(
+        engine.state().message_start_subscriptions["msg-b"].start_element_id,
+        "s_b"
+    );
+
+    // Each name fires its own start; a non-matching name fires nothing.
+    engine.correlate_message("msg-a", "", HashMap::new(), 0);
+    engine.correlate_message("msg-b", "", HashMap::new(), 0);
+    assert_eq!(engine.state().instances.len(), 2);
+}
+
+#[test]
+fn message_and_timer_starts_wire_both_triggers() {
+    // A message start and a timer start (no none start) each get wired at deploy.
+    let def = ProcessBuilder::new("msg-and-timer")
+        .message_start_event("m", "kick")
+        .timer_start_event_once("t", 5_000)
+        .end_event("me")
+        .end_event("te")
+        .connect("m", "me")
+        .connect("t", "te")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(def), 1_000)
+        .unwrap();
+
+    assert_eq!(engine.state().message_start_subscriptions.len(), 1);
+    assert_eq!(engine.state().start_timers.len(), 1);
+
+    engine.correlate_message("kick", "", HashMap::new(), 2_000);
+    engine.trigger_timers(6_000);
+    assert_eq!(engine.state().instances.len(), 2);
+}
+
 #[test]
 fn evicts_only_completed_instances_and_what_they_own() {
     let mut engine = Engine::new();
