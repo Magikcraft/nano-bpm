@@ -198,8 +198,9 @@ fn parse_directive(name: &str, xml: &str) -> Expectation {
     let verdict = after_verdict
         .split(|c: char| c.is_whitespace() || c == '|' || c == '-')
         .find(|t| !t.is_empty())
-        .unwrap_or("");
-    match verdict {
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match verdict.as_str() {
         "accept" => Expectation::Accept,
         "reject" => {
             let category = comment
@@ -442,7 +443,7 @@ fn assert_family_enum_exhaustive(f: ElementFamily) {
         | ElementFamily::SubProcess
         | ElementFamily::CallActivity => {}
     }
-    debug_assert!(ElementFamily::ALL.contains(&f));
+    assert!(ElementFamily::ALL.contains(&f));
 }
 
 /// Maps every modelled [`ElementKind`] to a coarse [`ElementFamily`]. The match
