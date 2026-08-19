@@ -753,6 +753,43 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
     },
+    /// An activity carrying a [`CompensationBoundaryEvent`] completed
+    /// successfully and became *compensable*: a later
+    /// [`CompensationThrowEvent`] can run its `handler` to compensate it.
+    /// Records the completed activity's element instance, its compensation
+    /// `handler` activity id, and the scope it completed in.
+    ///
+    /// [`CompensationBoundaryEvent`]: crate::model::ElementKind::CompensationBoundaryEvent
+    /// [`CompensationThrowEvent`]: crate::model::ElementKind::CompensationThrowEvent
+    CompensationSubscriptionCreated {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        handler: ElementId,
+        scope: Key,
+    },
+    /// A compensation throw event fired: it consumed the compensable
+    /// subscriptions in its `scope` and triggered their handlers. `handlers`
+    /// lists the handler activity ids activated and `consumed` the compensable
+    /// element-instance keys removed. The throw's token
+    /// (`throw_element_instance_key`) rests until every triggered handler
+    /// completes.
+    CompensationTriggered {
+        instance_key: Key,
+        throw_element_instance_key: Key,
+        throw_element_id: ElementId,
+        scope: Key,
+        handlers: Vec<ElementId>,
+        consumed: Vec<Key>,
+    },
+    /// One compensation handler triggered by a compensation throw event
+    /// completed. Removes the handler from the throw's outstanding set; when it
+    /// empties the throw event completes and routes onward.
+    CompensationHandlerCompleted {
+        instance_key: Key,
+        throw_element_instance_key: Key,
+        handler_element_id: ElementId,
+    },
     /// A multi-instance body activated: its `input_collection` was evaluated to
     /// `items` and one child of `element_id` will run per item (all at once when
     /// `sequential` is `false`, one after another when `true`). Carries the
@@ -999,6 +1036,9 @@ impl Event {
             | Event::ConditionalSubscriptionCreated { instance_key, .. }
             | Event::ConditionalTriggered { instance_key, .. }
             | Event::ConditionalSubscriptionCanceled { instance_key, .. }
+            | Event::CompensationSubscriptionCreated { instance_key, .. }
+            | Event::CompensationTriggered { instance_key, .. }
+            | Event::CompensationHandlerCompleted { instance_key, .. }
             | Event::MultiInstanceActivated { instance_key, .. }
             | Event::MultiInstanceChildActivated { instance_key, .. }
             | Event::MultiInstanceChildCompleted { instance_key, .. }
@@ -1196,6 +1236,26 @@ impl Event {
                 element_instance_key,
                 ..
             } => m = m.max(*subscription_key).max(*element_instance_key),
+            Event::CompensationSubscriptionCreated {
+                element_instance_key,
+                scope,
+                ..
+            } => m = m.max(*element_instance_key).max(*scope),
+            Event::CompensationTriggered {
+                throw_element_instance_key,
+                scope,
+                consumed,
+                ..
+            } => {
+                m = m.max(*throw_element_instance_key).max(*scope);
+                for key in consumed {
+                    m = m.max(*key);
+                }
+            }
+            Event::CompensationHandlerCompleted {
+                throw_element_instance_key,
+                ..
+            } => m = m.max(*throw_element_instance_key),
             Event::MultiInstanceActivated { body_key, .. }
             | Event::MultiInstanceCompleted { body_key, .. } => m = m.max(*body_key),
             Event::MultiInstanceChildActivated {

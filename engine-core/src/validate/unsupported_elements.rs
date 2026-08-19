@@ -149,18 +149,6 @@ mod tests {
                 "cancelEventDefinition",
                 "ce",
             ),
-            (
-                r#"<bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
-                   <bpmn:intermediateThrowEvent id="cmp"><bpmn:incoming>f1</bpmn:incoming>
-                     <bpmn:outgoing>f2</bpmn:outgoing>
-                     <bpmn:compensateEventDefinition />
-                   </bpmn:intermediateThrowEvent>
-                   <bpmn:endEvent id="e"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
-                   <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="cmp" />
-                   <bpmn:sequenceFlow id="f2" sourceRef="cmp" targetRef="e" />"#,
-                "compensateEventDefinition",
-                "cmp",
-            ),
         ];
 
         for (fragment, want_tag, want_id) in cases {

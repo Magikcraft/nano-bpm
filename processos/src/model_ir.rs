@@ -165,6 +165,8 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
             "conditionalIntermediateCatchEvent"
         }
         ElementKind::ConditionalBoundaryEvent { .. } => "conditionalBoundaryEvent",
+        ElementKind::CompensationBoundaryEvent { .. } => "compensationBoundaryEvent",
+        ElementKind::CompensationThrowEvent => "compensationThrowEvent",
     }
 }
 
@@ -178,6 +180,7 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         | ElementKind::ParallelGateway
         | ElementKind::EventBasedGateway
         | ElementKind::IntermediateThrowEvent
+        | ElementKind::CompensationThrowEvent
         | ElementKind::Task => {}
         ElementKind::ServiceTask {
             job_type,
@@ -316,6 +319,13 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
             attrs.push(format!("attachedTo {attached_to}"));
             attrs.push(format!("condition {}", quote(condition)));
             attrs.push(format!("interrupting {interrupting}"));
+        }
+        ElementKind::CompensationBoundaryEvent {
+            attached_to,
+            handler,
+        } => {
+            attrs.push(format!("attachedTo {attached_to}"));
+            attrs.push(format!("handler {handler}"));
         }
     }
 }
@@ -1184,6 +1194,11 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
             condition: attrs.require("condition", id)?,
             interrupting: attrs.bool_or("interrupting", true)?,
         },
+        "compensationBoundaryEvent" => ElementKind::CompensationBoundaryEvent {
+            attached_to: attrs.require("attachedTo", id)?,
+            handler: attrs.require("handler", id)?,
+        },
+        "compensationThrowEvent" => ElementKind::CompensationThrowEvent,
         other => return Err(format!("unknown element kind '{other}'")),
     };
     Ok(kind)
@@ -1197,7 +1212,8 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::TimerBoundaryEvent { attached_to, .. }
         | ElementKind::MessageBoundaryEvent { attached_to, .. }
         | ElementKind::SignalBoundaryEvent { attached_to, .. }
-        | ElementKind::ConditionalBoundaryEvent { attached_to, .. } => Some(attached_to),
+        | ElementKind::ConditionalBoundaryEvent { attached_to, .. }
+        | ElementKind::CompensationBoundaryEvent { attached_to, .. } => Some(attached_to),
         ElementKind::StartEvent
         | ElementKind::EndEvent
         | ElementKind::ServiceTask { .. }
@@ -1212,6 +1228,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::TimerStartEvent { .. }
         | ElementKind::SubProcess { .. }
         | ElementKind::IntermediateThrowEvent
+        | ElementKind::CompensationThrowEvent
         | ElementKind::Task
         | ElementKind::ScriptTask { .. }
         | ElementKind::CallActivity { .. }

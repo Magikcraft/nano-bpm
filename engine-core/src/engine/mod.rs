@@ -4483,6 +4483,43 @@ impl Engine {
                 events.extend(spawn_events);
                 followups.extend(spawn_followups);
             }
+            // A compensation throw event triggers compensation of the completed
+            // compensable activities in its scope, running each one's handler,
+            // and rests until they finish. With nothing to compensate it is a
+            // pass-through.
+            Some(ElementKind::CompensationThrowEvent) => {
+                let targets = self.compensable_in_scope(instance_key, scope);
+                if targets.is_empty() {
+                    followups.push(Step::Complete {
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                    });
+                } else {
+                    // Compensate newest-first (reverse completion order).
+                    let mut handlers = Vec::new();
+                    let mut consumed = Vec::new();
+                    for target in targets.iter().rev() {
+                        handlers.push(target.handler.clone());
+                        consumed.push(target.element_instance_key);
+                    }
+                    events.push(Event::CompensationTriggered {
+                        instance_key,
+                        throw_element_instance_key: element_instance_key,
+                        throw_element_id: element_id.clone(),
+                        scope,
+                        handlers: handlers.clone(),
+                        consumed,
+                    });
+                    for handler in handlers {
+                        followups.push(Step::Activate {
+                            instance_key,
+                            element_id: handler,
+                            scope,
+                        });
+                    }
+                }
+            }
             // An inline-FEEL script task is a synchronous activity: it activates
             // and immediately completes (no job). Its FEEL expression is
             // evaluated at completion (see `complete`), where a failure raises
@@ -6688,6 +6725,27 @@ impl Engine {
             return (events, Vec::new());
         }
 
+        // Compensation routing (inline, listener-free path). A completing
+        // compensation handler routes back to the throw event waiting on it (its
+        // `ElementCompleted` was emitted inline above); a completing compensable
+        // activity records a compensation subscription before its outgoing flow.
+        if let Some(throw_eik) = self.pending_compensation_handler(instance_key, &element_id, scope)
+        {
+            let (resume_events, resume_followups) =
+                self.resume_compensation_throw(instance_key, &element_id, throw_eik);
+            events.extend(resume_events);
+            return (events, resume_followups);
+        }
+        for handler in self.compensation_handlers_for(instance_key, &element_id) {
+            events.push(Event::CompensationSubscriptionCreated {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+                handler,
+                scope,
+            });
+        }
+
         let mut followups = Vec::new();
         for flow in self.outgoing(instance_key, &element_id) {
             events.push(Event::SequenceFlowTaken {
@@ -6810,12 +6868,35 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
+        // A compensation handler completing routes back to the compensation
+        // throw event waiting on it, not along (non-existent) outgoing flows.
+        if let Some(throw_eik) = self.pending_compensation_handler(instance_key, &element_id, scope)
+        {
+            return self.finalize_compensation_handler(
+                instance_key,
+                element_instance_key,
+                element_id,
+                throw_eik,
+            );
+        }
         let mut events = vec![Event::ElementCompleted {
             instance_key,
             element_instance_key,
             element_id: element_id.clone(),
         }];
         let mut followups = Vec::new();
+        // A completing activity that carries a compensation boundary event
+        // becomes compensable: record it so a later compensation throw event in
+        // the same scope can run its handler.
+        for handler in self.compensation_handlers_for(instance_key, &element_id) {
+            events.push(Event::CompensationSubscriptionCreated {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+                handler,
+                scope,
+            });
+        }
         for flow in self.outgoing(instance_key, &element_id) {
             events.push(Event::SequenceFlowTaken {
                 instance_key,
@@ -6827,6 +6908,81 @@ impl Engine {
                 element_id: flow.to,
                 scope,
             });
+        }
+        (events, followups)
+    }
+
+    /// Completes a compensation handler and, once its compensation throw event
+    /// has no outstanding handlers left, completes that throw event and routes
+    /// its token onward (an `intermediateThrowEvent`) or drains it (an
+    /// `endEvent`). The handler carries no outgoing flow of its own.
+    fn finalize_compensation_handler(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        throw_eik: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let mut events = vec![Event::ElementCompleted {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+        }];
+        let (resume_events, followups) =
+            self.resume_compensation_throw(instance_key, &element_id, throw_eik);
+        events.extend(resume_events);
+        (events, followups)
+    }
+
+    /// Records that a compensation handler (already emitted its own
+    /// `ElementCompleted` by the caller) finished, and — when it was the throw
+    /// event's last outstanding handler — completes the compensation throw event
+    /// and routes its token onward. Shared by the inline ([`complete`]) and
+    /// deferred ([`finalize_compensation_handler`]) completion paths.
+    fn resume_compensation_throw(
+        &self,
+        instance_key: Key,
+        handler_element_id: &str,
+        throw_eik: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let wait = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.compensation_waits.get(&throw_eik));
+        let (throw_element_id, throw_scope, last_handler) = match wait {
+            Some(wait) => (
+                wait.throw_element_id.clone(),
+                wait.scope,
+                wait.pending_handlers.len() == 1,
+            ),
+            None => return (Vec::new(), Vec::new()),
+        };
+        let mut events = vec![Event::CompensationHandlerCompleted {
+            instance_key,
+            throw_element_instance_key: throw_eik,
+            handler_element_id: handler_element_id.to_string(),
+        }];
+        let mut followups = Vec::new();
+        if last_handler {
+            // The compensation throw event completes and routes onward.
+            events.push(Event::ElementCompleted {
+                instance_key,
+                element_instance_key: throw_eik,
+                element_id: throw_element_id.clone(),
+            });
+            for flow in self.outgoing(instance_key, &throw_element_id) {
+                events.push(Event::SequenceFlowTaken {
+                    instance_key,
+                    from: throw_element_id.clone(),
+                    to: flow.to.clone(),
+                });
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: flow.to,
+                    scope: throw_scope,
+                });
+            }
         }
         (events, followups)
     }

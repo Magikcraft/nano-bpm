@@ -916,7 +916,9 @@ fn node_shape(el: &Element) -> NodeShape {
         | TimerBoundaryEvent { .. }
         | MessageBoundaryEvent { .. }
         | SignalBoundaryEvent { .. }
-        | ConditionalBoundaryEvent { .. } => NodeShape::Circle,
+        | ConditionalBoundaryEvent { .. }
+        | CompensationBoundaryEvent { .. }
+        | CompensationThrowEvent => NodeShape::Circle,
         _ => NodeShape::Rect,
     }
 }

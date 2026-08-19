@@ -26,9 +26,17 @@
 //!   `errorRef`, resolved against definitions-level `error` elements
 //!   (`<error id="…" errorCode="…">`) into an error boundary event; or a nested
 //!   `timerEventDefinition` (timer boundary); or a nested `messageEventDefinition`
-//!   (message boundary). `cancelActivity="false"` makes a timer or message
+//!   (message boundary); or a nested `compensateEventDefinition` (compensation
+//!   boundary — see below). `cancelActivity="false"` makes a timer or message
 //!   boundary **non-interrupting** (the activity keeps running and a parallel
 //!   token is spawned on each fire); the default is interrupting.
+//! * Compensation: a `boundaryEvent` with a `compensateEventDefinition`, wired
+//!   via a `<association sourceRef targetRef>` to an `isForCompensation` handler
+//!   activity, marks its attached activity compensable. A
+//!   `compensateEventDefinition` on an `intermediateThrowEvent`/`endEvent`
+//!   triggers compensation: the completed compensable activities in scope have
+//!   their handlers run (reverse completion order), and the throw event rests
+//!   until they finish before routing onward (single-activity path).
 //! * Definitions-level `message` elements (`<message id="…" name="…">`) with a
 //!   nested `zeebe:subscription correlationKey="=var"`, referenced by message
 //!   catch/boundary events via `messageRef`.
@@ -106,7 +114,7 @@ pub enum ParseError {
     },
     /// An unmodelled flow-element tag or event definition that Nano's parser
     /// does not recognise (e.g. `complexGateway`, `transaction`,
-    /// `compensateEventDefinition`). Zeebe only transforms known element types
+    /// `cancelEventDefinition`). Zeebe only transforms known element types
     /// and rejects the rest at deploy; Nano surfaces the offending `tag` and
     /// `element_id` rather than silently dropping it. Raised by the
     /// `unsupported_elements` validator (#853).
@@ -748,6 +756,7 @@ fn parse_with_captures(
                                             != Some("false"),
                                         signal_ref: None,
                                         condition: None,
+                                        compensation: false,
                                     });
                                 }
                             }
@@ -789,6 +798,34 @@ fn parse_with_captures(
                             // link throw or catch event. Recorded by direction so
                             // #851 can verify each throw link has a matching catch
                             // (Zeebe `ModelUtil.verifyLinkIntermediateEvents`).
+                            // `compensateEventDefinition` on a boundary event
+                            // (a compensation boundary marking its activity
+                            // compensable) or on an intermediate throw / end
+                            // event (a compensation throw). Modelled for
+                            // execution; the boundary's handler is resolved from
+                            // the `<association>` wiring at build.
+                            "compensateEventDefinition" => {
+                                if let Some(boundary) = cur_boundary.as_mut() {
+                                    boundary.compensation = true;
+                                } else if let Some(idx) =
+                                    flow_node_stack.iter().rev().find_map(|e| *e)
+                                {
+                                    acc.nodes[idx].is_compensation_throw = true;
+                                }
+                            }
+                            // `<association sourceRef=… targetRef=…>` — wires a
+                            // compensation boundary event to its
+                            // `isForCompensation` handler activity. Recorded so
+                            // the boundary's handler resolves at build; ignored
+                            // for any other association.
+                            "association" => {
+                                if let (Some(source), Some(target)) =
+                                    (attr(attrs, "sourceRef"), attr(attrs, "targetRef"))
+                                {
+                                    acc.associations
+                                        .push((source.to_string(), target.to_string()));
+                                }
+                            }
                             "linkEventDefinition" => {
                                 let link_name = attr(attrs, "name").unwrap_or("").to_string();
                                 if let Some(idx) = cur_throw {
@@ -1323,7 +1360,7 @@ fn parse_with_captures(
                                     // buffered in `cur_boundary` and never pushed
                                     // onto `flow_node_stack`, so an anonymous event
                                     // definition nested under one (e.g. an
-                                    // unsupported `<compensateEventDefinition>` on a
+                                    // unsupported `<cancelEventDefinition>` on a
                                     // `<boundaryEvent>`) must attribute to
                                     // `cur_boundary` before falling back to the open
                                     // flow-node stack — otherwise it would record a
@@ -1465,6 +1502,7 @@ fn parse_with_captures(
                             || boundary.message_ref.is_some()
                             || boundary.signal_ref.is_some()
                             || boundary.condition.is_some()
+                            || boundary.compensation
                         {
                             acc.boundaries.push(boundary);
                         }
@@ -1769,6 +1807,10 @@ struct NodeAcc {
     /// For a start event: the `zeebe:formDefinition formId` declared on it — the
     /// process's start form. `None` on other nodes and start events with no form.
     start_form_id: Option<String>,
+    /// True when this `intermediateThrowEvent`/`endEvent` carries a
+    /// `compensateEventDefinition`, making it a
+    /// [`CompensationThrowEvent`](crate::model::ElementKind::CompensationThrowEvent).
+    is_compensation_throw: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1819,6 +1861,12 @@ struct PendingBoundary {
     /// [`ConditionalBoundaryEvent`](crate::model::ElementKind::ConditionalBoundaryEvent).
     condition: Option<String>,
     interrupting: bool,
+    /// True when this boundary event carries a `compensateEventDefinition`,
+    /// making it a
+    /// [`CompensationBoundaryEvent`](crate::model::ElementKind::CompensationBoundaryEvent).
+    /// Its handler activity is resolved from the `<association>` wiring it to the
+    /// `isForCompensation` handler at build.
+    compensation: bool,
 }
 
 /// A definitions-level `<message>` declaration: its `name` and the instance
@@ -1872,6 +1920,9 @@ struct ProcessAcc {
     /// flow node, so the unsupported-elements error stays actionable. Consumed
     /// by the unsupported-elements validator (#853).
     unmodelled: Vec<(String, String)>,
+    /// `<association>` `(sourceRef, targetRef)` pairs, used to wire a
+    /// compensation boundary event to its `isForCompensation` handler activity.
+    associations: Vec<(String, String)>,
     /// Stack of open embedded sub-process ids, used to scope nested nodes.
     scope_stack: Vec<String>,
 }
@@ -1890,6 +1941,7 @@ impl ProcessAcc {
             link_throws: Vec::new(),
             link_catches: Vec::new(),
             unmodelled: Vec::new(),
+            associations: Vec::new(),
             scope_stack: Vec::new(),
         }
     }
@@ -1933,6 +1985,7 @@ impl ProcessAcc {
             task_headers: std::collections::BTreeMap::new(),
             linked_resources: Vec::new(),
             start_form_id: None,
+            is_compensation_throw: false,
         });
         let idx = self.nodes.len() - 1;
         Some(idx)
@@ -2564,8 +2617,20 @@ impl ProcessAcc {
                         builder.start_event(node.id)
                     }
                 }
-                NodeKind::End => builder.end_event(node.id),
-                NodeKind::IntermediateThrow => builder.intermediate_throw_event(node.id),
+                NodeKind::End => {
+                    if node.is_compensation_throw {
+                        builder.compensation_throw_event(node.id)
+                    } else {
+                        builder.end_event(node.id)
+                    }
+                }
+                NodeKind::IntermediateThrow => {
+                    if node.is_compensation_throw {
+                        builder.compensation_throw_event(node.id)
+                    } else {
+                        builder.intermediate_throw_event(node.id)
+                    }
+                }
                 NodeKind::Task => builder.task(node.id),
                 NodeKind::Exclusive => builder.exclusive_gateway(node.id),
                 NodeKind::Parallel => builder.parallel_gateway(node.id),
@@ -2693,6 +2758,7 @@ impl ProcessAcc {
                 builder = builder.with_name(name_id, name);
             }
         }
+        let associations = self.associations;
         for boundary in self.boundaries {
             let attached_to =
                 boundary
@@ -2701,6 +2767,30 @@ impl ProcessAcc {
                         process_id: self.id.clone(),
                         reason: format!("boundary event {} has no attachedToRef", boundary.id),
                     })?;
+            // A compensation boundary marks its activity compensable; its
+            // handler activity is the other end of the `<association>` wiring it.
+            if boundary.compensation {
+                let handler = associations
+                    .iter()
+                    .find_map(|(source, target)| {
+                        if source == &boundary.id {
+                            Some(target.clone())
+                        } else if target == &boundary.id {
+                            Some(source.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| ParseError::InvalidBoundaryEvent {
+                        process_id: self.id.clone(),
+                        reason: format!(
+                            "compensation boundary event {} has no associated handler activity (missing <association>)",
+                            boundary.id
+                        ),
+                    })?;
+                builder = builder.compensation_boundary_event(boundary.id, attached_to, handler);
+                continue;
+            }
             // Resolve the boundary's flavour: conditional (condition), timer
             // (duration), message (messageRef), signal (signalRef), or error
             // (errorRef -> declared error).
@@ -2929,6 +3019,7 @@ fn parse_correlation_key(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::model::Condition;
+    use crate::model::ElementId;
     use crate::model::ElementKind;
 
     const ORDER_BPMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -3109,18 +3200,18 @@ mod tests {
         // `cur_boundary` and are *never* pushed onto `flow_node_stack`, so a
         // fallback that consulted only the stack would misattribute the element —
         // making the future `UnsupportedElement { element_id }` report point at
-        // the wrong (or no) element. `<compensateEventDefinition>` is an
-        // unmodelled event def (Nano models none/error/timer/message/signal
-        // boundaries, not compensation), and it carries no `id`. We inspect the
-        // raw capture directly (the consuming #853 validator is still a stub),
-        // which is exactly the data that validator will see.
+        // the wrong (or no) element. `<cancelEventDefinition>` is an
+        // unmodelled event def (Nano models none/error/timer/message/signal/
+        // compensation boundaries, not cancel), and it carries no `id`. We
+        // inspect the raw capture directly (the consuming #853 validator is
+        // still a stub), which is exactly the data that validator will see.
         let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
             <bpmn:process id="boundary-attr" isExecutable="true">
               <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
               <bpmn:serviceTask id="Task"><bpmn:incoming>f1</bpmn:incoming></bpmn:serviceTask>
               <bpmn:boundaryEvent id="Boundary" attachedToRef="Task">
-                <bpmn:compensateEventDefinition />
+                <bpmn:cancelEventDefinition />
               </bpmn:boundaryEvent>
               <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Task" />
             </bpmn:process>
@@ -3130,13 +3221,66 @@ mod tests {
         let compensate = capture
             .unmodelled
             .iter()
-            .find(|u| u.tag == "compensateEventDefinition")
-            .expect("the anonymous compensateEventDefinition must be captured as unmodelled");
+            .find(|u| u.tag == "cancelEventDefinition")
+            .expect("the anonymous cancelEventDefinition must be captured as unmodelled");
         assert_eq!(
             compensate.element_id, "Boundary",
             "an anonymous unmodelled event def under a boundary event must attribute \
              to the boundary event, not a containing flow node or an empty id"
         );
+    }
+
+    #[test]
+    fn should_parse_compensation_throw_and_boundary_with_its_handler() {
+        // A `compensateEventDefinition` on an intermediateThrowEvent becomes a
+        // CompensationThrowEvent; on a boundary event it becomes a
+        // CompensationBoundaryEvent whose handler is resolved from the
+        // `<association>` wiring the boundary to the `isForCompensation` activity.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="comp" isExecutable="true">
+              <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+              <bpmn:serviceTask id="Book"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:serviceTask>
+              <bpmn:boundaryEvent id="BookComp" attachedToRef="Book">
+                <bpmn:compensateEventDefinition />
+              </bpmn:boundaryEvent>
+              <bpmn:serviceTask id="CancelBook" isForCompensation="true" />
+              <bpmn:association id="a1" sourceRef="BookComp" targetRef="CancelBook" />
+              <bpmn:intermediateThrowEvent id="Throw"><bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing>
+                <bpmn:compensateEventDefinition />
+              </bpmn:intermediateThrowEvent>
+              <bpmn:endEvent id="End"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+              <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Book" />
+              <bpmn:sequenceFlow id="f2" sourceRef="Book" targetRef="Throw" />
+              <bpmn:sequenceFlow id="f3" sourceRef="Throw" targetRef="End" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let defs = parse_bpmn(xml).unwrap();
+        let def = &defs[0];
+        let throw = def
+            .elements
+            .get(&ElementId::from("Throw"))
+            .expect("throw element");
+        assert!(
+            matches!(throw.kind, ElementKind::CompensationThrowEvent),
+            "compensateEventDefinition on a throw event must be a CompensationThrowEvent, got {:?}",
+            throw.kind
+        );
+        let boundary = def
+            .elements
+            .get(&ElementId::from("BookComp"))
+            .expect("boundary element");
+        match &boundary.kind {
+            ElementKind::CompensationBoundaryEvent {
+                attached_to,
+                handler,
+            } => {
+                assert_eq!(attached_to.as_str(), "Book");
+                assert_eq!(handler.as_str(), "CancelBook");
+            }
+            other => panic!("expected CompensationBoundaryEvent, got {other:?}"),
+        }
     }
 
     #[test]

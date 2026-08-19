@@ -725,6 +725,35 @@ pub enum ElementKind {
         #[cfg_attr(feature = "serde", serde(default = "default_true"))]
         interrupting: bool,
     },
+    /// A compensation boundary event attached to an activity. Unlike the other
+    /// boundary events it is **not** armed and never fires reactively during the
+    /// activity's execution: it is a structural marker recording that, once
+    /// `attached_to` completes successfully, the activity becomes *compensable*
+    /// and its compensation is performed by running the `handler` activity (a
+    /// task flagged `isForCompensation="true"`, wired to this boundary event via
+    /// a BPMN `<association>`). Compensation is triggered later by a
+    /// [`CompensationThrowEvent`](ElementKind::CompensationThrowEvent). It has no
+    /// incoming or outgoing sequence flow.
+    CompensationBoundaryEvent {
+        /// Id of the activity this boundary event is attached to.
+        attached_to: ElementId,
+        /// Id of the compensation handler activity run to compensate
+        /// `attached_to` (resolved from the `<association>` linking this boundary
+        /// event to the `isForCompensation` handler).
+        handler: ElementId,
+    },
+    /// A compensation throw event: a `compensateEventDefinition` on an
+    /// `intermediateThrowEvent` or an `endEvent`. On activation it triggers
+    /// compensation of the already-completed compensable activities in its scope
+    /// (those carrying a [`CompensationBoundaryEvent`](ElementKind::CompensationBoundaryEvent)),
+    /// running each one's compensation handler, in reverse order of completion.
+    /// The throw's token rests until every triggered handler completes, then it
+    /// completes and routes along its outgoing flow(s) (an `intermediateThrowEvent`)
+    /// or drains (an `endEvent`). With no compensable activity in scope it is an
+    /// immediate pass-through. (Single-activity path first: broader semantics —
+    /// compensating a whole sub-process, `cancelRemainingInstances`, strictly
+    /// ordered nested multi-activity compensation — are follow-ups.)
+    CompensationThrowEvent,
 }
 
 impl ElementKind {
@@ -770,6 +799,8 @@ impl ElementKind {
             | ElementKind::MessageBoundaryEvent { .. }
             | ElementKind::SignalBoundaryEvent { .. }
             | ElementKind::ConditionalBoundaryEvent { .. }
+            | ElementKind::CompensationBoundaryEvent { .. }
+            | ElementKind::CompensationThrowEvent
             | ElementKind::ExclusiveGateway
             | ElementKind::ParallelGateway
             | ElementKind::EventBasedGateway => false,
@@ -789,6 +820,7 @@ impl ElementKind {
             | ElementKind::TimerStartEvent { .. } => "START_EVENT",
             ElementKind::EndEvent => "END_EVENT",
             ElementKind::IntermediateThrowEvent => "INTERMEDIATE_THROW_EVENT",
+            ElementKind::CompensationThrowEvent => "INTERMEDIATE_THROW_EVENT",
             ElementKind::Task => "TASK",
             ElementKind::TimerIntermediateCatchEvent { .. }
             | ElementKind::MessageIntermediateCatchEvent { .. }
@@ -799,6 +831,7 @@ impl ElementKind {
             | ElementKind::MessageBoundaryEvent { .. }
             | ElementKind::SignalBoundaryEvent { .. }
             | ElementKind::ConditionalBoundaryEvent { .. } => "BOUNDARY_EVENT",
+            ElementKind::CompensationBoundaryEvent { .. } => "BOUNDARY_EVENT",
             ElementKind::ServiceTask { .. } => "SERVICE_TASK",
             ElementKind::BusinessRuleTask { .. } => "BUSINESS_RULE_TASK",
             ElementKind::ScriptTask { .. } => "SCRIPT_TASK",
@@ -1370,6 +1403,13 @@ fn remap_kind_ids(kind: &ElementKind, pfx: &impl Fn(&str) -> String) -> ElementK
             condition: condition.clone(),
             interrupting: *interrupting,
         },
+        ElementKind::CompensationBoundaryEvent {
+            attached_to,
+            handler,
+        } => ElementKind::CompensationBoundaryEvent {
+            attached_to: pfx(attached_to),
+            handler: pfx(handler),
+        },
         other => other.clone(),
     }
 }
@@ -1526,6 +1566,13 @@ impl ProcessBuilder {
     /// [`ElementKind::IntermediateThrowEvent`]).
     pub fn intermediate_throw_event(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::IntermediateThrowEvent)
+    }
+
+    /// Adds a compensation throw event (`compensateEventDefinition` on an
+    /// `intermediateThrowEvent`/`endEvent`; see
+    /// [`ElementKind::CompensationThrowEvent`]).
+    pub fn compensation_throw_event(self, id: impl Into<String>) -> Self {
+        self.add(id, ElementKind::CompensationThrowEvent)
     }
 
     /// Adds an abstract `task` (a pass-through; see [`ElementKind::Task`]).
@@ -1785,6 +1832,25 @@ impl ProcessBuilder {
             ElementKind::ErrorBoundaryEvent {
                 attached_to: attached_to.into(),
                 error_code: error_code.into(),
+            },
+        )
+    }
+
+    /// Adds a compensation boundary event attached to `attached_to`, whose
+    /// compensation `handler` activity (resolved from the BPMN `<association>`)
+    /// is run when compensation is triggered for the completed activity. See
+    /// [`ElementKind::CompensationBoundaryEvent`].
+    pub fn compensation_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        handler: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::CompensationBoundaryEvent {
+                attached_to: attached_to.into(),
+                handler: handler.into(),
             },
         )
     }

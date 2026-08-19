@@ -64,6 +64,8 @@ fn kind_label(kind: &ElementKind) -> &'static str {
             "conditionalIntermediateCatchEvent"
         }
         ElementKind::ConditionalBoundaryEvent { .. } => "conditionalBoundaryEvent",
+        ElementKind::CompensationBoundaryEvent { .. } => "compensationBoundaryEvent",
+        ElementKind::CompensationThrowEvent => "compensationThrowEvent",
     }
 }
 
@@ -74,6 +76,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::TimerBoundaryEvent { attached_to, .. }
         | ElementKind::SignalBoundaryEvent { attached_to, .. }
         | ElementKind::ConditionalBoundaryEvent { attached_to, .. }
+        | ElementKind::CompensationBoundaryEvent { attached_to, .. }
         | ElementKind::MessageBoundaryEvent { attached_to, .. } => Some(attached_to.as_str()),
         _ => None,
     }
@@ -2382,6 +2385,31 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             ));
             out.push_str("      </bpmn:conditionalEventDefinition>\n");
             out.push_str("    </bpmn:boundaryEvent>\n");
+        }
+        ElementKind::CompensationThrowEvent => {
+            out.push_str(&format!(
+                "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}>\n"
+            ));
+            out.push_str("      <bpmn:compensateEventDefinition/>\n");
+            out.push_str("    </bpmn:intermediateThrowEvent>\n");
+        }
+        ElementKind::CompensationBoundaryEvent {
+            attached_to,
+            handler,
+        } => {
+            out.push_str(&format!(
+                "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\">\n",
+                xml_escape(attached_to)
+            ));
+            out.push_str("      <bpmn:compensateEventDefinition/>\n");
+            out.push_str("    </bpmn:boundaryEvent>\n");
+            // The compensation handler is wired to this boundary by an
+            // `<association>`; emit it so the document round-trips back to the
+            // same CompensationBoundaryEvent on re-parse.
+            out.push_str(&format!(
+                "    <bpmn:association id=\"Association_{eid}\" associationDirection=\"One\" sourceRef=\"{eid}\" targetRef=\"{}\"/>\n",
+                xml_escape(handler)
+            ));
         }
         ElementKind::SubProcess { .. } => {
             out.push_str(&format!("    <bpmn:subProcess id=\"{eid}\"{na}>\n"));
