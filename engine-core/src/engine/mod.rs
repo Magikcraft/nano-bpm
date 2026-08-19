@@ -7434,6 +7434,24 @@ impl Engine {
         })
     }
 
+    /// The live call-activity child instance parked on `call_eik` (a parent's
+    /// call-activity element instance), if any. A call activity spawns exactly
+    /// one child, found here by its `parentElementInstanceKey` back-link.
+    /// Includes a `Terminating` child so an interrupt still reaps one already
+    /// mid-drain.
+    fn call_activity_child_of(&self, call_eik: Key) -> Option<Key> {
+        self.state
+            .instances
+            .values()
+            .find(|i| {
+                matches!(
+                    i.state,
+                    ProcessInstanceState::Active | ProcessInstanceState::Terminating
+                ) && i.parent_element_instance_key == Some(call_eik)
+            })
+            .map(|i| i.key)
+    }
+
     /// Depth of `instance_key` in the call-activity parent chain (0 for a
     /// top-level instance). Used to cap runaway recursion.
     fn call_activity_depth(&self, instance_key: Key) -> usize {
@@ -7637,10 +7655,19 @@ impl Engine {
                 .instances
                 .values()
                 .filter(|i| {
-                    i.state == ProcessInstanceState::Active
-                        && i.parent_process_instance_key
-                            .map(|p| terminated.contains(&p))
-                            .unwrap_or(false)
+                    // A cascade cancel is not interruptible, so it must also
+                    // sweep children already mid-drain (`Terminating`, e.g. a
+                    // child whose own cancel deferred on a user-task canceling
+                    // listener) — otherwise the parent's termination orphans
+                    // them. `discard_and_terminate_instance` force-completes
+                    // that deferred drain.
+                    matches!(
+                        i.state,
+                        ProcessInstanceState::Active | ProcessInstanceState::Terminating
+                    ) && i
+                        .parent_process_instance_key
+                        .map(|p| terminated.contains(&p))
+                        .unwrap_or(false)
                 })
                 .map(|i| i.key)
                 .collect();
@@ -7753,9 +7780,7 @@ impl Engine {
             .state
             .user_tasks
             .values()
-            .filter(|t| {
-                t.instance_key == instance_key && t.state == state::UserTaskState::Created
-            })
+            .filter(|t| t.instance_key == instance_key && t.state == state::UserTaskState::Created)
             .collect();
         user_tasks.sort_unstable_by_key(|t| t.key);
         cancels.extend(user_tasks.iter().map(|t| Event::UserTaskCanceled {

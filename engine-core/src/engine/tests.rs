@@ -6744,9 +6744,7 @@ fn deploy_native_call(io: crate::model::IoMapping, child: ProcessDefinition) -> 
     }
     let orchestrator = orchestrator.build().unwrap();
     let mut engine = Engine::new();
-    engine
-        .apply_command(Command::DeployProcess(child))
-        .unwrap();
+    engine.apply_command(Command::DeployProcess(child)).unwrap();
     engine
         .apply_command(Command::DeployProcess(orchestrator))
         .unwrap();
@@ -6807,7 +6805,10 @@ fn a_call_activity_spawns_a_distinct_child_process_instance_with_parent_linkage(
     assert_eq!(engine.pending_jobs().len(), 1);
     assert_eq!(engine.pending_jobs()[0].instance_key, child_key);
     assert_eq!(
-        engine.instance(child_key).unwrap().parent_process_instance_key,
+        engine
+            .instance(child_key)
+            .unwrap()
+            .parent_process_instance_key,
         Some(parent_key)
     );
 
@@ -6861,6 +6862,136 @@ fn cancelling_a_call_activity_parent_cancels_its_child() {
         crate::state::ProcessInstanceState::Terminated
     );
     // The child's job was cancelled with it — no activatable jobs remain.
+    assert!(engine.pending_jobs().is_empty());
+}
+
+#[test]
+fn interrupting_a_call_activity_via_a_boundary_cancels_its_child() {
+    // A boundary event that interrupts a call activity must also cancel the
+    // child process instance it spawned. Otherwise the parent token leaves via
+    // the boundary flow while the child keeps running — an orphan with no
+    // parent token left to complete it. The parent instance itself is NOT
+    // terminated; it routes out the interrupting boundary's flow.
+    let orchestrator = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "phase")
+        .timer_boundary_event("timeout", "c1", 5_000)
+        .end_event("end")
+        .end_event("escalated")
+        .connect("start", "c1")
+        .connect("c1", "end")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(phase_process("phase", "work")))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(orchestrator))
+        .unwrap();
+
+    let created = engine
+        .apply_command_at(Command::create_instance("orch"), 1_000)
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let child_key = engine
+        .pending_jobs()
+        .first()
+        .expect("child parked on its job")
+        .instance_key;
+    assert_ne!(child_key, parent_key);
+
+    // At the boundary timer's due instant it interrupts the call activity,
+    // cancels the child instance, and routes the parent to "escalated".
+    let fired = engine.trigger_timers(6_000);
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::ProcessInstanceTerminated { instance_key } if *instance_key == child_key
+        )),
+        "the boundary interrupt cancels the spawned child instead of orphaning it"
+    );
+    assert!(fired.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+    )));
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    // The parent was not terminated — it completed via the boundary path.
+    assert_ne!(
+        engine.instance(parent_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    assert!(engine.is_completed(parent_key));
+    // No orphaned job survives.
+    assert!(engine.pending_jobs().is_empty());
+}
+
+#[test]
+fn cancelling_a_parent_reaps_a_child_already_mid_termination() {
+    // A cascade cancel is not interruptible, so it must also sweep a child that
+    // is already `Terminating` — e.g. a child whose own cancel deferred on a
+    // user-task canceling listener. If the parent terminates while the child is
+    // mid-drain, sweeping only `Active` children would leave the child stuck in
+    // `Terminating` forever (orphaned).
+    let child_def = ProcessBuilder::new("phase")
+        .start_event("pstart")
+        .user_task("review")
+        .end_event("pend")
+        .connect("pstart", "review")
+        .connect("review", "pend")
+        .with_task_listeners(
+            "review",
+            vec![crate::model::TaskListener {
+                event_type: crate::model::TaskListenerEventType::Canceling,
+                job_type: "onCancel".to_string(),
+                retries: None,
+            }],
+        )
+        .build()
+        .unwrap();
+    let mut engine = deploy_native_call(Default::default(), child_def);
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let child_key = engine
+        .state()
+        .instances
+        .values()
+        .find(|i| i.parent_process_instance_key == Some(parent_key))
+        .map(|i| i.key)
+        .expect("a child instance was spawned");
+
+    // Cancel the child directly: its canceling listener defers termination, so
+    // it parks in `Terminating` waiting for the listener job to drain.
+    engine
+        .apply_command(Command::cancel_instance(child_key))
+        .unwrap();
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminating
+    );
+
+    // Now cancel the parent. The cascade must force-complete the child's
+    // deferred drain rather than leave it orphaned in `Terminating`.
+    let cancel = engine
+        .apply_command(Command::cancel_instance(parent_key))
+        .unwrap();
+    assert!(
+        cancel.iter().any(|e| matches!(
+            e,
+            Event::ProcessInstanceTerminated { instance_key } if *instance_key == child_key
+        )),
+        "the cascade reaps the still-Terminating child"
+    );
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
     assert!(engine.pending_jobs().is_empty());
 }
 
