@@ -648,6 +648,8 @@ mod tests {
                 created_at: 1,
                 tags: Vec::new(),
                 business_id: None,
+                parent_process_instance_key: None,
+                parent_element_instance_key: None,
                 active: HashMap::new(),
                 scopes: HashMap::new(),
                 variables: Arc::new(vars("payload")),

@@ -407,7 +407,8 @@ impl Engine {
     /// interrupting timer or message boundary fired on it: tears down the work it
     /// owns, completes its element instance, and disarms any sibling boundaries.
     /// A service task's job is cancelled; a sub-process's whole inner token scope
-    /// is terminated. The caller then routes the boundary's outgoing flow.
+    /// is terminated; a call activity's spawned child instance is cancelled. The
+    /// caller then routes the boundary's outgoing flow.
     pub(crate) fn interrupt_activity_via_boundary(
         &mut self,
         log: &mut Vec<Event>,
@@ -419,6 +420,15 @@ impl Engine {
             // Cancel every job/timer/subscription inside the sub-process and
             // complete its inner element instances first.
             self.terminate_subprocess_scope(log, instance_key, element_instance_key);
+        } else if let Some(child) = self.call_activity_child_of(element_instance_key) {
+            // A call activity parks its token on a distinct child process
+            // instance (Zeebe parity). Interrupting the call activity via a
+            // boundary event must cancel that child too — the parent token is
+            // about to leave via the boundary flow, so a surviving child would
+            // be orphaned (running with nothing left to complete it). The
+            // command tail's `cascade_cancel_children` reaps any transitive
+            // grandchildren off the `ProcessInstanceTerminated` emitted here.
+            self.discard_and_terminate_instance(log, child);
         } else if let Some(job_key) = self.active_job_on(element_instance_key) {
             self.emit(
                 log,

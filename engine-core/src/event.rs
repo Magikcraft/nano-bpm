@@ -154,6 +154,20 @@ pub enum Event {
         /// `0` (the `serde(default)`) for events written before version pinning.
         #[cfg_attr(feature = "serde", serde(default))]
         version: i32,
+        /// When this instance is a **child process instance** spawned by a call
+        /// activity, the `processInstanceKey` of the calling (parent) instance;
+        /// `None` for a top-level instance (created via the API, a message/timer
+        /// start, or a signal). Populated so tooling can draw the parent↔child
+        /// process tree (C8 `parentProcessInstanceKey`). `None` (the
+        /// `serde(default)`) for events written before native call activities.
+        #[cfg_attr(feature = "serde", serde(default))]
+        parent_process_instance_key: Option<Key>,
+        /// When this instance is a child spawned by a call activity, the element
+        /// instance key of the call-activity element in the parent instance that
+        /// spawned it (C8 `parentElementInstanceKey`); `None` for a top-level
+        /// instance. `None` (the `serde(default)`) for pre-native-call events.
+        #[cfg_attr(feature = "serde", serde(default))]
+        parent_element_instance_key: Option<Key>,
     },
 
     /// Variables were merged into a process instance.

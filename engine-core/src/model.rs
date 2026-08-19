@@ -654,12 +654,18 @@ pub enum ElementKind {
         /// The variable name the expression's result is stored under.
         result_variable: String,
     },
-    /// A call activity: invokes another process (`called_process_id`) and waits
-    /// for it to complete before routing along its outgoing flow. Nano consumes
-    /// call activities by **inline expansion** — [`ProcessDefinition::inline_call_activities`]
+    /// A call activity: invokes another process (`called_process_id`) as a
+    /// distinct **child process instance** and parks its own token until the
+    /// child completes (Zeebe/C8 parity). The engine executes this natively — on
+    /// activation it spawns a child instance of `called_process_id`, links it back
+    /// via `parentProcessInstanceKey`/`parentElementInstanceKey`, and completes
+    /// the call-activity token when the child finishes (see the `CallActivity` arm
+    /// of `Engine::run_activation_body` and `Engine::complete_call_activity`).
+    /// Variables cross the instance boundary through the call activity's input and
+    /// output mappings (isolated scopes). A legacy **inline-expansion** mode is
+    /// still available for callers that opt in — [`ProcessDefinition::inline_call_activities`]
     /// rewrites each call activity into an embedded [`SubProcess`] holding a copy
-    /// of the called process's flow — so the runtime engine itself never executes
-    /// this kind (an unexpanded call activity degrades to a pass-through).
+    /// of the callee's flow (embedded-subprocess semantics, no child instance).
     CallActivity {
         /// The `calledElement` / `zeebe:calledElement processId` of the invoked
         /// process definition.
@@ -1535,8 +1541,10 @@ impl ProcessBuilder {
     }
 
     /// Adds a call activity invoking `called_process_id` (see
-    /// [`ElementKind::CallActivity`]). Expanded inline before deployment by
-    /// [`ProcessDefinition::inline_call_activities`].
+    /// [`ElementKind::CallActivity`]). Executed natively by the engine as a child
+    /// process instance; the legacy inline-expansion mode
+    /// ([`ProcessDefinition::inline_call_activities`]) remains available as an
+    /// opt-in.
     pub fn call_activity(
         self,
         id: impl Into<String>,
