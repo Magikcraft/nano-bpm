@@ -10801,29 +10801,26 @@ fn adhoc_agent_runs_an_embedded_subprocess_tool_body_by_token_flow() {
          outputCollection once the body completes (#872)"
     );
 
-    // The tool child actually drained: its body ran to the end event and the
-    // tool completed, so the container's active set is empty again. Without this
-    // the outputCollection could be fed while the child is left dangling.
+    // The tool completed cleanly: its body ran to the end event, so (1) the
+    // container's active set is empty again — the child actually drained,
+    // rather than the outputCollection being fed while it dangles — and (2) the
+    // container iteration advanced, re-emitting the agent job for the next turn.
+    // Read both off the recorded container state (side-effect free — do not
+    // `activate_jobs` here, which would lock/mutate the re-emitted job), the
+    // same way the sibling drain guards in this file do.
+    let adhoc = engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .unwrap();
     assert_eq!(
-        engine
-            .instance(inst)
-            .unwrap()
-            .adhoc_instances
-            .get(&container)
-            .unwrap()
-            .active
-            .len(),
+        adhoc.active.len(),
         0,
         "the subProcess tool child drains once its body completes (#872)"
     );
-
-    // The container iteration advanced: with the tool done, the agent job is
-    // re-emitted so the agent can take its next turn.
-    assert!(
-        engine
-            .activate_jobs("agent-worker", "W", 10, 1_000, 0)
-            .into_iter()
-            .any(|j| j.element_id == "agent"),
+    assert_eq!(
+        adhoc.iterations, 1,
         "completing the subProcess tool re-emits the agent job for the next \
          turn (#872)"
     );
