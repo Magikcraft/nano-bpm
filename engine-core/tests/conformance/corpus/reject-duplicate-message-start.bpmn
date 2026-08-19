@@ -1,0 +1,19 @@
+<!-- verdict: reject | category: DuplicateStartEvent -->
+<!-- oracle: ModelUtil.verifyNoDuplicateMessageStartEvents — two starts correlating on one message (#856). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:message id="Msg" name="order-placed" />
+  <bpmn:process id="reject_duplicate_message_start" isExecutable="true">
+    <bpmn:startEvent id="s1">
+      <bpmn:messageEventDefinition messageRef="Msg" />
+      <bpmn:outgoing>f0</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:startEvent id="s2">
+      <bpmn:messageEventDefinition messageRef="Msg" />
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:endEvent id="e0"><bpmn:incoming>f0</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="e1"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="s1" targetRef="e0" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s2" targetRef="e1" />
+  </bpmn:process>
+</bpmn:definitions>

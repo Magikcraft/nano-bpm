@@ -1,0 +1,10 @@
+<!-- verdict: reject | category: InvalidProcess -->
+<!-- oracle: ProcessValidator — a process must have at least one start event; Nano's builder
+     surfaces this as InvalidProcess ("process has no start event") (#855 covers the multiple-none case). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="reject_no_start_event" isExecutable="true">
+    <bpmn:task id="t"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:task>
+    <bpmn:endEvent id="e"><bpmn:incoming>f0</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="t" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>

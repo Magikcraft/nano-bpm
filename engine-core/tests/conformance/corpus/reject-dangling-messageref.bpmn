@@ -1,0 +1,16 @@
+<!-- verdict: reject | category: InvalidMessageEvent -->
+<!-- oracle: messageRef must resolve to a declared <message>; Nano surfaces the unresolved message
+     reference as InvalidMessageEvent at build (Zeebe: unresolved QName -> INVALID_ARGUMENT). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="reject_dangling_messageref" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:intermediateCatchEvent id="catch">
+      <bpmn:messageEventDefinition messageRef="Msg_undeclared" />
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="e"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="catch" />
+    <bpmn:sequenceFlow id="f1" sourceRef="catch" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>

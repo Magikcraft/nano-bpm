@@ -1,0 +1,16 @@
+<!-- verdict: reject | category: InvalidBoundaryEvent -->
+<!-- oracle: a boundaryEvent must attach (attachedToRef) to a real activity; Zeebe rejects otherwise. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:error id="Err" errorCode="boom" />
+  <bpmn:process id="reject_invalid_boundary_event" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:endEvent id="e"><bpmn:incoming>f0</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+    <bpmn:boundaryEvent id="be">
+      <bpmn:errorEventDefinition errorRef="Err" />
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="e2"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="be" targetRef="e2" />
+  </bpmn:process>
+</bpmn:definitions>

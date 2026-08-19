@@ -1,0 +1,9 @@
+<!-- verdict: reject | category: MalformedXml -->
+<!-- oracle: an unterminated attribute quote is not well-formed XML; Zeebe rejects the deployment. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="reject_malformed_xml isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:endEvent id="e"><bpmn:incoming>f0</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>

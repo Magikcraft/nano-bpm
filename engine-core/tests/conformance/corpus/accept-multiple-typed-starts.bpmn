@@ -1,0 +1,16 @@
+<!-- verdict: accept -->
+<!-- oracle: ProcessValidator allows several typed starts; only multiple NONE starts are rejected (#855). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:message id="Msg" name="order-placed" />
+  <bpmn:process id="accept_multiple_typed_starts" isExecutable="true">
+    <bpmn:startEvent id="noneStart"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:startEvent id="msgStart">
+      <bpmn:messageEventDefinition messageRef="Msg" />
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:endEvent id="end0"><bpmn:incoming>f0</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="end1"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="noneStart" targetRef="end0" />
+    <bpmn:sequenceFlow id="f1" sourceRef="msgStart" targetRef="end1" />
+  </bpmn:process>
+</bpmn:definitions>

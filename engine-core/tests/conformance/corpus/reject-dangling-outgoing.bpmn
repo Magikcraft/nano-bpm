@@ -1,0 +1,9 @@
+<!-- verdict: reject | category: UnresolvedReference -->
+<!-- oracle: camunda-xml-model resolves <incoming>/<outgoing> QNames eagerly; unresolved -> INVALID_ARGUMENT (#849). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="reject_dangling_outgoing" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>Flow_missing</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:endEvent id="e"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>
