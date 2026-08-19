@@ -723,7 +723,10 @@ pub enum ElementKind {
 
 impl ElementKind {
     /// Whether this is a start-event kind (none, message or timer start). A
-    /// process has exactly one such element — its [`ProcessDefinition::start_event`].
+    /// process has exactly one process-entry start ([`ProcessDefinition::start_event`],
+    /// where a CreateInstance begins) but may declare several process-level starts
+    /// — a none start alongside any number of message/timer starts, each wired to
+    /// its own deploy-time trigger (#855).
     pub fn is_start_event(&self) -> bool {
         matches!(
             self,
@@ -2193,18 +2196,38 @@ impl ProcessBuilder {
             }
         }
 
-        // The process-level start event is the unique start event that is not
-        // contained in any sub-process (sub-process inner start events have a
-        // parent and start their own scope, not the instance).
-        let starts: Vec<&Element> = elements
+        // The process-level start event is a start event that is not contained in
+        // any sub-process (sub-process inner start events have a parent and start
+        // their own scope, not the instance).
+        //
+        // Zeebe permits a process to declare more than one start event — a none
+        // start alongside any number of *typed* (message/timer/signal) starts —
+        // and forbids only *multiple none* starts (rejected by the post-parse
+        // `start_events` validator, #855). Every message and timer start is wired
+        // to its own deploy-time trigger by `crate::engine::Engine::deploy`; this
+        // designation picks only the single process-entry start a CreateInstance
+        // begins at, so choose one deterministically: prefer the none start, else
+        // fall back to a typed start, tie-broken by id.
+        //
+        // Message and timer starts survive here as distinct typed kinds
+        // (`ElementKind::is_start_event`). A signal start carries no dedicated
+        // element kind: a surviving signal start is modelled as a plain
+        // `ElementKind::StartEvent`, so the `find(StartEvent)` preference below
+        // selects it as though it were the none start.
+        let mut starts: Vec<&Element> = elements
             .values()
             .filter(|e| e.kind.is_start_event() && e.parent.is_none())
             .collect();
-        let start_event = match starts.as_slice() {
-            [single] => single.id.clone(),
-            [] => return Err(BuildError::NoStartEvent),
-            _ => return Err(BuildError::MultipleStartEvents),
-        };
+        if starts.is_empty() {
+            return Err(BuildError::NoStartEvent);
+        }
+        starts.sort_by(|a, b| a.id.cmp(&b.id));
+        let start_event = starts
+            .iter()
+            .find(|e| matches!(e.kind, ElementKind::StartEvent))
+            .unwrap_or(&starts[0])
+            .id
+            .clone();
 
         Ok(ProcessDefinition {
             id: self.id,
@@ -2233,7 +2256,6 @@ pub enum BuildError {
         to: ElementId,
     },
     NoStartEvent,
-    MultipleStartEvents,
     /// A `contained_in` referenced a sub-process element that does not exist.
     UnknownParent {
         child: ElementId,
@@ -2275,7 +2297,6 @@ impl std::fmt::Display for BuildError {
                 )
             }
             BuildError::NoStartEvent => write!(f, "process has no start event"),
-            BuildError::MultipleStartEvents => write!(f, "process has more than one start event"),
             BuildError::UnknownParent { child, parent } => {
                 write!(
                     f,
@@ -2314,6 +2335,72 @@ impl std::fmt::Display for BuildError {
 }
 
 impl std::error::Error for BuildError {}
+
+#[cfg(test)]
+mod start_event_build_tests {
+    use super::{BuildError, ElementKind, ProcessBuilder};
+
+    fn end(builder: ProcessBuilder, start: &str) -> ProcessBuilder {
+        // Give a start event a valid outgoing flow to an end event so the graph
+        // is connected; each start gets its own private end.
+        let e = format!("{start}_end");
+        builder.end_event(e.clone()).connect(start, e)
+    }
+
+    #[test]
+    fn permits_none_plus_typed_starts_and_designates_the_none_entry() {
+        // A none start alongside a message start: Zeebe permits this, and the
+        // engine must begin a CreateInstance at the none start.
+        let builder = ProcessBuilder::new("p")
+            .start_event("noneStart")
+            .message_start_event("msgStart", "orderPlaced");
+        let builder = end(builder, "noneStart");
+        let def = end(builder, "msgStart")
+            .build()
+            .expect("multi-typed start permitted");
+        assert_eq!(def.start_event, "noneStart");
+        // Both start events are retained on the definition.
+        assert!(matches!(
+            def.element("noneStart").unwrap().kind,
+            ElementKind::StartEvent
+        ));
+        assert!(matches!(
+            def.element("msgStart").unwrap().kind,
+            ElementKind::MessageStartEvent { .. }
+        ));
+    }
+
+    #[test]
+    fn designates_a_typed_entry_when_there_is_no_none_start() {
+        // No none start: the entry falls back to a typed start, deterministically
+        // by id (so the choice is stable across builds).
+        let builder = ProcessBuilder::new("p")
+            .message_start_event("bMsg", "b")
+            .timer_start_event_once("aTimer", 1000);
+        let builder = end(builder, "bMsg");
+        let def = end(builder, "aTimer")
+            .build()
+            .expect("multiple typed starts permitted");
+        assert_eq!(def.start_event, "aTimer", "min-id typed start is the entry");
+    }
+
+    #[test]
+    fn zero_start_events_still_rejected() {
+        let def = ProcessBuilder::new("p").end_event("e").build();
+        assert_eq!(def.unwrap_err(), BuildError::NoStartEvent);
+    }
+
+    #[test]
+    fn build_no_longer_rejects_multiple_starts_outright() {
+        // The over-strict "more than one start event" rejection is gone; the
+        // multiple-none rule is enforced by the post-parse start_events validator,
+        // so the builder itself accepts two none starts.
+        let builder = ProcessBuilder::new("p").start_event("s1").start_event("s2");
+        let builder = end(builder, "s1");
+        let def = end(builder, "s2").build();
+        assert!(def.is_ok(), "builder permits multiple starts: {def:?}");
+    }
+}
 
 #[cfg(test)]
 mod approx_bytes_tests {

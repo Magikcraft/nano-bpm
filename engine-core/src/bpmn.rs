@@ -796,6 +796,13 @@ fn parse_with_captures(
                                     acc.nodes[idx].signal_ref = Some(signal_ref);
                                 } else if let Some(boundary) = cur_boundary.as_mut() {
                                     boundary.signal_ref = Some(signal_ref);
+                                } else if let Some(idx) = cur_start {
+                                    // On a start event, marks it a *signal* start
+                                    // (a typed start, distinct from a none start).
+                                    // Recorded so the start-event count rule (#855)
+                                    // does not mistake it for a second none start,
+                                    // and so #851 can resolve its `signalRef`.
+                                    acc.nodes[idx].signal_ref = Some(signal_ref);
                                 }
                             }
                             "taskDefinition" => {
@@ -2257,13 +2264,27 @@ impl ProcessAcc {
         }
 
         // A process may declare more than one start event (e.g. a "refresh batch"
-        // and a "manual intake" start that merge downstream). The engine begins an
-        // instance at a single process-level start event, so designate one — a
-        // plain none start preferred, tie-broken by id — and demote the surplus
-        // process-level starts to inert throw events. They keep their outgoing
-        // flow (so it still has a valid source) but, lacking any incoming flow,
-        // are never activated; instances created via CreateInstance begin at the
-        // designated start.
+        // and a "manual intake" start that merge downstream). Zeebe permits a none
+        // start alongside any number of *typed* (message/timer/signal) starts, and
+        // wires EVERY typed start independently: a message start opens a
+        // subscription and a timer start arms a process-level timer at deploy, each
+        // firing its own instance at its own start element (issue #855). So message
+        // and timer process-level starts are ALL kept here as their typed element
+        // kinds — `Engine::deploy` scans them and registers a trigger for each; the
+        // single process-entry start (used only for CreateInstance) is designated
+        // downstream in `ProcessBuilder::build`.
+        //
+        // Only surplus *signal* starts are demoted to inert throw events (they keep
+        // their outgoing flow, so it still has a valid source, but lacking any
+        // incoming flow are never activated). Nano has no dedicated signal-start
+        // element kind — a surviving signal start builds to a plain
+        // `ElementKind::StartEvent`, indistinguishable from a none start, so a
+        // second one would be miscounted as a second *none* start and wrongly
+        // rejected by the `start_events` validator (#855); signal-start runtime is
+        // out of scope. Surplus *none* starts are deliberately NOT demoted —
+        // multiple none starts are illegal, and keeping them lets that validator
+        // see and reject them (`InvalidStartEvents`) rather than silently
+        // collapsing them.
         let proc_starts: Vec<usize> = self
             .nodes
             .iter()
@@ -2272,8 +2293,16 @@ impl ProcessAcc {
             .map(|(i, _)| i)
             .collect();
         if proc_starts.len() > 1 {
-            let is_none_start =
-                |n: &NodeAcc| n.message_ref.is_none() && n.timer_repeating.is_none();
+            // A none start carries no message/timer/signal event definition.
+            let is_none_start = |n: &NodeAcc| {
+                n.message_ref.is_none() && n.timer_repeating.is_none() && n.signal_ref.is_none()
+            };
+            // A signal start carries a signalRef but no message/timer definition.
+            let is_signal_start = |n: &NodeAcc| {
+                n.signal_ref.is_some() && n.message_ref.is_none() && n.timer_repeating.is_none()
+            };
+            // Keep a single none/signal start as the process-entry `StartEvent`
+            // (prefer a none start); any additional *signal* start is surplus.
             let designated = proc_starts
                 .iter()
                 .copied()
@@ -2287,11 +2316,15 @@ impl ProcessAcc {
                         .expect("non-empty")
                 });
             for &i in &proc_starts {
-                if i != designated {
+                // Demote only surplus *signal* starts; keep none/message/timer (see
+                // the note above — none starts are kept for the validator, and
+                // message/timer starts are kept so deploy can wire their triggers).
+                if i != designated && is_signal_start(&self.nodes[i]) {
                     self.nodes[i].kind = NodeKind::IntermediateThrow;
                     self.nodes[i].message_ref = None;
                     self.nodes[i].timer_repeating = None;
                     self.nodes[i].duration_millis = None;
+                    self.nodes[i].signal_ref = None;
                 }
             }
         }
@@ -4834,6 +4867,101 @@ mod tests {
                 interval_millis: 3_600_000,
                 repeating: true,
             }
+        );
+    }
+
+    #[test]
+    fn none_plus_message_start_keeps_the_message_start_typed() {
+        // Regression guard (#855): a none start alongside a message start must
+        // keep the message start as a MessageStartEvent — NOT demote it to an
+        // inert throw event — so deploy can open its subscription. The none start
+        // remains the process-entry start.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="none_s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+              <bpmn:startEvent id="msg_s">
+                <bpmn:messageEventDefinition messageRef="Message_1" />
+                <bpmn:outgoing>f2</bpmn:outgoing>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e1"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+              <bpmn:endEvent id="e2"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+              <bpmn:sequenceFlow id="f1" sourceRef="none_s" targetRef="e1" />
+              <bpmn:sequenceFlow id="f2" sourceRef="msg_s" targetRef="e2" />
+            </bpmn:process>
+            <bpmn:message id="Message_1" name="order-placed" />
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(def.start_event, "none_s", "none start is the process entry");
+        assert_eq!(
+            def.element("msg_s").unwrap().kind,
+            ElementKind::MessageStartEvent {
+                message_name: "order-placed".to_string(),
+            },
+            "surplus message start must survive un-demoted"
+        );
+    }
+
+    #[test]
+    fn none_plus_timer_start_keeps_the_timer_start_typed() {
+        // Regression guard (#855): a surplus timer start must survive as a
+        // TimerStartEvent so deploy can arm its process-level timer.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="none_s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+              <bpmn:startEvent id="timer_s">
+                <bpmn:timerEventDefinition><bpmn:timeDuration>PT10S</bpmn:timeDuration></bpmn:timerEventDefinition>
+                <bpmn:outgoing>f2</bpmn:outgoing>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e1"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+              <bpmn:endEvent id="e2"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+              <bpmn:sequenceFlow id="f1" sourceRef="none_s" targetRef="e1" />
+              <bpmn:sequenceFlow id="f2" sourceRef="timer_s" targetRef="e2" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(def.start_event, "none_s");
+        assert_eq!(
+            def.element("timer_s").unwrap().kind,
+            ElementKind::TimerStartEvent {
+                interval_millis: 10_000,
+                repeating: false,
+            },
+            "surplus timer start must survive un-demoted"
+        );
+    }
+
+    #[test]
+    fn none_plus_signal_start_still_demotes_the_signal_start() {
+        // Nano has no dedicated signal-start element kind, so a surplus signal
+        // start is still demoted to an inert throw event: keeping it would make
+        // it a second `ElementKind::StartEvent`, wrongly counted as a second
+        // *none* start by the start-events validator (#855).
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="none_s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+              <bpmn:startEvent id="signal_s">
+                <bpmn:signalEventDefinition signalRef="Signal_1" />
+                <bpmn:outgoing>f2</bpmn:outgoing>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e1"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+              <bpmn:endEvent id="e2"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+              <bpmn:sequenceFlow id="f1" sourceRef="none_s" targetRef="e1" />
+              <bpmn:sequenceFlow id="f2" sourceRef="signal_s" targetRef="e2" />
+            </bpmn:process>
+            <bpmn:signal id="Signal_1" name="go" />
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(def.start_event, "none_s");
+        assert_eq!(
+            def.element("signal_s").unwrap().kind,
+            ElementKind::IntermediateThrowEvent,
+            "surplus signal start is demoted (no dedicated signal-start kind)"
         );
     }
 
