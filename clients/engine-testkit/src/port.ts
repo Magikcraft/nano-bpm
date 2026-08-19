@@ -24,8 +24,15 @@ export type UserTaskState = "CREATED" | "COMPLETED" | "CANCELED" | "FAILED";
 
 /** The user-task read-model query the DSL issues. Every field is an optional
  *  narrowing filter; an omitted field does not constrain the result. Mirrors the
- *  engine's user-task search filter (a superset is harmless — extra fields are
- *  ignored by an adapter that does not honour them). */
+ *  engine's user-task search filter.
+ *
+ *  Adapters **must honour every field defined here** — `assertThatUserTask`'s
+ *  `hasAssignee` / `hasCandidateGroup` narrow by re-issuing the query with the
+ *  `assignee` / `candidateGroup` filter set and treat a non-empty result as
+ *  proof, so an adapter that silently ignores a filter would make those
+ *  assertions pass when they should fail (false positives). Only *unknown future*
+ *  fields an adapter has not yet learned about may be ignored (a superset of this
+ *  shape is harmless); the fields declared below may not. */
 export interface UserTaskQuery {
   /** Restrict to tasks owned by this process instance. */
   readonly processInstanceKey?: string;
