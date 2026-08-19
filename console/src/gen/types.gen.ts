@@ -1577,7 +1577,7 @@ export type ListInstancesData = {
          */
         state?: 'Active' | 'Completed' | 'Terminated';
         /**
-         * When true, restrict the list to instances currently carrying an open incident. Omit for no incident constraint.
+         * Restrict the list by incident status. When `true`, only instances currently carrying an open incident; when `false`, only instances without one. Both values are real constraints. Omit the parameter entirely for no incident constraint (instances with and without incidents).
          */
         hasIncident?: boolean;
     };
