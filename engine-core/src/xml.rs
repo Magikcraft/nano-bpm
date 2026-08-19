@@ -196,16 +196,116 @@ fn parse_tag(inner: &str) -> Result<(String, Vec<(String, String)>), XmlError> {
     Ok((name, attrs))
 }
 
-/// Expands the five predefined XML entities.
+/// Expands the five predefined XML entities and numeric character references.
+///
+/// Handles the five named entities (`&lt;`, `&gt;`, `&quot;`, `&apos;`, `&amp;`)
+/// as well as decimal (`&#NN;`) and hexadecimal (`&#xHH;`) numeric character
+/// references. Camunda Modeler emits `&#34;` for the double-quotes inside a FEEL
+/// string literal placed in an attribute value, so decoding numeric references
+/// here is required for such attributes (e.g. a `zeebe:subscription`
+/// `correlationKey`) to reach FEEL correctly.
+///
+/// A single left-to-right pass is used so that already-decoded text (in
+/// particular a `&` produced by expanding `&amp;`) is never re-scanned as the
+/// start of another entity. Any unrecognised or malformed `&…` sequence is left
+/// verbatim.
 pub fn unescape(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
     }
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'&' {
+            // Copy the current UTF-8 character wholesale.
+            let ch = s[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        // Look for the terminating ';' of an entity reference. We only advance
+        // over bytes that can legitimately appear in a reference body — ASCII
+        // letters/digits (named entities and numeric digits) and the leading
+        // `#` — and stop at the first byte that cannot. This keeps the whole
+        // pass O(n): the scan from one `&` stops at the next `&` at the latest
+        // (a `&` is not a body byte), so the scanned spans never overlap and a
+        // pathological input (many `&` with no nearby `;`) can no longer be
+        // O(n²). Unlike a fixed byte cap it also decodes numeric references with
+        // arbitrary leading zeros (e.g. `&#x00000022;`). Body bytes are ASCII,
+        // so scanning bytes cannot split a multi-byte character.
+        let rest = &bytes[i..];
+        let mut j = 1; // skip the leading '&'
+        while j < rest.len() && is_entity_body_byte(rest[j]) {
+            j += 1;
+        }
+        if j < rest.len() && rest[j] == b';' {
+            let entity = &s[i + 1..i + j]; // between '&' and ';'
+            if let Some(ch) = decode_entity(entity) {
+                out.push(ch);
+                i += j + 1; // consume through the ';'
+                continue;
+            }
+        }
+        // Not a recognised entity — emit the '&' literally and move on.
+        out.push('&');
+        i += 1;
+    }
+    out
+}
+
+/// Whether `b` can appear in the body of an entity reference (between `&` and
+/// `;`): an ASCII letter (named entities and the `x`/`X` hex marker), an ASCII
+/// digit (decimal/hex references), or the leading `#` of a numeric reference.
+/// Used to bound the terminating-`;` scan in [`unescape`] to O(n).
+fn is_entity_body_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'#'
+}
+
+/// Decodes the body of an entity reference (the text between `&` and `;`).
+///
+/// Returns `Some(char)` for the five named entities and for valid decimal
+/// (`#NN`) / hexadecimal (`#xHH`) numeric character references, or `None` for
+/// anything unrecognised or malformed (which callers leave verbatim).
+///
+/// Numeric references that resolve to a code point not permitted by the XML 1.0
+/// `Char` production (e.g. `&#0;` → NUL, or other C0 control characters) are
+/// rejected as `None` too, so we never smuggle control characters into
+/// downstream parsers / FEEL — the original `&#...;` text is left verbatim.
+fn decode_entity(entity: &str) -> Option<char> {
+    match entity {
+        "lt" => return Some('<'),
+        "gt" => return Some('>'),
+        "quot" => return Some('"'),
+        "apos" => return Some('\''),
+        "amp" => return Some('&'),
+        _ => {}
+    }
+    let num = entity.strip_prefix('#')?;
+    let code = if let Some(hex) = num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+        u32::from_str_radix(hex, 16).ok()?
+    } else {
+        num.parse::<u32>().ok()?
+    };
+    let ch = char::from_u32(code)?;
+    is_xml_char(ch).then_some(ch)
+}
+
+/// Whether `ch` is permitted by the XML 1.0 `Char` production:
+///
+/// ```text
+/// Char ::= #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+/// ```
+///
+/// Surrogates (`#xD800-#xDFFF`) are already excluded by `char`; this additionally
+/// rejects the disallowed C0 control characters and the non-characters `#xFFFE` /
+/// `#xFFFF`.
+fn is_xml_char(ch: char) -> bool {
+    matches!(ch,
+        '\u{9}' | '\u{A}' | '\u{D}'
+        | '\u{20}'..='\u{D7FF}'
+        | '\u{E000}'..='\u{FFFD}'
+        | '\u{10000}'..='\u{10FFFF}')
 }
 
 /// A parsed XML element tree node.
@@ -305,5 +405,93 @@ pub fn parse_tree(xml: &str) -> Result<Element, XmlError> {
         1 => Ok(root.children.pop().unwrap()),
         0 => Err(XmlError("no root element".into())),
         _ => Err(XmlError("multiple root elements".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unescape;
+
+    #[test]
+    fn should_decode_the_five_named_entities() {
+        assert_eq!(unescape("a &lt; b &gt; c"), "a < b > c");
+        assert_eq!(unescape("&quot;q&quot;"), "\"q\"");
+        assert_eq!(unescape("it&apos;s"), "it's");
+        assert_eq!(unescape("a &amp; b"), "a & b");
+    }
+
+    #[test]
+    fn should_decode_decimal_numeric_character_references() {
+        // Camunda Modeler emits `&#34;` for a double-quote inside an attribute.
+        assert_eq!(unescape("=&#34;k&#34;"), "=\"k\"");
+        assert_eq!(unescape("&#60;&#62;"), "<>");
+    }
+
+    #[test]
+    fn should_decode_hexadecimal_numeric_character_references() {
+        // Both `&#xHH;` and the (rarer) uppercase `&#XHH;` are accepted.
+        assert_eq!(unescape("=&#x22;k&#x22;"), "=\"k\"");
+        assert_eq!(unescape("=&#X22;k&#X22;"), "=\"k\"");
+    }
+
+    #[test]
+    fn should_not_re_decode_an_ampersand_produced_by_amp() {
+        // A single left-to-right pass must not treat the `&` yielded by `&amp;`
+        // as the start of a further entity: `&amp;#34;` is the literal text
+        // `&#34;`, not a decimal reference to `"`.
+        assert_eq!(unescape("&amp;#34;"), "&#34;");
+        assert_eq!(unescape("&amp;quot;"), "&quot;");
+    }
+
+    #[test]
+    fn should_leave_unrecognised_or_malformed_sequences_verbatim() {
+        assert_eq!(unescape("a & b"), "a & b");
+        assert_eq!(unescape("Q&A"), "Q&A");
+        assert_eq!(unescape("&unknown;"), "&unknown;");
+        assert_eq!(unescape("&#;"), "&#;");
+        assert_eq!(unescape("&#xZZ;"), "&#xZZ;");
+        // Out-of-range code point (beyond U+10FFFF) is not a valid char.
+        assert_eq!(unescape("&#9999999999;"), "&#9999999999;");
+    }
+
+    #[test]
+    fn should_return_input_unchanged_when_there_is_no_ampersand() {
+        assert_eq!(unescape("plain text"), "plain text");
+    }
+
+    #[test]
+    fn should_leave_non_xml_control_character_references_verbatim() {
+        // Code points that resolve to a valid `char` but are NOT permitted by the
+        // XML 1.0 `Char` production must be left as their original text rather than
+        // smuggling control characters (e.g. NUL) into downstream parsers / FEEL.
+        assert_eq!(unescape("&#0;"), "&#0;"); // NUL
+        assert_eq!(unescape("&#x0;"), "&#x0;"); // NUL (hex)
+        assert_eq!(unescape("&#8;"), "&#8;"); // backspace (C0 control)
+        assert_eq!(unescape("&#x1F;"), "&#x1F;"); // unit separator (C0 control)
+        assert_eq!(unescape("&#xFFFE;"), "&#xFFFE;"); // non-character
+        assert_eq!(unescape("&#xFFFF;"), "&#xFFFF;"); // non-character
+                                                      // The XML-permitted control characters (tab, LF, CR) still decode.
+        assert_eq!(unescape("&#9;"), "\t");
+        assert_eq!(unescape("&#xA;"), "\n");
+        assert_eq!(unescape("&#xD;"), "\r");
+    }
+
+    #[test]
+    fn should_bound_the_scan_for_the_terminating_semicolon() {
+        // The scan for a reference's `;` only advances over valid body bytes and
+        // stops at the first non-body byte, so it stays O(n) instead of O(n²) on
+        // pathological input while still decoding any genuine reference.
+        // A long run that is not a known entity leaves the `&` verbatim:
+        assert_eq!(unescape("&aaaaaaaaaaa;"), "&aaaaaaaaaaa;");
+        // Many ampersands with no nearby `;` are all emitted literally:
+        assert_eq!(unescape("&&&&&&&&&&&&&&&"), "&&&&&&&&&&&&&&&");
+        // The longest un-padded reference (`&#x10FFFF;`) decodes:
+        assert_eq!(unescape("&#x10FFFF;"), "\u{10FFFF}");
+        assert_eq!(unescape("&#1114111;"), "\u{10FFFF}");
+        // Numeric references with arbitrary leading zeros — far longer than any
+        // fixed byte cap — still decode correctly (regression guard):
+        assert_eq!(unescape("&#x00000022;"), "\"");
+        assert_eq!(unescape("&#000000034;"), "\"");
+        assert_eq!(unescape("&#x0000000010FFFF;"), "\u{10FFFF}");
     }
 }
