@@ -150,7 +150,7 @@ fn task_definition_attributes_non_empty(input: &ValidationInput<'_>) -> Result<(
                     process_id: def.id.clone(),
                     task_id: task.task_id.clone(),
                     attribute: "type".to_string(),
-                    reason: "must be present and not empty".to_string(),
+                    reason: "must not be empty when declared".to_string(),
                 });
             }
         }
