@@ -17432,8 +17432,12 @@ fn app_running_gate<'a>(path: &'a str, method: &axum::http::Method) -> Option<&'
         None => (rest, None),
     };
     // `POST /console/api/projects/import` registers a *new* project by
-    // reference — a collection op, not a mutation of a running app.
-    if tail.is_none() && name == "import" {
+    // reference — a collection op, not a mutation of a running app. Scope the
+    // exemption to `POST`: any *other* non-GET method (`DELETE`/`PUT`/`PATCH`, …)
+    // on this exact path targets a real project literally named `import` and
+    // must be gated like any other project, so the collection-op exemption can't
+    // be abused to bypass the running-app gate.
+    if tail.is_none() && name == "import" && *method == Method::POST {
         return None;
     }
     // Reads are always allowed while running.
@@ -17597,6 +17601,16 @@ mod console_app_running_guard_tests {
             assert_eq!(
                 app_running_gate("/console/api/projects/import", &method),
                 None
+            );
+        }
+        // A real project literally named `import` must still be gated for any
+        // mutating (non-POST, non-read) method — the collection-import exemption
+        // is POST-only and can't be abused to bypass the running-app gate.
+        for method in [Method::DELETE, Method::PUT, Method::PATCH] {
+            assert_eq!(
+                app_running_gate("/console/api/projects/import", &method),
+                Some("import"),
+                "{method} on a project named `import` must be gated while running"
             );
         }
         assert_eq!(
