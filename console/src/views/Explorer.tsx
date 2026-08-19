@@ -135,9 +135,12 @@ export default function Explorer() {
   // the filtered set can be smaller than the current offset, so keeping the old
   // page could strand the user on an out-of-range (empty) page.
   const setStateFilter = (state?: InstanceStateFilter) => {
-    setSearchParams((prev) => applyFilterChange(prev, { kind: "state", state }), {
-      replace: true,
-    });
+    setSearchParams(
+      (prev) => applyFilterChange(prev, { kind: "state", state }),
+      {
+        replace: true,
+      },
+    );
     setPage(0);
   };
   const setHasIncident = (hasIncident: boolean) => {
