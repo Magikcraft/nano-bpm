@@ -1,0 +1,55 @@
+{
+  "name": "@nanobpm/engine-testkit",
+  "version": "0.1.0",
+  "description": "Engine-agnostic fluent assertion DSL (assertThat*) for the Nano BPMN engine read model. Zero-runtime-dependency matchers over a minimal structural read-model port (snapshot + user-task read channel) that @nanobpm/engine-wasm — and any adapter over it (urban-testkit, bojtos-kit) — satisfies. Lifted out of @nanobpm/urban-testkit so it is reusable beyond Urban apps.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "keywords": [
+    "nanobpm",
+    "nano",
+    "bpmn",
+    "testing",
+    "assertions",
+    "assertthat",
+    "engine",
+    "wasm"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": false
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Magikcraft/nano-bpm.git",
+    "directory": "clients/engine-testkit"
+  },
+  "homepage": "https://github.com/Magikcraft/nano-bpm/tree/main/clients/engine-testkit#readme",
+  "bugs": {
+    "url": "https://github.com/Magikcraft/nano-bpm/issues"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test --experimental-strip-types \"src/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
+  }
+}
