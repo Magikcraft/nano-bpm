@@ -2080,6 +2080,7 @@ impl ProcessAcc {
             declared_messages: messages.keys().cloned().collect(),
             declared_errors: errors.keys().cloned().collect(),
             declared_signals: signals.keys().cloned().collect(),
+            signal_names: signals.clone(),
             declared_escalations: escalations.keys().cloned().collect(),
             task_definitions,
         }

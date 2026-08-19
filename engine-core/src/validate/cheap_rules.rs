@@ -23,8 +23,12 @@
 //!      [`ProcessCapture`](crate::validate::ProcessCapture), which the parser
 //!      snapshots *before* that demotion. A `signalRef` reference site whose
 //!      declaring node is a process-level flow node with no incoming flow (and
-//!      is not a boundary / intermediate catch event) is a signal start event. A
-//!      repeated message name / signal id is rejected with
+//!      is not a boundary / intermediate catch event) is a signal start event.
+//!      Signals correlate by *name*, so each `signalRef` id is resolved to its
+//!      declared `<signal>` name (via the captured id→name map) and deduped by
+//!      name — matching the message rule and catching two distinct signal ids
+//!      that share one name. A repeated message name / signal name is rejected
+//!      with
 //!      [`ParseError::DuplicateStartEvent`](crate::bpmn::ParseError::DuplicateStartEvent).
 //!
 //!   3. **Required `zeebe:taskDefinition` attributes must be non-empty.** Zeebe's
@@ -124,11 +128,22 @@ fn no_duplicate_typed_starts(input: &ValidationInput<'_>) -> Result<(), ParseErr
         if !is_process_level_start {
             continue;
         }
-        if !seen_signals.insert(site.id.as_str()) {
+        // Signals correlate by *name*, not by `signalRef` id: two distinct
+        // `<bpmn:signal>` ids sharing one `name` still collide at correlation
+        // time. Resolve the id to its declared name and dedupe by that (falling
+        // back to the raw id if the name is somehow absent), so this matches the
+        // name-keyed message rule above rather than drifting from it.
+        let signal_name = input
+            .capture
+            .signal_names
+            .get(&site.id)
+            .map(String::as_str)
+            .unwrap_or(site.id.as_str());
+        if !seen_signals.insert(signal_name) {
             return Err(ParseError::DuplicateStartEvent {
                 process_id: def.id.clone(),
                 correlation_kind: "signal".to_string(),
-                reference: site.id.clone(),
+                reference: signal_name.to_string(),
                 reason: "multiple signal start events with the same signal are not allowed"
                     .to_string(),
             });
@@ -262,6 +277,37 @@ mod tests {
         // signals are permitted (and, per #855, multiple typed starts build).
         parse_bpmn(&two_typed_starts(MSG_A, MSG_B)).expect("distinct message starts accepted");
         parse_bpmn(&two_typed_starts(SIG_A, SIG_B)).expect("distinct signal starts accepted");
+    }
+
+    #[test]
+    fn signal_starts_correlating_on_the_same_name_via_distinct_ids_are_rejected() {
+        // RED before the name-keyed fix: signals correlate by NAME, so two
+        // signal starts whose `signalRef`s point at *distinct* `<bpmn:signal>`
+        // ids that share one `name` still collide at correlation time and must
+        // be rejected. Id-keyed dedup silently accepted this. The error reports
+        // the resolved name, not either raw id.
+        let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                                       xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+             <bpmn:signal id="Sig1" name="shared"/>
+             <bpmn:signal id="Sig2" name="shared"/>
+             <bpmn:process id="p" isExecutable="true">
+               <bpmn:startEvent id="s1"><bpmn:signalEventDefinition signalRef="Sig1"/><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+               <bpmn:startEvent id="s2"><bpmn:signalEventDefinition signalRef="Sig2"/><bpmn:outgoing>f2</bpmn:outgoing></bpmn:startEvent>
+               <bpmn:endEvent id="e1"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+               <bpmn:endEvent id="e2"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+               <bpmn:sequenceFlow id="f1" sourceRef="s1" targetRef="e1"/>
+               <bpmn:sequenceFlow id="f2" sourceRef="s2" targetRef="e2"/>
+             </bpmn:process>
+           </bpmn:definitions>"#;
+        let err = parse_bpmn(xml).expect_err("duplicate signal-by-name start rejected");
+        assert!(
+            matches!(
+                &err,
+                ParseError::DuplicateStartEvent { correlation_kind, reference, .. }
+                    if correlation_kind == "signal" && reference == "shared"
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]

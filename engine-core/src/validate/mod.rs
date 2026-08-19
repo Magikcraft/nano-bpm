@@ -24,7 +24,7 @@
 //! * `start_events`      — start-event count parity (#855).
 //! * `cheap_rules`       — end-event outgoing / duplicate starts / taskDef (#856).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::bpmn::ParseError;
 use crate::model::ProcessDefinition;
@@ -112,6 +112,11 @@ pub(crate) struct ProcessCapture {
     pub declared_errors: HashSet<String>,
     /// Declared definitions-level `<signal>` ids.
     pub declared_signals: HashSet<String>,
+    /// Declared definitions-level `<signal>` id → `name` map. Signals correlate
+    /// by *name*, so the duplicate-signal-start rule (#856) resolves each
+    /// `signalRef` id through this map and dedupes by the resolved name —
+    /// mirroring the name-keyed message-start rule.
+    pub signal_names: HashMap<String, String>,
     /// Declared definitions-level `<escalation>` ids.
     pub declared_escalations: HashSet<String>,
     /// `zeebe:taskDefinition`s on job-based tasks, with raw attribute strings.
