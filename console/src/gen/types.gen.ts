@@ -1572,6 +1572,14 @@ export type ListInstancesData = {
     query?: {
         page?: number;
         pageSize?: number;
+        /**
+         * Restrict the list to instances in this lifecycle state. Omit for no state constraint (all states).
+         */
+        state?: 'Active' | 'Completed' | 'Terminated';
+        /**
+         * When true, restrict the list to instances currently carrying an open incident. Omit for no incident constraint.
+         */
+        hasIncident?: boolean;
     };
     url: '/instances';
 };

@@ -372,7 +372,14 @@ impl apis::instances::Instances for ServerImpl {
     ) -> Result<apis::instances::ListInstancesResponse, ()> {
         let page = query_params.page.map(|p| p as i64).unwrap_or(0);
         let page_size = query_params.page_size.map(|p| p as i64).unwrap_or(50);
-        let dto = super::instances(self, page, page_size);
+        let filter = crate::readstore::InstanceFilter {
+            state: query_params
+                .state
+                .as_deref()
+                .and_then(super::parse_instance_state_filter),
+            has_incident: query_params.has_incident,
+        };
+        let dto = super::instances(self, page, page_size, filter);
         Ok(
             apis::instances::ListInstancesResponse::Status200_OnePageOfProcessInstances(from_dto(
                 dto,

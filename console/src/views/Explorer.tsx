@@ -9,6 +9,14 @@ import InstanceDetail from "./InstanceDetail";
 import { Badge, Button } from "../components/ui";
 import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
 import {
+  applyFilterChange,
+  filtersQueryKey,
+  INSTANCE_STATE_FILTERS,
+  parseExplorerFilters,
+  toInstanceQuery,
+  type InstanceStateFilter,
+} from "./explorerFilters";
+import {
   markBaseUrlCopied,
   markExplorerReached,
   swaggerUrl,
@@ -119,6 +127,27 @@ export default function Explorer() {
   // The prefix `["instances"]` invalidates every page query.
   useLiveInvalidation(["instances"]);
 
+  // Active filters are sourced from the URL so a filtered view is
+  // deep-linkable / reload-stable (cf. the `?instance=` deep-link above).
+  const filters = parseExplorerFilters(searchParams);
+
+  // Changing a filter rewrites the URL params and resets to the first page —
+  // the filtered set can be smaller than the current offset, so keeping the old
+  // page could strand the user on an out-of-range (empty) page.
+  const setStateFilter = (state?: InstanceStateFilter) => {
+    setSearchParams(applyFilterChange(searchParams, { kind: "state", state }), {
+      replace: true,
+    });
+    setPage(0);
+  };
+  const setHasIncident = (hasIncident: boolean) => {
+    setSearchParams(
+      applyFilterChange(searchParams, { kind: "hasIncident", hasIncident }),
+      { replace: true },
+    );
+    setPage(0);
+  };
+
   // Reaching Explorer is half of the headless-local-dev journey's outcome (the
   // other half is taking the v2 base URL below). Record it on mount so the
   // journey's successEvent can tell "walked the steps" from "actually debugged
@@ -128,11 +157,11 @@ export default function Explorer() {
   }, []);
 
   const { data, isLoading, error, isPlaceholderData } = useQuery({
-    queryKey: ["instances", page],
+    queryKey: ["instances", page, ...filtersQueryKey(filters)],
     queryFn: async () =>
       (
         await listInstances({
-          query: { page, pageSize: PAGE_SIZE },
+          query: { page, pageSize: PAGE_SIZE, ...toInstanceQuery(filters) },
           throwOnError: true,
         })
       ).data,
@@ -214,6 +243,49 @@ export default function Explorer() {
                 : `${rangeStart}–${rangeEnd} of ${total} instance(s)`
               : "Live view"}
           </p>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <div
+              role="group"
+              aria-label="Filter by state"
+              className="inline-flex overflow-hidden rounded-md border border-edge"
+            >
+              <button
+                type="button"
+                aria-pressed={filters.state === undefined}
+                onClick={() => setStateFilter(undefined)}
+                className={`px-2.5 py-1 text-xs ${
+                  filters.state === undefined
+                    ? "bg-accent text-on-accent"
+                    : "bg-panel text-fg-muted hover:bg-hover"
+                }`}
+              >
+                All
+              </button>
+              {INSTANCE_STATE_FILTERS.map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  aria-pressed={filters.state === s}
+                  onClick={() => setStateFilter(s)}
+                  className={`border-l border-edge px-2.5 py-1 text-xs ${
+                    filters.state === s
+                      ? "bg-accent text-on-accent"
+                      : "bg-panel text-fg-muted hover:bg-hover"
+                  }`}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+            <label className="inline-flex items-center gap-1.5 text-xs text-fg-muted">
+              <input
+                type="checkbox"
+                checked={filters.hasIncident}
+                onChange={(e) => setHasIncident(e.target.checked)}
+              />
+              Has incident
+            </label>
+          </div>
           <BaseUrlAffordance />
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
@@ -223,7 +295,9 @@ export default function Explorer() {
           )}
           {data && data.items.length === 0 && (
             <p className="p-5 text-fg-faint">
-              No instances yet. Deploy a process and create one.
+              {filters.state !== undefined || filters.hasIncident
+                ? "No instances match the current filters."
+                : "No instances yet. Deploy a process and create one."}
             </p>
           )}
           <ul>

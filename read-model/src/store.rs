@@ -666,6 +666,80 @@ fn instance_state_from(code: i64) -> ProcessInstanceState {
     }
 }
 
+/// Server-side filter for the console's paged process-instance list
+/// ([`ReadStore::process_instances_page`] / [`ReadStore::process_instance_count`]).
+///
+/// Both dimensions are optional; `None` means "no constraint on that dimension"
+/// (so `InstanceFilter::default()` == today's unfiltered list, byte-for-byte).
+/// The two present dimensions combine with **AND**.
+///
+/// This is the single source of truth for the filter derivation: the SQL page
+/// query, the SQL count, and the multi-shard in-memory merge
+/// (`server::readstore`) all derive from the same [`sql_predicate`] /
+/// [`matches`] pair, so a filtered page and its pager total can never drift, and
+/// a single-shard node filters identically to a sharded one.
+///
+/// [`sql_predicate`]: InstanceFilter::sql_predicate
+/// [`matches`]: InstanceFilter::matches
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceFilter {
+    /// Restrict to a single lifecycle state (`None` = any state).
+    pub state: Option<ProcessInstanceState>,
+    /// Restrict to instances with (`Some(true)`) / without (`Some(false)`) an
+    /// open incident (`None` = no incident constraint).
+    pub has_incident: Option<bool>,
+}
+
+impl InstanceFilter {
+    /// True when no dimension constrains the result — the unfiltered path.
+    pub fn is_unfiltered(&self) -> bool {
+        self.state.is_none() && self.has_incident.is_none()
+    }
+
+    /// SQL predicate fragment (without a leading `WHERE`) built from **literal
+    /// integer codes** — `state` is a typed enum mapped through the canonical
+    /// [`instance_state_code`] and `has_incident` a bool, so no user-supplied
+    /// string ever reaches SQL (no injection surface). Empty when unfiltered.
+    fn sql_predicate(&self) -> String {
+        let mut clauses: Vec<String> = Vec::new();
+        if let Some(state) = self.state {
+            clauses.push(format!("state = {}", instance_state_code(state)));
+        }
+        if let Some(has_incident) = self.has_incident {
+            clauses.push(format!("has_incident = {}", i64::from(has_incident)));
+        }
+        clauses.join(" AND ")
+    }
+
+    /// The `WHERE …` clause (with a leading space + `WHERE`) to splice into a
+    /// query, or the empty string when unfiltered.
+    fn where_clause(&self) -> String {
+        let predicate = self.sql_predicate();
+        if predicate.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {predicate}")
+        }
+    }
+
+    /// In-memory row predicate used by the multi-shard merge — must stay
+    /// semantically identical to [`sql_predicate`](Self::sql_predicate) so a
+    /// sharded node filters exactly like a single-shard node.
+    pub fn matches(&self, row: &ProcessInstanceRow) -> bool {
+        if let Some(state) = self.state
+            && row.state != state
+        {
+            return false;
+        }
+        if let Some(has_incident) = self.has_incident
+            && row.has_incident != has_incident
+        {
+            return false;
+        }
+        true
+    }
+}
+
 fn job_state_code(s: JobState) -> i64 {
     match s {
         JobState::Created => 0,
@@ -2028,29 +2102,42 @@ impl ReadStore {
         rows.filter_map(Result::ok).collect()
     }
 
-    /// Total number of process instances in the read model — the page count for
-    /// the console's paginated instance list. Cheap `COUNT(*)` on the table.
-    pub fn process_instance_count(&self) -> i64 {
+    /// Number of process instances matching `filter` — the page count for the
+    /// console's paginated instance list. With [`InstanceFilter::default`] this
+    /// is the cheap unfiltered `COUNT(*)`; with a filter it applies the **same**
+    /// predicate the page query uses, so the pager total tracks the filtered set
+    /// (never a desynced unfiltered count).
+    pub fn process_instance_count(&self, filter: &InstanceFilter) -> i64 {
         let conn = self.conn.lock().expect("read store poisoned");
-        conn.query_row("SELECT COUNT(*) FROM process_instances", [], |r| r.get(0))
-            .unwrap_or(0)
+        let sql = format!(
+            "SELECT COUNT(*) FROM process_instances{}",
+            filter.where_clause()
+        );
+        conn.query_row(&sql, [], |r| r.get(0)).unwrap_or(0)
     }
 
-    /// One page of process instances, newest first. Orders by `key DESC` — keys
-    /// are monotonic so this is newest-first (the same ordering the retention
-    /// prune uses) and rides the integer PRIMARY KEY index, so it is
-    /// `O(limit + offset)` in SQLite rather than loading and sorting every row
-    /// in memory (which is what made the console hang on large datasets).
-    pub fn process_instances_page(&self, limit: i64, offset: i64) -> Vec<ProcessInstanceRow> {
+    /// One page of process instances matching `filter`, newest first. Orders by
+    /// `key DESC` — keys are monotonic so this is newest-first (the same
+    /// ordering the retention prune uses) and rides the integer PRIMARY KEY
+    /// index, so it is `O(limit + offset)` in SQLite rather than loading and
+    /// sorting every row in memory (which is what made the console hang on large
+    /// datasets). The filter predicate is single-sourced with
+    /// [`process_instance_count`](Self::process_instance_count).
+    pub fn process_instances_page(
+        &self,
+        limit: i64,
+        offset: i64,
+        filter: &InstanceFilter,
+    ) -> Vec<ProcessInstanceRow> {
         let conn = self.conn.lock().expect("read store poisoned");
-        let mut stmt = conn
-            .prepare(
-                "SELECT key, process_id, process_definition_id, process_definition_key, \
+        let sql = format!(
+            "SELECT key, process_id, process_definition_id, process_definition_key, \
                  version, state, start_date_ms, has_incident, tags, business_id, \
                  parent_process_instance_key, parent_element_instance_key \
-                 FROM process_instances ORDER BY key DESC LIMIT ?1 OFFSET ?2",
-            )
-            .expect("prepare process_instances_page");
+                 FROM process_instances{} ORDER BY key DESC LIMIT ?1 OFFSET ?2",
+            filter.where_clause()
+        );
+        let mut stmt = conn.prepare(&sql).expect("prepare process_instances_page");
         let rows = stmt
             .query_map(params![limit, offset], map_instance)
             .expect("query process_instances_page");
@@ -5731,28 +5818,168 @@ mod definition_xml_tests {
 
     #[test]
     fn process_instances_page_returns_newest_first_bounded_pages() {
+        use super::InstanceFilter;
         let store = ReadStore::open(None).unwrap();
         // Keys 1..=5, created oldest→newest; keys are monotonic so newest = key 5.
         for k in 1..=5u64 {
             store.export(&[&created_event(k)]).unwrap();
         }
 
-        assert_eq!(store.process_instance_count(), 5);
+        assert_eq!(store.process_instance_count(&InstanceFilter::default()), 5);
 
         // First page: the 2 newest, descending by key.
-        let page0 = store.process_instances_page(2, 0);
+        let page0 = store.process_instances_page(2, 0, &InstanceFilter::default());
         assert_eq!(page0.iter().map(|r| r.key).collect::<Vec<_>>(), vec![5, 4]);
 
         // Second page picks up where the first left off.
-        let page1 = store.process_instances_page(2, 2);
+        let page1 = store.process_instances_page(2, 2, &InstanceFilter::default());
         assert_eq!(page1.iter().map(|r| r.key).collect::<Vec<_>>(), vec![3, 2]);
 
         // Final partial page.
-        let page2 = store.process_instances_page(2, 4);
+        let page2 = store.process_instances_page(2, 4, &InstanceFilter::default());
         assert_eq!(page2.iter().map(|r| r.key).collect::<Vec<_>>(), vec![1]);
 
         // Offset past the end yields nothing.
-        assert!(store.process_instances_page(2, 6).is_empty());
+        assert!(
+            store
+                .process_instances_page(2, 6, &InstanceFilter::default())
+                .is_empty()
+        );
+    }
+
+    /// A `ProcessInstanceCreated` with an explicit key so filter tests can wire
+    /// up several instances and then transition/incident a subset.
+    #[test]
+    fn process_instances_page_and_count_apply_state_and_incident_filter() {
+        use nanobpmn_engine_core::ProcessInstanceState;
+
+        use super::InstanceFilter;
+        let store = ReadStore::open(None).unwrap();
+        // Five Active instances, keys 1..=5.
+        for k in 1..=5u64 {
+            store.export(&[&created_event(k)]).unwrap();
+        }
+        // Complete key 2 and key 4 → Completed.
+        store
+            .export(&[&Event::ProcessInstanceCompleted { instance_key: 2 }])
+            .unwrap();
+        store
+            .export(&[&Event::ProcessInstanceCompleted { instance_key: 4 }])
+            .unwrap();
+        // Terminate key 1 → Terminated.
+        store
+            .export(&[&Event::ProcessInstanceTerminated { instance_key: 1 }])
+            .unwrap();
+        // Raise an incident on (still Active) key 5.
+        store
+            .export(&[&Event::IncidentRaised {
+                incident_key: 900,
+                instance_key: 5,
+                element_instance_key: 5001,
+                element_id: "t".to_string(),
+                kind: nanobpmn_engine_core::IncidentKind::JobNoRetries,
+                reason: "boom".to_string(),
+                job_key: Some(42),
+                created_at: 5,
+            }])
+            .unwrap();
+        // Final states: 1=Terminated, 2=Completed, 3=Active, 4=Completed,
+        // 5=Active(+incident).
+
+        let active = InstanceFilter {
+            state: Some(ProcessInstanceState::Active),
+            has_incident: None,
+        };
+        let completed = InstanceFilter {
+            state: Some(ProcessInstanceState::Completed),
+            has_incident: None,
+        };
+        let terminated = InstanceFilter {
+            state: Some(ProcessInstanceState::Terminated),
+            has_incident: None,
+        };
+        let has_incident = InstanceFilter {
+            state: None,
+            has_incident: Some(true),
+        };
+        let active_incident = InstanceFilter {
+            state: Some(ProcessInstanceState::Active),
+            has_incident: Some(true),
+        };
+
+        // Filtered page returns only matching rows, newest-first, bounded.
+        let page = store.process_instances_page(50, 0, &active);
+        assert_eq!(page.iter().map(|r| r.key).collect::<Vec<_>>(), vec![5, 3]);
+        // Filtered count matches the number of filtered rows (pager-desync guard).
+        assert_eq!(store.process_instance_count(&active), 2);
+
+        assert_eq!(
+            store
+                .process_instances_page(50, 0, &completed)
+                .iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>(),
+            vec![4, 2]
+        );
+        assert_eq!(store.process_instance_count(&completed), 2);
+
+        assert_eq!(
+            store
+                .process_instances_page(50, 0, &terminated)
+                .iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(store.process_instance_count(&terminated), 1);
+
+        // Has-incident on its own.
+        assert_eq!(
+            store
+                .process_instances_page(50, 0, &has_incident)
+                .iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+        assert_eq!(store.process_instance_count(&has_incident), 1);
+
+        // state + has_incident combine with AND.
+        assert_eq!(
+            store
+                .process_instances_page(50, 0, &active_incident)
+                .iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+        assert_eq!(store.process_instance_count(&active_incident), 1);
+        // Completed + has_incident: no completed instance carries an incident.
+        let completed_incident = InstanceFilter {
+            state: Some(ProcessInstanceState::Completed),
+            has_incident: Some(true),
+        };
+        assert!(
+            store
+                .process_instances_page(50, 0, &completed_incident)
+                .is_empty()
+        );
+        assert_eq!(store.process_instance_count(&completed_incident), 0);
+
+        // Filtered paging is still bounded/offset-correct.
+        let terminal_page = store.process_instances_page(1, 1, &completed);
+        assert_eq!(
+            terminal_page.iter().map(|r| r.key).collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        // Empty/None filter == unfiltered result (regression guard).
+        let unfiltered = store.process_instances_page(50, 0, &InstanceFilter::default());
+        assert_eq!(
+            unfiltered.iter().map(|r| r.key).collect::<Vec<_>>(),
+            vec![5, 4, 3, 2, 1]
+        );
+        assert_eq!(store.process_instance_count(&InstanceFilter::default()), 5);
     }
 
     #[test]

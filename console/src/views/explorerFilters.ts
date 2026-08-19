@@ -1,0 +1,114 @@
+// Pure filter logic for the Process Instances Explorer, kept out of the React
+// component so it can be unit-tested with the Node test runner (no DOM).
+//
+// The Explorer filters the instance list by lifecycle **state** and by whether
+// an instance carries an open **incident**. Both are applied server-side (so the
+// pager total stays correct) and both are reflected in the URL query string so a
+// filtered view is deep-linkable / reload-stable.
+//
+// URL contract (mirrors the existing `?instance=` deep-link pattern):
+//   - `state=Active|Completed|Terminated`  (absent = All)
+//   - `incident=1`                          (absent = no incident constraint)
+
+/** The lifecycle states the console can filter on (the console-api enum). */
+export type InstanceStateFilter = "Active" | "Completed" | "Terminated";
+
+export const INSTANCE_STATE_FILTERS: readonly InstanceStateFilter[] = [
+  "Active",
+  "Completed",
+  "Terminated",
+];
+
+/** The parsed, normalized filter selection driving the instance query. */
+export type ExplorerFilters = {
+  /** Selected state, or `undefined` for "All" (no state constraint). */
+  state?: InstanceStateFilter;
+  /** When true, restrict to instances with an open incident. */
+  hasIncident: boolean;
+};
+
+/** The `state` query param the console API accepts (undefined = All). */
+function isStateFilter(value: string | null): value is InstanceStateFilter {
+  return value === "Active" || value === "Completed" || value === "Terminated";
+}
+
+/**
+ * Derive the active filters from URL search params. Unknown / absent values
+ * fall back to the unconstrained defaults (All states, no incident constraint),
+ * so a malformed deep-link degrades to the full list rather than erroring.
+ */
+export function parseExplorerFilters(params: URLSearchParams): ExplorerFilters {
+  const stateParam = params.get("state");
+  return {
+    state: isStateFilter(stateParam) ? stateParam : undefined,
+    hasIncident: params.get("incident") === "1",
+  };
+}
+
+/** The `listInstances` query object shape for the filter dimensions. */
+export type InstanceQueryFilters = {
+  state?: InstanceStateFilter;
+  hasIncident?: boolean;
+};
+
+/**
+ * Build the `query` filter fields passed to `listInstances`. Omits a dimension
+ * entirely when unconstrained so "no param = current behaviour" holds on the
+ * wire (an omitted param means no constraint, byte-for-byte the old request).
+ */
+export function toInstanceQuery(
+  filters: ExplorerFilters,
+): InstanceQueryFilters {
+  const query: InstanceQueryFilters = {};
+  if (filters.state) query.state = filters.state;
+  if (filters.hasIncident) query.hasIncident = true;
+  return query;
+}
+
+/**
+ * A stable, serializable representation of the filters for a React Query
+ * `queryKey`, so each distinct filter combination caches (and refetches)
+ * independently while sharing the `["instances"]` prefix that live SSE
+ * invalidation targets.
+ */
+export function filtersQueryKey(
+  filters: ExplorerFilters,
+): [string | null, boolean] {
+  return [filters.state ?? null, filters.hasIncident];
+}
+
+/** A single change to one filter dimension. */
+export type FilterChange =
+  | { kind: "state"; state?: InstanceStateFilter }
+  | { kind: "hasIncident"; hasIncident: boolean };
+
+/**
+ * Apply a filter change to the current search params, returning the next params
+ * to push. Callers pair this with a reset of the pager to page 0 (see
+ * {@link shouldResetPageOnFilterChange}) so a narrowed set never leaves the user
+ * stranded on an out-of-range page. Other params (e.g. `instance`) are
+ * preserved untouched.
+ */
+export function applyFilterChange(
+  current: URLSearchParams,
+  change: FilterChange,
+): URLSearchParams {
+  const next = new URLSearchParams(current);
+  if (change.kind === "state") {
+    if (change.state) next.set("state", change.state);
+    else next.delete("state");
+  } else {
+    if (change.hasIncident) next.set("incident", "1");
+    else next.delete("incident");
+  }
+  return next;
+}
+
+/**
+ * Whether a filter change should reset the pager to the first page. Always true
+ * — the filtered set can be smaller than the current page offset — but exposed
+ * as a named predicate so the intent is explicit and testable.
+ */
+export function shouldResetPageOnFilterChange(): boolean {
+  return true;
+}

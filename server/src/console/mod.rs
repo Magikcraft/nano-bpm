@@ -2090,18 +2090,44 @@ pub(super) struct ActiveElementDto {
     element_name: Option<String>,
 }
 
-/// `GET /console/api/instances?page=N&pageSize=M` — one page of process
-/// instances, newest first, plus the total count for the pager. Pagination is
-/// pushed into SQLite (`process_instances_page`) so a node with a large read
-/// model returns a bounded page instead of materializing and sorting every row
-/// (which made the Process Explorer hang).
-pub(super) fn instances(server: &ServerImpl, page: i64, page_size: i64) -> InstancePage {
+/// Parses a console `state` filter string into an engine
+/// [`ProcessInstanceState`]. Accepts exactly the spec's enum values
+/// (`Active` / `Completed` / `Terminated`) — the same names the console
+/// projects for a row (see [`InstanceDto`]) — so "filter by what you see" holds.
+/// An unrecognized value yields `None`, i.e. no state constraint (unfiltered).
+pub(super) fn parse_instance_state_filter(
+    state: &str,
+) -> Option<nanobpmn_engine_core::ProcessInstanceState> {
+    use nanobpmn_engine_core::ProcessInstanceState;
+    match state {
+        "Active" => Some(ProcessInstanceState::Active),
+        "Completed" => Some(ProcessInstanceState::Completed),
+        "Terminated" => Some(ProcessInstanceState::Terminated),
+        _ => None,
+    }
+}
+
+/// `GET /console/api/instances?page=N&pageSize=M&state=…&hasIncident=…` — one
+/// page of process instances, newest first, plus the total count for the pager.
+/// Pagination and filtering are pushed into SQLite
+/// (`process_instances_page` / `process_instance_count`) so a node with a large
+/// read model returns a bounded, correctly-counted page instead of
+/// materializing and sorting every row (which made the Process Explorer hang).
+/// The `filter` (state + has-incident) is applied server-side so the pager
+/// total and page boundaries stay correct.
+pub(super) fn instances(
+    server: &ServerImpl,
+    page: i64,
+    page_size: i64,
+    filter: crate::readstore::InstanceFilter,
+) -> InstancePage {
     let page = page.max(0);
     let page_size = page_size.clamp(1, 500);
-    let total = server.store.process_instance_count();
-    let rows = server
-        .store
-        .process_instances_page(page_size, page.saturating_mul(page_size));
+    let total = server.store.process_instance_count(&filter);
+    let rows =
+        server
+            .store
+            .process_instances_page(page_size, page.saturating_mul(page_size), &filter);
     InstancePage {
         items: rows.iter().map(InstanceDto::from).collect(),
         total,
