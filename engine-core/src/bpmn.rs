@@ -282,6 +282,16 @@ fn is_ignorable_tag(tag: &str) -> bool {
             | "escalationEventDefinition"
             | "linkEventDefinition"
             | "conditionalEventDefinition"
+            // `terminateEventDefinition` is a *documented* "parsed-not-executed"
+            // element (see `docs/camunda-compatibility.md`): its owning
+            // `<endEvent>` IS modelled, and — matching Zeebe deploy parity, which
+            // accepts terminate end events — Nano accepts it too, degrading to a
+            // plain end event (the "kill remaining tokens in scope" semantics are
+            // a known, documented limitation, not a silent accept-and-mis-execute
+            // of an *unknown* construct). So it must NOT be recorded as an
+            // unsupported element; rejecting it would break deploy parity for the
+            // many real-world models that use terminate ends.
+            | "terminateEventDefinition"
             // Nested value/config children of already-modelled constructs.
             | "condition"
             | "conditionExpression"
@@ -471,6 +481,17 @@ fn parse_with_captures(
     // io_stack. Without this a stray `linkedResource` tag elsewhere in
     // `extensionElements` (or from another namespace) would be treated as a link.
     let mut in_linked_resources = false;
+    // Depth of the currently-open `<extensionElements>` subtree(s). Every child
+    // of `extensionElements` is foreign-namespace vendor metadata (Zeebe's
+    // `zeebe:*`, Nano's semantic `nano:*`, or any other), *not* a BPMN flow
+    // element or event definition — the children Nano reads are consumed by the
+    // explicit extension arms above; everything else is noise Zeebe likewise
+    // ignores rather than failing the deploy. So while this is `> 0` the
+    // flow-element catch-all must **not** record a tag as unmodelled, or a
+    // `<nano:cost>` / stray `<zeebe:header>` would be mis-reported as an
+    // unsupported element. A self-closing `<extensionElements/>` has no children
+    // and emits no end tag, so it never increments this.
+    let mut extension_depth: u32 = 0;
 
     for token in &tokens {
         // An end tag closes an element: balance the open-element stack pushed on
@@ -1066,6 +1087,18 @@ fn parse_with_captures(
                             "completionCondition" => {
                                 completion_condition_text = Some(String::new());
                             }
+                            // A `<bpmn:extensionElements>` container. Its
+                            // children are foreign vendor metadata (see
+                            // `extension_depth`): the ones Nano reads are matched
+                            // by the explicit arms above; the rest must not reach
+                            // the flow-element catch-all as unmodelled elements.
+                            // A self-closing container has no children, so only a
+                            // real open element enters the subtree.
+                            "extensionElements" => {
+                                if !self_closing {
+                                    extension_depth += 1;
+                                }
+                            }
                             // zeebe:ioMapping and its nested zeebe:input/output.
                             // input/output are only read inside an ioMapping that
                             // belongs to an open activity (the innermost on the
@@ -1265,12 +1298,16 @@ fn parse_with_captures(
                             // genuinely-unmodelled flow elements / event
                             // definitions as `(tag, element_id)`. The
                             // unsupported-elements validator (#853) consumes this
-                            // list; an explicit ignore-list keeps out non-flow
-                            // noise (DI, documentation, extensionElements children
-                            // Nano reads elsewhere, structural BPMN, and the event
-                            // definitions Nano does model).
+                            // list; the `is_ignorable_tag` ignore-list keeps out
+                            // non-flow noise (DI, documentation, structural BPMN,
+                            // and the event definitions Nano does model), while the
+                            // `extension_depth` guard keeps out foreign
+                            // extension-element children (`zeebe:*`, `nano:*`, …)
+                            // that Nano reads elsewhere or ignores — a BPMN flow
+                            // element / event definition never appears inside
+                            // `<extensionElements>`.
                             other => {
-                                if !is_ignorable_tag(other) {
+                                if extension_depth == 0 && !is_ignorable_tag(other) {
                                     // Prefer the tag's own `id`, but many
                                     // unmodelled constructs (notably event
                                     // definitions) carry no `id`; attribute those
@@ -1369,6 +1406,7 @@ fn parse_with_captures(
                     in_io_mapping = false;
                     in_execution_listeners = false;
                     in_task_listeners = false;
+                    extension_depth = 0;
                 }
                 "serviceTask" => {
                     cur_service_task = None;
@@ -1403,6 +1441,9 @@ fn parse_with_captures(
                     io_stack.pop();
                 }
                 "ioMapping" => in_io_mapping = false,
+                "extensionElements" => {
+                    extension_depth = extension_depth.saturating_sub(1);
+                }
                 "taskHeaders" => in_task_headers = false,
                 "linkedResources" => in_linked_resources = false,
                 "executionListeners" => in_execution_listeners = false,
