@@ -634,15 +634,31 @@ impl Engine {
             let version = self.next_version(&process.id);
             let process_definition_key = self.mint_key();
             let process_id = process.id.clone();
-            let start_element_id = process.start_event.clone();
-            let start_kind = process
-                .elements
-                .get(&process.start_event)
-                .map(|e| e.kind.clone());
-            let start_timer_def = process
-                .elements
-                .get(&process.start_event)
-                .and_then(|e| e.timer.clone());
+            // Zeebe permits a process to declare several *typed*
+            // (message/timer) start events alongside an optional none start,
+            // and EVERY one of them arms its own trigger at deploy — a message
+            // start opens a subscription, a timer start arms a process-level
+            // timer — each firing an independent instance at its own start
+            // element (issue #855). `process.start_event` designates only the
+            // single CreateInstance entry point; it does NOT limit which starts
+            // are wired. So scan all process-level (`parent.is_none()`) typed
+            // starts, deterministically ordered by element id so key minting
+            // and replay stay in lock-step.
+            let mut typed_starts: Vec<(ElementId, ElementKind, Option<crate::model::TimerDef>)> =
+                process
+                    .elements
+                    .values()
+                    .filter(|e| e.parent.is_none())
+                    .filter(|e| {
+                        matches!(
+                            e.kind,
+                            ElementKind::MessageStartEvent { .. }
+                                | ElementKind::TimerStartEvent { .. }
+                        )
+                    })
+                    .map(|e| (e.id.clone(), e.kind.clone(), e.timer.clone()))
+                    .collect();
+            typed_starts.sort_by(|a, b| a.0.cmp(&b.0));
             self.emit(
                 log,
                 Event::ProcessDeployed {
@@ -652,51 +668,53 @@ impl Engine {
                     process,
                 },
             );
-            match start_kind {
-                Some(ElementKind::MessageStartEvent { message_name }) => {
-                    // Per Zeebe, a start-event name expression is evaluated at
-                    // deploy time against an empty context; a static name passes
-                    // through unchanged.
-                    let message_name = self.resolve_event_name(&HashMap::new(), &message_name);
-                    self.emit(
-                        log,
-                        Event::MessageStartSubscriptionCreated {
-                            process_definition_key,
-                            process_id,
-                            message_name,
-                            start_element_id,
-                        },
-                    );
-                }
-                Some(ElementKind::TimerStartEvent {
-                    interval_millis,
-                    repeating,
-                }) => {
-                    let timer_key = self.mint_key();
-                    // Evaluate a FEEL start-timer expression against an empty
-                    // context at deploy; a static literal falls back to the
-                    // parsed interval. For a cycle the resolved interval is
-                    // persisted so re-arming recurs on the same delay.
-                    let (due_at, interval_millis) = self.resolve_timer(
-                        &HashMap::new(),
-                        start_timer_def.as_ref(),
-                        self.now,
+            for (start_element_id, start_kind, start_timer_def) in typed_starts {
+                match start_kind {
+                    ElementKind::MessageStartEvent { message_name } => {
+                        // Per Zeebe, a start-event name expression is evaluated
+                        // at deploy time against an empty context; a static name
+                        // passes through unchanged.
+                        let message_name = self.resolve_event_name(&HashMap::new(), &message_name);
+                        self.emit(
+                            log,
+                            Event::MessageStartSubscriptionCreated {
+                                process_definition_key,
+                                process_id: process_id.clone(),
+                                message_name,
+                                start_element_id,
+                            },
+                        );
+                    }
+                    ElementKind::TimerStartEvent {
                         interval_millis,
-                    );
-                    self.emit(
-                        log,
-                        Event::ProcessStartTimerArmed {
-                            timer_key,
-                            process_definition_key,
-                            process_id,
-                            start_element_id,
-                            due_at,
+                        repeating,
+                    } => {
+                        let timer_key = self.mint_key();
+                        // Evaluate a FEEL start-timer expression against an empty
+                        // context at deploy; a static literal falls back to the
+                        // parsed interval. For a cycle the resolved interval is
+                        // persisted so re-arming recurs on the same delay.
+                        let (due_at, interval_millis) = self.resolve_timer(
+                            &HashMap::new(),
+                            start_timer_def.as_ref(),
+                            self.now,
                             interval_millis,
-                            repeating,
-                        },
-                    );
+                        );
+                        self.emit(
+                            log,
+                            Event::ProcessStartTimerArmed {
+                                timer_key,
+                                process_definition_key,
+                                process_id: process_id.clone(),
+                                start_element_id,
+                                due_at,
+                                interval_millis,
+                                repeating,
+                            },
+                        );
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         Ok(())
