@@ -375,6 +375,28 @@ jobs:
       - name: Verify + test
         run: mvn --batch-mode --no-transfer-progress verify
 
+  ai-assert-npm:
+    name: '@nanobpm/ai-assert (build + test)'
+    runs-on: ubuntu-24.04
+    needs: [changes]
+    if: *code_gate
+    defaults:
+      run:
+        working-directory: clients/ai-assert
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Install
+        run: npm install
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Test
+        run: npm test
+
   spec-app:
     name: spec-app (Urban App manifest)
     runs-on: ubuntu-24.04
