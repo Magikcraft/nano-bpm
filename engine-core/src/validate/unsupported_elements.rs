@@ -65,6 +65,14 @@ use crate::bpmn::ParseError;
 /// such a BPMN flow-element local name would be dead and, worse, would silently
 /// mask a genuinely unsupported `<bpmn:userTask>` capture should the parser's
 /// recording logic ever change.
+///
+/// Likewise, only a name the parser ever encounters as an *element tag* belongs
+/// here. A Zeebe attribute name or attribute *value* — e.g. `versionTag`, which
+/// the parser only ever reads as the `zeebe:linkedResource` `versionTag`
+/// attribute and as the `bindingType="versionTag"` value, never as a tag — can
+/// never be recorded on `capture.unmodelled`, so listing it is dead and, worse,
+/// would silently mask a genuinely unsupported element named `versionTag`
+/// should one ever appear.
 const EXTENSION_NOISE: &[&str] = &[
     "taskDefinition",
     "taskHeaders",
@@ -88,7 +96,6 @@ const EXTENSION_NOISE: &[&str] = &[
     "executionListener",
     "taskListeners",
     "taskListener",
-    "versionTag",
 ];
 
 /// Whether a recorded unmodelled tag is a foreign extension-element child
