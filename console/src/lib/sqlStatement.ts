@@ -40,8 +40,8 @@ function stripLeadingSqlComments(sql: string): string {
  * Conservative by construction — anything not provably read-only is treated as
  * a write:
  * - `SELECT` / `EXPLAIN` are always reads.
- * - A CTE (`WITH …`) is a read only when it terminates in a `SELECT`, i.e. it
- *   carries no mutating verb; `WITH … INSERT/UPDATE/DELETE/REPLACE …` mutates
+ * - A CTE (`WITH …`) is treated as a read when it carries no mutating verb; a
+ *   `WITH …` that contains `INSERT`/`UPDATE`/`DELETE`/`REPLACE` anywhere mutates
  *   and must not be classified as a read.
  * - `PRAGMA name` reads a setting, but `PRAGMA name = value` mutates. The call
  *   form `PRAGMA name(x)` is often a read (e.g. `table_info(t)`); we still treat
