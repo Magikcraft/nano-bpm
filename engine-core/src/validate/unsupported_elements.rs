@@ -27,124 +27,42 @@
 //! `ElementKind` (a new parser arm) makes its tag stop appearing in
 //! `capture.unmodelled`, so it is accepted here with **no change to this file**.
 //!
-//! ## The one residual filter: foreign extension-element children
+//! ## Foreign extension-element children are filtered at the parser, not here
 //!
-//! The scaffold's parse-side ignore-list is deliberately an *exclusion list of
-//! noise* and, as its own doc-comment notes, "over-recording a rare non-flow tag
-//! is harmless (the validator filters it)". The streaming gates that consume
-//! Zeebe extension-element children (`<zeebe:header>` inside `<zeebe:taskHeaders>`,
-//! `<zeebe:linkedResource>` inside `<zeebe:linkedResources>`, …) only match those
-//! children *in position*; a **misplaced** extension child therefore falls
-//! through to the flow-element catch-all and is over-recorded. Such a child is
-//! foreign-namespace extension metadata, not a BPMN flow element or event
-//! definition — Zeebe ignores it rather than failing the deploy — so this rule
-//! must ignore it too. [`is_extension_noise`] performs exactly that final filter
-//! (the parser strips namespace prefixes, so the discriminator is the set of
-//! Zeebe extension-element local names). It is *not* a supported-element
-//! allowlist: every BPMN flow element / event definition Nano does not model
-//! still rejects.
+//! `<extensionElements>` carries foreign-namespace vendor metadata — Zeebe's
+//! `zeebe:*`, Nano's semantic `nano:*`, or any other namespace — not BPMN flow
+//! elements or event definitions. The children Nano executes are consumed by the
+//! parser's explicit extension arms; every other child (a stray `<zeebe:header>`,
+//! a `<zeebe:properties>` container, an open-ended `<nano:cost>`) is metadata
+//! Zeebe ignores rather than failing the deploy, so it must not be reported as an
+//! unsupported element. The parser recognises this *by position* — its
+//! `extension_depth` guard suppresses the flow-element catch-all for anything
+//! nested inside `<extensionElements>` — so such children never reach
+//! `capture.unmodelled` at all. This validator therefore needs no tag allowlist
+//! of its own: it rejects the residual list verbatim, and because the
+//! discriminator is "inside `extensionElements`?" (which the parser knows) rather
+//! than a curated set of local names (which cannot cover the open-ended `nano:*`
+//! vocabulary), there is no second source of truth to drift.
 
 use super::ValidationInput;
 use crate::bpmn::ParseError;
 
-/// Local names of the Zeebe extension-element tags that reach the flow-element
-/// catch-all as foreign-namespace extension metadata (which Zeebe ignores),
-/// rather than as an unmodelled BPMN flow element — so the unsupported-element
-/// rule filters them out. There are two ways such a tag reaches the catch-all,
-/// and both belong here:
-///
-/// - **Consumed positionally, but misplaced.** Most entries are children the
-///   parser consumes inside their designated container / owner in `crate::bpmn`
-///   (e.g. `zeebe:header` inside `zeebe:taskHeaders`, `zeebe:input` inside
-///   `zeebe:ioMapping`). Correctly placed they never reach the catch-all; only
-///   when *misplaced* does the container guard fail and the tag fall through and
-///   get over-recorded on `capture.unmodelled`.
-/// - **Not modelled at all.** A few are Zeebe extension containers the parser
-///   does not handle anywhere (e.g. the `zeebe:properties` container — Nano does
-///   not model element/process properties). These are *never* consumed, so they
-///   *always* reach the catch-all, misplaced or not, and would be over-recorded
-///   without this filter.
-///
-/// This is therefore **not** simply "the `zeebe:` local names the parser
-/// handles": it is the set that must be suppressed at the catch-all, which is
-/// neither a subset nor a superset of the handled set.
-///
-/// Only local names that would otherwise fall through to the flow-element
-/// catch-all (and so be over-recorded on `capture.unmodelled`) belong here. A
-/// `zeebe:` extension local name that *collides* with a modelled BPMN
-/// flow-element tag — e.g. `zeebe:userTask`, whose local name `userTask` is
-/// consumed by the same modelled `"userTask"` parser arm as `<bpmn:userTask>`
-/// (and, being id-less, is a no-op there) — is **not** listed: it never reaches
-/// the catch-all, so it is not noise this filter needs to suppress. Listing
-/// such a BPMN flow-element local name would be dead and, worse, would silently
-/// mask a genuinely unsupported `<bpmn:userTask>` capture should the parser's
-/// recording logic ever change.
-///
-/// Likewise, only a name the parser ever encounters as an *element tag* belongs
-/// here. A Zeebe attribute name or attribute *value* — e.g. `versionTag`, which
-/// the parser only ever reads as the `zeebe:linkedResource` `versionTag`
-/// attribute and as the `bindingType="versionTag"` value, never as a tag — can
-/// never be recorded on `capture.unmodelled`, so listing it is dead and, worse,
-/// would silently mask a genuinely unsupported element named `versionTag`
-/// should one ever appear.
-///
-/// Finally, a name already covered by `is_ignorable_tag` (in `crate::bpmn`) must
-/// **not** be duplicated here. That noise filter runs *first* at the catch-all,
-/// so such a tag never reaches this filter — e.g. `property`, listed there as
-/// structural BPMN, also captures a namespace-stripped `zeebe:property`. Listing
-/// it here too would be dead and duplicate a second source of truth for the same
-/// tag.
-const EXTENSION_NOISE: &[&str] = &[
-    "taskDefinition",
-    "taskHeaders",
-    "header",
-    "ioMapping",
-    "input",
-    "output",
-    "subscription",
-    "calledDecision",
-    "calledElement",
-    "formDefinition",
-    "assignmentDefinition",
-    "taskSchedule",
-    "priorityDefinition",
-    "properties",
-    "script",
-    "linkedResources",
-    "linkedResource",
-    "executionListeners",
-    "executionListener",
-    "taskListeners",
-    "taskListener",
-];
-
-/// Whether a recorded unmodelled tag is a foreign extension-element child
-/// (surfaced only when misplaced) rather than a BPMN flow element / event
-/// definition. See the module docs.
-fn is_extension_noise(tag: &str) -> bool {
-    EXTENSION_NOISE.contains(&tag)
-}
-
 /// Rejects the first recorded unmodelled flow element / event definition.
 ///
 /// Every entry in `capture.unmodelled` is a flow-element tag or event definition
-/// the engine does not model — the parser's noise `is_ignorable_tag` filter has
+/// the engine does not model — the parser's `is_ignorable_tag` noise filter has
 /// already excluded diagram interchange, documentation, structural/data BPMN,
-/// and the event definitions the engine *does* model — save for the rare
-/// misplaced extension child [`is_extension_noise`] filters out here.
-/// Historically such a tag was silently dropped: a flow into it then failed
-/// deploy with a misleading "unknown target element" error at the flow, and an
-/// element with no inbound flow deployed clean and mis-executed. Zeebe instead
-/// only transforms known element types and rejects the rest at deploy; matching
-/// that, we reject with an actionable [`ParseError::UnsupportedElement`] naming
-/// the offending tag and element id.
+/// and the event definitions the engine *does* model, and its `extension_depth`
+/// guard has already excluded foreign extension-element children (`zeebe:*`,
+/// `nano:*`, …) that live inside `<extensionElements>`. Historically such a
+/// flow-element tag was silently dropped: a flow into it then failed deploy with
+/// a misleading "unknown target element" error at the flow, and an element with
+/// no inbound flow deployed clean and mis-executed. Zeebe instead only
+/// transforms known element types and rejects the rest at deploy; matching that,
+/// we reject with an actionable [`ParseError::UnsupportedElement`] naming the
+/// offending tag and element id.
 pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
-    if let Some(unsupported) = input
-        .capture
-        .unmodelled
-        .iter()
-        .find(|u| !is_extension_noise(&u.tag))
-    {
+    if let Some(unsupported) = input.capture.unmodelled.first() {
         return Err(ParseError::UnsupportedElement {
             tag: unsupported.tag.clone(),
             element_id: unsupported.element_id.clone(),
@@ -348,12 +266,13 @@ mod tests {
         );
     }
 
-    /// Foreign extension-element children that fall through the streaming gates
-    /// when misplaced (a `<zeebe:header>` outside `<zeebe:taskHeaders>`, a
-    /// `<zeebe:linkedResource>` outside `<zeebe:linkedResources>`) are extension
-    /// metadata Zeebe ignores — they must NOT be reported as unsupported flow
-    /// elements. Guards the [`is_extension_noise`] filter against regressing to
-    /// rejecting valid deploys.
+    /// Foreign extension-element children — a `<zeebe:header>` misplaced outside
+    /// `<zeebe:taskHeaders>`, a `<zeebe:properties>` container the parser models
+    /// nowhere — are extension metadata Zeebe ignores, not unsupported flow
+    /// elements. The parser's `extension_depth` guard suppresses the flow-element
+    /// catch-all for anything nested inside `<extensionElements>`, so they never
+    /// reach `capture.unmodelled`. Guards that against regressing to rejecting
+    /// valid deploys.
     #[test]
     fn misplaced_extension_children_are_not_unsupported_elements() {
         let stray_header = defs_xml(
@@ -376,9 +295,9 @@ mod tests {
         );
 
         // The `zeebe:properties` container is a distinct sub-case: the parser
-        // models it *nowhere*, so it always reaches the flow-element catch-all
-        // (not only when misplaced) and would be over-recorded without the
-        // `EXTENSION_NOISE` entry. Its `zeebe:property` children are absorbed by
+        // models it *nowhere*, so absent the `extension_depth` guard it would
+        // always reach the flow-element catch-all (not only when misplaced) and
+        // be over-recorded. Its `zeebe:property` children are absorbed by
         // `is_ignorable_tag` upstream. A service task carrying element
         // properties must still deploy clean.
         let element_properties = defs_xml(
@@ -402,8 +321,43 @@ mod tests {
             parse_bpmn(&element_properties).err(),
         );
 
+        // Open-ended `nano:*` semantic extensions (`processos` round-trips these
+        // as `nano:cost` / `nano:time` / `nano:role`, and captures *every* nano
+        // child — so no tag allowlist could cover them) live inside
+        // `<extensionElements>` like any other vendor metadata. They must deploy
+        // clean: this is the exact defect that regressed the `processos`
+        // `definition_to_xml_labeled_preserves_nano_extensions_across_round_trip`
+        // round-trip, and `nano:sla` stands in for a nano tag no list knows.
+        let nano_extensions = r#"<bpmn:definitions
+                 xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                 xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                 xmlns:nano="http://nano.camunda.io/schema/semantic/1.0">
+                 <bpmn:process id="p" isExecutable="true">
+                   <bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+                   <bpmn:serviceTask id="t"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+                     <bpmn:extensionElements>
+                       <zeebe:taskDefinition type="w" />
+                       <nano:cost value="0.50" currency="USD" per="invocation" />
+                       <nano:time p50="2s" p99="8s" />
+                       <nano:role>external</nano:role>
+                       <nano:sla>99.9</nano:sla>
+                     </bpmn:extensionElements>
+                   </bpmn:serviceTask>
+                   <bpmn:endEvent id="e"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+                   <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+                   <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+                 </bpmn:process>
+               </bpmn:definitions>"#;
+        assert!(
+            parse_bpmn(nano_extensions).is_ok(),
+            "open-ended nano:* semantic extensions are metadata, not unsupported \
+             elements: {:?}",
+            parse_bpmn(nano_extensions).err(),
+        );
+
         // A genuine unsupported element sitting alongside extension noise must
-        // still reject (the noise filter never masks a real flow element).
+        // still reject — the `extension_depth` guard only suppresses children
+        // *inside* `<extensionElements>`, never a real flow element beside it.
         let noise_plus_unsupported = defs_xml(
             r#"<bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
                <bpmn:serviceTask id="t"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
@@ -425,6 +379,31 @@ mod tests {
             "a real unsupported `transaction` must reject even when extension noise \
              was also over-recorded: {:?}",
             parse_err(&noise_plus_unsupported),
+        );
+    }
+
+    /// A `<terminateEventDefinition>` is a *documented* "parsed-not-executed"
+    /// element (`docs/camunda-compatibility.md`): Zeebe accepts terminate end
+    /// events at deploy, so Nano does too — degrading to a plain end event rather
+    /// than rejecting. This is a KNOWN, documented limitation, not the silent
+    /// accept-and-mis-execute of an *unknown* construct that this rule guards
+    /// against, so a terminate end event must deploy clean. (Real corpus models —
+    /// e.g. the `cdd-refresh` sanctions gate — rely on this.)
+    #[test]
+    fn a_terminate_end_event_is_accepted_as_a_documented_parsed_not_executed_element() {
+        let terminate_end = defs_xml(
+            r#"<bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+               <bpmn:endEvent id="e">
+                 <bpmn:incoming>f1</bpmn:incoming>
+                 <bpmn:terminateEventDefinition id="TerminateEventDefinition_1" />
+               </bpmn:endEvent>
+               <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />"#,
+        );
+        assert!(
+            parse_bpmn(&terminate_end).is_ok(),
+            "a terminate end event is a documented parsed-not-executed element, not \
+             an unsupported one: {:?}",
+            parse_bpmn(&terminate_end).err(),
         );
     }
 }
