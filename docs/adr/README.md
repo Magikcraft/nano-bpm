@@ -71,6 +71,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0059](0059-supervisor-enrolment-app-driven-fleet-configuration.md) | Supervisor enrolment: app-driven fleet configuration | Proposed | 2026-08-13 |
 | [0060](0060-institutional-memory-context-grounding.md) | Institutional memory: model-grounded context for agent sessions | Proposed | 2026-08-17 |
 | [0061](0061-ecosystem-knowledge-plane.md) | Ecosystem knowledge plane: the context/memory split above AGENTS.md | Proposed | 2026-08-17 |
+| [0062](0062-durable-agent-session-resume.md) | Durable agent-session resume: authoritative session log, mind/world checkpoint, and the ACP/stream-json harness seam | Proposed | 2026-08-19 |
 
 ## Reading paths
 
