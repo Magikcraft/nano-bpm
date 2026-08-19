@@ -7,8 +7,8 @@ backends and on-disk record/replay.
 This package is **framework- and engine-agnostic**: it has no dependency on the Nano engine
 or the Urban runtime — just Node and two *optional* peers. It was lifted out of
 `@nanobpm/urban-testkit`'s `/ai` subpath (issue [#297]) so the AI matchers are reusable in
-any app or package ([#894], S3). `@nanobpm/urban-testkit` re-exports this package to keep
-its `/ai` subpath stable.
+any app or package ([#894], S3). A follow-up will re-export this package from
+`@nanobpm/urban-testkit` to keep its `/ai` subpath stable.
 
 ```bash
 npm i -D @nanobpm/ai-assert

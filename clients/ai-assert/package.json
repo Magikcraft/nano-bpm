@@ -43,7 +43,10 @@
   "files": [
     "dist",
     "src",
-    "README.md"
+    "README.md",
+    "!src/**/*.test.ts",
+    "!src/**/__guards__",
+    "!src/**/__cassettes__"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
