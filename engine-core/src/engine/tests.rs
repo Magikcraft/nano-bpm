@@ -14569,7 +14569,11 @@ fn nested_adhoc_completion_condition_cancels_remaining_and_feeds_parent() {
     // nested container propagated `subResults` out of its scope, landing it in the
     // root instance variables (no ancestor scope defines it).
     assert!(
-        !engine.instance(inst).unwrap().variables.contains_key("subResults"),
+        !engine
+            .instance(inst)
+            .unwrap()
+            .variables
+            .contains_key("subResults"),
         "the nested container's internal outputCollection did not leak into the root scope"
     );
     assert_eq!(
@@ -14656,7 +14660,11 @@ fn nested_adhoc_parent_cancel_recursively_tears_down_nested_container() {
         .expect("leaf tool job in-flight inside the nested container");
     let leaf = leaf_job.element_instance_key;
     assert!(
-        engine.instance(inst).unwrap().adhoc_instances.contains_key(&nested),
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .contains_key(&nested),
         "nested container active before the parent cancels"
     );
 
@@ -14754,7 +14762,10 @@ fn nested_adhoc_cancel_child_skips_already_completed_inner_instance() {
     // The inner wrapper the nested tool hangs off.
     let inner = engine.scope_of(inst, nested);
     assert_ne!(inner, 0, "nested tool hangs off a dedicated inner instance");
-    assert_ne!(inner, outer, "the inner wrapper is distinct from the container");
+    assert_ne!(
+        inner, outer,
+        "the inner wrapper is distinct from the container"
+    );
 
     // Simulate that inner wrapper having ALREADY been torn down: drop it from
     // `active` (so its element id no longer resolves) while its `scopes` mapping
