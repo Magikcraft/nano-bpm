@@ -62,7 +62,7 @@
 
     <bpmn:sequenceFlow id="toDecide" sourceRef="Review" targetRef="Decide" />
 
-    <bpmn:exclusiveGateway id="Decide" name="Operator decision">
+    <bpmn:exclusiveGateway id="Decide" name="Operator decision" default="flowStop">
       <bpmn:incoming>toDecide</bpmn:incoming>
       <bpmn:outgoing>flowAccept</bpmn:outgoing>
       <bpmn:outgoing>flowIterate</bpmn:outgoing>
