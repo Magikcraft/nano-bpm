@@ -309,7 +309,7 @@ mod tests {
       <bpmn:extensionElements><zeebe:taskDefinition type="credit-check"/></bpmn:extensionElements>
       <bpmn:incoming>f0</bpmn:incoming><bpmn:outgoing>f1</bpmn:outgoing>
     </bpmn:serviceTask>
-    <bpmn:exclusiveGateway id="Decision">
+    <bpmn:exclusiveGateway id="Decision" default="f3">
       <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing><bpmn:outgoing>f3</bpmn:outgoing>
     </bpmn:exclusiveGateway>
     <bpmn:serviceTask id="Approve">
@@ -324,7 +324,9 @@ mod tests {
     <bpmn:endEvent id="EndRejected"><bpmn:incoming>f5</bpmn:incoming></bpmn:endEvent>
     <bpmn:sequenceFlow id="f0" sourceRef="Start" targetRef="CreditCheck"/>
     <bpmn:sequenceFlow id="f1" sourceRef="CreditCheck" targetRef="Decision"/>
-    <bpmn:sequenceFlow id="f2" sourceRef="Decision" targetRef="Approve"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="Decision" targetRef="Approve">
+      <bpmn:conditionExpression>= creditScore &gt;= 700</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f3" sourceRef="Decision" targetRef="Reject"/>
     <bpmn:sequenceFlow id="f4" sourceRef="Approve" targetRef="EndApproved"/>
     <bpmn:sequenceFlow id="f5" sourceRef="Reject" targetRef="EndRejected"/>

@@ -4068,7 +4068,7 @@ mod tests {
           <definitions>
             <process id="route">
               <startEvent id="s" />
-              <exclusiveGateway id="gw" />
+              <exclusiveGateway id="gw" default="f2" />
               <endEvent id="yes" />
               <endEvent id="no" />
               <sequenceFlow id="f0" sourceRef="s" targetRef="gw" />

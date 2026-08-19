@@ -3532,12 +3532,16 @@ fn apply_edit_op(
                 is_default: false,
             });
             let parent = anchor.parent.clone();
-            for f in original {
-                // Carried as default branches (conditions dropped: the gateway now decides).
+            for (i, f) in original.into_iter().enumerate() {
+                // Carried as the default branch (conditions dropped: the gateway now decides). A
+                // diverging exclusive gateway may name only one default flow, so the first preserved
+                // path becomes the default; any others fall back to conditionless branches, which the
+                // gateway validation will reject — the anchor is spliced on its single outgoing edge,
+                // so in practice there is exactly one preserved path.
                 outgoing.push(SequenceFlow {
                     to: f.to,
                     condition: None,
-                    is_default: false,
+                    is_default: i == 0,
                 });
             }
             def.elements.insert(
@@ -3705,7 +3709,7 @@ mod tests {
       <bpmn:extensionElements><zeebe:taskDefinition type="credit-check"/></bpmn:extensionElements>
       <bpmn:incoming>f0</bpmn:incoming><bpmn:outgoing>f1</bpmn:outgoing>
     </bpmn:serviceTask>
-    <bpmn:exclusiveGateway id="Decision">
+    <bpmn:exclusiveGateway id="Decision" default="f3">
       <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing><bpmn:outgoing>f3</bpmn:outgoing>
     </bpmn:exclusiveGateway>
     <bpmn:serviceTask id="Approve">
@@ -3851,7 +3855,7 @@ mod tests {
       <bpmn:extensionElements><zeebe:taskDefinition type="work"/></bpmn:extensionElements>
       <bpmn:incoming>a</bpmn:incoming><bpmn:incoming>retry</bpmn:incoming><bpmn:outgoing>b</bpmn:outgoing>
     </bpmn:serviceTask>
-    <bpmn:exclusiveGateway id="G">
+    <bpmn:exclusiveGateway id="G" default="done">
       <bpmn:incoming>b</bpmn:incoming><bpmn:outgoing>retry</bpmn:outgoing><bpmn:outgoing>done</bpmn:outgoing>
     </bpmn:exclusiveGateway>
     <bpmn:endEvent id="E"><bpmn:incoming>done</bpmn:incoming></bpmn:endEvent>
