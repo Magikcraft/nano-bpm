@@ -31,7 +31,7 @@
 //!   boundary **non-interrupting** (the activity keeps running and a parallel
 //!   token is spawned on each fire); the default is interrupting.
 //! * Compensation: a `boundaryEvent` with a `compensateEventDefinition`, wired
-//!   via a `<association sourceRef targetRef>` to an `isForCompensation` handler
+//!   via an `<association sourceRef targetRef>` to an `isForCompensation` handler
 //!   activity, marks its attached activity compensable. A
 //!   `compensateEventDefinition` on an `intermediateThrowEvent`/`endEvent`
 //!   triggers compensation: the completed compensable activities in scope have

@@ -2413,9 +2413,13 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str("    </bpmn:boundaryEvent>\n");
             // The compensation handler is wired to this boundary by an
             // `<association>`; emit it so the document round-trips back to the
-            // same CompensationBoundaryEvent on re-parse.
+            // same CompensationBoundaryEvent on re-parse. The `id` attribute is
+            // deliberately omitted: BPMN ids share one global namespace, so a
+            // synthesized `Association_{eid}` could collide with a user-defined
+            // id and produce invalid XML — and the parser wires compensation
+            // purely from `sourceRef`/`targetRef`, never the association id.
             out.push_str(&format!(
-                "    <bpmn:association id=\"Association_{eid}\" associationDirection=\"One\" sourceRef=\"{eid}\" targetRef=\"{}\"/>\n",
+                "    <bpmn:association associationDirection=\"One\" sourceRef=\"{eid}\" targetRef=\"{}\"/>\n",
                 xml_escape(handler)
             ));
         }
