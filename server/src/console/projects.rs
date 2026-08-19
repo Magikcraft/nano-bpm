@@ -6142,13 +6142,32 @@ fn finalize_generated_models(
 // Run / compile supervisor
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Phase {
     Stopped,
     Starting,
     Running,
     Crashed,
+}
+
+impl Phase {
+    /// A project is in a *terminal* phase when it holds no live process:
+    /// `Stopped` (clean exit / never started) or `Crashed`. Every other phase —
+    /// `Starting`, `Running`, and any future non-terminal phase such as a
+    /// draining `Stopping` — is *live*: it has already bound its workers/schema
+    /// contract, so the console edit gate must refuse mutations.
+    ///
+    /// This is the single source of truth for the terminal/editable set; the
+    /// edit gate ([`ProjectSupervisor::is_running`]) and the stop bookkeeping
+    /// derive from it rather than each re-listing the variants. Deriving the
+    /// gate as the inverse of this predicate keeps it **fail-safe**: a new
+    /// non-terminal phase is treated as running (non-editable) by default
+    /// instead of silently bypassing the guard. Mirrors the console's
+    /// `appIsEditable` (`console/src/lib/appRunning.ts`).
+    fn is_terminal(self) -> bool {
+        matches!(self, Phase::Stopped | Phase::Crashed)
+    }
 }
 
 /// A single log line from a project's run/compile output.
@@ -6628,10 +6647,14 @@ impl ProjectSupervisor {
         // arbitrary/nonexistent project name (e.g. via `console_app_running_guard`)
         // can't grow the supervisor map. An untracked project is, by definition,
         // not running.
+        //
+        // Derive "running" as the inverse of the terminal set (`Phase::is_terminal`)
+        // rather than enumerating `Starting | Running`: that keeps the edit gate
+        // fail-safe, so any future non-terminal phase (e.g. a draining `Stopping`)
+        // is treated as running (non-editable) by default instead of bypassing the
+        // guard. Matches the console's `appIsRunning`.
         match self.existing_entry(name).await {
-            Some(inner) => {
-                matches!(*inner.phase.lock().await, Phase::Starting | Phase::Running)
-            }
+            Some(inner) => !inner.phase.lock().await.is_terminal(),
             None => false,
         }
     }
@@ -7216,7 +7239,7 @@ impl ProjectSupervisor {
         // started) so a stopped App stops acting on its triggers.
         triggers::dispatcher().stop(name).await;
         let inner = self.entry(name).await;
-        if matches!(*inner.phase.lock().await, Phase::Stopped | Phase::Crashed) {
+        if inner.phase.lock().await.is_terminal() {
             return Ok(());
         }
         inner.desired_running.store(false, Ordering::Relaxed);
@@ -7252,7 +7275,7 @@ impl ProjectSupervisor {
         // trigger dispatcher, mirroring `stop(name)`.
         for (name, inner) in &entries {
             triggers::dispatcher().stop(name).await;
-            if !matches!(*inner.phase.lock().await, Phase::Stopped | Phase::Crashed) {
+            if !inner.phase.lock().await.is_terminal() {
                 inner.desired_running.store(false, Ordering::Relaxed);
                 // `notify_one` (not `notify_waiters`): it stores a permit when
                 // the reap task hasn't parked on `stop.notified()` yet, so the
@@ -7269,7 +7292,7 @@ impl ProjectSupervisor {
             std::time::Instant::now() + std::time::Duration::from_millis(STOP_ALL_TIMEOUT_MS);
         for (name, inner) in &entries {
             loop {
-                if matches!(*inner.phase.lock().await, Phase::Stopped | Phase::Crashed) {
+                if inner.phase.lock().await.is_terminal() {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
@@ -8456,6 +8479,28 @@ mod tests {
             sup.is_running("live").await,
             "a running project reports running"
         );
+
+        // The edit gate is the inverse of the terminal set, not a fixed
+        // `Starting | Running` allowlist: every non-terminal phase must gate,
+        // and only `Stopped`/`Crashed` are editable. This pins the fail-safe
+        // contract so a future non-terminal phase can't silently bypass the
+        // guard.
+        for phase in [Phase::Starting, Phase::Running] {
+            *sup.entry("live").await.phase.lock().await = phase;
+            assert!(
+                sup.is_running("live").await,
+                "non-terminal phase {phase:?} must gate edits"
+            );
+            assert!(!phase.is_terminal(), "{phase:?} is not terminal");
+        }
+        for phase in [Phase::Stopped, Phase::Crashed] {
+            *sup.entry("live").await.phase.lock().await = phase;
+            assert!(
+                !sup.is_running("live").await,
+                "terminal phase {phase:?} must be editable"
+            );
+            assert!(phase.is_terminal(), "{phase:?} is terminal");
+        }
     }
 
     #[tokio::test]

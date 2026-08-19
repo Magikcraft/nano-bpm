@@ -17453,12 +17453,17 @@ fn app_running_gate<'a>(path: &'a str, method: &axum::http::Method) -> Option<&'
 }
 
 /// Console "app must be stopped to edit it" guard (issue #889): the single
-/// server-side chokepoint enforcing that a project cannot be mutated while its
-/// run status is `starting`/`running`. When [`app_running_gate`] flags the
-/// request as a project mutation and the supervisor reports that project as
-/// running, refuse with **409 Conflict** (`app_running`); otherwise the request
-/// passes through untouched. Layered over the whole console router so it covers
-/// every `/console/api/projects/{name}/…` mutation — including endpoints added
+/// server-side chokepoint enforcing that a project cannot be mutated while it
+/// holds a live process. When [`app_running_gate`] flags the request as a
+/// project mutation and the supervisor reports that project as running — i.e.
+/// in any non-terminal lifecycle phase (`starting`/`running`, and any future
+/// draining phase such as `stopping`), everything except the editable terminal
+/// states `stopped`/`crashed` — refuse with **409 Conflict** (`app_running`);
+/// otherwise the request passes through untouched. The running/editable split
+/// is derived from one predicate (`Phase::is_terminal`), mirroring the console's
+/// `appIsRunning`, so the two surfaces can't drift as phases are added. Layered
+/// over the whole console router so it covers every
+/// `/console/api/projects/{name}/…` mutation — including endpoints added
 /// later — from one place.
 #[cfg(feature = "console")]
 async fn console_app_running_guard(
