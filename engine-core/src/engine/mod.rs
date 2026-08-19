@@ -7493,7 +7493,39 @@ impl Engine {
     ) -> (Vec<Event>, Vec<Step>) {
         // The callee id may be a literal or a FEEL `=` expression (C8
         // `zeebe:calledElement processId`), resolved against the activating view.
-        let called = self.resolve_job_type(element_vars, called_process_id);
+        // A failing expression must surface as an expression-evaluation incident
+        // that names the expression — not fall back to the raw `=…` text, which
+        // would masquerade as an "unknown called process '=…'" lookup miss and
+        // point diagnosis at the wrong thing.
+        let called = {
+            let trimmed = called_process_id.trim();
+            if trimmed.starts_with('=') {
+                match crate::feel::eval_string(trimmed, element_vars) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        let incident_key = self.mint_key();
+                        return (
+                            vec![Event::IncidentRaised {
+                                incident_key,
+                                instance_key: parent_instance,
+                                element_instance_key: call_eik,
+                                element_id: element_id.to_string(),
+                                kind: state::IncidentKind::ExpressionEvaluation,
+                                reason: format!(
+                                    "call activity '{element_id}' could not evaluate \
+                                     calledElement expression '{called_process_id}': {err}"
+                                ),
+                                job_key: None,
+                                created_at: self.now,
+                            }],
+                            Vec::new(),
+                        );
+                    }
+                }
+            } else {
+                called_process_id.to_string()
+            }
+        };
         // Guard runaway recursion (self / mutually-recursive callees).
         if self.call_activity_depth(parent_instance) >= MAX_CALL_ACTIVITY_DEPTH {
             let incident_key = self.mint_key();

@@ -6996,6 +6996,56 @@ fn cancelling_a_parent_reaps_a_child_already_mid_termination() {
 }
 
 #[test]
+fn a_failing_called_element_expression_raises_an_expression_evaluation_incident() {
+    // When `zeebe:calledElement` is a FEEL expression (leading `=`) that cannot
+    // be evaluated (missing var, parse error, non-string result), the incident
+    // must describe the *expression* failure — not masquerade as an "unknown
+    // called process '=…'" lookup miss, which points diagnosis at the wrong
+    // thing. Here `=calleeName` references an unbound variable, so evaluation
+    // fails and no callee id is ever resolved.
+    let orchestrator = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "=calleeName")
+        .end_event("end")
+        .connect("start", "c1")
+        .connect("c1", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(phase_process("phase", "work")))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(orchestrator))
+        .unwrap();
+
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "the failed expression parks one incident");
+    assert_eq!(active[0].kind, state::IncidentKind::ExpressionEvaluation);
+    let reason = &active[0].reason;
+    assert!(
+        reason.contains("calledElement") && reason.contains("=calleeName"),
+        "incident should name the failing calledElement expression, got: {reason}"
+    );
+    assert!(
+        !reason.contains("unknown called process"),
+        "expression failure must not be reported as an unknown-process lookup, got: {reason}"
+    );
+    // No child instance was spawned and the parent did not complete.
+    assert!(!engine.is_completed(parent_key));
+    assert!(engine
+        .state()
+        .instances
+        .values()
+        .all(|i| i.parent_process_instance_key != Some(parent_key)));
+}
+
+#[test]
 fn a_call_activity_propagates_variables_via_io_mappings_across_isolated_scopes() {
     // The callee is a pass-through (pstart -> pend) so it completes on its seed
     // variables, letting us observe both directions of the mapping in one command.
