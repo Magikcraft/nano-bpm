@@ -10800,6 +10800,33 @@ fn adhoc_agent_runs_an_embedded_subprocess_tool_body_by_token_flow() {
         "the subProcess tool body's output reaches the container's \
          outputCollection once the body completes (#872)"
     );
+
+    // The tool child actually drained: its body ran to the end event and the
+    // tool completed, so the container's active set is empty again. Without this
+    // the outputCollection could be fed while the child is left dangling.
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        0,
+        "the subProcess tool child drains once its body completes (#872)"
+    );
+
+    // The container iteration advanced: with the tool done, the agent job is
+    // re-emitted so the agent can take its next turn.
+    assert!(
+        engine
+            .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+            .into_iter()
+            .any(|j| j.element_id == "agent"),
+        "completing the subProcess tool re-emits the agent job for the next \
+         turn (#872)"
+    );
 }
 
 // Reads the ad-hoc container's local `outputCollection` variable (`results`)
