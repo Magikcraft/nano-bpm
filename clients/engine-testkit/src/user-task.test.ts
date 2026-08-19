@@ -140,3 +140,16 @@ test("no matching task at all yields the 'no user task matches' headline", async
     ["no user task matches"],
   );
 });
+
+test("a task present but missing its elementId is surfaced, not hidden behind 'no user task matches'", async () => {
+  // An adapter returned a row without projecting `elementId` (allowed by
+  // `UserTaskRow`). Narrowing by the requested elementId drops it, but the
+  // failure message must reveal the task existed so the adapter bug is visible.
+  const engine = engineWith([
+    { userTaskKey: "ut-1", processInstanceKey: "pi-1", state: "CREATED" },
+  ]);
+  await expectFailure(
+    () => assertThatUserTask(engine, { instance: "pi-1", elementId: "approve" }).isCreated(),
+    ["matched the instance filter but not elementId", "ut-1", "approve"],
+  );
+});

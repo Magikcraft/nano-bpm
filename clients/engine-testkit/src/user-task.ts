@@ -85,8 +85,25 @@ async function describeActual(
   filter: TaskFilter,
   selector: UserTaskSelector,
 ): Promise<string> {
-  const all = narrow(await engine.searchUserTasks({ ...filter }), selector);
-  if (all.length === 0) return `no user task matches ${describeSelector(selector)}`;
+  const preNarrow = await engine.searchUserTasks({ ...filter });
+  const all = narrow(preNarrow, selector);
+  if (all.length === 0) {
+    // Distinguish "genuinely no tasks" from "tasks existed but none carried the
+    // requested elementId" — the latter usually means an adapter returned rows
+    // without projecting `elementId` (allowed by `UserTaskRow`), which would
+    // otherwise be silently hidden behind a misleading "no user task matches".
+    if (selector.elementId !== undefined && preNarrow.length > 0) {
+      const others = preNarrow
+        .map((row) => `{ userTaskKey: ${formatValue(row.userTaskKey)}, elementId: ${formatValue(row.elementId)} }`)
+        .join(", ");
+      return (
+        `no user task matches ${describeSelector(selector)} ` +
+        `(${preNarrow.length} task(s) matched the instance filter but not elementId ` +
+        `${formatValue(selector.elementId)}: [${others}])`
+      );
+    }
+    return `no user task matches ${describeSelector(selector)}`;
+  }
   const created = new Set(
     narrow(await engine.searchUserTasks({ ...filter, state: "CREATED" }), selector).map(
       (row) => row.userTaskKey,
