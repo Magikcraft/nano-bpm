@@ -486,8 +486,11 @@ impl ReadModel {
             .sum()
     }
 
-    pub fn process_instance_count(&self) -> i64 {
-        self.shards.iter().map(|s| s.process_instance_count()).sum()
+    pub fn process_instance_count(&self, filter: &InstanceFilter) -> i64 {
+        self.shards
+            .iter()
+            .map(|s| s.process_instance_count(filter))
+            .sum()
     }
 
     /// Sum of every shard's `exported_position`. Monotonic across all shards, so
@@ -514,11 +517,20 @@ impl ReadModel {
 
     // --- paged: single-shard pushes down to SQL; multi merges + slices ---
 
-    pub fn process_instances_page(&self, limit: i64, offset: i64) -> Vec<ProcessInstanceRow> {
+    pub fn process_instances_page(
+        &self,
+        limit: i64,
+        offset: i64,
+        filter: &InstanceFilter,
+    ) -> Vec<ProcessInstanceRow> {
         if self.shards.len() == 1 {
-            return self.shards[0].process_instances_page(limit, offset);
+            return self.shards[0].process_instances_page(limit, offset, filter);
         }
-        let mut all = self.process_instances();
+        let mut all: Vec<ProcessInstanceRow> = self
+            .process_instances()
+            .into_iter()
+            .filter(|row| filter.matches(row))
+            .collect();
         // Newest-first by key (keys are monotonic per partition), matching the
         // single-store `ORDER BY key DESC`.
         all.sort_by_key(|b| std::cmp::Reverse(b.key));
@@ -551,5 +563,137 @@ mod tests {
         let mut pids: Vec<u64> = model.shards().into_iter().map(|(pid, _)| pid).collect();
         pids.sort_unstable();
         assert_eq!(pids, vec![0, 2, 5]);
+    }
+
+    fn created(instance_key: Key) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        }
+    }
+
+    /// A sharded read model must filter and count identically to a single-shard
+    /// model holding the same data: the multi-partition merge path applies the
+    /// same [`InstanceFilter`] predicate SQLite does, so a filtered page + total
+    /// are byte-for-byte equal across the single- and multi-shard paths.
+    #[test]
+    fn multi_shard_filtered_page_and_count_match_single_shard() {
+        use nanobpmn_engine_core::{IncidentKind, ProcessInstanceState, compose_key};
+
+        // Instances spread across partitions 0, 1, 2. Local counters chosen so
+        // the raw keys interleave when sorted descending.
+        let p0a = compose_key(0, 10);
+        let p0b = compose_key(0, 40);
+        let p1a = compose_key(1, 20);
+        let p1b = compose_key(1, 50);
+        let p2a = compose_key(2, 30);
+
+        // The event stream, applied identically to every store.
+        let raise = |instance_key: Key, incident_key: u64| Event::IncidentRaised {
+            incident_key,
+            instance_key,
+            element_instance_key: instance_key + 1,
+            element_id: "t".to_string(),
+            kind: IncidentKind::JobNoRetries,
+            reason: "boom".to_string(),
+            job_key: Some(42),
+            created_at: 5,
+        };
+
+        let per_partition: Vec<Vec<Event>> = vec![
+            // partition 0
+            vec![
+                created(p0a),
+                created(p0b),
+                Event::ProcessInstanceCompleted { instance_key: p0b },
+                raise(p0a, 900),
+            ],
+            // partition 1
+            vec![
+                created(p1a),
+                created(p1b),
+                Event::ProcessInstanceTerminated { instance_key: p1a },
+            ],
+            // partition 2
+            vec![created(p2a), raise(p2a, 901)],
+        ];
+
+        // Single-shard reference: everything in one store.
+        let single = shard();
+        for events in &per_partition {
+            let refs: Vec<&Event> = events.iter().collect();
+            single.export(&refs).unwrap();
+        }
+        let single_model = ReadModel::from_shards(vec![(0, single)]);
+
+        // Multi-shard: one store per partition, each seeing only its events.
+        let shards: Vec<(u64, Arc<ReadStore>)> = per_partition
+            .iter()
+            .enumerate()
+            .map(|(pid, events)| {
+                let s = shard();
+                let refs: Vec<&Event> = events.iter().collect();
+                s.export(&refs).unwrap();
+                (pid as u64, s)
+            })
+            .collect();
+        let multi_model = ReadModel::from_shards(shards);
+        assert!(multi_model.shards().len() > 1, "must exercise merge path");
+
+        let filters = [
+            InstanceFilter::default(),
+            InstanceFilter {
+                state: Some(ProcessInstanceState::Active),
+                has_incident: None,
+            },
+            InstanceFilter {
+                state: Some(ProcessInstanceState::Completed),
+                has_incident: None,
+            },
+            InstanceFilter {
+                state: Some(ProcessInstanceState::Terminated),
+                has_incident: None,
+            },
+            InstanceFilter {
+                state: None,
+                has_incident: Some(true),
+            },
+            InstanceFilter {
+                state: Some(ProcessInstanceState::Active),
+                has_incident: Some(true),
+            },
+        ];
+
+        for filter in &filters {
+            assert_eq!(
+                single_model.process_instance_count(filter),
+                multi_model.process_instance_count(filter),
+                "count parity for {filter:?}"
+            );
+            for &(limit, offset) in &[(100, 0), (2, 0), (2, 2), (1, 1)] {
+                let single_keys: Vec<Key> = single_model
+                    .process_instances_page(limit, offset, filter)
+                    .into_iter()
+                    .map(|r| r.key)
+                    .collect();
+                let multi_keys: Vec<Key> = multi_model
+                    .process_instances_page(limit, offset, filter)
+                    .into_iter()
+                    .map(|r| r.key)
+                    .collect();
+                assert_eq!(
+                    single_keys, multi_keys,
+                    "page parity for {filter:?} limit={limit} offset={offset}"
+                );
+            }
+        }
     }
 }
