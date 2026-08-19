@@ -1721,7 +1721,7 @@ fn feel_gateway_condition_routes_end_to_end() {
                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <bpmn:process id="feel-route" isExecutable="true">
     <bpmn:startEvent id="s" />
-    <bpmn:exclusiveGateway id="g" />
+    <bpmn:exclusiveGateway id="g" default="f2" />
     <bpmn:endEvent id="big" />
     <bpmn:serviceTask id="work"><bpmn:extensionElements><zeebe:taskDefinition type="manual" /></bpmn:extensionElements></bpmn:serviceTask>
     <bpmn:endEvent id="small" />
