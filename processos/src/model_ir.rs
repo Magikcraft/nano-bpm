@@ -1741,7 +1741,10 @@ mod tests {
             "baseline has no default flow"
         );
         // Now the edit an LLM would make: switch the Miss branch's guard to ` default`.
-        let edited = ir.replace("Gate -> Miss when \"= score < 700\"\n", "Gate -> Miss default\n");
+        let edited = ir.replace(
+            "Gate -> Miss when \"= score < 700\"\n",
+            "Gate -> Miss default\n",
+        );
         let after = write_model_ir(&edited, None, None, None).expect("write with default");
         let after_model = after["model"].as_str().unwrap();
         let after_def = parse_bpmn(after_model).expect("parse edited");
@@ -1949,7 +1952,10 @@ mod tests {
             .as_str()
             .expect("ir string")
             .to_string();
-        let edited = ir.replace("Gate -> Miss when \"= score < 700\"\n", "Gate -> Miss default\n");
+        let edited = ir.replace(
+            "Gate -> Miss when \"= score < 700\"\n",
+            "Gate -> Miss default\n",
+        );
         assert_ne!(edited, ir, "the edit must actually change the IR");
         let v = write_model_ir(&edited, None, None, Some(HAND_LAID_BPMN)).expect("write");
         let model = v["model"].as_str().expect("model xml");
