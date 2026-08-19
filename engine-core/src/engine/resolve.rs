@@ -395,10 +395,20 @@ impl Engine {
     }
 
     /// Resolves a user-task string attribute (assignee, due/follow-up date)
-    /// declared on the BPMN element. A literal is returned verbatim; a FEEL
-    /// expression (leading `=`) is evaluated against `vars` (the element's scoped
-    /// view), falling back to the literal text when it cannot be evaluated.
+    /// declared on the BPMN element. A literal (no leading `=`) is returned
+    /// verbatim. A FEEL expression (leading `=`) is evaluated against `vars`
+    /// (the element's scoped view): a string result yields `Some(string)`, while
+    /// a **null** result or an **evaluation failure** (parse/runtime error,
+    /// unresolved variable) yields `None` — the attribute is treated as absent
+    /// (the task is created unassigned / with no date), matching Zeebe, which
+    /// creates the task unassigned when the assignee expression resolves to null.
     /// `None` (the attribute was not declared) resolves to `None`.
+    ///
+    /// The raw `=expr` text is **never** stored: a value beginning with `=` is a
+    /// FEEL expression, never a valid literal assignee/date, so falling back to
+    /// it can only ever produce garbage that hides the task from assignee-aware
+    /// views. The invariant callers rely on is that a resolved user-task string
+    /// attribute never begins with `=`.
     pub(crate) fn resolve_user_task_string(
         &self,
         vars: &HashMap<String, Value>,
@@ -409,7 +419,11 @@ impl Engine {
         if !trimmed.starts_with('=') {
             return Some(raw.to_string());
         }
-        Some(crate::feel::eval_string(trimmed, vars).unwrap_or_else(|_| raw.to_string()))
+        // A FEEL expression: a null result or an evaluation error means the
+        // attribute is absent. `eval_string` returns `Err` for a null result as
+        // well as for parse/runtime errors, so both collapse to `None` — never
+        // the raw `=expr`.
+        crate::feel::eval_string(trimmed, vars).ok()
     }
 
     /// Resolves a user-task candidate list (groups or users). A literal is a
@@ -709,5 +723,95 @@ mod tests {
         assert!(engine
             .resolve_correlation_value_checked(&vars, "missingVar")
             .is_err());
+    }
+
+    #[test]
+    fn user_task_string_null_expression_resolves_absent() {
+        // A `=FEEL` attribute whose expression evaluates to null must resolve to
+        // None (attribute absent / task unassigned), NOT the raw `=expr` — this
+        // is the red test for #900 (a null `=escalationAssignee` was stored as
+        // the literal "=escalationAssignee").
+        let engine = Engine::new();
+        let mut vars = HashMap::new();
+        vars.insert("x".to_string(), Value::Null);
+        assert_eq!(engine.resolve_user_task_string(&vars, Some("=x")), None);
+    }
+
+    #[test]
+    fn user_task_string_missing_variable_resolves_absent() {
+        // An unset/missing variable in the expression must resolve to None, not
+        // the raw `=x`.
+        let engine = Engine::new();
+        let vars = HashMap::new();
+        assert_eq!(engine.resolve_user_task_string(&vars, Some("=x")), None);
+    }
+
+    #[test]
+    fn user_task_string_expression_resolves_to_string() {
+        // A `=FEEL` expression yielding a real string is surfaced as that string.
+        let engine = Engine::new();
+        let mut vars = HashMap::new();
+        vars.insert("x".to_string(), Value::Str("alice".to_string()));
+        assert_eq!(
+            engine.resolve_user_task_string(&vars, Some("=x")),
+            Some("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn user_task_string_literal_is_verbatim() {
+        // A plain literal (no leading `=`) is returned unchanged.
+        let engine = Engine::new();
+        let vars = HashMap::new();
+        assert_eq!(
+            engine.resolve_user_task_string(&vars, Some("alice")),
+            Some("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn user_task_string_malformed_expression_resolves_absent() {
+        // A malformed expression must resolve to None, never the raw `=1 + `.
+        let engine = Engine::new();
+        let vars = HashMap::new();
+        assert_eq!(engine.resolve_user_task_string(&vars, Some("=1 + ")), None);
+    }
+
+    #[test]
+    fn user_task_string_none_stays_none() {
+        // An undeclared attribute resolves to None.
+        let engine = Engine::new();
+        let vars = HashMap::new();
+        assert_eq!(engine.resolve_user_task_string(&vars, None), None);
+    }
+
+    #[test]
+    fn user_task_string_never_begins_with_equals() {
+        // The categorical invariant: a resolved user-task string attribute is
+        // never a value beginning with `=`. Covers assignee + both dates (all
+        // routed through resolve_user_task_string) against re-introduction.
+        let engine = Engine::new();
+        let mut vars = HashMap::new();
+        vars.insert("nullVar".to_string(), Value::Null);
+        vars.insert(
+            "dateStr".to_string(),
+            Value::Str("2026-01-01T00:00:00Z".to_string()),
+        );
+        let cases = [
+            Some("=escalationAssignee"), // missing var -> None
+            Some("=nullVar"),            // null -> None
+            Some("=dateStr"),            // string -> the date, no leading '='
+            Some("=1 + "),               // malformed -> None
+            Some("alice"),               // literal -> verbatim
+            None,
+        ];
+        for raw in cases {
+            if let Some(resolved) = engine.resolve_user_task_string(&vars, raw) {
+                assert!(
+                    !resolved.starts_with('='),
+                    "resolved user-task string attribute {resolved:?} must never begin with '='"
+                );
+            }
+        }
     }
 }
