@@ -1,0 +1,14 @@
+<!-- verdict: reject | category: InvalidEndEvent -->
+<!-- oracle: EndEventValidator — an end event must have no outgoing sequence flow (#856). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="reject_end_event_outgoing" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:endEvent id="e">
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="e2"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="e" targetRef="e2" />
+  </bpmn:process>
+</bpmn:definitions>

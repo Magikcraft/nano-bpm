@@ -1,0 +1,21 @@
+<!-- verdict: reject | category: InvalidLinkedResource -->
+<!-- oracle: zeebe:linkedResource must carry resourceId/bindingType/resourceType; Zeebe rejects (INVALID_ARGUMENT). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="reject_invalid_linked_resource" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="task">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="do-work" />
+        <zeebe:linkedResources>
+          <zeebe:linkedResource linkName="agent" />
+        </zeebe:linkedResources>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="task" />
+    <bpmn:sequenceFlow id="f1" sourceRef="task" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>

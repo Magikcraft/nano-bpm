@@ -1,0 +1,9 @@
+<!-- verdict: reject | category: InvalidProcess -->
+<!-- oracle: a sequenceFlow targetRef must point at a real element; Zeebe rejects an unresolved flow target. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="reject_invalid_process_dangling_flow" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:endEvent id="e"><bpmn:incoming>f0</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="ghost" />
+  </bpmn:process>
+</bpmn:definitions>

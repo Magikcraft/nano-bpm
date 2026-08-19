@@ -1,0 +1,18 @@
+<!-- verdict: accept -->
+<!-- oracle: baseline valid model (none start -> service task -> end); Zeebe deploys. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="accept_minimal" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="task">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="do-work" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="start" targetRef="task" />
+    <bpmn:sequenceFlow id="f1" sourceRef="task" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>
