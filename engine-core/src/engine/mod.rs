@@ -3635,9 +3635,47 @@ impl Engine {
                 continue;
             }
 
-            // Output mappings on a sub-process evaluate against the sub-process's
-            // own scope view (its input-mapped locals + anything set inside it)
-            // BEFORE its scope is torn down, then propagate the mapped result to
+            // A drained sub-process that is an embedded-subProcess ad-hoc TOOL
+            // (#872): it hangs off an `#innerInstance` whose own scope is the
+            // ad-hoc container that still lists it active. Its completion must feed
+            // the container's `outputCollection` + activate-element loop and tear
+            // down the inner instance — not take an outgoing flow (it has none). It
+            // routes there via `Step::Complete`, which `complete` dispatches to
+            // `complete_adhoc_tool` by the same scope-chain check the leaf-tool
+            // completion path uses. Disarm any boundary events on the tool first,
+            // mirroring the multi-instance-child branch above (the ad-hoc
+            // completion path does not run the normal boundary-cleanup branch).
+            let is_adhoc_tool = {
+                let container = self.scope_of(instance_key, scope);
+                container != 0
+                    && self
+                        .state
+                        .instances
+                        .get(&instance_key)
+                        .and_then(|i| i.adhoc_instances.get(&container))
+                        .map(|a| a.active.contains(&eik))
+                        .unwrap_or(false)
+            };
+            if is_adhoc_tool {
+                for event in self.cancel_boundary_timers_on(eik) {
+                    self.emit(log, event);
+                }
+                for event in self.cancel_boundary_message_subscriptions_on(eik) {
+                    self.emit(log, event);
+                }
+                for event in self.cancel_boundary_signal_subscriptions_on(eik) {
+                    self.emit(log, event);
+                }
+                for event in self.cancel_boundary_conditional_subscriptions_on(eik) {
+                    self.emit(log, event);
+                }
+                followups.push(Step::Complete {
+                    instance_key,
+                    element_instance_key: eik,
+                    element_id,
+                });
+                continue;
+            }
             // the enclosing (parent) scope. Capture the values now; emit them as
             // scoped writes after `ElementCompleted` has dropped the local scope.
             let outputs = self.io_outputs(instance_key, &element_id);
@@ -5216,6 +5254,17 @@ impl Engine {
                 cancelled: true,
             });
         } else {
+            // A leaf tool (service/user task) has no body scope, so
+            // `cancel_mi_child_events` alone tears it down. An embedded-subProcess
+            // tool (#872) additionally owns its own body scope: cancel every
+            // active body descendant (open user tasks, jobs, armed timers,
+            // subscriptions, nested scopes) before completing the subProcess
+            // element instance itself, so cancelling the container leaves nothing
+            // dangling. `scope_descendants` is empty for a leaf tool, so this is a
+            // no-op there and the leaf behaviour is byte-identical.
+            for descendant in self.scope_descendants(instance_key, child) {
+                events.extend(self.cancel_mi_child_events(instance_key, descendant));
+            }
             events.extend(self.cancel_mi_child_events(instance_key, child));
         }
         // Each tool child hangs off a dedicated inner instance; tear it down too
@@ -5417,10 +5466,10 @@ impl Engine {
     /// Activates one ad-hoc "tool" child (ADR 0023 seam 2): instantiates
     /// `element_id` inside the container scope, seeding the agent's
     /// activate-element `variables` as the child's local overlay, and marks it
-    /// active in the container. A service-task tool creates a job; any other kind
-    /// passes straight through to completion (which feeds the loop). v1 targets
-    /// single-activity tools (service/connector tasks); richer tool sub-graphs
-    /// are a deferred refinement.
+    /// active in the container. A service-task tool creates a job; a user-task
+    /// tool parks a human task; an embedded-`subProcess` tool injects a token at
+    /// its body's start event and runs the body by token flow (#872); any other
+    /// kind passes straight through to completion (which feeds the loop).
     fn activate_adhoc_tool(
         &mut self,
         instance_key: Key,
@@ -5676,6 +5725,31 @@ impl Engine {
                     priority,
                     form_key,
                     external_form_reference,
+                });
+            }
+            // An embedded `subProcess` tool (#872): run its multi-element body by
+            // ordinary token flow within the tool's scope. The tool child (the
+            // subProcess element instance created above) is the body's variable
+            // scope — already parented to the container by `AdHocToolActivated`,
+            // so body elements resolve container + seed variables — and its token
+            // scope for the inner flow. Inject a token at the body's start event
+            // and park: the tool stays in the container's active set until the
+            // body drains to its end event, at which point
+            // `complete_drained_subprocesses` routes the drained tool through
+            // `complete` → `complete_adhoc_tool` (append `outputElement`, tear
+            // down the inner instance, re-emit the agent job). Boundary events on
+            // the subProcess tool arm exactly like a normal embedded sub-process.
+            Some(crate::model::AdHocToolKind::SubProcess { start_event }) => {
+                events.extend(self.arm_boundary_events(
+                    instance_key,
+                    child_key,
+                    inner_key,
+                    &element_id,
+                ));
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: start_event,
+                    scope: child_key,
                 });
             }
             // Other / an unlisted id: no job or task to run, so the child passes
@@ -6303,8 +6377,11 @@ impl Engine {
         // container that still lists the tool child active. Its completion feeds
         // the container's output collection and the activate-element loop rather
         // than taking an outgoing flow, and tears the inner instance down with it.
-        // (v1 supports single-activity tools; a tool that is a multi-element
-        // sub-graph is a deferred refinement — see ADR 0023 §Subset.)
+        // This covers both single-activity tools (service/user tasks) and an
+        // embedded-`subProcess` tool whose multi-element body has drained to its
+        // end event (#872) — the latter reaches here via
+        // `complete_drained_subprocesses` routing the drained tool to
+        // `Step::Complete`.
         if scope != 0 {
             let container = self.scope_of(instance_key, scope);
             if container != 0

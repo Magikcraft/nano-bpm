@@ -909,6 +909,15 @@ pub enum AdHocToolKind {
     UserTask(UserTaskProps),
     /// A call activity; `process_id` is the invoked process id, if declared.
     CallActivity { process_id: Option<String> },
+    /// An embedded `bpmn:subProcess` tool with a multi-element token-flow body
+    /// (ADR 0023 §Subset, issue #872). `start_event` is the id of the body's
+    /// inner start event, where a token is injected when the tool is activated;
+    /// the tool completes only when its body reaches its end event, feeding the
+    /// agent loop like any other tool. Unlike the other kinds, a subProcess
+    /// tool's body is *retained* in the executable graph (not pruned to a
+    /// catalog entry), so it runs by ordinary token flow within the tool's
+    /// scope (tasks, gateways, boundary events, nested scopes).
+    SubProcess { start_event: ElementId },
     /// Any other element kind usable as a tool.
     Other,
 }
@@ -936,11 +945,14 @@ pub struct AdHocTool {
 /// The retained metadata + tool catalog of one `adHocSubProcess`.
 ///
 /// Nano keeps the container itself as a single job-bearing activity in the
-/// executable graph and does not (yet) run its inner tools by token flow; this
-/// struct preserves what the pruned inner elements were, plus the `zeebe:adHoc`
-/// wiring, so the Camunda agentic contract can be honoured later (ADR 0023:
-/// activate-element execution) without re-parsing. It is non-executable metadata
-/// today — engine token flow does not read it.
+/// executable graph. Leaf tools (service / user tasks, call activities) are
+/// pruned to this catalog and activated out-of-band by the agent loop; an
+/// embedded-`subProcess` tool is instead RETAINED in the executable graph and
+/// runs its body by ordinary token flow when activated (#872), but is still
+/// listed here (kind [`AdHocToolKind::SubProcess`]) so the agent can activate it
+/// by id. The catalog preserves what the inner elements were, plus the
+/// `zeebe:adHoc` wiring, so the Camunda agentic contract (ADR 0023:
+/// activate-element execution) is honoured without re-parsing.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AdHocSubProcessDef {

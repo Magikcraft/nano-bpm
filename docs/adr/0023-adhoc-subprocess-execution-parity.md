@@ -144,8 +144,15 @@ Ship in this order; state each boundary in `PERFORMANCE.md`/feature matrix:
   `cancelRemainingInstances`) crosses the nesting boundary through the parent's
   tool-completion path, nesting correctly in the read-model element-instance tree
   (issue #631).
-- **Deferred**: embedded `SUB_PROCESS` tools whose multi-element body runs by
-  token flow, boundary events on tools, compensation inside ad-hoc.
+- **v1.3**: embedded `SUB_PROCESS` tools whose multi-element body runs by token
+  flow — a plain `bpmn:subProcess` tool (a real inner flow of tasks / gateways /
+  events) is retained in the executable graph; activating it mints its inner
+  instance, injects a token at the body's start event, and completes the tool
+  only when the body reaches its end event, feeding the agent loop like any other
+  tool. Cancel propagation tears the body down across the tool boundary, and the
+  read-model element-instance tree nests container → inner instance → subProcess
+  tool → its body's leaves (issue #872, the deferred remainder of #631).
+- **Deferred**: boundary events on tools, compensation inside ad-hoc.
 
 ## Phased plan
 

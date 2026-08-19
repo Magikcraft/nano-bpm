@@ -660,6 +660,10 @@ fn parse_with_captures(
                                 // its scope so nested nodes are tagged as
                                 // contained in it until its end tag.
                                 let idx = acc.add_node(attrs, NodeKind::SubProcess);
+                                if let Some(i) = idx {
+                                    acc.nodes[i].is_event_subprocess =
+                                        attr(attrs, "triggeredByEvent") == Some("true");
+                                }
                                 if let Some(id) = attr(attrs, "id") {
                                     if !self_closing {
                                         acc.scope_stack.push(id.to_string());
@@ -1645,6 +1649,12 @@ struct NodeAcc {
     /// True for an `adHocSubProcess`: kept as a single Service job activity while
     /// its contained elements are pruned at build (see `build`).
     is_adhoc: bool,
+    /// True for a `subProcess triggeredByEvent="true"` (an event sub-process). An
+    /// event sub-process is triggered by its start event, not activated by token
+    /// flow, so — even as a direct child of an ad-hoc container — it is NOT an
+    /// activatable embedded-subProcess tool (#872) and stays on the pruned-catalog
+    /// path with its inner activities.
+    is_event_subprocess: bool,
     /// `zeebe:adHoc outputCollection` on an ad-hoc container, if declared.
     adhoc_output_collection: Option<String>,
     /// `zeebe:adHoc outputElement` FEEL expression on an ad-hoc container.
@@ -1860,6 +1870,7 @@ impl ProcessAcc {
             parent: self.scope_stack.last().cloned(),
             user_task: crate::model::UserTaskProps::default(),
             is_adhoc: false,
+            is_event_subprocess: false,
             adhoc_output_collection: None,
             adhoc_output_element: None,
             adhoc_active_elements: None,
@@ -2088,10 +2099,50 @@ impl ProcessAcc {
                 }
                 None
             };
+            // Embedded `subProcess` tools (issue #872): a plain `bpmn:subProcess`
+            // that is a DIRECT child of an ad-hoc container is a multi-element
+            // token-flow tool — its body must run by ordinary token flow, so
+            // (unlike a leaf service/user-task tool) neither the subProcess
+            // element nor its body is pruned; both are retained in the executable
+            // graph and reached only when the tool is activated. A nested
+            // `adHocSubProcess` (agent-of-agents, #631) is NOT such a tool — it is
+            // `is_adhoc` and keeps its own pruned-catalog handling — so exclude it
+            // here.
+            let subprocess_tool_ids: std::collections::HashSet<String> = self
+                .nodes
+                .iter()
+                .filter(|n| {
+                    matches!(n.kind, NodeKind::SubProcess)
+                        && !n.is_adhoc
+                        && !n.is_event_subprocess
+                        && n.parent
+                            .as_deref()
+                            .map(|p| adhoc_ids.contains(p))
+                            .unwrap_or(false)
+                })
+                .map(|n| n.id.clone())
+                .collect();
+            // Is `id` the subProcess tool itself or one of its body descendants?
+            // Walk ancestor-or-self: a subProcess-tool ancestor means retained; an
+            // ad-hoc ancestor reached first (e.g. a nested ad-hoc container's own
+            // tool) means it is pruned by the ad-hoc rule, not retained.
+            let in_subprocess_tool = |id: &str| -> bool {
+                let mut cur = Some(id);
+                while let Some(c) = cur {
+                    if subprocess_tool_ids.contains(c) {
+                        return true;
+                    }
+                    if adhoc_ids.contains(c) {
+                        return false;
+                    }
+                    cur = parent_of.get(c).copied();
+                }
+                false
+            };
             let pruned: std::collections::HashSet<String> = self
                 .nodes
                 .iter()
-                .filter(|n| inside_adhoc(&n.id))
+                .filter(|n| inside_adhoc(&n.id) && !in_subprocess_tool(&n.id))
                 .map(|n| n.id.clone())
                 .collect();
 
@@ -2212,18 +2263,43 @@ impl ProcessAcc {
                     tools: Vec::new(),
                 });
             }
-            // Assign each pruned tool to its nearest ad-hoc container, preserving
-            // document order.
-            for n in self.nodes.iter().filter(|n| pruned.contains(&n.id)) {
-                let kind = match n.kind {
-                    NodeKind::Service => crate::model::AdHocToolKind::ServiceTask {
-                        job_type: n.job_type.clone().unwrap_or_else(|| n.id.clone()),
-                    },
-                    NodeKind::User => crate::model::AdHocToolKind::UserTask(n.user_task.clone()),
-                    NodeKind::Call => crate::model::AdHocToolKind::CallActivity {
-                        process_id: n.called_process_id.clone(),
-                    },
-                    _ => crate::model::AdHocToolKind::Other,
+            // Assign each pruned tool — and each retained embedded-subProcess
+            // tool (#872) — to its nearest ad-hoc container, preserving document
+            // order. A subProcess tool stays in the executable graph, so it is
+            // NOT in `pruned`; it is added to the catalog here so the agent can
+            // activate it by id and `activate_adhoc_tool` can inject a token at
+            // its body's start event.
+            for n in self
+                .nodes
+                .iter()
+                .filter(|n| pruned.contains(&n.id) || subprocess_tool_ids.contains(&n.id))
+            {
+                let kind = if subprocess_tool_ids.contains(&n.id) {
+                    // The inner start event (a Start node whose parent is this
+                    // subProcess tool) — where a token is injected on activation.
+                    let start_event = self
+                        .nodes
+                        .iter()
+                        .find(|c| {
+                            matches!(c.kind, NodeKind::Start)
+                                && c.parent.as_deref() == Some(n.id.as_str())
+                        })
+                        .map(|c| c.id.clone())
+                        .unwrap_or_default();
+                    crate::model::AdHocToolKind::SubProcess { start_event }
+                } else {
+                    match n.kind {
+                        NodeKind::Service => crate::model::AdHocToolKind::ServiceTask {
+                            job_type: n.job_type.clone().unwrap_or_else(|| n.id.clone()),
+                        },
+                        NodeKind::User => {
+                            crate::model::AdHocToolKind::UserTask(n.user_task.clone())
+                        }
+                        NodeKind::Call => crate::model::AdHocToolKind::CallActivity {
+                            process_id: n.called_process_id.clone(),
+                        },
+                        _ => crate::model::AdHocToolKind::Other,
+                    }
                 };
                 if let Some(pos) = nearest_adhoc(&n.id).and_then(|c| index.get(&c).copied()) {
                     adhoc_catalog[pos].tools.push(crate::model::AdHocTool {
@@ -2235,17 +2311,20 @@ impl ProcessAcc {
                 }
             }
 
-            // ADR 0023 seam 2 (runtime): the inner "tool" activities are pruned
+            // ADR 0023 seam 2 (runtime): the inner LEAF "tool" activities
+            // (service / user tasks, call activities, gateways, events) are pruned
             // from the executable graph — an ad-hoc container is flattened to a
-            // single job-bearing activity, so its tools are never reached by
+            // single job-bearing activity, so those tools are never reached by
             // ordinary token flow. They are NOT lost: the catalog above captures
             // each tool's id + kind (job type), which is all the runtime needs to
             // activate one when the agent's job result requests it (the container
             // scope + activate-element seeding drive execution, not the flat
-            // element graph). Keeping tools out of `self.nodes`/`flows` also keeps
-            // `ProcessDefinition.elements` — and thus the processos model
-            // round-trip — identical to a plain container, avoiding a modeler
-            // cascade over arbitrary inner activities.
+            // element graph). An embedded-`subProcess` tool and its body are the
+            // exception (#872): they are NOT in `pruned`, so they stay in
+            // `self.nodes`/`flows` and run by token flow when the tool is
+            // activated. Pruning the leaf tools keeps `ProcessDefinition.elements`
+            // otherwise minimal, avoiding a modeler cascade over arbitrary inner
+            // leaf activities.
             if !pruned.is_empty() {
                 self.nodes.retain(|n| !pruned.contains(&n.id));
                 self.flows.retain(|f| {
