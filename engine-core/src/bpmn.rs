@@ -4732,7 +4732,7 @@ mod tests {
                     message_name: "payment-received".to_string(),
                     correlation_key: "\"k\"".to_string(),
                 },
-                "correlation key FEEL for reference {reference} should decode to =\"k\""
+                "correlation key FEEL for reference {reference} should decode to \"k\""
             );
         }
     }

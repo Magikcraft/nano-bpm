@@ -247,6 +247,11 @@ pub fn unescape(s: &str) -> String {
 /// Returns `Some(char)` for the five named entities and for valid decimal
 /// (`#NN`) / hexadecimal (`#xHH`) numeric character references, or `None` for
 /// anything unrecognised or malformed (which callers leave verbatim).
+///
+/// Numeric references that resolve to a code point not permitted by the XML 1.0
+/// `Char` production (e.g. `&#0;` → NUL, or other C0 control characters) are
+/// rejected as `None` too, so we never smuggle control characters into
+/// downstream parsers / FEEL — the original `&#...;` text is left verbatim.
 fn decode_entity(entity: &str) -> Option<char> {
     match entity {
         "lt" => return Some('<'),
@@ -262,7 +267,25 @@ fn decode_entity(entity: &str) -> Option<char> {
     } else {
         num.parse::<u32>().ok()?
     };
-    char::from_u32(code)
+    let ch = char::from_u32(code)?;
+    is_xml_char(ch).then_some(ch)
+}
+
+/// Whether `ch` is permitted by the XML 1.0 `Char` production:
+///
+/// ```text
+/// Char ::= #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+/// ```
+///
+/// Surrogates (`#xD800-#xDFFF`) are already excluded by `char`; this additionally
+/// rejects the disallowed C0 control characters and the non-characters `#xFFFE` /
+/// `#xFFFF`.
+fn is_xml_char(ch: char) -> bool {
+    matches!(ch,
+        '\u{9}' | '\u{A}' | '\u{D}'
+        | '\u{20}'..='\u{D7FF}'
+        | '\u{E000}'..='\u{FFFD}'
+        | '\u{10000}'..='\u{10FFFF}')
 }
 
 /// A parsed XML element tree node.
@@ -414,5 +437,22 @@ mod tests {
     #[test]
     fn should_return_input_unchanged_when_there_is_no_ampersand() {
         assert_eq!(unescape("plain text"), "plain text");
+    }
+
+    #[test]
+    fn should_leave_non_xml_control_character_references_verbatim() {
+        // Code points that resolve to a valid `char` but are NOT permitted by the
+        // XML 1.0 `Char` production must be left as their original text rather than
+        // smuggling control characters (e.g. NUL) into downstream parsers / FEEL.
+        assert_eq!(unescape("&#0;"), "&#0;"); // NUL
+        assert_eq!(unescape("&#x0;"), "&#x0;"); // NUL (hex)
+        assert_eq!(unescape("&#8;"), "&#8;"); // backspace (C0 control)
+        assert_eq!(unescape("&#x1F;"), "&#x1F;"); // unit separator (C0 control)
+        assert_eq!(unescape("&#xFFFE;"), "&#xFFFE;"); // non-character
+        assert_eq!(unescape("&#xFFFF;"), "&#xFFFF;"); // non-character
+                                                      // The XML-permitted control characters (tab, LF, CR) still decode.
+        assert_eq!(unescape("&#9;"), "\t");
+        assert_eq!(unescape("&#xA;"), "\n");
+        assert_eq!(unescape("&#xD;"), "\r");
     }
 }
