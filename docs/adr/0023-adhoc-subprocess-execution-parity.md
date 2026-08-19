@@ -138,8 +138,14 @@ Ship in this order; state each boundary in `PERFORMANCE.md`/feature matrix:
   inner sub-graphs; `activateElements` + `completionCondition` + `cancelRemainingInstances` +
   `outputCollection/outputElement`.
 - **v1.1**: the declarative `BPMN_TASK` `activeElementsCollection` execution mode.
-- **Deferred**: nested ad-hoc (agent-of-agents), boundary events on tools, compensation inside
-  ad-hoc.
+- **v1.2**: nested ad-hoc (agent-of-agents) — a tool that is itself an
+  `adHocSubProcess` stands up a real second-level container (its own agent job,
+  tool catalog and `outputCollection`), and its completion (natural or
+  `cancelRemainingInstances`) crosses the nesting boundary through the parent's
+  tool-completion path, nesting correctly in the read-model element-instance tree
+  (issue #631).
+- **Deferred**: embedded `SUB_PROCESS` tools whose multi-element body runs by
+  token flow, boundary events on tools, compensation inside ad-hoc.
 
 ## Phased plan
 

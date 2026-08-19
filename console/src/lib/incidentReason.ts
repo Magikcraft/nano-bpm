@@ -30,7 +30,11 @@ export function countReasonLines(reason: string): number {
   // large stderr dump, and we only need the count — no need to allocate an
   // array proportional to the number of lines.
   let lines = 1;
-  for (let i = reason.indexOf("\n"); i !== -1; i = reason.indexOf("\n", i + 1)) {
+  for (
+    let i = reason.indexOf("\n");
+    i !== -1;
+    i = reason.indexOf("\n", i + 1)
+  ) {
     lines++;
   }
   return lines;
