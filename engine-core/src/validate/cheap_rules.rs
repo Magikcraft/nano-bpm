@@ -42,9 +42,14 @@
 //!      An *absent* attribute is left to Nano's defaulting (an absent `type`
 //!      defaults to the id), matching Zeebe's "when present" semantics.
 //!
-//! Do **not** edit `crate::bpmn`'s streaming parser, `validate/mod.rs` (this
-//! validator is already registered), or the `ParseError` enum: every reason is
-//! pre-declared and every input is pre-captured.
+//! Keep this a **cheap post-parse validator**: work from the built
+//! [`ProcessDefinition`](crate::model::ProcessDefinition) and the pre-captured
+//! [`ProcessCapture`](crate::validate::ProcessCapture), and avoid widening the
+//! parser / capture / [`ParseError`] surface unless a
+//! rule genuinely needs a new input — as the signal rule did, adding the
+//! captured signal id→name map (`ProcessCapture::signal_names`). This validator
+//! is already registered in `validate/mod.rs`, and every `ParseError` reason it
+//! raises is already declared.
 
 use std::collections::HashSet;
 
