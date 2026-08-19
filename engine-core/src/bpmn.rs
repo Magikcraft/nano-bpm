@@ -2240,6 +2240,41 @@ impl ProcessAcc {
                 }
             }
 
+            // Embedded `subProcess` tools (#872) are activated by injecting a
+            // token at their inner start event (`activate_adhoc_tool` does a
+            // `Step::Activate` on it), so each MUST have exactly one direct-child
+            // start event. Zero would leave the tool with no entry token — and
+            // the catalog build below would silently default the start id to ""
+            // (`unwrap_or_default`), so activation would `Step::Activate` a
+            // non-existent element and hard-fail at runtime. More than one makes
+            // the injection target ambiguous. Reject both at parse/deploy time
+            // with a clear error rather than defaulting. Iterate in document
+            // order (over `self.nodes`, not the `HashSet`) so the error is
+            // deterministic when several tools are malformed.
+            for n in self
+                .nodes
+                .iter()
+                .filter(|n| subprocess_tool_ids.contains(&n.id))
+            {
+                let start_count = self
+                    .nodes
+                    .iter()
+                    .filter(|c| {
+                        matches!(c.kind, NodeKind::Start)
+                            && c.parent.as_deref() == Some(n.id.as_str())
+                    })
+                    .count();
+                if start_count != 1 {
+                    return Err(ParseError::InvalidProcess {
+                        process_id: self.id.clone(),
+                        reason: format!(
+                            "embedded subProcess tool {} must have exactly one start event, found {}",
+                            n.id, start_count
+                        ),
+                    });
+                }
+            }
+
             // One catalog entry per ad-hoc container, in document order.
             let mut index: HashMap<String, usize> = HashMap::new();
             for n in self.nodes.iter().filter(|n| n.is_adhoc) {
@@ -2277,6 +2312,9 @@ impl ProcessAcc {
                 let kind = if subprocess_tool_ids.contains(&n.id) {
                     // The inner start event (a Start node whose parent is this
                     // subProcess tool) — where a token is injected on activation.
+                    // The validation loop above guarantees exactly one such node,
+                    // so `find` always succeeds; the `unwrap_or_default` is only a
+                    // belt-and-braces fallback that the parse-time check prevents.
                     let start_event = self
                         .nodes
                         .iter()
@@ -3580,6 +3618,55 @@ mod tests {
         let inner = r#"<bpmn:serviceTask id="tool" /><bpmn:endEvent id="inner_end" />"#;
         let xml = adhoc_model("", td, inner);
         assert_rejected(&xml, "must not contain an end event");
+    }
+
+    // ---- Embedded subProcess tool start-event validation (#872) ----
+    // An embedded `subProcess` tool is driven by injecting a token at its inner
+    // start event, so it must have exactly one. Zero or many is rejected at
+    // parse/deploy time rather than silently defaulting to an empty/ambiguous
+    // start id (which would `Step::Activate` a non-existent element at runtime).
+
+    #[test]
+    fn rejects_embedded_subprocess_tool_with_no_start_event() {
+        let td = r#"<zeebe:taskDefinition type="agent" />"#;
+        let inner = r#"<bpmn:subProcess id="review"><bpmn:userTask id="ask" /></bpmn:subProcess>"#;
+        let xml = adhoc_model("", td, inner);
+        assert_rejected(&xml, "must have exactly one start event");
+    }
+
+    #[test]
+    fn rejects_embedded_subprocess_tool_with_multiple_start_events() {
+        let td = r#"<zeebe:taskDefinition type="agent" />"#;
+        let inner = r#"<bpmn:subProcess id="review">
+            <bpmn:startEvent id="r_s1" />
+            <bpmn:startEvent id="r_s2" />
+            <bpmn:userTask id="ask" />
+        </bpmn:subProcess>"#;
+        let xml = adhoc_model("", td, inner);
+        assert_rejected(&xml, "must have exactly one start event");
+    }
+
+    #[test]
+    fn accepts_embedded_subprocess_tool_with_one_start_event() {
+        let td = r#"<zeebe:taskDefinition type="agent" />"#;
+        let inner = r#"<bpmn:subProcess id="review">
+            <bpmn:startEvent id="r_s" />
+            <bpmn:userTask id="ask" />
+            <bpmn:sequenceFlow id="rf1" sourceRef="r_s" targetRef="ask" />
+        </bpmn:subProcess>"#;
+        let xml = adhoc_model("", td, inner);
+        let def = &parse_bpmn(&xml).unwrap()[0];
+        let tool = def.adhoc[0]
+            .tools
+            .iter()
+            .find(|t| t.element_id == "review")
+            .expect("embedded subProcess tool is catalogued");
+        assert_eq!(
+            tool.kind,
+            crate::model::AdHocToolKind::SubProcess {
+                start_event: "r_s".to_string(),
+            }
+        );
     }
 
     #[test]
