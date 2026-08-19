@@ -113,15 +113,15 @@ type RetirementBuffer = Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<
 /// the crate compiling clean under `warnings = "deny"`.
 #[derive(Clone, Default)]
 #[allow(dead_code)] // #905 (batch-operations) fills this
-pub struct BatchOperationStore { /* #905 fills this */ }
+pub struct BatchOperationStore {/* #905 fills this */}
 
 #[derive(Clone, Default)]
 #[allow(dead_code)] // #906 (cluster-variables) fills this
-pub struct ClusterVariableStore { /* #906 fills this */ }
+pub struct ClusterVariableStore {/* #906 fills this */}
 
 #[derive(Clone, Default)]
 #[allow(dead_code)] // #907 (jobs & job-statistics) fills this
-pub struct JobStatisticsState { /* #907 fills this */ }
+pub struct JobStatisticsState {/* #907 fills this */}
 
 #[derive(Clone)]
 pub struct ServerImpl {
