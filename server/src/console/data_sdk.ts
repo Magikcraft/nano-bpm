@@ -90,6 +90,37 @@ export interface ExecResult {
   lastInsertId?: number | bigint;
 }
 
+/// Whether `sql` is a pure *read* (safe to serve through the row-returning
+/// `query` op, and to allow while the app is running). This is the **canonical**
+/// server data-gateway read-vs-write split (issue #889): the console's
+/// `console/src/lib/sqlStatement.ts` is an explicit mirror of it, so the client
+/// routing and this server gate can never drift.
+///
+/// Conservative by construction — anything not provably read-only is a write, so
+/// the dangerous permissive failure (mis-classifying a mutation as a read, e.g.
+/// `INSERT … RETURNING`, a data-modifying CTE, or an assigning `PRAGMA`) can
+/// never slip a write down the `query` path and past the running-app edit gate:
+/// - `SELECT` / `EXPLAIN` are always reads.
+/// - A CTE (`WITH …`) is a read only when it carries no mutating verb; a
+///   `WITH … INSERT/UPDATE/DELETE/REPLACE …` statement mutates.
+/// - `PRAGMA name` reads a setting, but `PRAGMA name = value` / `PRAGMA name(x)`
+///   sets one, so only the argument-less form is a read.
+/// - Everything else (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, …) is a
+///   write.
+export function isReadStatement(sql: string): boolean {
+  const s = sql.trim();
+  if (/^(select|explain)\b/i.test(s)) return true;
+  if (/^with\b/i.test(s)) {
+    // A CTE that contains any mutating verb is a data-modifying statement.
+    return !/\b(insert|update|delete|replace)\b/i.test(s);
+  }
+  if (/^pragma\b/i.test(s)) {
+    // `=` (assignment) or `(` (call form) makes the PRAGMA a write.
+    return !/[=(]/.test(s);
+  }
+  return false;
+}
+
 /// The one thin, uniform interface behind every driver (ADR 0024 §2) — the
 /// `TDataSet` equivalent. The driver underneath is interchangeable because every
 /// consumer shares exactly this surface.

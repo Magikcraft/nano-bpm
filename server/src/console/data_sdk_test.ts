@@ -8,6 +8,7 @@
 
 import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
+  isReadStatement,
   openDataSource,
   resolveEnvTemplate,
   resolveSource,
@@ -161,4 +162,39 @@ Deno.test("openDataSource: unknown driver hints at a pack", async () => {
     "nano-ide-data-mysql",
   );
   await Deno.remove(root, { recursive: true });
+});
+
+Deno.test("isReadStatement: plain reads are reads, plain writes are writes", () => {
+  for (const sql of ["SELECT 1", "  select * from t  ", "EXPLAIN QUERY PLAN SELECT 1", "explain select 1"]) {
+    assertEquals(isReadStatement(sql), true, sql);
+  }
+  for (
+    const sql of [
+      "INSERT INTO t VALUES (1)",
+      "update t set a = 1",
+      "DELETE FROM t",
+      "CREATE TABLE t (a int)",
+      "DROP TABLE t",
+      "REPLACE INTO t VALUES (1)",
+    ]
+  ) {
+    assertEquals(isReadStatement(sql), false, sql);
+  }
+});
+
+Deno.test("isReadStatement: mutating RETURNING and data-modifying CTEs are writes", () => {
+  // The query-op bypass: a mutation that returns rows must not be a read.
+  assertEquals(isReadStatement("INSERT INTO t VALUES (1) RETURNING id"), false, "INSERT … RETURNING");
+  assertEquals(isReadStatement("update t set a = 1 returning *"), false, "UPDATE … RETURNING");
+  assertEquals(isReadStatement("DELETE FROM t WHERE id = 1 RETURNING id"), false, "DELETE … RETURNING");
+  assertEquals(isReadStatement("WITH c AS (SELECT 1) SELECT * FROM c"), true, "WITH … SELECT");
+  assertEquals(isReadStatement("WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c"), false, "WITH … INSERT");
+  assertEquals(isReadStatement("with c as (select 1) delete from t"), false, "WITH … DELETE");
+});
+
+Deno.test("isReadStatement: PRAGMA is a read only in its argument-less query form", () => {
+  assertEquals(isReadStatement("PRAGMA foreign_keys"), true, "read PRAGMA");
+  assertEquals(isReadStatement("pragma table_info"), true, "read PRAGMA");
+  assertEquals(isReadStatement("PRAGMA foreign_keys = ON"), false, "assigning PRAGMA");
+  assertEquals(isReadStatement("pragma table_info(t)"), false, "call-form PRAGMA");
 });

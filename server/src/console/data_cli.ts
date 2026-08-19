@@ -21,7 +21,7 @@
 //   op = "sources" | "schema" | "query" | "exec" | "script" | "migrations"
 //      | "migrate" | "domaintypes"
 
-import { listSources, manifestTypes, manifestWorkers, openDataSource, type WorkerDecl } from "./data-sdk.ts";
+import { isReadStatement, listSources, manifestTypes, manifestWorkers, openDataSource, type WorkerDecl } from "./data-sdk.ts";
 import {
   DOMAIN_BINDINGS,
   DOMAIN_DTS,
@@ -352,8 +352,20 @@ async function run(req: Request): Promise<unknown> {
       return { tables: await db.schema() };
     }
     case "query": {
+      // The `query` op is allowlisted while the app is running, so it must be
+      // read-only: `db.query` runs `prepare(sql).all(...)`, which happily
+      // executes a mutating `INSERT/UPDATE/DELETE … RETURNING` or a
+      // data-modifying CTE and returns its rows. Reject any non-read statement
+      // here (using the canonical `isReadStatement` split) so a client cannot
+      // launder a write through the read path and past the running-app gate.
+      const sql = req.sql ?? "";
+      if (!isReadStatement(sql)) {
+        throw new Error(
+          "query op accepts read-only statements only; use the exec op for a mutation",
+        );
+      }
       const db = await openDataSource(req.source);
-      const rows = (await db.query(req.sql ?? "", req.params ?? [])) as Record<
+      const rows = (await db.query(sql, req.params ?? [])) as Record<
         string,
         unknown
       >[];
