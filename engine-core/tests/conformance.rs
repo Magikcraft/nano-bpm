@@ -194,9 +194,10 @@ fn corpus_dir() -> PathBuf {
 ///   * `<!-- verdict: accept -->`
 ///   * `<!-- verdict: reject | category: <NanoCategory> -->`
 fn parse_directive(name: &str, xml: &str) -> Expectation {
+    let mut in_comment = false;
     let comment = xml
         .lines()
-        .take_while(|l| is_prolog_line(l))
+        .take_while(|l| is_prolog_line(l, &mut in_comment))
         .find(|l| l.contains("<!--") && contains_keyword(l, "verdict:"))
         .unwrap_or_else(|| panic!("{name}: missing leading `<!-- verdict: … -->` directive"));
     let after_verdict = after_keyword(comment, "verdict:")
@@ -228,12 +229,34 @@ fn contains_keyword(haystack: &str, keyword: &str) -> bool {
 }
 
 /// Whether `line` belongs to a fixture's leading prolog: a blank line, an XML
-/// declaration (`<?xml … ?>`), or an XML comment line (`<!-- … -->`). The first
-/// line that is none of these marks the start of element content, bounding the
-/// directive search in [`parse_directive`] to the leading comment block.
-fn is_prolog_line(line: &str) -> bool {
+/// declaration (`<?xml … ?>`), or an XML comment — **including the continuation
+/// and closing lines of a *wrapped* multi-line `<!-- … -->` comment**. The
+/// `in_comment` cursor carries that open-comment state across lines so a comment
+/// that spans several lines (e.g. a wrapped `oracle:` note) does not prematurely
+/// end the prolog scan on a continuation line that lacks a leading `<!--`. The
+/// first line that is none of these marks the start of element content, bounding
+/// the directive search in [`parse_directive`] to the leading comment block.
+fn is_prolog_line(line: &str, in_comment: &mut bool) -> bool {
     let trimmed = line.trim_start();
-    trimmed.is_empty() || trimmed.starts_with("<?") || trimmed.starts_with("<!--")
+    if *in_comment {
+        // Inside a wrapped comment: this line is still prolog; clear the cursor
+        // once the comment closes.
+        if trimmed.contains("-->") {
+            *in_comment = false;
+        }
+        return true;
+    }
+    if trimmed.is_empty() || trimmed.starts_with("<?") {
+        return true;
+    }
+    if trimmed.starts_with("<!--") {
+        // A comment that does not close on this line opens a wrapped comment.
+        if !trimmed.contains("-->") {
+            *in_comment = true;
+        }
+        return true;
+    }
+    false
 }
 
 /// Returns the slice of `haystack` following the first case-insensitive match of
@@ -642,4 +665,39 @@ fn every_element_family_is_covered_or_explicitly_baselined() {
         baseline.len(),
         ElementFamily::ALL.len()
     );
+}
+
+// ─────────────────────────── directive-parsing unit tests ─────────────────
+
+/// A `verdict:` directive placed *after* a wrapped, multi-line leading comment
+/// must still be found: the prolog scan has to treat the comment's continuation
+/// and closing lines as prolog rather than stopping at the first line that does
+/// not itself open with `<!--`.
+#[test]
+fn parse_directive_finds_verdict_after_wrapped_comment() {
+    let xml = "\
+<!-- oracle: this note wraps across
+     several physical lines before the
+     directive is reached -->
+<!-- verdict: reject | category: InvalidProcess -->
+<bpmn:definitions/>
+";
+    match parse_directive("wrapped", xml) {
+        Expectation::Reject { category } => assert_eq!(category, "InvalidProcess"),
+        other => panic!("expected reject, got {other:?}"),
+    }
+}
+
+/// The prolog scan must still stop at the first element-content line, so an
+/// in-model comment that only appears *after* content is never mistaken for the
+/// directive.
+#[test]
+#[should_panic(expected = "missing leading")]
+fn parse_directive_ignores_directive_after_content() {
+    let xml = "\
+<bpmn:definitions>
+  <!-- verdict: accept -->
+</bpmn:definitions>
+";
+    parse_directive("after-content", xml);
 }
