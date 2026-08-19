@@ -182,13 +182,18 @@ fn corpus_dir() -> PathBuf {
 
 /// Extracts the leading `<!-- verdict: … -->` directive from a fixture.
 ///
+/// Scans for the first XML *comment* line carrying the `verdict:` keyword, so
+/// unrelated element/attribute text that merely contains the word cannot be
+/// mistaken for the directive (matching the leading-comment contract documented
+/// in `tests/conformance/README.md`).
+///
 /// Grammar (case-insensitive on the keywords):
 ///   * `<!-- verdict: accept -->`
 ///   * `<!-- verdict: reject | category: <NanoCategory> -->`
 fn parse_directive(name: &str, xml: &str) -> Expectation {
     let comment = xml
         .lines()
-        .find(|l| contains_keyword(l, "verdict:"))
+        .find(|l| l.contains("<!--") && contains_keyword(l, "verdict:"))
         .unwrap_or_else(|| panic!("{name}: missing `<!-- verdict: … -->` directive"));
     let after_verdict = after_keyword(comment, "verdict:")
         .expect("verdict token")
@@ -219,13 +224,16 @@ fn contains_keyword(haystack: &str, keyword: &str) -> bool {
 }
 
 /// Returns the slice of `haystack` following the first case-insensitive match of
-/// the ASCII `keyword`. ASCII-lowercasing preserves byte length, so indices from
-/// the lowercased copy align with the original string.
+/// the ASCII `keyword`. Both sides are ASCII-lowercased, so the match is
+/// case-insensitive regardless of how `keyword` is cased. ASCII-lowercasing
+/// preserves byte length, so indices from the lowercased copy align with the
+/// original string.
 fn after_keyword<'a>(haystack: &'a str, keyword: &str) -> Option<&'a str> {
+    let needle = keyword.to_ascii_lowercase();
     haystack
         .to_ascii_lowercase()
-        .find(keyword)
-        .map(|i| &haystack[i + keyword.len()..])
+        .find(&needle)
+        .map(|i| &haystack[i + needle.len()..])
 }
 
 fn load_corpus() -> Vec<CorpusEntry> {
@@ -483,10 +491,27 @@ fn mapping_covers_every_parse_error_category() {
 // ───────────────── coverage ratchet #2: element-kind registry ──────────────
 
 /// A coarse family of modelled BPMN element kinds, used by the element-kind
-/// coverage ratchet. New families force an `ALL` update via
-/// [`assert_family_enum_exhaustive`].
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum ElementFamily {
+/// coverage ratchet.
+///
+/// The variant list **and** [`ElementFamily::ALL`] are generated from a single
+/// `element_families!` invocation, so a new family lands in the enum and in
+/// `ALL` in the same edit — there is no hand-maintained second list to drift out
+/// of sync, and the coverage ratchet that iterates `ALL` therefore sees every
+/// family by construction.
+macro_rules! element_families {
+    ($($variant:ident),+ $(,)?) => {
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+        enum ElementFamily {
+            $($variant),+
+        }
+
+        impl ElementFamily {
+            const ALL: &'static [ElementFamily] = &[$(ElementFamily::$variant),+];
+        }
+    };
+}
+
+element_families! {
     StartEvent,
     EndEvent,
     Task,
@@ -498,43 +523,6 @@ enum ElementFamily {
     TimerStartEvent,
     SubProcess,
     CallActivity,
-}
-
-impl ElementFamily {
-    const ALL: &'static [ElementFamily] = &[
-        ElementFamily::StartEvent,
-        ElementFamily::EndEvent,
-        ElementFamily::Task,
-        ElementFamily::Gateway,
-        ElementFamily::BoundaryEvent,
-        ElementFamily::IntermediateCatchEvent,
-        ElementFamily::IntermediateThrowEvent,
-        ElementFamily::MessageStartEvent,
-        ElementFamily::TimerStartEvent,
-        ElementFamily::SubProcess,
-        ElementFamily::CallActivity,
-    ];
-}
-
-/// No-wildcard guard: adding an [`ElementFamily`] variant breaks compilation
-/// here until it is also appended to [`ElementFamily::ALL`], keeping the ratchet
-/// honest.
-#[allow(dead_code)]
-fn assert_family_enum_exhaustive(f: ElementFamily) {
-    match f {
-        ElementFamily::StartEvent
-        | ElementFamily::EndEvent
-        | ElementFamily::Task
-        | ElementFamily::Gateway
-        | ElementFamily::BoundaryEvent
-        | ElementFamily::IntermediateCatchEvent
-        | ElementFamily::IntermediateThrowEvent
-        | ElementFamily::MessageStartEvent
-        | ElementFamily::TimerStartEvent
-        | ElementFamily::SubProcess
-        | ElementFamily::CallActivity => {}
-    }
-    assert!(ElementFamily::ALL.contains(&f));
 }
 
 /// Maps every modelled [`ElementKind`] to a coarse [`ElementFamily`]. The match
