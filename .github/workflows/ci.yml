@@ -350,6 +350,28 @@ jobs:
       - name: Test
         run: npm test
 
+  engine-testkit-npm:
+    name: '@nanobpm/engine-testkit (build + test)'
+    runs-on: ubuntu-24.04
+    needs: [changes]
+    if: *code_gate
+    defaults:
+      run:
+        working-directory: clients/engine-testkit
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Install
+        run: npm install
+      - name: Type-check
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Test
+        run: npm test
+
   nano-bernd-jvm:
     name: 'io.github.jwulf:nano-bernd (JVM, Chicory)'
     runs-on: ubuntu-24.04
