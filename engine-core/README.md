@@ -196,6 +196,20 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   the activity (and its job) running and spawns a new parallel token along the
   boundary's outgoing flow for **every** matching message — its subscription stays
   open rather than settling.
+- **Compensation** lets a completed activity be undone by a dedicated handler. A
+  `boundaryEvent` carrying a `compensateEventDefinition`, wired by an
+  `<association>` to an `isForCompensation` handler activity, marks its attached
+  activity **compensable**: when that activity completes a durable
+  `CompensationSubscription` is recorded (`CompensationSubscriptionCreated`,
+  journaled in completion order). A `compensateEventDefinition` on an
+  `intermediateThrowEvent`/`endEvent` is a **compensation throw**: activating it
+  triggers the handlers of the compensable activities in scope in **reverse
+  completion order** (`CompensationTriggered`), running each handler activity as
+  a normal job; the throw rests until every handler completes
+  (`CompensationHandlerCompleted`) before routing its own token onward. With
+  nothing to compensate the throw is a pass-through. This covers the
+  single-activity path (one completed task → its handler); whole-scope and nested
+  compensation are follow-ups.
 - **Message start events** create a new process instance when a matching message
   arrives. Deploying a process whose start event carries a
   `messageEventDefinition` opens a **process-level** `MessageStartSubscription`

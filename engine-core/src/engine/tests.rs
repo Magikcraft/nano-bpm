@@ -4229,6 +4229,104 @@ fn should_reject_throwing_an_error_from_a_job_that_was_never_activated() {
     assert_eq!(err, EngineError::JobNotActivated { job_key });
 }
 
+/// start -> book(job) -> throw(compensation) -> done
+///            \--(compensation boundary "book-comp")..association..> cancel(job)
+///                                                    isForCompensation
+fn process_with_compensation() -> ProcessDefinition {
+    ProcessBuilder::new("trip")
+        .start_event("s")
+        .service_task("book", "book-job")
+        .compensation_boundary_event("book-comp", "book", "cancel")
+        .service_task("cancel", "cancel-job")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("s", "book")
+        .connect("book", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn should_run_the_compensation_handler_when_a_compensation_throw_event_fires() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_compensation()))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("trip"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Complete the compensable activity: it becomes compensable and the token
+    // advances to the compensation throw event, which triggers its handler.
+    let book = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+    let events = engine.apply_command(Command::complete_job(book)).unwrap();
+    // the handler was activated (its job now exists) but the instance is not
+    // done — the throw event rests until the handler completes
+    assert!(!engine.is_completed(instance_key));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::CompensationSubscriptionCreated { element_id, handler, .. }
+            if element_id == "book" && handler == "cancel"
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::CompensationTriggered { throw_element_id, handlers, .. }
+            if throw_element_id == "throw" && handlers == &vec!["cancel".to_string()]
+    )));
+    // the throw's outgoing flow has NOT been taken yet
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "done")));
+
+    // Complete the compensation handler's job: the throw event completes, routes
+    // to `done`, and the instance finishes.
+    let cancel = engine.activate_jobs("cancel-job", "w", 1, 60_000, 0)[0].key;
+    let events = engine.apply_command(Command::complete_job(cancel)).unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::CompensationHandlerCompleted { handler_element_id, .. }
+            if handler_element_id == "cancel"
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "throw" && to == "done"
+    )));
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+}
+
+#[test]
+fn should_pass_through_a_compensation_throw_event_with_nothing_to_compensate() {
+    // start -> throw(compensation) -> done, with a compensable activity that is
+    // never reached, so the throw finds nothing to compensate.
+    let def = ProcessBuilder::new("noop-comp")
+        .start_event("s")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("s", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("noop-comp"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // the throw is a pass-through: it routes straight to `done` and completes
+    assert!(engine.is_completed(instance_key));
+    assert!(created.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "throw" && to == "done"
+    )));
+    assert!(!created
+        .iter()
+        .any(|e| matches!(e, Event::CompensationTriggered { .. })));
+}
+
 /// start -> sub[ sub_start -> inner(work) -> sub_end ] --normal--> done
 ///                               (sub catches BUSINESS_ERROR)
 ///          sub --(error boundary)--> sad(sad-flow) -> sad_end

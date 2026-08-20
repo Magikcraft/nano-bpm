@@ -3,6 +3,73 @@
 use super::*;
 
 impl Engine {
+    /// The compensation handler activity ids wired — via a compensation boundary
+    /// event — to the completed activity `element_id`. Sorted by boundary id so
+    /// selection stays deterministic when an activity carries several.
+    pub(crate) fn compensation_handlers_for(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+    ) -> Vec<ElementId> {
+        let Some(process) = self.process_of_instance(instance_key) else {
+            return Vec::new();
+        };
+        let mut wired: Vec<(ElementId, ElementId)> = process
+            .elements
+            .values()
+            .filter_map(|e| match &e.kind {
+                ElementKind::CompensationBoundaryEvent {
+                    attached_to,
+                    handler,
+                } if attached_to == element_id => Some((e.id.clone(), handler.clone())),
+                _ => None,
+            })
+            .collect();
+        wired.sort();
+        wired.into_iter().map(|(_, handler)| handler).collect()
+    }
+
+    /// The compensable activities recorded in `scope` (completion order, oldest
+    /// first). A compensation throw event consumes these newest-first.
+    pub(crate) fn compensable_in_scope(
+        &self,
+        instance_key: Key,
+        scope: Key,
+    ) -> Vec<crate::state::CompensationSubscription> {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return Vec::new();
+        };
+        instance
+            .compensable
+            .iter()
+            .filter(|c| c.scope == scope)
+            .cloned()
+            .collect()
+    }
+
+    /// If a completing element instance (identified by `element_id` running in
+    /// `scope`) is a compensation handler a compensation throw event is still
+    /// waiting on, returns that throw event's element instance key. A
+    /// compensation handler has no incoming sequence flow, so it is only ever
+    /// activated by compensation; its completion therefore routes back to the
+    /// throw rather than along (non-existent) outgoing flows.
+    pub(crate) fn pending_compensation_handler(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+        scope: Key,
+    ) -> Option<Key> {
+        let instance = self.state.instances.get(&instance_key)?;
+        instance
+            .compensation_waits
+            .iter()
+            .filter(|(_, wait)| {
+                wait.scope == scope && wait.pending_handlers.iter().any(|h| h == element_id)
+            })
+            .map(|(throw_eik, _)| *throw_eik)
+            .min()
+    }
+
     /// Finds the error boundary event attached to `task_element_id` that catches
     /// `error_code`, if any. When several match (a malformed model), the one with
     /// the smallest id is chosen so selection stays deterministic.
