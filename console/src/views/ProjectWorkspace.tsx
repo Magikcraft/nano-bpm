@@ -63,6 +63,7 @@ import {
 import { Button, inputClass } from "../components/ui";
 import { useTemplateUpdate } from "../components/TemplateUpdate";
 import { toUpdateTarget } from "../lib/templateUpdate";
+import { appIsRunning } from "../lib/appRunning";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
 import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
 import {
@@ -312,8 +313,9 @@ export default function ProjectWorkspace() {
 
   const runnable = detail?.runnable ?? false;
   const lang = detail?.config.lang ?? "deno";
-  const running =
-    runState?.status === "running" || runState?.status === "starting";
+  // Categorical edit gate (issue #889): mirror the server's "running" set so
+  // the banner + disabled affordances match exactly what it refuses with 409.
+  const running = appIsRunning(runState?.status);
   const compiling = runState?.compiling ?? false;
 
   // Urban App projects carry a root `nano.app.json`; only those have
@@ -596,6 +598,31 @@ export default function ProjectWorkspace() {
         </ToolbarButton>
       </div>
 
+      {/*
+        "Stop the app to edit it" banner (issue #889). While the app is running,
+        the server refuses every project-mutating request with 409 `app_running`
+        (a single categorical chokepoint). Rather than let those calls fail, the
+        studio surfaces the gate up front: a persistent banner plus disabled
+        apply/deploy/migrate affordances (see the `running` prop threaded into
+        the editor and the Data/Triggers/Connectors panels). One-click Stop
+        re-enables editing; the user starts the app again to pick up the changes.
+      */}
+      {running && (
+        <div className="flex items-center gap-3 border-b border-warn/30 bg-warn/10 px-4 py-1.5 text-xs text-warn">
+          <span className="flex-1">
+            This app is running — stop it to make changes. Edits, deploys and
+            migrations are disabled until it stops.
+          </span>
+          <button
+            type="button"
+            onClick={() => void stop()}
+            className="shrink-0 rounded-md border border-warn/50 px-2 py-0.5 text-xs font-medium text-warn transition-colors hover:bg-warn/20"
+          >
+            ■ Stop app
+          </button>
+        </div>
+      )}
+
       {updateError && (
         <div className="border-b border-danger/30 bg-danger/10 px-4 py-1.5 text-xs text-danger">
           {updateError}
@@ -664,7 +691,7 @@ export default function ProjectWorkspace() {
                 </div>
               }
             >
-              <DataPanel name={name} />
+              <DataPanel name={name} appRunning={running} />
             </Suspense>
           </div>
         ) : activePanel === "triggers" ? (
@@ -676,7 +703,7 @@ export default function ProjectWorkspace() {
                 </div>
               }
             >
-              <TriggersPanel name={name} />
+              <TriggersPanel name={name} appRunning={running} />
             </Suspense>
           </div>
         ) : activePanel === "connectors" ? (
@@ -688,7 +715,7 @@ export default function ProjectWorkspace() {
                 </div>
               }
             >
-              <ConnectorsPanel name={name} />
+              <ConnectorsPanel name={name} appRunning={running} />
             </Suspense>
           </div>
         ) : activePanel === "model" ? (
@@ -723,6 +750,7 @@ export default function ProjectWorkspace() {
                     name={name}
                     path={selected}
                     deployTarget={detail.config.deployTarget}
+                    appRunning={running}
                   />
                 )
               ) : (
@@ -1459,10 +1487,12 @@ function EditorPane({
   name,
   path,
   deployTarget,
+  appRunning,
 }: {
   name: string;
   path: string;
   deployTarget: string;
+  appRunning: boolean;
 }) {
   const [content, setContent] = useState<string | null>(null);
   const [meta, setMeta] = useState<ProjectFile | null>(null);
@@ -2113,6 +2143,10 @@ function EditorPane({
   }, [content, kind, editorReady]);
 
   const save = useCallback(async () => {
+    // Belt-and-braces with the disabled Save button: while the app is running
+    // the server refuses the write (409 `app_running`), so short-circuit every
+    // save path (button, Cmd/Ctrl+S, graphical-editor onSave) up front.
+    if (appRunning) return;
     setSaving(true);
     try {
       let body = content ?? "";
@@ -2179,7 +2213,17 @@ function EditorPane({
     } finally {
       setSaving(false);
     }
-  }, [content, kind, name, path, bpmnView, bpmnXml, formView, formJson]);
+  }, [
+    content,
+    kind,
+    name,
+    path,
+    bpmnView,
+    bpmnXml,
+    formView,
+    formJson,
+    appRunning,
+  ]);
 
   // Prime lastDeployedXml on load — probes <deployTarget> for the currently
   // deployed BPMN of primaryProcessId. Silent on failure (network down, no
@@ -2414,13 +2458,15 @@ function EditorPane({
           <>
             <button
               onClick={() => void deploy()}
-              disabled={deploying || dirty || !primaryProcessId}
+              disabled={deploying || dirty || !primaryProcessId || appRunning}
               title={
-                !primaryProcessId
-                  ? "The BPMN file has no <process id=...>"
-                  : dirty
-                    ? "Save first"
-                    : `Deploy to ${deployTarget}`
+                appRunning
+                  ? "Stop the app before deploying"
+                  : !primaryProcessId
+                    ? "The BPMN file has no <process id=...>"
+                    : dirty
+                      ? "Save first"
+                      : `Deploy to ${deployTarget}`
               }
               className="rounded-md border border-edge-strong px-3 py-1 text-xs font-medium text-fg transition-colors hover:border-accent hover:text-accent-strong disabled:opacity-40"
             >
@@ -2476,7 +2522,8 @@ function EditorPane({
         )}
         <button
           onClick={() => void save()}
-          disabled={saving || !dirty}
+          disabled={saving || !dirty || appRunning}
+          title={appRunning ? "Stop the app before saving changes" : undefined}
           className="rounded-md bg-accent px-3 py-1 text-xs font-medium text-on-accent transition-colors hover:bg-accent-strong disabled:opacity-40"
         >
           {saving ? "Saving…" : "Save"}
