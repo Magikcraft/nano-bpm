@@ -93,6 +93,28 @@ function stripComments(source: string): string {
   return out;
 }
 
+/** Source files EXCLUDED from the published build (`tsconfig.build.json`'s
+ *  `exclude`) are not shipped implementation — e.g. the test-only `fixtures.ts`
+ *  fake engine — so the determinism guard must not scan them: a test helper must
+ *  not gate the shipped DSL. Derived from `tsconfig.build.json` so the exclusion
+ *  tracks the build config's single source of truth rather than duplicating a
+ *  hard-coded file list. Returns paths relative to `SRC_DIR` (matching
+ *  `implementationFiles`). Glob entries (e.g. `**\/*.test.ts`) are left to the
+ *  `.test.ts` filter in `implementationFiles`; only concrete `src/<file>.ts`
+ *  entries are collected here. */
+async function nonShippedSources(): Promise<Set<string>> {
+  const cfg = JSON.parse(
+    await readFile(join(SRC_DIR, "..", "tsconfig.build.json"), "utf8"),
+  ) as { exclude?: string[] };
+  const excluded = new Set<string>();
+  for (const pattern of cfg.exclude ?? []) {
+    if (pattern.startsWith("src/") && pattern.endsWith(".ts") && !pattern.includes("*")) {
+      excluded.add(pattern.slice("src/".length));
+    }
+  }
+  return excluded;
+}
+
 /** The implementation files under `src/**`: every `.ts` that is not a test and
  *  not a `.d.ts`. Walks subdirectories recursively so nested helpers (e.g.
  *  `src/utils/*.ts`) added later stay covered by the guard. Paths are returned
@@ -117,7 +139,8 @@ async function implementationFiles(dir: string = SRC_DIR, prefix = ""): Promise<
 }
 
 test("the assertion DSL implementation scans clean of wall-clock / entropy APIs", async () => {
-  const files = await implementationFiles();
+  const excluded = await nonShippedSources();
+  const files = (await implementationFiles()).filter((name) => !excluded.has(name));
   // Sanity: the scan must actually cover the shipped DSL, or a clean result is
   // meaningless. The lifted Tier-A matcher/implementation sources.
   assert.ok(files.length >= 6, `expected to scan the DSL implementation files, found ${files.join(", ")}`);

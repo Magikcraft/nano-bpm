@@ -9,6 +9,13 @@
 // shapes are introspected against the in-memory `fakeEngine`. The two Urban-only
 // surfaces (SQLite table, HTTP response) have no analog here and are dropped.
 //
+// The DSL's public types and matchers are imported through the package barrel
+// (`./index.ts`), not the internal modules, so this guard ALSO fails if a public
+// re-export is accidentally dropped from the barrel. The only non-barrel import
+// is the in-memory `fakeEngine` test fixture (`./fixtures.ts`), which is
+// deliberately excluded from the published build and is not part of the public
+// surface.
+//
 // Every state / surface IN THE DSL'S DECLARED SCOPE must have a corresponding
 // matcher, so adding a new in-scope engine state without a matcher fails CI.
 // Three dimensions, and no others (we do NOT invent a dimension for a type the
@@ -28,10 +35,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { UserTaskState } from "./port.ts";
-import type { ProcessInstanceState } from "./state.ts";
-import { assertThatInstance, type InstanceAssert } from "./instance.ts";
-import { assertThatUserTask, type UserTaskAssert } from "./user-task.ts";
+import {
+  assertThatInstance,
+  assertThatUserTask,
+  type InstanceAssert,
+  type ProcessInstanceState,
+  type UserTaskAssert,
+  type UserTaskState,
+} from "./index.ts";
 import { fakeEngine } from "./fixtures.ts";
 
 // ---------------------------------------------------------------------------
@@ -100,14 +111,12 @@ const INSTANCE_ASSERT: InstanceAssert = assertThatInstance(
 const USER_TASK_ASSERT: UserTaskAssert = assertThatUserTask(fakeEngine({}), { instance: "pi-1" });
 
 test("(a) every ProcessInstanceState member has an assertThatInstance state matcher", () => {
-  // Derived from the union via the `satisfies Record<ProcessInstanceState, …>`
-  // map above — a new member without a matcher already fails tsc; here we also
-  // prove each derived matcher name is a real callable method at runtime.
-  assert.deepEqual(
-    Object.keys(PROCESS_INSTANCE_STATE_MATCHERS).sort(),
-    ["ACTIVE", "COMPLETED", "TERMINATED"],
-    "the ProcessInstanceState union must map to exactly {ACTIVE, COMPLETED, TERMINATED}",
-  );
+  // Exhaustiveness over the union is enforced at the TYPE level by the
+  // `satisfies Record<ProcessInstanceState, …>` map above — a new member without
+  // a matcher fails tsc, and an extra key fails as an excess property — so we do
+  // NOT re-assert the literal key set here (that would duplicate the union and
+  // create a second drift point). The runtime part only proves each derived
+  // matcher name is a real callable method.
   for (const [state, matcher] of Object.entries(PROCESS_INSTANCE_STATE_MATCHERS)) {
     assert.ok(
       hasMatcher(INSTANCE_ASSERT, matcher),
