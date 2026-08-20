@@ -36,7 +36,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -46,7 +46,7 @@ const SCHEMA_VERSION: i64 = 2;
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -1950486211382609378;
+const SCHEMA_FINGERPRINT: i64 = -8497225416382442826;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -127,7 +127,8 @@ CREATE TABLE jobs (
     process_definition_id  TEXT NOT NULL,
     process_definition_key TEXT NOT NULL,
     job_kind               INTEGER NOT NULL DEFAULT 0,
-    listener_event_type    INTEGER NOT NULL DEFAULT 0
+    listener_event_type    INTEGER NOT NULL DEFAULT 0,
+    created_at_ms          INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE incidents (
     key                    INTEGER PRIMARY KEY,
@@ -956,6 +957,10 @@ pub struct JobRow {
     /// the display-relevant discriminant (kind + listener event type) is
     /// preserved in the read model; the listener index/scope are not projected.
     pub kind: JobKind,
+    /// Wall-clock instant (epoch ms) the job was created, carried from
+    /// [`crate::Event::JobCreated`]. `0` for jobs created before the engine
+    /// recorded the field. Feeds the `/v2/jobs/statistics/*` `created` counters.
+    pub created_at_ms: u64,
 }
 
 pub struct UserTaskRow {
@@ -2162,7 +2167,7 @@ impl ReadStore {
             .prepare(
                 "SELECT key, instance_key, element_instance_key, element_id, job_type, state, \
                  retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 job_kind, listener_event_type \
+                 job_kind, listener_event_type, created_at_ms \
                  FROM jobs",
             )
             .expect("prepare jobs");
@@ -2673,6 +2678,7 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         process_definition_id: r.get(9)?,
         process_definition_key: r.get(10)?,
         kind: job_kind_from(r.get(11)?, r.get(12)?),
+        created_at_ms: r.get::<_, i64>(13)? as u64,
     })
 }
 
@@ -3844,13 +3850,15 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             element_id,
             job_type,
             retries,
+            created_at,
             ..
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
             tx.cexecute(
                 "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
-                 state, retries, worker, deadline_ms, process_definition_id, process_definition_key) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9) \
+                 state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
+                 created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
                  worker = NULL, deadline_ms = NULL",
                 params![
@@ -3863,6 +3871,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     *retries,
                     def_id,
                     def_key,
+                    *created_at as i64,
                 ],
             )?;
         }
@@ -3875,6 +3884,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             job_type,
             event_type,
             retries,
+            created_at,
             ..
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
@@ -3886,8 +3896,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             tx.cexecute(
                 "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 job_kind, listener_event_type) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11) \
+                 job_kind, listener_event_type, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
                  worker = NULL, deadline_ms = NULL",
                 params![
@@ -3902,6 +3912,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     def_key,
                     kind_code,
                     event_code,
+                    *created_at as i64,
                 ],
             )?;
         }

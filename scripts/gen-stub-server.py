@@ -94,7 +94,12 @@ OVERRIDES: dict[tuple[str, str], str] = {
     # (issue-906 adds its cluster-variables entries here)
     # --- END issue-906 cluster-variables delegations ---
     # --- BEGIN issue-907 jobs & job-statistics delegations ---
-    # (issue-907 adds its jobs & job-statistics entries here)
+    ("job", "batch_update_jobs"): "self.batch_update_jobs_impl(body).await",
+    ("job", "get_global_job_statistics"): "self.get_global_job_statistics_impl(query_params).await",
+    ("job", "get_job_type_statistics"): "self.get_job_type_statistics_impl(body).await",
+    ("job", "get_job_worker_statistics"): "self.get_job_worker_statistics_impl(body).await",
+    ("job", "get_job_time_series_statistics"): "self.get_job_time_series_statistics_impl(body).await",
+    ("job", "get_job_error_statistics"): "self.get_job_error_statistics_impl(body).await",
     # --- END issue-907 jobs & job-statistics delegations ---
     # --- BEGIN issue-908 expression & conditional delegations ---
     # (issue-908 adds its expression & conditional entries here)
