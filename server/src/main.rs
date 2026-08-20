@@ -111,9 +111,172 @@ type RetirementBuffer = Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<
 /// which fills in its fields/methods without touching the `ServerImpl` struct or
 /// `Default` blocks. Empty and unread until then, so `#[allow(dead_code)]` keeps
 /// the crate compiling clean under `warnings = "deny"`.
+/// In-memory registry of batch operations (epic #903, sub-issue #905).
+///
+/// A batch operation is minted by a batch *creator* (process-instance
+/// cancellation / incident-resolution) over a set of matched process instances,
+/// then tracked through get/search and driven through its lifecycle
+/// (suspend → resume → cancel). State is shared across the cheaply-`Clone`d
+/// `ServerImpl` via an `Arc<Mutex<…>>`, so every request handler observes the
+/// same registry.
 #[derive(Clone, Default)]
-#[allow(dead_code)] // #905 (batch-operations) fills this
-pub struct BatchOperationStore {/* #905 fills this */}
+pub struct BatchOperationStore {
+    inner: Arc<std::sync::Mutex<BatchOperationStoreInner>>,
+}
+
+#[derive(Default)]
+struct BatchOperationStoreInner {
+    /// Monotonic key allocator, seeded lazily from the wall clock so batch keys
+    /// don't visually collide with engine-minted instance keys and stay unique
+    /// across creates within the process.
+    seq: u64,
+    ops: std::collections::HashMap<u64, BatchOperationRecord>,
+}
+
+/// One tracked batch operation.
+#[derive(Clone)]
+struct BatchOperationRecord {
+    key: u64,
+    op_type: models::BatchOperationTypeEnum,
+    state: models::BatchOperationStateEnum,
+    start_date_ms: u64,
+    end_date_ms: Option<u64>,
+    items: Vec<BatchOperationItemRecord>,
+}
+
+/// One item (target process instance) of a batch operation.
+#[derive(Clone)]
+struct BatchOperationItemRecord {
+    item_key: u64,
+    process_instance_key: Option<u64>,
+    state: models::BatchOperationItemStateEnum,
+    processed_date_ms: Option<u64>,
+    error_message: Option<String>,
+}
+
+/// Outcome of a lifecycle transition (suspend/resume/cancel) request.
+enum BatchLifecycleOutcome {
+    Ok,
+    /// The `(from, to)` pair is not a legal lifecycle move (e.g. resuming a
+    /// `CANCELED` batch, or otherwise leaving a terminal state). Maps to `400`.
+    Invalid {
+        detail: String,
+    },
+    NotFound,
+}
+
+impl BatchOperationStore {
+    /// Mints and registers a new batch operation over `item_keys` (target
+    /// process-instance keys), returning the allocated batch-operation key.
+    ///
+    /// The batch is registered `ACTIVE` with every item `ACTIVE`: this gateway's
+    /// job here is to make the operation *trackable* (get/search) and expose its
+    /// item counts, and to keep it in a state where the documented lifecycle
+    /// transitions (`ACTIVE → SUSPENDED → ACTIVE`; any `→ CANCELED`) are valid.
+    fn create(&self, op_type: models::BatchOperationTypeEnum, item_keys: Vec<u64>) -> u64 {
+        let now = now_millis();
+        let mut inner = self.inner.lock().expect("batch-operation store poisoned");
+        if inner.seq == 0 {
+            inner.seq = now;
+        }
+        inner.seq += 1;
+        let key = inner.seq;
+        let items = item_keys
+            .into_iter()
+            .map(|item_key| BatchOperationItemRecord {
+                item_key,
+                process_instance_key: Some(item_key),
+                state: models::BatchOperationItemStateEnum::Active,
+                processed_date_ms: None,
+                error_message: None,
+            })
+            .collect();
+        inner.ops.insert(
+            key,
+            BatchOperationRecord {
+                key,
+                op_type,
+                state: models::BatchOperationStateEnum::Active,
+                start_date_ms: now,
+                end_date_ms: None,
+                items,
+            },
+        );
+        key
+    }
+
+    /// Returns a clone of the record for `key`, if present.
+    fn get(&self, key: u64) -> Option<BatchOperationRecord> {
+        self.inner
+            .lock()
+            .expect("batch-operation store poisoned")
+            .ops
+            .get(&key)
+            .cloned()
+    }
+
+    /// Returns a clone of every registered record.
+    fn all(&self) -> Vec<BatchOperationRecord> {
+        self.inner
+            .lock()
+            .expect("batch-operation store poisoned")
+            .ops
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Applies a lifecycle transition to `key`, enforcing the documented batch
+    /// state machine: `ACTIVE ⇄ SUSPENDED`, and any non-terminal state `→
+    /// CANCELED`. Terminal states (`CANCELED`, `COMPLETED`, `FAILED`,
+    /// `PARTIALLY_COMPLETED`) are absorbing — you cannot leave them. Legal moves
+    /// that are also no-ops (`ACTIVE→ACTIVE`, `SUSPENDED→SUSPENDED`,
+    /// `CANCELED→CANCELED`) are accepted idempotently. `end_date_ms` is stamped
+    /// only on the *first* terminal transition, so repeated cancels never
+    /// restamp it. An illegal `(from, to)` pair is `Invalid` (maps to `400`); an
+    /// unknown key is `NotFound`.
+    fn transition(&self, key: u64, to: models::BatchOperationStateEnum) -> BatchLifecycleOutcome {
+        use models::BatchOperationStateEnum as S;
+        let mut inner = self.inner.lock().expect("batch-operation store poisoned");
+        match inner.ops.get_mut(&key) {
+            None => BatchLifecycleOutcome::NotFound,
+            Some(rec) => {
+                let from = rec.state;
+                let allowed = match to {
+                    // suspend / resume only shuttle between the two live states.
+                    S::Suspended => matches!(from, S::Active | S::Suspended),
+                    S::Active => matches!(from, S::Active | S::Suspended),
+                    // cancel is legal from any non-terminal state, and is an
+                    // idempotent no-op if the batch is already CANCELED.
+                    S::Canceled => from == S::Canceled || !Self::is_terminal(&from),
+                    _ => false,
+                };
+                if !allowed {
+                    return BatchLifecycleOutcome::Invalid {
+                        detail: format!(
+                            "Batch operation with key '{key}' cannot transition from {from} to {to}."
+                        ),
+                    };
+                }
+                rec.state = to;
+                if Self::is_terminal(&to) && rec.end_date_ms.is_none() {
+                    rec.end_date_ms = Some(now_millis());
+                }
+                BatchLifecycleOutcome::Ok
+            }
+        }
+    }
+
+    /// Whether `state` is a terminal (absorbing) batch-operation state: once a
+    /// batch reaches one it cannot transition out of it.
+    fn is_terminal(state: &models::BatchOperationStateEnum) -> bool {
+        use models::BatchOperationStateEnum as S;
+        matches!(
+            state,
+            S::Canceled | S::Completed | S::Failed | S::PartiallyCompleted
+        )
+    }
+}
 
 #[derive(Clone, Default)]
 #[allow(dead_code)] // #906 (cluster-variables) fills this
@@ -15473,6 +15636,433 @@ impl ServerImpl {
     }
 }
 
+/// v2 REST batch-operations surface (epic #903, sub-issue #905).
+///
+/// Kept in its own `impl` block so this slice never touches the shared
+/// `ServerImpl` struct / `Default` blocks that sibling PRs also edit.
+impl ServerImpl {
+    /// Enumerates the read-model process-instance keys matched by a
+    /// `ProcessInstanceFilter`, using the exact same filter algebra as
+    /// `search_process_instances_impl`. These become the items of a batch
+    /// operation minted by a process-instance batch creator.
+    fn batch_matched_process_instances(&self, filter: &models::ProcessInstanceFilter) -> Vec<u64> {
+        let mut keys: Vec<u64> = self
+            .store
+            .process_instances()
+            .into_iter()
+            .filter(|inst| {
+                let state_str = process_instance_state_enum(inst.state).to_string();
+                query::match_process_instance_key(
+                    &filter.process_instance_key,
+                    &inst.key.to_string(),
+                ) && query::match_process_definition_key(
+                    &filter.process_definition_key,
+                    &inst.process_definition_key,
+                ) && query::match_string(&filter.process_definition_id, &inst.process_definition_id)
+                    && query::match_integer(
+                        &filter.process_definition_version,
+                        Some(i64::from(inst.version)),
+                    )
+                    && query::match_process_instance_state(&filter.state, &state_str)
+                    && filter
+                        .has_incident
+                        .is_none_or(|want| want == inst.has_incident)
+                    && query::match_date_time_ms(
+                        &filter.start_date,
+                        Some(inst.start_date_ms as i64),
+                    )
+                    && query::match_date_time_ms(&filter.end_date, None)
+                    && query::match_string_opt(&filter.business_id, inst.business_id.as_deref())
+            })
+            .map(|inst| inst.key)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// `POST /v2/process-instances/cancellation` — mint a `CANCEL_PROCESS_INSTANCE`
+    /// batch operation over every process instance matched by the request filter.
+    async fn cancel_process_instances_batch_operation_impl(
+        &self,
+        body: &models::ProcessInstanceCancellationBatchOperationRequest,
+    ) -> Result<apis::process_instance::CancelProcessInstancesBatchOperationResponse, ()> {
+        use apis::process_instance::CancelProcessInstancesBatchOperationResponse as Resp;
+        let op_type = models::BatchOperationTypeEnum::CancelProcessInstance;
+        let items = self.batch_matched_process_instances(&body.filter);
+        let key = self.batch_operations.create(op_type, items);
+        Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
+            models::BatchOperationCreatedResult::new(key.to_string(), op_type),
+        ))
+    }
+
+    /// `POST /v2/process-instances/incident-resolution` — mint a `RESOLVE_INCIDENT`
+    /// batch operation over every process instance matched by the request filter.
+    async fn resolve_incidents_batch_operation_impl(
+        &self,
+        body: &Option<models::ProcessInstanceIncidentResolutionBatchOperationRequest>,
+    ) -> Result<apis::process_instance::ResolveIncidentsBatchOperationResponse, ()> {
+        use apis::process_instance::ResolveIncidentsBatchOperationResponse as Resp;
+        let Some(req) = body.as_ref() else {
+            return Ok(Resp::Status400_TheProcessInstanceBatchOperationFailed(
+                problem(
+                    "INVALID_ARGUMENT",
+                    400,
+                    "A process instance filter is required.".to_string(),
+                ),
+            ));
+        };
+        let op_type = models::BatchOperationTypeEnum::ResolveIncident;
+        let items = self.batch_matched_process_instances(&req.filter);
+        let key = self.batch_operations.create(op_type, items);
+        Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
+            models::BatchOperationCreatedResult::new(key.to_string(), op_type),
+        ))
+    }
+
+    /// `GET /v2/batch-operations/{batchOperationKey}`.
+    async fn get_batch_operation_impl(
+        &self,
+        path_params: &models::GetBatchOperationPathParams,
+    ) -> Result<apis::batch_operation::GetBatchOperationResponse, ()> {
+        use apis::batch_operation::GetBatchOperationResponse as Resp;
+        let key = match parse_batch_operation_key(&path_params.batch_operation_key) {
+            Ok(k) => k,
+            Err(detail) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "INVALID_ARGUMENT",
+                    400,
+                    detail,
+                )));
+            }
+        };
+        match self.batch_operations.get(key) {
+            Some(rec) => Ok(Resp::Status200_TheBatchOperationWasFound(
+                batch_operation_response(&rec),
+            )),
+            None => Ok(Resp::Status404_TheBatchOperationIsNotFound(problem(
+                "NOT_FOUND",
+                404,
+                format!("Batch operation with key '{key}' not found."),
+            ))),
+        }
+    }
+
+    /// `POST /v2/batch-operations/search`.
+    async fn search_batch_operations_impl(
+        &self,
+        body: &Option<models::BatchOperationSearchQuery>,
+    ) -> Result<apis::batch_operation::SearchBatchOperationsResponse, ()> {
+        use apis::batch_operation::SearchBatchOperationsResponse as Resp;
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let mut matched: Vec<BatchOperationRecord> = self
+            .batch_operations
+            .all()
+            .into_iter()
+            .filter(|rec| match filter {
+                None => true,
+                Some(f) => {
+                    query::match_basic_string(&f.batch_operation_key, &rec.key.to_string())
+                        && query::match_batch_operation_type(
+                            &f.operation_type,
+                            &rec.op_type.to_string(),
+                        )
+                        && query::match_batch_operation_state(&f.state, &rec.state.to_string())
+                        // Nano does not track a batch-operation actor, so an
+                        // `actorType`/`actorId` equality filter excludes every
+                        // row (honest, not silently ignored).
+                        && f.actor_type.is_none()
+                        && query::match_string_opt(&f.actor_id, None)
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::BatchOperationSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |rec, field| match field {
+                "state" => query::SortVal::Str(rec.state.to_string()),
+                "operationType" => query::SortVal::Str(rec.op_type.to_string()),
+                "startDate" => query::SortVal::Num(rec.start_date_ms as i64),
+                "endDate" => query::SortVal::Num(rec.end_date_ms.unwrap_or(0) as i64),
+                _ => query::SortVal::Num(rec.key as i64),
+            },
+            |rec| rec.key,
+        );
+
+        let sorted: Vec<(u64, BatchOperationRecord)> =
+            matched.into_iter().map(|rec| (rec.key, rec)).collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::BatchOperationResponse> =
+            page.items.iter().map(batch_operation_response).collect();
+
+        Ok(Resp::Status200_TheBatchOperationSearchResult(
+            models::BatchOperationSearchQueryResult::new(page.response, items),
+        ))
+    }
+
+    /// `POST /v2/batch-operation-items/search`.
+    async fn search_batch_operation_items_impl(
+        &self,
+        body: &Option<models::BatchOperationItemSearchQuery>,
+    ) -> Result<apis::batch_operation::SearchBatchOperationItemsResponse, ()> {
+        use apis::batch_operation::SearchBatchOperationItemsResponse as Resp;
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+
+        // Flatten every item across all batch operations, carrying each item's
+        // owning batch key + operation type for the response projection.
+        let mut matched: Vec<(
+            u64,
+            models::BatchOperationTypeEnum,
+            BatchOperationItemRecord,
+        )> = self
+            .batch_operations
+            .all()
+            .into_iter()
+            .flat_map(|rec| {
+                rec.items
+                    .into_iter()
+                    .map(move |item| (rec.key, rec.op_type, item))
+            })
+            .filter(|(batch_key, op_type, item)| match filter {
+                None => true,
+                Some(f) => {
+                    let pik = item
+                        .process_instance_key
+                        .map(|k| k.to_string())
+                        .unwrap_or_default();
+                    query::match_basic_string(&f.batch_operation_key, &batch_key.to_string())
+                        && query::match_basic_string(&f.item_key, &item.item_key.to_string())
+                        && query::match_process_instance_key(&f.process_instance_key, &pik)
+                        && query::match_batch_operation_item_state(
+                            &f.state,
+                            &item.state.to_string(),
+                        )
+                        && query::match_batch_operation_type(
+                            &f.operation_type,
+                            &op_type.to_string(),
+                        )
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::BatchOperationItemSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |(_, op_type, item), field| match field {
+                "state" => query::SortVal::Str(item.state.to_string()),
+                "operationType" => query::SortVal::Str(op_type.to_string()),
+                "processInstanceKey" => {
+                    query::SortVal::Num(item.process_instance_key.unwrap_or(0) as i64)
+                }
+                _ => query::SortVal::Num(item.item_key as i64),
+            },
+            // No single column is unique (the same instance can appear in two
+            // batches), so the cursor key is the composite (batchKey, itemKey).
+            |(batch_key, _, item)| (*batch_key, item.item_key),
+        );
+
+        let sorted: Vec<((u64, u64), models::BatchOperationItemResponse)> = matched
+            .into_iter()
+            .map(|(batch_key, op_type, item)| {
+                (
+                    (batch_key, item.item_key),
+                    batch_operation_item_response(batch_key, op_type, &item),
+                )
+            })
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+
+        Ok(Resp::Status200_TheBatchOperationSearchResult(
+            models::BatchOperationItemSearchQueryResult::new(page.response, page.items),
+        ))
+    }
+
+    /// `POST /v2/batch-operations/{batchOperationKey}/suspension`.
+    async fn suspend_batch_operation_impl(
+        &self,
+        path_params: &models::SuspendBatchOperationPathParams,
+    ) -> Result<apis::batch_operation::SuspendBatchOperationResponse, ()> {
+        use apis::batch_operation::SuspendBatchOperationResponse as Resp;
+        let key = match parse_batch_operation_key(&path_params.batch_operation_key) {
+            Ok(k) => k,
+            Err(detail) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "INVALID_ARGUMENT",
+                    400,
+                    detail,
+                )));
+            }
+        };
+        Ok(
+            match self
+                .batch_operations
+                .transition(key, models::BatchOperationStateEnum::Suspended)
+            {
+                BatchLifecycleOutcome::Ok => {
+                    Resp::Status204_TheBatchOperationPauseRequestWasCreated
+                }
+                BatchLifecycleOutcome::Invalid { detail } => {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem("INVALID_STATE", 400, detail))
+                }
+                BatchLifecycleOutcome::NotFound => Resp::Status404_NotFound(problem(
+                    "NOT_FOUND",
+                    404,
+                    format!("Batch operation with key '{key}' not found."),
+                )),
+            },
+        )
+    }
+
+    /// `POST /v2/batch-operations/{batchOperationKey}/resumption`.
+    async fn resume_batch_operation_impl(
+        &self,
+        path_params: &models::ResumeBatchOperationPathParams,
+    ) -> Result<apis::batch_operation::ResumeBatchOperationResponse, ()> {
+        use apis::batch_operation::ResumeBatchOperationResponse as Resp;
+        let key = match parse_batch_operation_key(&path_params.batch_operation_key) {
+            Ok(k) => k,
+            Err(detail) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "INVALID_ARGUMENT",
+                    400,
+                    detail,
+                )));
+            }
+        };
+        Ok(
+            match self
+                .batch_operations
+                .transition(key, models::BatchOperationStateEnum::Active)
+            {
+                BatchLifecycleOutcome::Ok => {
+                    Resp::Status204_TheBatchOperationResumeRequestWasCreated
+                }
+                BatchLifecycleOutcome::Invalid { detail } => {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem("INVALID_STATE", 400, detail))
+                }
+                BatchLifecycleOutcome::NotFound => Resp::Status404_NotFound(problem(
+                    "NOT_FOUND",
+                    404,
+                    format!("Batch operation with key '{key}' not found."),
+                )),
+            },
+        )
+    }
+
+    /// `POST /v2/batch-operations/{batchOperationKey}/cancellation`.
+    async fn cancel_batch_operation_impl(
+        &self,
+        path_params: &models::CancelBatchOperationPathParams,
+    ) -> Result<apis::batch_operation::CancelBatchOperationResponse, ()> {
+        use apis::batch_operation::CancelBatchOperationResponse as Resp;
+        let key = match parse_batch_operation_key(&path_params.batch_operation_key) {
+            Ok(k) => k,
+            Err(detail) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "INVALID_ARGUMENT",
+                    400,
+                    detail,
+                )));
+            }
+        };
+        Ok(
+            match self
+                .batch_operations
+                .transition(key, models::BatchOperationStateEnum::Canceled)
+            {
+                BatchLifecycleOutcome::Ok => {
+                    Resp::Status204_TheBatchOperationCancelRequestWasCreated
+                }
+                BatchLifecycleOutcome::Invalid { detail } => {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem("INVALID_STATE", 400, detail))
+                }
+                BatchLifecycleOutcome::NotFound => Resp::Status404_NotFound(problem(
+                    "NOT_FOUND",
+                    404,
+                    format!("Batch operation with key '{key}' not found."),
+                )),
+            },
+        )
+    }
+}
+
+/// Parses a `batchOperationKey` path/filter value into a numeric key. A
+/// non-numeric key is invalid input (`400`), reserving `404` for well-formed
+/// keys that don't resolve.
+fn parse_batch_operation_key(raw: &str) -> Result<u64, String> {
+    raw.parse::<u64>()
+        .map_err(|_| format!("Batch operation key '{raw}' is not a valid key."))
+}
+
+/// Converts an epoch-millis instant into a nullable REST date-time.
+fn batch_ms_to_datetime(ms: Option<u64>) -> types::Nullable<chrono::DateTime<chrono::Utc>> {
+    match ms.and_then(|m| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(m as i64)) {
+        Some(dt) => types::Nullable::Present(dt),
+        None => types::Nullable::Null,
+    }
+}
+
+/// Projects a stored batch-operation record into its REST response model,
+/// deriving the total/failed/completed item counts from the item rows.
+fn batch_operation_response(rec: &BatchOperationRecord) -> models::BatchOperationResponse {
+    let total = rec.items.len() as i32;
+    let completed = rec
+        .items
+        .iter()
+        .filter(|i| matches!(i.state, models::BatchOperationItemStateEnum::Completed))
+        .count() as i32;
+    let failed = rec
+        .items
+        .iter()
+        .filter(|i| matches!(i.state, models::BatchOperationItemStateEnum::Failed))
+        .count() as i32;
+    models::BatchOperationResponse {
+        batch_operation_key: rec.key.to_string(),
+        state: rec.state,
+        batch_operation_type: rec.op_type,
+        start_date: batch_ms_to_datetime(Some(rec.start_date_ms)),
+        end_date: batch_ms_to_datetime(rec.end_date_ms),
+        actor_type: types::Nullable::Null,
+        actor_id: types::Nullable::Null,
+        operations_total_count: total,
+        operations_failed_count: failed,
+        operations_completed_count: completed,
+        r_errors: Vec::new(),
+    }
+}
+
+/// Projects a stored batch-operation item into its REST response model.
+fn batch_operation_item_response(
+    batch_key: u64,
+    op_type: models::BatchOperationTypeEnum,
+    item: &BatchOperationItemRecord,
+) -> models::BatchOperationItemResponse {
+    models::BatchOperationItemResponse {
+        operation_type: op_type,
+        batch_operation_key: batch_key.to_string(),
+        item_key: item.item_key.to_string(),
+        process_instance_key: match item.process_instance_key {
+            Some(k) => types::Nullable::Present(models::ProcessInstanceKey(k.to_string())),
+            None => types::Nullable::Null,
+        },
+        root_process_instance_key: types::Nullable::Null,
+        state: item.state.to_string(),
+        processed_date: batch_ms_to_datetime(item.processed_date_ms),
+        error_message: match &item.error_message {
+            Some(m) => types::Nullable::Present(m.clone()),
+            None => types::Nullable::Null,
+        },
+    }
+}
+
 /// Current wall-clock time in milliseconds since the Unix epoch. The engine is
 /// clock-free; the server owns the real clock and feeds it logical instants.
 fn now_millis() -> u64 {
@@ -29483,5 +30073,352 @@ mod task_result_mapping_tests {
         let mut variables = std::collections::HashMap::new();
         variables.insert("amount".to_string(), Value::Int(42));
         assert!(reject_task_result_with_variables(&None, &variables).is_none());
+    }
+}
+
+#[cfg(test)]
+mod batch_operation_tests {
+    use super::*;
+
+    /// Builds an in-memory server holding a single batch operation seeded
+    /// directly into the store, returning `(server, key)`. Used by the
+    /// lifecycle/error tests that don't need a live engine.
+    fn server_with_seeded_batch(
+        op_type: models::BatchOperationTypeEnum,
+        items: Vec<u64>,
+    ) -> (ServerImpl, u64) {
+        let server = ServerImpl::default();
+        let key = server.batch_operations.create(op_type, items);
+        (server, key)
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_request_mints_a_trackable_batch_operation() {
+        use apis::batch_operation::GetBatchOperationResponse as GetResp;
+        use apis::batch_operation::SearchBatchOperationItemsResponse as ItemsResp;
+        use apis::batch_operation::SearchBatchOperationsResponse as SearchResp;
+        use apis::process_instance::CancelProcessInstancesBatchOperationResponse as CreateResp;
+
+        let server = ServerImpl::default();
+
+        // A process that parks on a user task so its instance stays ACTIVE (and
+        // therefore projected into the read model) while we build the batch.
+        let proc = ProcessBuilder::new("to-cancel")
+            .start_event("s")
+            .user_task("wait")
+            .end_event("e")
+            .connect("s", "wait")
+            .connect("wait", "e")
+            .build()
+            .expect("valid user-task process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("to-cancel".to_string(), "to-cancel.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let (instance_key, _) = server
+            .create_for_stream(
+                Some("to-cancel".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create the instance");
+
+        // Wait until the instance is projected so the batch matches it.
+        let mut projected = false;
+        for _ in 0..200 {
+            if server
+                .batch_matched_process_instances(&models::ProcessInstanceFilter::new())
+                .contains(&instance_key)
+            {
+                projected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(projected, "the instance is projected into the read model");
+
+        // Mint the batch over an all-matching filter.
+        let req = models::ProcessInstanceCancellationBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+        );
+        let created = match server
+            .cancel_process_instances_batch_operation_impl(&req)
+            .await
+            .expect("creator returns a response")
+        {
+            CreateResp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+            other => panic!("expected a 200 created result, got {other:?}"),
+        };
+        assert_eq!(
+            created.batch_operation_type,
+            models::BatchOperationTypeEnum::CancelProcessInstance
+        );
+        let batch_key = created.batch_operation_key.clone();
+
+        // GET the batch: ACTIVE, of the right type, with the instance counted.
+        let path = models::GetBatchOperationPathParams {
+            batch_operation_key: batch_key.clone(),
+        };
+        let got = match server.get_batch_operation_impl(&path).await.unwrap() {
+            GetResp::Status200_TheBatchOperationWasFound(r) => r,
+            other => panic!("expected a 200 get, got {other:?}"),
+        };
+        assert_eq!(got.state, models::BatchOperationStateEnum::Active);
+        assert_eq!(
+            got.batch_operation_type,
+            models::BatchOperationTypeEnum::CancelProcessInstance
+        );
+        assert!(got.operations_total_count >= 1);
+        assert_eq!(got.operations_completed_count, 0);
+        assert_eq!(got.operations_failed_count, 0);
+
+        // SEARCH finds it.
+        let found = match server.search_batch_operations_impl(&None).await.unwrap() {
+            SearchResp::Status200_TheBatchOperationSearchResult(r) => r,
+            other => panic!("expected a 200 search, got {other:?}"),
+        };
+        assert!(
+            found
+                .items
+                .iter()
+                .any(|b| b.batch_operation_key == batch_key)
+        );
+
+        // The item-search surfaces the instance as an item of the batch.
+        let items = match server
+            .search_batch_operation_items_impl(&None)
+            .await
+            .unwrap()
+        {
+            ItemsResp::Status200_TheBatchOperationSearchResult(r) => r,
+            other => panic!("expected a 200 item search, got {other:?}"),
+        };
+        assert!(items.items.iter().any(|i| {
+            i.batch_operation_key == batch_key && i.item_key == instance_key.to_string()
+        }));
+    }
+
+    #[tokio::test]
+    async fn suspend_resume_cancel_drive_the_state_machine() {
+        use apis::batch_operation::CancelBatchOperationResponse as CancelResp;
+        use apis::batch_operation::GetBatchOperationResponse as GetResp;
+        use apis::batch_operation::ResumeBatchOperationResponse as ResumeResp;
+        use apis::batch_operation::SuspendBatchOperationResponse as SuspendResp;
+
+        let (server, key) = server_with_seeded_batch(
+            models::BatchOperationTypeEnum::CancelProcessInstance,
+            Vec::new(),
+        );
+        let get = |k: u64| {
+            let server = server.clone();
+            async move {
+                let path = models::GetBatchOperationPathParams {
+                    batch_operation_key: k.to_string(),
+                };
+                match server.get_batch_operation_impl(&path).await.unwrap() {
+                    GetResp::Status200_TheBatchOperationWasFound(r) => r,
+                    other => panic!("expected 200 get, got {other:?}"),
+                }
+            }
+        };
+
+        // ACTIVE → SUSPENDED.
+        let suspend = models::SuspendBatchOperationPathParams {
+            batch_operation_key: key.to_string(),
+        };
+        assert!(matches!(
+            server.suspend_batch_operation_impl(&suspend).await.unwrap(),
+            SuspendResp::Status204_TheBatchOperationPauseRequestWasCreated
+        ));
+        assert_eq!(
+            get(key).await.state,
+            models::BatchOperationStateEnum::Suspended
+        );
+
+        // SUSPENDED → (resume) ACTIVE.
+        let resume = models::ResumeBatchOperationPathParams {
+            batch_operation_key: key.to_string(),
+        };
+        assert!(matches!(
+            server.resume_batch_operation_impl(&resume).await.unwrap(),
+            ResumeResp::Status204_TheBatchOperationResumeRequestWasCreated
+        ));
+        assert_eq!(
+            get(key).await.state,
+            models::BatchOperationStateEnum::Active
+        );
+
+        // any → CANCELED (stamps an end date).
+        let cancel = models::CancelBatchOperationPathParams {
+            batch_operation_key: key.to_string(),
+        };
+        assert!(matches!(
+            server.cancel_batch_operation_impl(&cancel).await.unwrap(),
+            CancelResp::Status204_TheBatchOperationCancelRequestWasCreated
+        ));
+        let after = get(key).await;
+        assert_eq!(after.state, models::BatchOperationStateEnum::Canceled);
+        assert!(matches!(after.end_date, types::Nullable::Present(_)));
+    }
+
+    #[tokio::test]
+    async fn canceled_is_terminal_and_rejects_further_transitions() {
+        use apis::batch_operation::CancelBatchOperationResponse as CancelResp;
+        use apis::batch_operation::GetBatchOperationResponse as GetResp;
+        use apis::batch_operation::ResumeBatchOperationResponse as ResumeResp;
+        use apis::batch_operation::SuspendBatchOperationResponse as SuspendResp;
+
+        let (server, key) = server_with_seeded_batch(
+            models::BatchOperationTypeEnum::CancelProcessInstance,
+            Vec::new(),
+        );
+        let get = |k: u64| {
+            let server = server.clone();
+            async move {
+                let path = models::GetBatchOperationPathParams {
+                    batch_operation_key: k.to_string(),
+                };
+                match server.get_batch_operation_impl(&path).await.unwrap() {
+                    GetResp::Status200_TheBatchOperationWasFound(r) => r,
+                    other => panic!("expected 200 get, got {other:?}"),
+                }
+            }
+        };
+
+        // ACTIVE → CANCELED stamps a terminal end date.
+        let cancel = models::CancelBatchOperationPathParams {
+            batch_operation_key: key.to_string(),
+        };
+        assert!(matches!(
+            server.cancel_batch_operation_impl(&cancel).await.unwrap(),
+            CancelResp::Status204_TheBatchOperationCancelRequestWasCreated
+        ));
+        let stamped = match get(key).await.end_date {
+            types::Nullable::Present(dt) => dt,
+            types::Nullable::Null => panic!("cancel must stamp an end date"),
+        };
+
+        // Leaving CANCELED via suspend or resume is illegal → 400, and the state
+        // stays CANCELED (never hops out of a terminal state).
+        let suspend = models::SuspendBatchOperationPathParams {
+            batch_operation_key: key.to_string(),
+        };
+        assert!(matches!(
+            server.suspend_batch_operation_impl(&suspend).await.unwrap(),
+            SuspendResp::Status400_TheProvidedDataIsNotValid(_)
+        ));
+        let resume = models::ResumeBatchOperationPathParams {
+            batch_operation_key: key.to_string(),
+        };
+        assert!(matches!(
+            server.resume_batch_operation_impl(&resume).await.unwrap(),
+            ResumeResp::Status400_TheProvidedDataIsNotValid(_)
+        ));
+        assert_eq!(
+            get(key).await.state,
+            models::BatchOperationStateEnum::Canceled
+        );
+
+        // Re-cancel is an idempotent no-op (204) that never restamps end_date.
+        assert!(matches!(
+            server.cancel_batch_operation_impl(&cancel).await.unwrap(),
+            CancelResp::Status204_TheBatchOperationCancelRequestWasCreated
+        ));
+        assert_eq!(
+            get(key).await.end_date,
+            types::Nullable::Present(stamped),
+            "a repeated cancel must not restamp the terminal end date"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_and_unknown_keys_map_to_400_and_404() {
+        use apis::batch_operation::GetBatchOperationResponse as GetResp;
+        use apis::batch_operation::SuspendBatchOperationResponse as SuspendResp;
+
+        let server = ServerImpl::default();
+
+        // Non-numeric key → 400 (invalid), not 500.
+        let bad = models::GetBatchOperationPathParams {
+            batch_operation_key: "not-a-key".to_string(),
+        };
+        assert!(matches!(
+            server.get_batch_operation_impl(&bad).await.unwrap(),
+            GetResp::Status400_TheProvidedDataIsNotValid(_)
+        ));
+
+        // Well-formed but unknown key → 404.
+        let missing = models::GetBatchOperationPathParams {
+            batch_operation_key: "999999".to_string(),
+        };
+        assert!(matches!(
+            server.get_batch_operation_impl(&missing).await.unwrap(),
+            GetResp::Status404_TheBatchOperationIsNotFound(_)
+        ));
+
+        // Lifecycle endpoints map the same way.
+        let bad_suspend = models::SuspendBatchOperationPathParams {
+            batch_operation_key: "nope".to_string(),
+        };
+        assert!(matches!(
+            server
+                .suspend_batch_operation_impl(&bad_suspend)
+                .await
+                .unwrap(),
+            SuspendResp::Status400_TheProvidedDataIsNotValid(_)
+        ));
+        let missing_suspend = models::SuspendBatchOperationPathParams {
+            batch_operation_key: "888888".to_string(),
+        };
+        assert!(matches!(
+            server
+                .suspend_batch_operation_impl(&missing_suspend)
+                .await
+                .unwrap(),
+            SuspendResp::Status404_NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn incident_resolution_requires_a_filter_and_mints_the_right_type() {
+        use apis::process_instance::ResolveIncidentsBatchOperationResponse as Resp;
+
+        let server = ServerImpl::default();
+
+        // A missing body is invalid input → 400, never a 500.
+        assert!(matches!(
+            server
+                .resolve_incidents_batch_operation_impl(&None)
+                .await
+                .unwrap(),
+            Resp::Status400_TheProcessInstanceBatchOperationFailed(_)
+        ));
+
+        // A present filter mints a RESOLVE_INCIDENT batch.
+        let req = models::ProcessInstanceIncidentResolutionBatchOperationRequest::new(
+            models::ProcessInstanceFilter::new(),
+        );
+        let created = match server
+            .resolve_incidents_batch_operation_impl(&Some(req))
+            .await
+            .unwrap()
+        {
+            Resp::Status200_TheBatchOperationRequestWasCreated(r) => r,
+            other => panic!("expected a 200 created result, got {other:?}"),
+        };
+        assert_eq!(
+            created.batch_operation_type,
+            models::BatchOperationTypeEnum::ResolveIncident
+        );
     }
 }

@@ -727,6 +727,72 @@ pub fn match_user_task_state(
     }
 }
 
+/// Matches a `BatchOperationStateFilterProperty` against a batch operation
+/// state's wire spelling (`ACTIVE`, `SUSPENDED`, `CANCELED`, …).
+pub fn match_batch_operation_state(
+    filter: &Option<models::BatchOperationStateFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::BatchOperationStateFilterProperty::BatchOperationStateEnum(e)) => {
+            e.to_string() == value
+        }
+        Some(models::BatchOperationStateFilterProperty::AdvancedBatchOperationStateFilter(a)) => {
+            ops!(
+                a,
+                |e: &models::BatchOperationStateEnum| e.to_string(),
+                like_no_notin
+            )
+            .matches(Some(value))
+        }
+    }
+}
+
+/// Matches a `BatchOperationTypeFilterProperty` against a batch operation type's
+/// wire spelling (`CANCEL_PROCESS_INSTANCE`, `RESOLVE_INCIDENT`, …).
+pub fn match_batch_operation_type(
+    filter: &Option<models::BatchOperationTypeFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::BatchOperationTypeFilterProperty::BatchOperationTypeEnum(e)) => {
+            e.to_string() == value
+        }
+        Some(models::BatchOperationTypeFilterProperty::AdvancedBatchOperationTypeFilter(a)) => {
+            ops!(
+                a,
+                |e: &models::BatchOperationTypeEnum| e.to_string(),
+                like_no_notin
+            )
+            .matches(Some(value))
+        }
+    }
+}
+
+/// Matches a `BatchOperationItemStateFilterProperty` against a batch-operation
+/// item state's wire spelling (`ACTIVE`, `COMPLETED`, `FAILED`, `CANCELED`).
+pub fn match_batch_operation_item_state(
+    filter: &Option<models::BatchOperationItemStateFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::BatchOperationItemStateFilterProperty::BatchOperationItemStateEnum(e)) => {
+            e.to_string() == value
+        }
+        Some(
+            models::BatchOperationItemStateFilterProperty::AdvancedBatchOperationItemStateFilter(a),
+        ) => ops!(
+            a,
+            |e: &models::BatchOperationItemStateEnum| e.to_string(),
+            like_no_notin
+        )
+        .matches(Some(value)),
+    }
+}
+
 /// One normalised sort instruction: the field name and whether it is descending.
 pub struct SortKey {
     pub field: String,
