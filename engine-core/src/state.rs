@@ -596,6 +596,14 @@ pub enum IncidentKind {
     /// Recoverable once the callee is deployed (or the recursion fixed) and the
     /// incident is resolved.
     CalledElementError,
+    /// A `zeebe:ioMapping` source expression (an input mapping on activation or
+    /// an output mapping on completion) failed to evaluate — a FEEL parse error,
+    /// a type error, or an operation on a missing value (e.g. `"x" + missingVar`).
+    /// The element halts with the target variable unset rather than proceeding
+    /// with a silent blank, matching Zeebe's `IO_MAPPING_ERROR`. Recoverable once
+    /// the mapping (or the missing variable it reads) is fixed and the incident is
+    /// resolved — resolution re-drives the activation/completion.
+    IoMapping,
 }
 
 /// Lifecycle state of an incident. Incidents are retained after resolution (as

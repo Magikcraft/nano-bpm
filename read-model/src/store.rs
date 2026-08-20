@@ -907,6 +907,7 @@ fn incident_kind_code(k: IncidentKind) -> i64 {
         IncidentKind::ExpressionEvaluation => 3,
         IncidentKind::DecisionEvaluation => 4,
         IncidentKind::CalledElementError => 5,
+        IncidentKind::IoMapping => 6,
     }
 }
 fn incident_kind_from(code: i64) -> IncidentKind {
@@ -916,6 +917,7 @@ fn incident_kind_from(code: i64) -> IncidentKind {
         3 => IncidentKind::ExpressionEvaluation,
         4 => IncidentKind::DecisionEvaluation,
         5 => IncidentKind::CalledElementError,
+        6 => IncidentKind::IoMapping,
         _ => IncidentKind::JobNoRetries,
     }
 }
