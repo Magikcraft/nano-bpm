@@ -145,19 +145,36 @@ impl Engine {
     /// merged projection. Used when an as-yet-unapplied result (e.g. a script
     /// task's `resultVariable`) must be visible to output mappings within the
     /// same step.
+    ///
+    /// A source expression that fails to evaluate (a FEEL parse error, a type
+    /// error, or an operation on a missing value like `"x" + missingVar`) is a
+    /// hard failure returned as `Err` — it is **not** silently dropped. Callers
+    /// raise an `IO_MAPPING_ERROR` incident and halt the element instead of
+    /// proceeding with the target variable unset (Zeebe parity, #939). A bare
+    /// reference to a missing variable (`=missingVar`) still evaluates to FEEL
+    /// `null` (an `Ok`), so it is assigned as `null` and does not fail here.
     pub(crate) fn eval_io_mappings_in(
         &self,
         vars: &HashMap<String, Value>,
         mappings: &[crate::model::Mapping],
-    ) -> HashMap<String, Value> {
+    ) -> Result<HashMap<String, Value>, IoMappingFailure> {
         let mut result: HashMap<String, Value> = HashMap::new();
         for m in mappings {
             match crate::feel::eval(m.source.trim(), vars) {
                 Ok(value) => Self::assign_io_target(&mut result, vars, &m.target, value),
-                Err(_) => continue,
+                Err(err) => {
+                    return Err(IoMappingFailure {
+                        reason: format!(
+                            "failed to evaluate io mapping source '{}' for target '{}': {}",
+                            m.source.trim(),
+                            m.target,
+                            err.0
+                        ),
+                    });
+                }
             }
         }
-        result
+        Ok(result)
     }
 
     pub(crate) fn outgoing(&self, instance_key: Key, element_id: &str) -> Vec<SequenceFlow> {
