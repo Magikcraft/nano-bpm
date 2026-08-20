@@ -12,7 +12,7 @@
 root      ::= ws "process" sp string sp "{" nl indent "start" sp id nl elements flows "}" ws
 elements  ::= element*
 flows     ::= flow*
-element   ::= elem-startEvent | elem-endEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent
+element   ::= elem-startEvent | elem-endEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
 
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
@@ -173,6 +173,18 @@ attr-line-conditionalBoundaryEvent  ::= attr-conditionalBoundaryEvent-attachedTo
 attr-conditionalBoundaryEvent-attachedTo  ::= "attachedTo" sp attr-id   # Id of the activity this boundary is attached to.
 attr-conditionalBoundaryEvent-condition  ::= "condition" sp attr-str   # FEEL boolean condition (leading `=` optional).
 attr-conditionalBoundaryEvent-interrupting  ::= "interrupting" sp attr-bool   # `true` cancels the activity on fire; `false` spawns a parallel token.
+
+# compensationBoundaryEvent — Compensation boundary on an activity. Marks the activity compensable and names the handler activity run to undo it.
+elem-compensationBoundaryEvent  ::= indent "compensationBoundaryEvent" sp id (sp string)? (sp attrs-compensationBoundaryEvent)? nl
+attrs-compensationBoundaryEvent   ::= "{" nl (indent2 attr-line-compensationBoundaryEvent nl)+ indent "}"
+attr-line-compensationBoundaryEvent  ::= attr-compensationBoundaryEvent-attachedTo | attr-compensationBoundaryEvent-handler | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-compensationBoundaryEvent-attachedTo  ::= "attachedTo" sp attr-id   # Id of the activity this boundary is attached to (made compensable).
+attr-compensationBoundaryEvent-handler  ::= "handler" sp attr-id   # Id of the `isForCompensation` handler activity run to compensate it.
+
+# compensationThrowEvent — Compensation throw. Triggers the compensation handlers of completed compensable activities in scope (reverse completion order).
+elem-compensationThrowEvent  ::= indent "compensationThrowEvent" sp id (sp string)? (sp attrs-compensationThrowEvent)? nl
+attrs-compensationThrowEvent   ::= "{" nl (indent2 attr-line-compensationThrowEvent nl)+ indent "}"
+attr-line-compensationThrowEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
 
 # --- Attribute value primitives ---
 attr-str      ::= string

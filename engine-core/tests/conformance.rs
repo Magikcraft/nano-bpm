@@ -584,6 +584,7 @@ fn element_kind_family(kind: &ElementKind) -> ElementFamily {
         | ElementKind::TimerBoundaryEvent { .. }
         | ElementKind::MessageBoundaryEvent { .. }
         | ElementKind::SignalBoundaryEvent { .. }
+        | ElementKind::CompensationBoundaryEvent { .. }
         | ElementKind::ConditionalBoundaryEvent { .. } => ElementFamily::BoundaryEvent,
         ElementKind::TimerIntermediateCatchEvent { .. }
         | ElementKind::MessageIntermediateCatchEvent { .. }
@@ -591,7 +592,9 @@ fn element_kind_family(kind: &ElementKind) -> ElementFamily {
         | ElementKind::ConditionalIntermediateCatchEvent { .. } => {
             ElementFamily::IntermediateCatchEvent
         }
-        ElementKind::IntermediateThrowEvent => ElementFamily::IntermediateThrowEvent,
+        ElementKind::IntermediateThrowEvent | ElementKind::CompensationThrowEvent => {
+            ElementFamily::IntermediateThrowEvent
+        }
         ElementKind::MessageStartEvent { .. } => ElementFamily::MessageStartEvent,
         ElementKind::TimerStartEvent { .. } => ElementFamily::TimerStartEvent,
         ElementKind::SubProcess { .. } => ElementFamily::SubProcess,

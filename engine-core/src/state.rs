@@ -455,6 +455,47 @@ pub struct ProcessInstance {
     /// keeping the flat fast path unchanged.
     #[cfg_attr(feature = "serde", serde(default))]
     pub scope_variables: HashMap<Key, HashMap<String, Value>>,
+    /// Compensable activities that completed successfully and carry a
+    /// compensation boundary event, in completion order (oldest first). A
+    /// [`crate::model::ElementKind::CompensationThrowEvent`] in the same scope
+    /// consumes these (newest first) to run each one's compensation handler.
+    /// Empty for instances with no compensation and for snapshots written
+    /// before compensation support existed (`serde(default)`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub compensable: Vec<CompensationSubscription>,
+    /// In-flight compensation throw events, keyed by the throw event's element
+    /// instance. Each records the handler activities it is still waiting on;
+    /// when a throw's `pending_handlers` empties the throw completes. Empty for
+    /// instances with no active compensation and for pre-compensation snapshots.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub compensation_waits: HashMap<Key, CompensationWait>,
+}
+
+/// A completed, compensable activity awaiting a possible compensation throw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CompensationSubscription {
+    /// The completed activity's element instance key.
+    pub element_instance_key: Key,
+    /// The completed activity's element id.
+    pub element_id: ElementId,
+    /// The compensation handler activity run to compensate it.
+    pub handler: ElementId,
+    /// The scope the activity completed in (`0` for the root scope).
+    pub scope: Key,
+}
+
+/// A compensation throw event's outstanding wait: the handler activities it
+/// triggered that have not yet completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CompensationWait {
+    /// The throw event's element id (routed onward when the wait empties).
+    pub throw_element_id: ElementId,
+    /// The scope the throw event runs in.
+    pub scope: Key,
+    /// Handler activity ids still outstanding (one entry per triggered handler).
+    pub pending_handlers: Vec<ElementId>,
 }
 
 /// Runtime state of an active multi-instance body (the element instance carrying
@@ -1601,6 +1642,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     adhoc_instances: HashMap::new(),
                     scope_parents: HashMap::new(),
                     scope_variables: HashMap::new(),
+                    compensable: Vec::new(),
+                    compensation_waits: HashMap::new(),
                 },
             );
         }
@@ -2535,6 +2578,81 @@ pub fn apply(state: &mut State, event: &Event) {
         } => {
             if let Some(subscription) = state.conditional_subscriptions.get_mut(subscription_key) {
                 subscription.state = MessageSubscriptionState::Canceled;
+            }
+        }
+
+        // A compensable activity completed: remember it (in completion order) so
+        // a later compensation throw event can run its handler.
+        Event::CompensationSubscriptionCreated {
+            instance_key,
+            element_instance_key,
+            element_id,
+            handler,
+            scope,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.compensable.push(CompensationSubscription {
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    handler: handler.clone(),
+                    scope: *scope,
+                });
+            }
+        }
+
+        // A compensation throw event fired: consume the compensable subscriptions
+        // it triggered and record the handlers it now waits on.
+        Event::CompensationTriggered {
+            instance_key,
+            throw_element_instance_key,
+            throw_element_id,
+            scope,
+            handlers,
+            consumed,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance
+                    .compensable
+                    .retain(|c| !consumed.contains(&c.element_instance_key));
+                instance.compensation_waits.insert(
+                    *throw_element_instance_key,
+                    CompensationWait {
+                        throw_element_id: throw_element_id.clone(),
+                        scope: *scope,
+                        pending_handlers: handlers.clone(),
+                    },
+                );
+            }
+        }
+
+        // A compensation handler completed: drop it from its throw's outstanding
+        // set, and drop the wait entirely once the last handler is done.
+        Event::CompensationHandlerCompleted {
+            instance_key,
+            throw_element_instance_key,
+            handler_element_id,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                let done = if let Some(wait) = instance
+                    .compensation_waits
+                    .get_mut(throw_element_instance_key)
+                {
+                    if let Some(pos) = wait
+                        .pending_handlers
+                        .iter()
+                        .position(|h| h == handler_element_id)
+                    {
+                        wait.pending_handlers.remove(pos);
+                    }
+                    wait.pending_handlers.is_empty()
+                } else {
+                    false
+                };
+                if done {
+                    instance
+                        .compensation_waits
+                        .remove(throw_element_instance_key);
+                }
             }
         }
 

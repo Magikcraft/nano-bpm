@@ -442,6 +442,31 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
             },
         ],
     },
+    KindSpec {
+        keyword: "compensationBoundaryEvent",
+        doc: "Compensation boundary on an activity. Marks the activity compensable and \
+              names the handler activity run to undo it.",
+        attrs: &[
+            AttrSpec {
+                key: "attachedTo",
+                required: true,
+                ty: AttrType::Id,
+                doc: "Id of the activity this boundary is attached to (made compensable).",
+            },
+            AttrSpec {
+                key: "handler",
+                required: true,
+                ty: AttrType::Id,
+                doc: "Id of the `isForCompensation` handler activity run to compensate it.",
+            },
+        ],
+    },
+    KindSpec {
+        keyword: "compensationThrowEvent",
+        doc: "Compensation throw. Triggers the compensation handlers of completed \
+              compensable activities in scope (reverse completion order).",
+        attrs: &[],
+    },
 ];
 
 /// Element-level attributes shared across every kind (they are emitted by
@@ -817,6 +842,8 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         SignalBoundaryEvent { .. } => "signalBoundaryEvent",
         ConditionalIntermediateCatchEvent { .. } => "conditionalIntermediateCatchEvent",
         ConditionalBoundaryEvent { .. } => "conditionalBoundaryEvent",
+        CompensationBoundaryEvent { .. } => "compensationBoundaryEvent",
+        CompensationThrowEvent => "compensationThrowEvent",
     }
 }
 
@@ -963,6 +990,17 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
                 condition: "=orderCancelled".into(),
                 interrupting: true,
             },
+        ),
+        (
+            "compensationBoundaryEvent",
+            ElementKind::CompensationBoundaryEvent {
+                attached_to: "svc_1".into(),
+                handler: "undo_1".into(),
+            },
+        ),
+        (
+            "compensationThrowEvent",
+            ElementKind::CompensationThrowEvent,
         ),
     ]
 }

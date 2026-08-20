@@ -269,7 +269,9 @@ fn field_node_dims(el: &nanobpmn_engine_core::Element) -> (f64, f64) {
         | TimerBoundaryEvent { .. }
         | MessageBoundaryEvent { .. }
         | SignalBoundaryEvent { .. }
-        | ConditionalBoundaryEvent { .. } => (36.0, 36.0),
+        | ConditionalBoundaryEvent { .. }
+        | CompensationBoundaryEvent { .. }
+        | CompensationThrowEvent => (36.0, 36.0),
         ExclusiveGateway | ParallelGateway => (50.0, 50.0),
         _ => (110.0, 80.0),
     }
