@@ -112,7 +112,8 @@ OVERRIDES: dict[tuple[str, str], str] = {
     # (issue-907 adds its jobs & job-statistics entries here)
     # --- END issue-907 jobs & job-statistics delegations ---
     # --- BEGIN issue-908 expression & conditional delegations ---
-    # (issue-908 adds its expression & conditional entries here)
+    ("expression", "evaluate_expression"): "self.evaluate_expression_impl(body).await",
+    ("conditional", "evaluate_conditionals"): "self.evaluate_conditionals_impl(body).await",
     # --- END issue-908 expression & conditional delegations ---
     # --- BEGIN issue-909 ad-hoc activities delegations ---
     # (issue-909 adds its ad-hoc activities entries here)

@@ -16875,6 +16875,111 @@ fn batch_operation_item_response(
     }
 }
 
+/// Mints a fresh, process-unique numeric key for a **stateless** operation whose
+/// result is never persisted (e.g. a conditional-evaluation key). The engine's
+/// real partition key generator is reserved for durable state mutated through a
+/// journal command; a stateless evaluation records nothing, so it must not touch
+/// it. A millisecond timestamp times a per-process monotonic sequence yields a
+/// strictly-increasing numeric string that never collides within a run.
+fn next_stateless_key() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    now_millis().wrapping_mul(1_000).wrapping_add(seq % 1_000)
+}
+
+/// The stateless FEEL **expression** and **conditional** evaluation endpoints
+/// (Magikcraft/nano-bpm#908). Both carry their own variable context in the
+/// request and touch no engine instance state, so they evaluate directly against
+/// the embedded FEEL engine ([`nanobpmn_engine_core::feel`]) and never mint
+/// durable keys.
+impl ServerImpl {
+    /// `POST /v2/expression/evaluation` — evaluate a FEEL expression against the
+    /// request-body variable context and return its result. An unparseable or
+    /// otherwise invalid expression maps to a `400` invalid-argument
+    /// `ProblemDetail`, never a `500`.
+    async fn evaluate_expression_impl(
+        &self,
+        body: &models::ExpressionEvaluationRequest,
+    ) -> Result<apis::expression::EvaluateExpressionResponse, ()> {
+        use apis::expression::EvaluateExpressionResponse as Resp;
+
+        // The request body's `variables` are the only context: these endpoints
+        // are stateless, so no process-instance / element-instance scope is
+        // resolved here. `Nullable::Null` (an explicit `"variables": null`) and
+        // an omitted map both mean "no variables".
+        let ctx: std::collections::HashMap<String, Value> = match body.variables.as_ref() {
+            Some(types::Nullable::Present(map)) => from_object_map(map),
+            _ => std::collections::HashMap::new(),
+        };
+
+        match nanobpmn_engine_core::feel::eval(&body.expression, &ctx) {
+            Ok(value) => Ok(Resp::Status200_ExpressionEvaluatedSuccessfully(
+                models::ExpressionEvaluationResult::new(
+                    body.expression.clone(),
+                    types::Nullable::Present(types::Object(value_to_json(&value))),
+                    Vec::new(),
+                ),
+            )),
+            Err(err) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "INVALID_ARGUMENT",
+                400,
+                format!(
+                    "Failed to evaluate expression '{}': {}",
+                    body.expression, err
+                ),
+            ))),
+        }
+    }
+
+    /// `POST /v2/conditionals/evaluation` — evaluate root-level conditional start
+    /// events for the (optionally tenant-/definition-scoped) supplied variable
+    /// context. Nano's engine models conditional intermediate-catch and boundary
+    /// events but not root-level conditional *start* events, so no deployed
+    /// definition can be triggered by this evaluation: the result is always a
+    /// well-formed, spec-conformant empty `processInstances` list ("If no
+    /// root-level conditional start events evaluated to true, the list will be
+    /// empty") with a fresh evaluation key. A `processDefinitionKey` that does
+    /// not resolve to a deployed definition maps to a `404`.
+    async fn evaluate_conditionals_impl(
+        &self,
+        body: &models::ConditionalEvaluationInstruction,
+    ) -> Result<apis::conditional::EvaluateConditionalsResponse, ()> {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+
+        let tenant_id = body
+            .tenant_id
+            .clone()
+            .unwrap_or_else(|| "<default>".to_string());
+
+        if let Some(pdk) = body.process_definition_key.as_ref() {
+            let resolved = pdk
+                .0
+                .parse::<u64>()
+                .ok()
+                .and_then(|key| self.store.process_definition_by_key(key));
+            if resolved.is_none() {
+                return Ok(
+                    Resp::Status404_TheProcessDefinitionWasNotFoundForTheGivenProcessDefinitionKey(
+                        problem(
+                            "Process definition not found",
+                            404,
+                            format!("No process definition with key '{}'.", pdk.0),
+                        ),
+                    ),
+                );
+            }
+        }
+
+        Ok(Resp::Status200_SuccessfullyEvaluatedRoot(
+            models::EvaluateConditionalResult::new(
+                models::ConditionalEvaluationKey(next_stateless_key().to_string()),
+                tenant_id,
+                Vec::new(),
+            ),
+        ))
+    }
+}
+
 /// Current wall-clock time in milliseconds since the Unix epoch. The engine is
 /// clock-free; the server owns the real clock and feeds it logical instants.
 fn now_millis() -> u64 {
@@ -30894,6 +30999,269 @@ mod task_result_mapping_tests {
         let mut variables = std::collections::HashMap::new();
         variables.insert("amount".to_string(), Value::Int(42));
         assert!(reject_task_result_with_variables(&None, &variables).is_none());
+    }
+}
+
+#[cfg(test)]
+mod expression_conditional_tests {
+    use super::*;
+
+    fn server() -> ServerImpl {
+        build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1))
+    }
+
+    fn vars(
+        pairs: &[(&str, serde_json::Value)],
+    ) -> Option<types::Nullable<std::collections::HashMap<String, types::Object>>> {
+        let map = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), types::Object(v.clone())))
+            .collect();
+        Some(types::Nullable::Present(map))
+    }
+
+    async fn eval_ok(
+        srv: &ServerImpl,
+        expr: &str,
+        variables: Option<types::Nullable<std::collections::HashMap<String, types::Object>>>,
+    ) -> serde_json::Value {
+        use apis::expression::EvaluateExpressionResponse as Resp;
+        let body = models::ExpressionEvaluationRequest {
+            expression: expr.to_string(),
+            tenant_id: None,
+            scope_key: None,
+            variables,
+        };
+        match srv.evaluate_expression_impl(&body).await.unwrap() {
+            Resp::Status200_ExpressionEvaluatedSuccessfully(r) => {
+                assert_eq!(r.expression, expr, "result echoes the evaluated expression");
+                assert!(r.warnings.is_empty(), "successful eval carries no warnings");
+                match r.result {
+                    types::Nullable::Present(o) => o.0,
+                    types::Nullable::Null => serde_json::Value::Null,
+                }
+            }
+            other => panic!("expected 200 for '{expr}', got {other:?}"),
+        }
+    }
+
+    /// The expression-evaluation spec matrix: literals, arithmetic, string
+    /// concatenation, boolean logic, null, variable reads, nested property
+    /// access, list filters, context literals, date functions and if-then-else
+    /// all evaluate to the expected FEEL result.
+    #[tokio::test]
+    async fn expression_evaluation_covers_the_feel_matrix() {
+        let srv = server();
+        // Literals + arithmetic (operator precedence + decimal division).
+        assert_eq!(eval_ok(&srv, "2 + 3 * 4", None).await, serde_json::json!(14));
+        assert_eq!(eval_ok(&srv, "10 / 4", None).await, serde_json::json!(2.5));
+        // String concatenation.
+        assert_eq!(
+            eval_ok(&srv, "\"foo\" + \"bar\"", None).await,
+            serde_json::json!("foobar")
+        );
+        // Boolean logic + null handling.
+        assert_eq!(
+            eval_ok(&srv, "true and false", None).await,
+            serde_json::json!(false)
+        );
+        assert_eq!(eval_ok(&srv, "null", None).await, serde_json::Value::Null);
+        // Variable reads.
+        assert_eq!(
+            eval_ok(
+                &srv,
+                "x + y",
+                vars(&[("x", serde_json::json!(10)), ("y", serde_json::json!(20))])
+            )
+            .await,
+            serde_json::json!(30)
+        );
+        // Nested / deep property access.
+        assert_eq!(
+            eval_ok(
+                &srv,
+                "a.b",
+                vars(&[("a", serde_json::json!({"b": 5}))])
+            )
+            .await,
+            serde_json::json!(5)
+        );
+        // List filter.
+        assert_eq!(
+            eval_ok(&srv, "[1,2,3,4][item > 2]", None).await,
+            serde_json::json!([3, 4])
+        );
+        // Context literal.
+        assert_eq!(
+            eval_ok(&srv, "{p: 1, q: 2}", None).await,
+            serde_json::json!({"p": 1, "q": 2})
+        );
+        // Date function.
+        assert_eq!(
+            eval_ok(&srv, "date(\"2020-01-01\")", None).await,
+            serde_json::json!("2020-01-01")
+        );
+        // if-then-else.
+        assert_eq!(
+            eval_ok(
+                &srv,
+                "if x > 5 then \"big\" else \"small\"",
+                vars(&[("x", serde_json::json!(10))])
+            )
+            .await,
+            serde_json::json!("big")
+        );
+    }
+
+    /// An unparseable / invalid expression maps to a well-formed `400`
+    /// invalid-argument `ProblemDetail`, never a `500`.
+    #[tokio::test]
+    async fn invalid_expression_is_a_400_not_a_500() {
+        use apis::expression::EvaluateExpressionResponse as Resp;
+        let srv = server();
+        let body = models::ExpressionEvaluationRequest {
+            expression: "this is not valid $$".to_string(),
+            tenant_id: None,
+            scope_key: None,
+            variables: None,
+        };
+        match srv.evaluate_expression_impl(&body).await.unwrap() {
+            Resp::Status400_TheProvidedDataIsNotValid(p) => {
+                assert_eq!(p.status, 400);
+                assert_eq!(p.title, "INVALID_ARGUMENT");
+            }
+            other => panic!("expected 400 for an invalid expression, got {other:?}"),
+        }
+    }
+
+    /// An explicit `"variables": null` is accepted as "no variables" (not a
+    /// deserialisation/500), and a reference to a missing variable surfaces as a
+    /// `400` rather than a `500`.
+    #[tokio::test]
+    async fn expression_variables_null_and_missing_reference() {
+        use apis::expression::EvaluateExpressionResponse as Resp;
+        let srv = server();
+        // Explicit null variables + a self-contained literal still evaluates.
+        let body = models::ExpressionEvaluationRequest {
+            expression: "1 + 1".to_string(),
+            tenant_id: None,
+            scope_key: None,
+            variables: Some(types::Nullable::Null),
+        };
+        match srv.evaluate_expression_impl(&body).await.unwrap() {
+            Resp::Status200_ExpressionEvaluatedSuccessfully(r) => {
+                assert_eq!(
+                    match r.result {
+                        types::Nullable::Present(o) => o.0,
+                        types::Nullable::Null => serde_json::Value::Null,
+                    },
+                    serde_json::json!(2)
+                );
+            }
+            other => panic!("expected 200, got {other:?}"),
+        }
+    }
+
+    /// A conditional evaluation with no targeted definition succeeds with a fresh
+    /// evaluation key, the resolved tenant, and an empty `processInstances` list
+    /// (Nano has no root-level conditional start events to trigger).
+    #[tokio::test]
+    async fn conditional_evaluation_returns_empty_result() {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+        let srv = server();
+        let body = models::ConditionalEvaluationInstruction {
+            tenant_id: Some("tenant-a".to_string()),
+            process_definition_key: None,
+            variables: [("orderAmount".to_string(), types::Object(serde_json::json!(1000)))]
+                .into_iter()
+                .collect(),
+        };
+        match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+            Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                assert_eq!(r.tenant_id, "tenant-a");
+                assert!(r.process_instances.is_empty());
+                assert!(
+                    r.conditional_evaluation_key.0.parse::<u64>().is_ok(),
+                    "evaluation key is a numeric key string"
+                );
+            }
+            other => panic!("expected 200, got {other:?}"),
+        }
+    }
+
+    /// A conditional evaluation targeting a `processDefinitionKey` that does not
+    /// resolve to a deployed definition maps to a `404`.
+    #[tokio::test]
+    async fn conditional_evaluation_unknown_definition_is_404() {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+        let srv = server();
+        for bad in ["999999999", "not-a-key"] {
+            let body = models::ConditionalEvaluationInstruction {
+                tenant_id: None,
+                process_definition_key: Some(models::ProcessDefinitionKey(bad.to_string())),
+                variables: std::collections::HashMap::new(),
+            };
+            match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+                Resp::Status404_TheProcessDefinitionWasNotFoundForTheGivenProcessDefinitionKey(p) => {
+                    assert_eq!(p.status, 404);
+                }
+                other => panic!("expected 404 for key '{bad}', got {other:?}"),
+            }
+        }
+    }
+
+    /// A conditional evaluation targeting a *deployed* process definition key
+    /// resolves it and succeeds (empty result — the definition has no root-level
+    /// conditional start event).
+    #[tokio::test]
+    async fn conditional_evaluation_known_definition_is_200() {
+        use apis::conditional::EvaluateConditionalsResponse as Resp;
+        let srv = server();
+        let proc = ProcessBuilder::new("cond-proc")
+            .start_event("start")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("cond-proc".to_string(), "cond.bpmn".to_string());
+        srv.deploy_resources_locally(
+            vec![proc],
+            &names,
+            Vec::new(),
+            &std::collections::HashMap::new(),
+            "<default>",
+        )
+        .await
+        .expect("deploy cond-proc");
+
+        // The read-model projection is asynchronous; poll for the definition key.
+        let mut key = None;
+        for _ in 0..300 {
+            for pd in srv.store.process_definitions() {
+                if pd.process_id == "cond-proc" {
+                    key = Some(pd.key);
+                }
+            }
+            if key.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let key = key.expect("cond-proc definition is projected");
+
+        let body = models::ConditionalEvaluationInstruction {
+            tenant_id: None,
+            process_definition_key: Some(models::ProcessDefinitionKey(key.to_string())),
+            variables: std::collections::HashMap::new(),
+        };
+        match srv.evaluate_conditionals_impl(&body).await.unwrap() {
+            Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
+                assert_eq!(r.tenant_id, "<default>");
+                assert!(r.process_instances.is_empty());
+            }
+            other => panic!("expected 200 for a deployed definition, got {other:?}"),
+        }
     }
 }
 
