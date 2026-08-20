@@ -1,0 +1,74 @@
+name: release-ai-assert-npm
+
+# Triggered by tags of the form `ai-assert-npm-v0.1.0`. Builds & publishes
+# @nanobpm/ai-assert to the npm registry.
+#
+# Like release-engine-testkit-npm, this package is pure TypeScript with ZERO
+# required runtime dependencies and no wasm — the real OpenAI/Transformers
+# adapters are optional peers — so there is no engine build / wasm sync step. It
+# just installs, verifies the tag, builds (tsc), tests, and publishes.
+#
+# Authentication is npm OIDC trusted publishing — NO NPM_TOKEN. The package must
+# have a Trusted Publisher configured on npmjs.com pointing at this repo + this
+# workflow file (see clients/ai-assert/RELEASING.md).
+#
+# Note: npm provenance is intentionally disabled (NPM_CONFIG_PROVENANCE=false) —
+# it requires a public source repository, and nano-bpm is private by design.
+
+on:
+  push:
+    tags:
+      - 'ai-assert-npm-v*'
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    if: startsWith(github.ref, 'refs/tags/ai-assert-npm-v')
+    name: Publish @nanobpm/ai-assert
+    runs-on: ubuntu-24.04
+    permissions:
+      # id-token: write lets npm exchange the GitHub OIDC token for a
+      # short-lived publish token (trusted publishing).
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # npm OIDC trusted publishing needs npm CLI >= 11.5.1; pin a known-good
+      # version (explicit, not @latest) so the publish pipeline is reproducible.
+      - name: Upgrade npm (OIDC-capable)
+        run: npm install -g npm@11.5.1
+
+      - name: Install
+        working-directory: clients/ai-assert
+        run: npm ci
+
+      - name: Verify tag matches package version
+        working-directory: clients/ai-assert
+        run: |
+          pkg_version=$(node -p "require('./package.json').version")
+          tag_version="${GITHUB_REF_NAME#ai-assert-npm-v}"
+          if [[ "$pkg_version" != "$tag_version" ]]; then
+            echo "::error::tag $tag_version does not match package.json version $pkg_version"
+            exit 1
+          fi
+          echo "releasing @nanobpm/ai-assert $pkg_version"
+
+      - name: Build
+        working-directory: clients/ai-assert
+        run: npm run build
+
+      - name: Test
+        working-directory: clients/ai-assert
+        run: npm test
+
+      - name: Publish
+        working-directory: clients/ai-assert
+        env:
+          NPM_CONFIG_PROVENANCE: 'false'
+        run: npm publish --access public
