@@ -329,7 +329,10 @@ impl ServerImpl {
                 problem(
                     "Cluster variable already exists",
                     409,
-                    format!("A global cluster variable named '{}' already exists.", body.name),
+                    format!(
+                        "A global cluster variable named '{}' already exists.",
+                        body.name
+                    ),
                 ),
             ))
         }
@@ -346,7 +349,10 @@ impl ServerImpl {
         use apis::cluster_variable::CreateTenantClusterVariableResponse as Resp;
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
-        if self.cluster_variables.create(Some(tenant), &body.name, value) {
+        if self
+            .cluster_variables
+            .create(Some(tenant), &body.name, value)
+        {
             let stored = self
                 .cluster_variables
                 .get(Some(tenant), &body.name)
@@ -379,7 +385,10 @@ impl ServerImpl {
     ) -> Result<apis::cluster_variable::UpdateGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::UpdateGlobalClusterVariableResponse as Resp;
         let value = json_to_value(&body.value.0);
-        if self.cluster_variables.update(None, &path_params.name, value) {
+        if self
+            .cluster_variables
+            .update(None, &path_params.name, value)
+        {
             let stored = self
                 .cluster_variables
                 .get(None, &path_params.name)
@@ -391,10 +400,7 @@ impl ServerImpl {
             Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
-                format!(
-                    "No global cluster variable named '{}'.",
-                    path_params.name
-                ),
+                format!("No global cluster variable named '{}'.", path_params.name),
             )))
         }
     }
@@ -447,10 +453,7 @@ impl ServerImpl {
             None => Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
-                format!(
-                    "No global cluster variable named '{}'.",
-                    path_params.name
-                ),
+                format!("No global cluster variable named '{}'.", path_params.name),
             ))),
         }
     }
@@ -491,10 +494,7 @@ impl ServerImpl {
             Ok(Resp::Status404_ClusterVariableNotFound(problem(
                 "Cluster variable not found",
                 404,
-                format!(
-                    "No global cluster variable named '{}'.",
-                    path_params.name
-                ),
+                format!("No global cluster variable named '{}'.", path_params.name),
             )))
         }
     }
@@ -527,7 +527,9 @@ impl ServerImpl {
     /// POST /v2/cluster-variables/search — search cluster variables across all
     /// scopes, applying the name/value/tenantId/scope/isTruncated filters,
     /// multi-field sort, and cursor/offset pagination. `truncateValues` (query
-    /// param, default true) governs value truncation of the returned items.
+    /// param, default true) governs value truncation of the returned items only;
+    /// the `isTruncated` *filter* is a storage characteristic independent of it
+    /// (see [`CLUSTER_VARIABLE_STORED_TRUNCATED`]).
     async fn search_cluster_variables_impl(
         &self,
         query_params: &models::SearchClusterVariablesQueryParams,
@@ -547,12 +549,12 @@ impl ServerImpl {
                 Some(f) => {
                     let value_str = cluster_variable_value_string(&v.value);
                     let (scope_enum, _) = cluster_variable_scope(&v.tenant_id);
-                    let truncated = value_is_truncated(&value_str, truncate);
                     query::match_string(&f.name, &v.name)
                         && query::match_string(&f.value, &value_str)
                         && query::match_string_opt(&f.tenant_id, v.tenant_id.as_deref())
                         && query::match_cluster_variable_scope(&f.scope, &scope_enum.to_string())
-                        && f.is_truncated.is_none_or(|want| want == truncated)
+                        && f.is_truncated
+                            .is_none_or(|want| want == CLUSTER_VARIABLE_STORED_TRUNCATED)
                 }
             })
             .collect();
@@ -567,9 +569,7 @@ impl ServerImpl {
             |v, field| match field {
                 "name" => query::SortVal::Str(v.name.clone()),
                 "value" => query::SortVal::Str(cluster_variable_value_string(&v.value)),
-                "tenantId" => {
-                    query::SortVal::Str(v.tenant_id.clone().unwrap_or_default())
-                }
+                "tenantId" => query::SortVal::Str(v.tenant_id.clone().unwrap_or_default()),
                 "scope" => {
                     let (scope_enum, _) = cluster_variable_scope(&v.tenant_id);
                     query::SortVal::Str(scope_enum.to_string())
@@ -596,9 +596,10 @@ impl ServerImpl {
 
 #[cfg(test)]
 mod cluster_variable_tests {
-    use super::*;
-    use serde_json::json;
     use nanobpmn_engine_core::DEFAULT_TENANT;
+    use serde_json::json;
+
+    use super::*;
 
     fn store() -> ClusterVariableStore {
         ClusterVariableStore::new(ClusterVariables::default())
@@ -686,7 +687,7 @@ mod cluster_variable_tests {
             );
         }
         s.delete(None, "region");
-        assert!(runtime.read().unwrap().global.get("region").is_none());
+        assert!(!runtime.read().unwrap().global.contains_key("region"));
     }
 
     #[test]
@@ -711,6 +712,216 @@ mod cluster_variable_tests {
         let stored = s.get(None, "big").unwrap();
         assert!(cluster_variable_search_result(&stored, true).is_truncated);
         assert!(!cluster_variable_search_result(&stored, false).is_truncated);
+    }
+
+    // ---- `search_cluster_variables_impl` handler tests ----------------------
+    //
+    // The above exercise the store/projection helpers; these drive the actual
+    // externally-facing search handler (filtering, sorting, paging) so spec
+    // mismatches in that logic can't slip through unnoticed.
+
+    /// Runs the search handler against `server`'s cluster-variable store and
+    /// unwraps the 200 result (any non-200 outcome is a test failure).
+    async fn run_search(
+        server: &ServerImpl,
+        truncate_values: Option<bool>,
+        filter: Option<models::ClusterVariableSearchQueryFilterRequest>,
+        sort: Option<Vec<models::ClusterVariableSearchQuerySortRequest>>,
+        page: Option<models::SearchQueryPageRequest>,
+    ) -> models::ClusterVariableSearchQueryResult {
+        let query_params = models::SearchClusterVariablesQueryParams { truncate_values };
+        let body = Some(models::ClusterVariableSearchQueryRequest { page, sort, filter });
+        match server
+            .search_cluster_variables_impl(&query_params, &body)
+            .await
+        {
+            Ok(apis::cluster_variable::SearchClusterVariablesResponse::Status200_TheClusterVariableSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    fn name_filter(name: &str) -> models::ClusterVariableSearchQueryFilterRequest {
+        models::ClusterVariableSearchQueryFilterRequest {
+            name: Some(models::StringFilterProperty::String(name.to_string())),
+            ..models::ClusterVariableSearchQueryFilterRequest::new()
+        }
+    }
+
+    fn names(result: &models::ClusterVariableSearchQueryResult) -> Vec<String> {
+        result.items.iter().map(|i| i.name.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn search_filters_by_scope_and_tenant() {
+        let server = ServerImpl::default();
+        server
+            .cluster_variables
+            .create(None, "region", val(json!("global")));
+        server
+            .cluster_variables
+            .create(Some("acme"), "region", val(json!("acme")));
+        server
+            .cluster_variables
+            .create(Some("beta"), "tier", val(json!(2)));
+
+        // scope = GLOBAL matches only the global-scoped variable.
+        let global_only = models::ClusterVariableSearchQueryFilterRequest {
+            scope: Some(
+                models::ClusterVariableScopeFilterProperty::ClusterVariableScopeEnum(
+                    models::ClusterVariableScopeEnum::Global,
+                ),
+            ),
+            ..models::ClusterVariableSearchQueryFilterRequest::new()
+        };
+        let r = run_search(&server, None, Some(global_only), None, None).await;
+        assert_eq!(r.page.total_items, 1);
+        assert_eq!(r.items[0].scope, models::ClusterVariableScopeEnum::Global);
+
+        // scope = TENANT matches both tenant-scoped variables.
+        let tenant_only = models::ClusterVariableSearchQueryFilterRequest {
+            scope: Some(
+                models::ClusterVariableScopeFilterProperty::ClusterVariableScopeEnum(
+                    models::ClusterVariableScopeEnum::Tenant,
+                ),
+            ),
+            ..models::ClusterVariableSearchQueryFilterRequest::new()
+        };
+        let r = run_search(&server, None, Some(tenant_only), None, None).await;
+        assert_eq!(r.page.total_items, 2);
+        assert!(
+            r.items
+                .iter()
+                .all(|i| i.scope == models::ClusterVariableScopeEnum::Tenant)
+        );
+
+        // tenantId filter narrows to a single tenant.
+        let acme_only = models::ClusterVariableSearchQueryFilterRequest {
+            tenant_id: Some(models::StringFilterProperty::String("acme".to_string())),
+            ..models::ClusterVariableSearchQueryFilterRequest::new()
+        };
+        let r = run_search(&server, None, Some(acme_only), None, None).await;
+        assert_eq!(names(&r), vec!["region".to_string()]);
+        assert_eq!(
+            r.items[0].tenant_id,
+            types::Nullable::Present("acme".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn search_is_truncated_filter_is_independent_of_truncate_values() {
+        let server = ServerImpl::default();
+        let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
+        server
+            .cluster_variables
+            .create(None, "big", val(json!(long)));
+        server
+            .cluster_variables
+            .create(None, "small", val(json!("x")));
+
+        // The `isTruncated` filter is a *storage* characteristic (spec), so it
+        // must not depend on the response-only `truncateValues`. This in-memory
+        // store never truncates at rest: `isTruncated: true` matches nothing and
+        // `isTruncated: false` matches everything — identically for either
+        // `truncateValues` setting.
+        for truncate_values in [Some(true), Some(false), None] {
+            let want_truncated = models::ClusterVariableSearchQueryFilterRequest {
+                is_truncated: Some(true),
+                ..models::ClusterVariableSearchQueryFilterRequest::new()
+            };
+            let r = run_search(&server, truncate_values, Some(want_truncated), None, None).await;
+            assert_eq!(
+                r.page.total_items, 0,
+                "isTruncated=true must match no stored value (truncate_values={truncate_values:?})"
+            );
+
+            let want_untruncated = models::ClusterVariableSearchQueryFilterRequest {
+                is_truncated: Some(false),
+                ..models::ClusterVariableSearchQueryFilterRequest::new()
+            };
+            let r = run_search(&server, truncate_values, Some(want_untruncated), None, None).await;
+            assert_eq!(
+                r.page.total_items, 2,
+                "isTruncated=false must match every stored value (truncate_values={truncate_values:?})"
+            );
+        }
+
+        // The response *item's* `isTruncated` flag is the separate response-format
+        // concept and still reflects `truncateValues` (true truncates the long one).
+        let big = name_filter("big");
+        let r = run_search(&server, Some(true), Some(big.clone()), None, None).await;
+        assert!(
+            r.items[0].is_truncated,
+            "long value truncated in the response"
+        );
+        let r = run_search(&server, Some(false), Some(big), None, None).await;
+        assert!(
+            !r.items[0].is_truncated,
+            "full value returned when truncateValues=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_sorts_and_paginates_with_a_stable_cursor() {
+        let server = ServerImpl::default();
+        for n in ["charlie", "alpha", "bravo"] {
+            server.cluster_variables.create(None, n, val(json!(n)));
+        }
+
+        let sort_by_name_asc = vec![models::ClusterVariableSearchQuerySortRequest {
+            field: "name".to_string(),
+            order: Some(models::SortOrderEnum::Asc),
+        }];
+
+        // First page: one item, ascending by name -> "alpha".
+        let page1 = run_search(
+            &server,
+            None,
+            None,
+            Some(sort_by_name_asc.clone()),
+            Some(models::SearchQueryPageRequest::LimitPagination(
+                models::LimitPagination { limit: Some(1) },
+            )),
+        )
+        .await;
+        assert_eq!(names(&page1), vec!["alpha".to_string()]);
+        assert_eq!(page1.page.total_items, 3);
+        let cursor = match &page1.page.end_cursor {
+            types::Nullable::Present(c) => c.clone(),
+            types::Nullable::Null => panic!("expected an end cursor to resume from"),
+        };
+
+        // Resuming from that cursor yields the next item in order ("bravo") with
+        // no duplication or skipping — the cursor is stable across requests.
+        let page2 = run_search(
+            &server,
+            None,
+            None,
+            Some(sort_by_name_asc.clone()),
+            Some(models::SearchQueryPageRequest::CursorForwardPagination(
+                models::CursorForwardPagination {
+                    after: Some(cursor.clone()),
+                    limit: Some(1),
+                },
+            )),
+        )
+        .await;
+        assert_eq!(names(&page2), vec!["bravo".to_string()]);
+
+        // Re-issuing the identical cursor request returns the identical page.
+        let page2_again = run_search(
+            &server,
+            None,
+            None,
+            Some(sort_by_name_asc),
+            Some(models::SearchQueryPageRequest::CursorForwardPagination(
+                models::CursorForwardPagination {
+                    after: Some(cursor),
+                    limit: Some(1),
+                },
+            )),
+        )
+        .await;
+        assert_eq!(names(&page2_again), names(&page2));
     }
 }
 
@@ -16440,6 +16651,15 @@ fn value_is_truncated(value: &str, truncate: bool) -> bool {
     truncate && value.len() > VARIABLE_VALUE_PREVIEW_LEN
 }
 
+/// Storage-level truncation state of a cluster variable's value, as seen by the
+/// `isTruncated` *filter* (spec: "based on the underlying storage
+/// characteristic, not the response format"). This in-memory store always
+/// persists full values — it never truncates at rest — so stored-truncation is
+/// always `false`, independent of the response-only `truncateValues` param. A
+/// filter of `isTruncated: true` therefore matches nothing. (The response
+/// item's `isTruncated` flag is separate: it reflects response-preview
+/// truncation via [`value_is_truncated`].)
+const CLUSTER_VARIABLE_STORED_TRUNCATED: bool = false;
 /// Truncates `value` to the preview length on a char boundary when `truncate` is
 /// on, returning the (possibly shortened) value and whether it was truncated.
 fn truncate_value(value: &str, truncate: bool) -> (String, bool) {
