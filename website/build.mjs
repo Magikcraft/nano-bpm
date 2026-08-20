@@ -324,7 +324,7 @@ function homeHtml() {
 <section class="hero">
   <p class="eyebrow"><span class="arp">Advanced Research Prototype</span></p>
   <h1>Agent Graph Orchestration<br><span class="hl-sub">for the Developer Workstation.</span></h1>
-  <p class="subhead">Graphs that run the loops.</p>
+  <p class="subhead">Graphs that run the loops. An entropy sink for agent fleets.</p>
   <p class="lede">A RAAD — Rapid Agent Application Development — environment that runs on
   your machine. Compose coding agents, tools, and human approvals into durable workflows.
   Code-first or Model-first Graphs, provider-agnostic, and small enough to start on a Raspberry Pi.</p>
@@ -366,11 +366,12 @@ function homeHtml() {
 
 <section class="band problem">
   <div class="wrap">
-    <h2>New levels of abstraction demand new primitives.</h2>
+    <h2>Autonomous agents generate entropy. Nano is the sink.</h2>
     <p>You're already orchestrating agents to write, review, and test code — but the wiring is a
     pile of shell scripts and retries. When the machine reboots overnight — a crash, or an
-    IT-forced update — the run dies, the state is gone, and the tokens are re-spent. Agent
-    systems need durable, inspectable primitives, not more glue.</p>
+    IT-forced update — the run dies, the state is gone, and the tokens are re-spent. Left
+    unmanaged, that disorder compounds with every agent you add. Nano is where it goes — durable,
+    inspectable primitives that drive work to convergence instead of drift.</p>
   </div>
 </section>
 
