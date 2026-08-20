@@ -88,7 +88,14 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("user_task", "update_user_task"): "self.update_user_task_impl(path_params, body).await",
     ("ad_hoc_sub_process", "activate_ad_hoc_sub_process_activities"): "self.activate_ad_hoc_sub_process_activities_impl(path_params, body).await",
     # --- BEGIN issue-905 batch-operations delegations ---
-    # (issue-905 adds its batch-operations entries here)
+    ("batch_operation", "get_batch_operation"): "self.get_batch_operation_impl(path_params).await",
+    ("batch_operation", "search_batch_operations"): "self.search_batch_operations_impl(body).await",
+    ("batch_operation", "search_batch_operation_items"): "self.search_batch_operation_items_impl(body).await",
+    ("batch_operation", "suspend_batch_operation"): "self.suspend_batch_operation_impl(path_params).await",
+    ("batch_operation", "resume_batch_operation"): "self.resume_batch_operation_impl(path_params).await",
+    ("batch_operation", "cancel_batch_operation"): "self.cancel_batch_operation_impl(path_params).await",
+    ("process_instance", "cancel_process_instances_batch_operation"): "self.cancel_process_instances_batch_operation_impl(body).await",
+    ("process_instance", "resolve_incidents_batch_operation"): "self.resolve_incidents_batch_operation_impl(body).await",
     # --- END issue-905 batch-operations delegations ---
     # --- BEGIN issue-906 cluster-variables delegations ---
     # (issue-906 adds its cluster-variables entries here)
