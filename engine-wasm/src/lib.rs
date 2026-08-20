@@ -1987,6 +1987,10 @@ fn incident_kind_tag(kind: &IncidentKind) -> &'static str {
         IncidentKind::DecisionEvaluation => "decisionEvaluation",
         IncidentKind::CalledElementError => "calledElementError",
         IncidentKind::IoMapping => "ioMapping",
+        // Output-mapping failures share the one external `ioMapping` taxonomy
+        // (REST `IO_MAPPING_ERROR`); they differ from `IoMapping` only in the
+        // engine's internal resolution re-drive (completion vs activation).
+        IncidentKind::IoMappingOutput => "ioMapping",
     }
 }
 

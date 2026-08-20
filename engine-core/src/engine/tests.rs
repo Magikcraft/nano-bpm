@@ -7843,12 +7843,13 @@ fn output_mapping_eval_failure_raises_incident_and_does_not_complete() {
         .apply_command(Command::complete_job(job_key))
         .unwrap();
 
-    // The output mapping failed: one active ExpressionEvaluation incident (the
-    // output-phase kind, REST `EXTRACT_VALUE_ERROR`), and the element has NOT
-    // completed.
+    // The output mapping failed: one active IoMappingOutput incident (the
+    // output-phase kind, REST `IO_MAPPING_ERROR` — matching Zeebe, which raises
+    // `IO_MAPPING_ERROR` for both input and output mapping failures), and the
+    // element has NOT completed.
     let active = engine.active_incidents();
     assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
-    assert_eq!(active[0].kind, state::IncidentKind::ExpressionEvaluation);
+    assert_eq!(active[0].kind, state::IncidentKind::IoMappingOutput);
     assert!(
         !engine.is_completed(key),
         "must not complete on eval failure"
@@ -7872,6 +7873,60 @@ fn output_mapping_eval_failure_raises_incident_and_does_not_complete() {
         merged_var(&events, "approved"),
         Some(Value::Int(42)),
         "output mapping should surface approved=42; events: {events:?}"
+    );
+}
+
+#[test]
+fn subprocess_output_mapping_eval_failure_raises_io_mapping_output_incident() {
+    // #939 parity (ports Zeebe `OutputMappingIncidentTest` to a scoped element):
+    // an OUTPUT `zeebe:ioMapping` failure on a *sub-process* (not the mainstream
+    // service-task path) must raise the `IoMappingOutput` incident kind (REST
+    // `IO_MAPPING_ERROR` — the same taxonomy Zeebe raises for both input and
+    // output mapping failures) and hold the sub-process in COMPLETING rather than
+    // completing it with the target silently unset. This locks the taxonomy
+    // relabel across every output path, not just the mainstream element.
+    //
+    // NOTE: the *resolution* re-drive for scoped/specialized completion paths
+    // (sub-process, MI, ad-hoc, call-activity) is tracked as a follow-up to #939
+    // (phase-driven re-drive, dropping the `IncidentKind`→`Step` coupling); the
+    // mainstream service-task output path is fully resolvable and covered by
+    // `output_mapping_eval_failure_raises_incident_and_does_not_complete`.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(vec![
+            crate::model::Mapping {
+                source: "=bad + 1".to_string(),
+                target: "exported".to_string(),
+            },
+        ])))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "sub-scope",
+            vars(&[("seed", Value::Int(4)), ("bad", Value::Str("oops".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    // Completing the inner job drives the sub-process into its output-mapping
+    // projection, which fails on `=bad + 1` (string + int).
+    let _ = complete_one(&mut engine, "work");
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(
+        active[0].kind,
+        state::IncidentKind::IoMappingOutput,
+        "a sub-process output-mapping failure must raise IO_MAPPING_ERROR, not EXTRACT_VALUE_ERROR",
+    );
+    assert_eq!(
+        active[0].element_id, "sub",
+        "the incident parks on the sub-process, not the inner task"
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "the process must not complete while the output mapping is unresolved"
     );
 }
 

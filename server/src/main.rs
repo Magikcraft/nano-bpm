@@ -17822,6 +17822,7 @@ fn incident_error_type_enum(kind: IncidentKind) -> models::IncidentErrorTypeEnum
         IncidentKind::DecisionEvaluation => models::IncidentErrorTypeEnum::DecisionEvaluationError,
         IncidentKind::CalledElementError => models::IncidentErrorTypeEnum::CalledElementError,
         IncidentKind::IoMapping => models::IncidentErrorTypeEnum::IoMappingError,
+        IncidentKind::IoMappingOutput => models::IncidentErrorTypeEnum::IoMappingError,
     }
 }
 

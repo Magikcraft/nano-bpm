@@ -596,14 +596,33 @@ pub enum IncidentKind {
     /// Recoverable once the callee is deployed (or the recursion fixed) and the
     /// incident is resolved.
     CalledElementError,
-    /// A `zeebe:ioMapping` source expression (an input mapping on activation or
-    /// an output mapping on completion) failed to evaluate — a FEEL parse error,
-    /// a type error, or an operation on a missing value (e.g. `"x" + missingVar`).
-    /// The element halts with the target variable unset rather than proceeding
-    /// with a silent blank, matching Zeebe's `IO_MAPPING_ERROR`. Recoverable once
-    /// the mapping (or the missing variable it reads) is fixed and the incident is
-    /// resolved — resolution re-drives the activation/completion.
+    /// An **input** `zeebe:ioMapping` source expression failed to evaluate on
+    /// activation — a FEEL parse error, a type error, or an operation on a
+    /// missing value (e.g. `"x" + missingVar`). The element halts with the target
+    /// variable unset rather than proceeding with a silent blank, matching
+    /// Zeebe's `IO_MAPPING_ERROR`. Raised for the mainstream activation path
+    /// (elements activated via [`crate::engine`]'s `activate_body`); resolution
+    /// re-drives the **activation** body ([`crate::engine`] `Step::RetryActivation`)
+    /// so the now-fixed mapping is re-applied before the element's behaviour runs.
+    /// Recoverable once the mapping (or the missing variable it reads) is fixed
+    /// and the incident is resolved.
+    ///
+    /// The specialized multi-instance / ad-hoc / call-activity **input**
+    /// activation paths do not yet route through this kind — they still raise
+    /// [`IncidentKind::ExpressionEvaluation`] pending the phase-driven re-drive
+    /// refactor tracked as a follow-up to #939.
     IoMapping,
+    /// An **output** `zeebe:ioMapping` source expression failed to evaluate at
+    /// completion — same FEEL failure modes as [`IncidentKind::IoMapping`]. The
+    /// element halts in the COMPLETING phase with the target unset rather than
+    /// completing with a silent blank, matching Zeebe's `IO_MAPPING_ERROR` (both
+    /// input and output mapping failures share the one `IO_MAPPING_ERROR`
+    /// taxonomy). Distinct from [`IncidentKind::IoMapping`] only in its re-drive:
+    /// resolution re-drives **completion** ([`crate::engine`] `Step::Complete`),
+    /// re-evaluating the output mapping against the now-fixed variables without
+    /// re-running the element's behaviour. Recoverable once the mapping (or the
+    /// missing variable it reads) is fixed and the incident is resolved.
+    IoMappingOutput,
 }
 
 /// Lifecycle state of an incident. Incidents are retained after resolution (as

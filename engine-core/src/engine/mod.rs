@@ -2184,11 +2184,17 @@ impl Engine {
                     state::IncidentKind::JobNoRetries => {}
                     // Exclusive gateway matched no flow, or a condition failed to
                     // evaluate: re-evaluate the gateway against the (possibly
-                    // updated) variables.
+                    // updated) variables. An `IoMappingOutput` incident (an
+                    // *output* `zeebe:ioMapping` that failed at completion) parks
+                    // the element in the COMPLETING phase; re-driving `Complete`
+                    // re-projects the now-fixed output mapping without re-running
+                    // the element's behaviour — the same lifecycle as a
+                    // script/decision output failure.
                     state::IncidentKind::NoMatchingSequenceFlow
                     | state::IncidentKind::ExpressionEvaluation
                     | state::IncidentKind::DecisionEvaluation
-                    | state::IncidentKind::CalledElementError => {
+                    | state::IncidentKind::CalledElementError
+                    | state::IncidentKind::IoMappingOutput => {
                         // A message intermediate catch event whose correlation
                         // key failed to evaluate parks ACTIVATED with no
                         // subscription; re-driving `Complete` would advance the
@@ -2228,8 +2234,7 @@ impl Engine {
                     // re-applies the now-fixed input mappings and re-enacts the
                     // element's behaviour (creating the job, opening the scope,
                     // etc.). Output-mapping failures park in the COMPLETING phase
-                    // and are raised as `ExpressionEvaluation`, re-driven by
-                    // `Complete` above (same as a script/decision output failure).
+                    // as `IoMappingOutput` and are re-driven by `Complete` above.
                     state::IncidentKind::IoMapping => {
                         queue.push_back(Step::RetryActivation {
                             instance_key,
@@ -3756,7 +3761,7 @@ impl Engine {
                         // sub-process for the rest of the sweep; it stays active
                         // parked on the incident (re-driven by `Complete` on
                         // resolution).
-                        let event = self.io_mapping_expr_incident(
+                        let event = self.io_mapping_output_incident(
                             instance_key,
                             eik,
                             element_id.clone(),
@@ -4226,14 +4231,45 @@ impl Engine {
         }
     }
 
+    /// Builds an `IO_MAPPING_ERROR` [`Event::IncidentRaised`] for an **output**
+    /// `zeebe:ioMapping` whose source failed to evaluate at completion, using the
+    /// [`state::IncidentKind::IoMappingOutput`] kind (REST `IO_MAPPING_ERROR`)
+    /// whose resolution re-drives `Complete` (#939). The element halts in the
+    /// COMPLETING phase; resolving it re-projects the now-fixed output mapping
+    /// without re-running the element's behaviour — the same lifecycle as the
+    /// former `ExpressionEvaluation` routing, but reported under the correct
+    /// `IO_MAPPING_ERROR` taxonomy (Zeebe parity: both input and output mapping
+    /// failures raise `IO_MAPPING_ERROR`). Used for every output-mapping failure:
+    /// the mainstream element, sub-processes, multi-instance children, ad-hoc
+    /// tools, and call activities.
+    fn io_mapping_output_incident(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        failure: IoMappingFailure,
+    ) -> Event {
+        Event::IncidentRaised {
+            incident_key: self.mint_key(),
+            instance_key,
+            element_instance_key,
+            element_id,
+            kind: state::IncidentKind::IoMappingOutput,
+            reason: failure.reason,
+            job_key: None,
+            created_at: self.now,
+        }
+    }
+
     /// Builds an [`Event::IncidentRaised`] for a `zeebe:ioMapping` whose source
     /// failed to evaluate, using the `ExpressionEvaluation` kind (REST
-    /// `EXTRACT_VALUE_ERROR`) whose resolution re-drives `Complete` — the same
-    /// lifecycle as a script/decision output failure (#939). Used for every
-    /// io-mapping failure that halts in a phase re-driven by `Complete`: all
-    /// output mappings, and input mappings on the specialized multi-instance /
-    /// ad-hoc / call-activity activation paths (which are not re-driven by
-    /// `activate_body`).
+    /// `EXTRACT_VALUE_ERROR`) whose resolution re-drives `Complete`. Now used only
+    /// for the specialized multi-instance / ad-hoc / call-activity **input**
+    /// activation paths, which are not re-driven by `activate_body` and whose
+    /// correct context-preserving re-activation (plus `IO_MAPPING_ERROR`
+    /// relabelling) is tracked as a follow-up to #939. Output mappings use
+    /// [`io_mapping_output_incident`]; the mainstream input path uses
+    /// [`io_mapping_incident`].
     fn io_mapping_expr_incident(
         &mut self,
         instance_key: Key,
@@ -5215,7 +5251,7 @@ impl Engine {
                             // child with an incident instead of completing it with
                             // a silently-unset output (#939). The child does not
                             // complete; resolution re-drives its completion.
-                            let event = self.io_mapping_expr_incident(
+                            let event = self.io_mapping_output_incident(
                                 instance_key,
                                 child_eik,
                                 element_id,
@@ -6268,7 +6304,7 @@ impl Engine {
                         // tool with an incident instead of completing it with a
                         // silently-unset output (#939). The tool does not complete;
                         // resolution re-drives its completion.
-                        let event = self.io_mapping_expr_incident(
+                        let event = self.io_mapping_output_incident(
                             instance_key,
                             child_eik,
                             tool_element_id,
@@ -6943,14 +6979,15 @@ impl Engine {
                     // Halt in the COMPLETING phase: the element stays active and
                     // parks on the incident, re-driven by `Complete` on resolution
                     // — the same lifecycle as a script/decision output failure in
-                    // this function. `io_mapping_expr_incident` uses the
-                    // `ExpressionEvaluation` kind (REST `EXTRACT_VALUE_ERROR`)
-                    // rather than the `IoMapping` kind, whose resolution re-drives
-                    // the *activation* body (for the input-mapping phase); the
-                    // issue explicitly sanctions `ExpressionEvaluation` for the
-                    // mapping-eval-failure case.
+                    // this function. `io_mapping_output_incident` uses the
+                    // `IoMappingOutput` kind (REST `IO_MAPPING_ERROR`), whose
+                    // resolution re-drives `Complete` (re-projecting the output),
+                    // rather than the `IoMapping` kind whose resolution re-drives
+                    // the *activation* body (the input-mapping phase). Both surface
+                    // the one `IO_MAPPING_ERROR` taxonomy (Zeebe parity: input and
+                    // output mapping failures share it).
                     return (
-                        vec![self.io_mapping_expr_incident(
+                        vec![self.io_mapping_output_incident(
                             instance_key,
                             element_instance_key,
                             element_id,
@@ -8569,7 +8606,7 @@ impl Engine {
                     // A call-activity output mapping that fails to evaluate halts the
                     // call activity with an incident instead of completing it with a
                     // silently-unset output (#939).
-                    let event = self.io_mapping_expr_incident(
+                    let event = self.io_mapping_output_incident(
                         instance_key,
                         element_instance_key,
                         element_id,
