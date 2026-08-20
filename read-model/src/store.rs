@@ -3860,7 +3860,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                  created_at_ms) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-                 worker = NULL, deadline_ms = NULL",
+                 worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms",
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -3899,7 +3899,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                  job_kind, listener_event_type, created_at_ms) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-                 worker = NULL, deadline_ms = NULL",
+                 worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms",
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -6928,5 +6928,66 @@ mod read_surface_tests {
             .map(|t| t.key)
             .collect();
         assert_eq!(completed_only, vec![101]);
+    }
+
+    /// Defect-class guard: a `JobCreated` replay/repair must *refresh*
+    /// `created_at_ms`, not leave it stuck at a stale value. The
+    /// `/v2/jobs/statistics/*` aggregations count `created` jobs off
+    /// `created_at_ms`, so a row whose `created_at_ms` was persisted as `0` by an
+    /// older projection (predating the column) would be under-counted forever if
+    /// the upsert's `ON CONFLICT` clause did not overwrite it. Re-projecting the
+    /// same job with its real timestamp must repair the stale `0`.
+    #[test]
+    fn job_created_replay_repairs_stale_created_at_ms() {
+        let store = ReadStore::open(None).unwrap();
+        // Initial projection lands the row with a stale created_at_ms of 0, as an
+        // old DB predating the column would have.
+        store
+            .export(&[&Event::JobCreated {
+                job_key: 8001,
+                instance_key: 7000,
+                element_instance_key: 7001,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 0,
+                priority: 0,
+                retries: 3,
+            }])
+            .unwrap();
+        assert_eq!(
+            store
+                .jobs()
+                .into_iter()
+                .find(|j| j.key == 8001)
+                .unwrap()
+                .created_at_ms,
+            0,
+            "precondition: stale row starts at created_at_ms = 0"
+        );
+
+        // A repair/replay re-projects the same job carrying its real creation time.
+        store
+            .export(&[&Event::JobCreated {
+                job_key: 8001,
+                instance_key: 7000,
+                element_instance_key: 7001,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 1_724_000_000_000,
+                priority: 0,
+                retries: 3,
+            }])
+            .unwrap();
+
+        assert_eq!(
+            store
+                .jobs()
+                .into_iter()
+                .find(|j| j.key == 8001)
+                .unwrap()
+                .created_at_ms,
+            1_724_000_000_000,
+            "ON CONFLICT must refresh created_at_ms so statistics stop under-counting"
+        );
     }
 }
