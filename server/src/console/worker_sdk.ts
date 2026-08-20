@@ -274,12 +274,17 @@ export async function publishMessage(
  * empty key (a silent no-op, or worse, cross-instance corruption).
  */
 export class MalformedJobError extends Error {
-  constructor(
-    readonly detail: string,
-    readonly raw: unknown,
-  ) {
+  // Plain field declarations (not TS parameter properties): the Node worker
+  // fallback loads this SDK with `--experimental-strip-types`, whose strip-only
+  // parser rejects `constructor(readonly x)` shorthand. Assign in the body so
+  // the type stays erasable on both Deno and Node.
+  readonly detail: string;
+  readonly raw: unknown;
+  constructor(detail: string, raw: unknown) {
     super(`malformed job frame: ${detail}`);
     this.name = "MalformedJobError";
+    this.detail = detail;
+    this.raw = raw;
   }
 }
 
