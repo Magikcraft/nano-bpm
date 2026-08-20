@@ -16961,19 +16961,23 @@ impl ServerImpl {
             .unwrap_or_else(|| "<default>".to_string());
 
         if let Some(pdk) = body.process_definition_key.as_ref() {
-            let resolved = pdk
-                .0
-                .parse::<u64>()
-                .ok()
-                .and_then(|key| self.store.process_definition_by_key(key));
-            if resolved.is_none() {
+            // Distinguish a malformed (non-numeric) key from a well-formed but
+            // unknown one so clients get a clear message, mirroring
+            // `get_process_definition_xml_impl`. Both still map to 404.
+            let detail = match pdk.0.parse::<u64>() {
+                Err(_) => Some(format!(
+                    "Process definition key '{}' is not a valid key.",
+                    pdk.0
+                )),
+                Ok(key) if self.store.process_definition_by_key(key).is_none() => {
+                    Some(format!("No process definition with key {key}."))
+                }
+                Ok(_) => None,
+            };
+            if let Some(detail) = detail {
                 return Ok(
                     Resp::Status404_TheProcessDefinitionWasNotFoundForTheGivenProcessDefinitionKey(
-                        problem(
-                            "Process definition not found",
-                            404,
-                            format!("No process definition with key '{}'.", pdk.0),
-                        ),
+                        problem("Process definition not found", 404, detail),
                     ),
                 );
             }
@@ -31255,7 +31259,16 @@ mod expression_conditional_tests {
     async fn conditional_evaluation_unknown_definition_is_404() {
         use apis::conditional::EvaluateConditionalsResponse as Resp;
         let srv = server();
-        for bad in ["999999999", "not-a-key"] {
+        // A well-formed but unknown key and a malformed (non-numeric) key both
+        // return 404, but with distinct, non-misleading detail messages.
+        let cases = [
+            ("999999999", "No process definition with key 999999999."),
+            (
+                "not-a-key",
+                "Process definition key 'not-a-key' is not a valid key.",
+            ),
+        ];
+        for (bad, expected_detail) in cases {
             let body = models::ConditionalEvaluationInstruction {
                 tenant_id: None,
                 process_definition_key: Some(models::ProcessDefinitionKey(bad.to_string())),
@@ -31266,6 +31279,7 @@ mod expression_conditional_tests {
                     p,
                 ) => {
                     assert_eq!(p.status, 404);
+                    assert_eq!(p.detail, expected_detail);
                 }
                 other => panic!("expected 404 for key '{bad}', got {other:?}"),
             }
