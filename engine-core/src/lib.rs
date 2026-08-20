@@ -69,6 +69,7 @@
 //! assert!(engine.is_completed(instance_key));
 //! ```
 
+mod cluster_vars;
 mod command;
 mod engine;
 mod event;
@@ -88,6 +89,7 @@ mod validate;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
+pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT};
 #[cfg(feature = "serde")]
 pub use command::form_id_of;
 pub use command::{

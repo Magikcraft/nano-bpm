@@ -98,7 +98,15 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("process_instance", "resolve_incidents_batch_operation"): "self.resolve_incidents_batch_operation_impl(body).await",
     # --- END issue-905 batch-operations delegations ---
     # --- BEGIN issue-906 cluster-variables delegations ---
-    # (issue-906 adds its cluster-variables entries here)
+    ("cluster_variable", "create_global_cluster_variable"): "self.create_global_cluster_variable_impl(body).await",
+    ("cluster_variable", "create_tenant_cluster_variable"): "self.create_tenant_cluster_variable_impl(path_params, body).await",
+    ("cluster_variable", "update_global_cluster_variable"): "self.update_global_cluster_variable_impl(path_params, body).await",
+    ("cluster_variable", "update_tenant_cluster_variable"): "self.update_tenant_cluster_variable_impl(path_params, body).await",
+    ("cluster_variable", "get_global_cluster_variable"): "self.get_global_cluster_variable_impl(path_params).await",
+    ("cluster_variable", "get_tenant_cluster_variable"): "self.get_tenant_cluster_variable_impl(path_params).await",
+    ("cluster_variable", "delete_global_cluster_variable"): "self.delete_global_cluster_variable_impl(path_params).await",
+    ("cluster_variable", "delete_tenant_cluster_variable"): "self.delete_tenant_cluster_variable_impl(path_params).await",
+    ("cluster_variable", "search_cluster_variables"): "self.search_cluster_variables_impl(query_params, body).await",
     # --- END issue-906 cluster-variables delegations ---
     # --- BEGIN issue-907 jobs & job-statistics delegations ---
     # (issue-907 adds its jobs & job-statistics entries here)

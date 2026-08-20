@@ -159,6 +159,14 @@ pub struct Engine {
     /// window between a retirement and its create, so it drains continuously. NOT
     /// part of the snapshot; pure host-side bookkeeping, never affects determinism.
     retired_tombstones: HashSet<Key>,
+    /// Host-injected **cluster variables** (see [`crate::cluster_vars`]): a shared,
+    /// mutable snapshot of global + per-tenant configuration values that FEEL
+    /// expressions resolve at runtime. External configuration, not journaled
+    /// state: it is never part of a snapshot and never affects replay determinism
+    /// (the host re-installs the shared handle on every engine rebuild via
+    /// [`set_cluster_variables`](Engine::set_cluster_variables)). Empty by default,
+    /// in which case variable resolution keeps its zero-copy fast path.
+    cluster_variables: crate::cluster_vars::ClusterVariables,
 }
 
 /// A unit of internal work in the processing loop — one transition of the BPMN
@@ -306,6 +314,7 @@ impl Engine {
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
             retired_tombstones: HashSet::new(),
+            cluster_variables: crate::cluster_vars::ClusterVariables::default(),
         }
     }
 
@@ -338,6 +347,25 @@ impl Engine {
     /// Whether lenient completion is enabled (see [`Self::set_lenient_completion`]).
     pub fn lenient_completion(&self) -> bool {
         self.lenient_completion
+    }
+
+    /// Installs the shared [`ClusterVariables`](crate::cluster_vars::ClusterVariables)
+    /// handle the engine reads while assembling a FEEL evaluation context. The host
+    /// (the gateway) owns the write side and mutates the snapshot as REST create /
+    /// update / delete requests land; the engine observes the live set. Cluster
+    /// variables are external configuration, so this is host-side wiring that never
+    /// affects replay/snapshot determinism — the host re-installs the handle after
+    /// every engine rebuild (replay / snapshot restore) so the link survives.
+    pub fn set_cluster_variables(
+        &mut self,
+        cluster_variables: crate::cluster_vars::ClusterVariables,
+    ) {
+        self.cluster_variables = cluster_variables;
+    }
+
+    /// The shared cluster-variable handle (see [`Self::set_cluster_variables`]).
+    pub fn cluster_variables(&self) -> &crate::cluster_vars::ClusterVariables {
+        &self.cluster_variables
     }
 
     /// The cluster-wide partition count this engine is configured with.
@@ -405,6 +433,7 @@ impl Engine {
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
             retired_tombstones: HashSet::new(),
+            cluster_variables: crate::cluster_vars::ClusterVariables::default(),
         }
     }
 
