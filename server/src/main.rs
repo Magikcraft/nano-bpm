@@ -28377,6 +28377,76 @@ mod subscription_placement_tests {
     }
 
     #[tokio::test]
+    async fn rest_activate_ad_hoc_activities_maps_unknown_activity_id_to_404() {
+        // A well-formed, live ad-hoc container but an element id that the
+        // container does not contain: the engine's AdHocUnknownElement branch
+        // must surface as 404 (NOT_FOUND parity), and the container stays parked.
+        use apis::ad_hoc_sub_process::ActivateAdHocSubProcessActivitiesResponse as Resp;
+        use apis::job::ActivateJobsResponse as JobResp;
+
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("agent.bpmn".into(), ADHOC_AGENT_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("the ad-hoc agent process deploys onto every partition");
+
+        server
+            .create_for_stream(Some("agent-proc".into()), None, Default::default())
+            .await
+            .expect("the instance is created and parks on the agent container");
+
+        let mut agent_req = models::JobActivationRequest::new("agent-worker".into(), 60_000, 10);
+        agent_req.request_timeout = Some(-1);
+        let container_key = match server
+            .activate_jobs_impl(&agent_req)
+            .await
+            .expect("activate the agent job")
+        {
+            JobResp::Status200_TheListOfActivatedJobs(r) => {
+                r.jobs
+                    .into_iter()
+                    .next()
+                    .expect("an agent job is emitted for the ad-hoc container")
+                    .element_instance_key
+                    .0
+            }
+            other => panic!("expected the agent job list, got {other:?}"),
+        };
+
+        // Unknown activity id in a live container: 404, not 500.
+        let path = models::ActivateAdHocSubProcessActivitiesPathParams {
+            ad_hoc_sub_process_instance_key: container_key,
+        };
+        let body = models::AdHocSubProcessActivateActivitiesInstruction::new(vec![
+            models::AdHocSubProcessActivateActivityReference::new("no-such-tool".into()),
+        ]);
+        let resp = server
+            .activate_ad_hoc_sub_process_activities_impl(&path, &body)
+            .await
+            .expect("the endpoint returns a response");
+        assert!(
+            matches!(resp, Resp::Status404_TheAd(_)),
+            "an unknown activity id maps to 404, got {resp:?}"
+        );
+
+        // The container is untouched — a subsequent real activation still succeeds.
+        let real = models::AdHocSubProcessActivateActivitiesInstruction::new(vec![
+            models::AdHocSubProcessActivateActivityReference::new("toolA".into()),
+        ]);
+        let resp2 = server
+            .activate_ad_hoc_sub_process_activities_impl(&path, &real)
+            .await
+            .expect("the endpoint returns a response");
+        assert!(
+            matches!(resp2, Resp::Status204_TheAd),
+            "activating a real tool after the unknown-id rejection is 204, got {resp2:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn deploy_rejects_linked_resource_missing_resource_type_with_400() {
         // Magikcraft/nano-bpm#767: a `zeebe:linkedResource` omitting the
         // Zeebe-required `resourceType` was silently dropped (deploy 200, empty
