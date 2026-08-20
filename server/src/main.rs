@@ -157,6 +157,11 @@ struct BatchOperationItemRecord {
 /// Outcome of a lifecycle transition (suspend/resume/cancel) request.
 enum BatchLifecycleOutcome {
     Ok,
+    /// The `(from, to)` pair is not a legal lifecycle move (e.g. resuming a
+    /// `CANCELED` batch, or otherwise leaving a terminal state). Maps to `400`.
+    Invalid {
+        detail: String,
+    },
     NotFound,
 }
 
@@ -168,11 +173,7 @@ impl BatchOperationStore {
     /// job here is to make the operation *trackable* (get/search) and expose its
     /// item counts, and to keep it in a state where the documented lifecycle
     /// transitions (`ACTIVE → SUSPENDED → ACTIVE`; any `→ CANCELED`) are valid.
-    fn create(
-        &self,
-        op_type: models::BatchOperationTypeEnum,
-        item_keys: Vec<u64>,
-    ) -> u64 {
+    fn create(&self, op_type: models::BatchOperationTypeEnum, item_keys: Vec<u64>) -> u64 {
         let now = now_millis();
         let mut inner = self.inner.lock().expect("batch-operation store poisoned");
         if inner.seq == 0 {
@@ -225,26 +226,55 @@ impl BatchOperationStore {
             .collect()
     }
 
-    /// Applies a lifecycle transition to `key`. `to` is the target state
-    /// (`SUSPENDED`, `ACTIVE`, or `CANCELED`); when `terminal` the end date is
-    /// stamped. Idempotent request semantics: an unknown key is `NotFound`.
-    fn transition(
-        &self,
-        key: u64,
-        to: models::BatchOperationStateEnum,
-        terminal: bool,
-    ) -> BatchLifecycleOutcome {
+    /// Applies a lifecycle transition to `key`, enforcing the documented batch
+    /// state machine: `ACTIVE ⇄ SUSPENDED`, and any non-terminal state `→
+    /// CANCELED`. Terminal states (`CANCELED`, `COMPLETED`, `FAILED`,
+    /// `PARTIALLY_COMPLETED`) are absorbing — you cannot leave them. Legal moves
+    /// that are also no-ops (`ACTIVE→ACTIVE`, `SUSPENDED→SUSPENDED`,
+    /// `CANCELED→CANCELED`) are accepted idempotently. `end_date_ms` is stamped
+    /// only on the *first* terminal transition, so repeated cancels never
+    /// restamp it. An illegal `(from, to)` pair is `Invalid` (maps to `400`); an
+    /// unknown key is `NotFound`.
+    fn transition(&self, key: u64, to: models::BatchOperationStateEnum) -> BatchLifecycleOutcome {
+        use models::BatchOperationStateEnum as S;
         let mut inner = self.inner.lock().expect("batch-operation store poisoned");
         match inner.ops.get_mut(&key) {
             None => BatchLifecycleOutcome::NotFound,
             Some(rec) => {
+                let from = rec.state;
+                let allowed = match to {
+                    // suspend / resume only shuttle between the two live states.
+                    S::Suspended => matches!(from, S::Active | S::Suspended),
+                    S::Active => matches!(from, S::Active | S::Suspended),
+                    // cancel is legal from any non-terminal state, and is an
+                    // idempotent no-op if the batch is already CANCELED.
+                    S::Canceled => from == S::Canceled || !Self::is_terminal(&from),
+                    _ => false,
+                };
+                if !allowed {
+                    return BatchLifecycleOutcome::Invalid {
+                        detail: format!(
+                            "Batch operation with key '{key}' cannot transition from {from} to {to}."
+                        ),
+                    };
+                }
                 rec.state = to;
-                if terminal {
+                if Self::is_terminal(&to) && rec.end_date_ms.is_none() {
                     rec.end_date_ms = Some(now_millis());
                 }
                 BatchLifecycleOutcome::Ok
             }
         }
+    }
+
+    /// Whether `state` is a terminal (absorbing) batch-operation state: once a
+    /// batch reaches one it cannot transition out of it.
+    fn is_terminal(state: &models::BatchOperationStateEnum) -> bool {
+        use models::BatchOperationStateEnum as S;
+        matches!(
+            state,
+            S::Canceled | S::Completed | S::Failed | S::PartiallyCompleted
+        )
     }
 }
 
@@ -15766,11 +15796,8 @@ impl ServerImpl {
         let sorted: Vec<(u64, BatchOperationRecord)> =
             matched.into_iter().map(|rec| (rec.key, rec)).collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
-        let items: Vec<models::BatchOperationResponse> = page
-            .items
-            .iter()
-            .map(batch_operation_response)
-            .collect();
+        let items: Vec<models::BatchOperationResponse> =
+            page.items.iter().map(batch_operation_response).collect();
 
         Ok(Resp::Status200_TheBatchOperationSearchResult(
             models::BatchOperationSearchQueryResult::new(page.response, items),
@@ -15787,7 +15814,11 @@ impl ServerImpl {
 
         // Flatten every item across all batch operations, carrying each item's
         // owning batch key + operation type for the response projection.
-        let mut matched: Vec<(u64, models::BatchOperationTypeEnum, BatchOperationItemRecord)> = self
+        let mut matched: Vec<(
+            u64,
+            models::BatchOperationTypeEnum,
+            BatchOperationItemRecord,
+        )> = self
             .batch_operations
             .all()
             .into_iter()
@@ -15810,7 +15841,10 @@ impl ServerImpl {
                             &f.state,
                             &item.state.to_string(),
                         )
-                        && query::match_batch_operation_type(&f.operation_type, &op_type.to_string())
+                        && query::match_batch_operation_type(
+                            &f.operation_type,
+                            &op_type.to_string(),
+                        )
                 }
             })
             .collect();
@@ -15868,13 +15902,15 @@ impl ServerImpl {
             }
         };
         Ok(
-            match self.batch_operations.transition(
-                key,
-                models::BatchOperationStateEnum::Suspended,
-                false,
-            ) {
+            match self
+                .batch_operations
+                .transition(key, models::BatchOperationStateEnum::Suspended)
+            {
                 BatchLifecycleOutcome::Ok => {
                     Resp::Status204_TheBatchOperationPauseRequestWasCreated
+                }
+                BatchLifecycleOutcome::Invalid { detail } => {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem("INVALID_STATE", 400, detail))
                 }
                 BatchLifecycleOutcome::NotFound => Resp::Status404_NotFound(problem(
                     "NOT_FOUND",
@@ -15902,13 +15938,15 @@ impl ServerImpl {
             }
         };
         Ok(
-            match self.batch_operations.transition(
-                key,
-                models::BatchOperationStateEnum::Active,
-                false,
-            ) {
+            match self
+                .batch_operations
+                .transition(key, models::BatchOperationStateEnum::Active)
+            {
                 BatchLifecycleOutcome::Ok => {
                     Resp::Status204_TheBatchOperationResumeRequestWasCreated
+                }
+                BatchLifecycleOutcome::Invalid { detail } => {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem("INVALID_STATE", 400, detail))
                 }
                 BatchLifecycleOutcome::NotFound => Resp::Status404_NotFound(problem(
                     "NOT_FOUND",
@@ -15936,13 +15974,15 @@ impl ServerImpl {
             }
         };
         Ok(
-            match self.batch_operations.transition(
-                key,
-                models::BatchOperationStateEnum::Canceled,
-                true,
-            ) {
+            match self
+                .batch_operations
+                .transition(key, models::BatchOperationStateEnum::Canceled)
+            {
                 BatchLifecycleOutcome::Ok => {
                     Resp::Status204_TheBatchOperationCancelRequestWasCreated
+                }
+                BatchLifecycleOutcome::Invalid { detail } => {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem("INVALID_STATE", 400, detail))
                 }
                 BatchLifecycleOutcome::NotFound => Resp::Status404_NotFound(problem(
                     "NOT_FOUND",
@@ -30085,7 +30125,11 @@ mod batch_operation_tests {
             .expect("deploy succeeds");
 
         let (instance_key, _) = server
-            .create_for_stream(Some("to-cancel".into()), None, std::collections::HashMap::new())
+            .create_for_stream(
+                Some("to-cancel".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
             .await
             .expect("create the instance");
 
@@ -30143,10 +30187,19 @@ mod batch_operation_tests {
             SearchResp::Status200_TheBatchOperationSearchResult(r) => r,
             other => panic!("expected a 200 search, got {other:?}"),
         };
-        assert!(found.items.iter().any(|b| b.batch_operation_key == batch_key));
+        assert!(
+            found
+                .items
+                .iter()
+                .any(|b| b.batch_operation_key == batch_key)
+        );
 
         // The item-search surfaces the instance as an item of the batch.
-        let items = match server.search_batch_operation_items_impl(&None).await.unwrap() {
+        let items = match server
+            .search_batch_operation_items_impl(&None)
+            .await
+            .unwrap()
+        {
             ItemsResp::Status200_TheBatchOperationSearchResult(r) => r,
             other => panic!("expected a 200 item search, got {other:?}"),
         };
@@ -30187,7 +30240,10 @@ mod batch_operation_tests {
             server.suspend_batch_operation_impl(&suspend).await.unwrap(),
             SuspendResp::Status204_TheBatchOperationPauseRequestWasCreated
         ));
-        assert_eq!(get(key).await.state, models::BatchOperationStateEnum::Suspended);
+        assert_eq!(
+            get(key).await.state,
+            models::BatchOperationStateEnum::Suspended
+        );
 
         // SUSPENDED → (resume) ACTIVE.
         let resume = models::ResumeBatchOperationPathParams {
@@ -30197,7 +30253,10 @@ mod batch_operation_tests {
             server.resume_batch_operation_impl(&resume).await.unwrap(),
             ResumeResp::Status204_TheBatchOperationResumeRequestWasCreated
         ));
-        assert_eq!(get(key).await.state, models::BatchOperationStateEnum::Active);
+        assert_eq!(
+            get(key).await.state,
+            models::BatchOperationStateEnum::Active
+        );
 
         // any → CANCELED (stamps an end date).
         let cancel = models::CancelBatchOperationPathParams {
@@ -30210,6 +30269,76 @@ mod batch_operation_tests {
         let after = get(key).await;
         assert_eq!(after.state, models::BatchOperationStateEnum::Canceled);
         assert!(matches!(after.end_date, types::Nullable::Present(_)));
+    }
+
+    #[tokio::test]
+    async fn canceled_is_terminal_and_rejects_further_transitions() {
+        use apis::batch_operation::CancelBatchOperationResponse as CancelResp;
+        use apis::batch_operation::GetBatchOperationResponse as GetResp;
+        use apis::batch_operation::ResumeBatchOperationResponse as ResumeResp;
+        use apis::batch_operation::SuspendBatchOperationResponse as SuspendResp;
+
+        let (server, key) = server_with_seeded_batch(
+            models::BatchOperationTypeEnum::CancelProcessInstance,
+            Vec::new(),
+        );
+        let get = |k: u64| {
+            let server = server.clone();
+            async move {
+                let path = models::GetBatchOperationPathParams {
+                    batch_operation_key: k.to_string(),
+                };
+                match server.get_batch_operation_impl(&path).await.unwrap() {
+                    GetResp::Status200_TheBatchOperationWasFound(r) => r,
+                    other => panic!("expected 200 get, got {other:?}"),
+                }
+            }
+        };
+
+        // ACTIVE → CANCELED stamps a terminal end date.
+        let cancel = models::CancelBatchOperationPathParams {
+            batch_operation_key: key.to_string(),
+        };
+        assert!(matches!(
+            server.cancel_batch_operation_impl(&cancel).await.unwrap(),
+            CancelResp::Status204_TheBatchOperationCancelRequestWasCreated
+        ));
+        let stamped = match get(key).await.end_date {
+            types::Nullable::Present(dt) => dt,
+            types::Nullable::Null => panic!("cancel must stamp an end date"),
+        };
+
+        // Leaving CANCELED via suspend or resume is illegal → 400, and the state
+        // stays CANCELED (never hops out of a terminal state).
+        let suspend = models::SuspendBatchOperationPathParams {
+            batch_operation_key: key.to_string(),
+        };
+        assert!(matches!(
+            server.suspend_batch_operation_impl(&suspend).await.unwrap(),
+            SuspendResp::Status400_TheProvidedDataIsNotValid(_)
+        ));
+        let resume = models::ResumeBatchOperationPathParams {
+            batch_operation_key: key.to_string(),
+        };
+        assert!(matches!(
+            server.resume_batch_operation_impl(&resume).await.unwrap(),
+            ResumeResp::Status400_TheProvidedDataIsNotValid(_)
+        ));
+        assert_eq!(
+            get(key).await.state,
+            models::BatchOperationStateEnum::Canceled
+        );
+
+        // Re-cancel is an idempotent no-op (204) that never restamps end_date.
+        assert!(matches!(
+            server.cancel_batch_operation_impl(&cancel).await.unwrap(),
+            CancelResp::Status204_TheBatchOperationCancelRequestWasCreated
+        ));
+        assert_eq!(
+            get(key).await.end_date,
+            types::Nullable::Present(stamped),
+            "a repeated cancel must not restamp the terminal end date"
+        );
     }
 
     #[tokio::test]
@@ -30242,14 +30371,20 @@ mod batch_operation_tests {
             batch_operation_key: "nope".to_string(),
         };
         assert!(matches!(
-            server.suspend_batch_operation_impl(&bad_suspend).await.unwrap(),
+            server
+                .suspend_batch_operation_impl(&bad_suspend)
+                .await
+                .unwrap(),
             SuspendResp::Status400_TheProvidedDataIsNotValid(_)
         ));
         let missing_suspend = models::SuspendBatchOperationPathParams {
             batch_operation_key: "888888".to_string(),
         };
         assert!(matches!(
-            server.suspend_batch_operation_impl(&missing_suspend).await.unwrap(),
+            server
+                .suspend_batch_operation_impl(&missing_suspend)
+                .await
+                .unwrap(),
             SuspendResp::Status404_NotFound(_)
         ));
     }
@@ -30262,7 +30397,10 @@ mod batch_operation_tests {
 
         // A missing body is invalid input → 400, never a 500.
         assert!(matches!(
-            server.resolve_incidents_batch_operation_impl(&None).await.unwrap(),
+            server
+                .resolve_incidents_batch_operation_impl(&None)
+                .await
+                .unwrap(),
             Resp::Status400_TheProcessInstanceBatchOperationFailed(_)
         ));
 
