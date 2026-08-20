@@ -7737,6 +7737,340 @@ fn output_mapping_projects_job_result() {
 }
 
 #[test]
+fn input_mapping_eval_failure_raises_io_mapping_incident_and_no_job() {
+    // #939: an input `zeebe:ioMapping` whose SOURCE fails to evaluate (here
+    // `=x + 1` with `x` bound to a string — a FEEL type error, not a bare
+    // missing reference) must raise an `IO_MAPPING_ERROR` incident and PARK the
+    // element ACTIVATED — no job, no silent proceed with the target unset.
+    // Before the fix the failure was swallowed (`continue`) and the token sailed
+    // on. Fixing the variable and resolving the incident re-drives the activation
+    // body, which re-applies the now-valid mapping and creates the job.
+    let def = ProcessBuilder::new("io-in-fail")
+        .start_event("s")
+        .service_task("t", "work")
+        .with_io(
+            "t",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=x + 1".to_string(),
+                    target: "y".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("e")
+        .connect("s", "t")
+        .connect("t", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let key = engine
+        .apply_command(Command::create_instance_with(
+            "io-in-fail",
+            vars(&[("x", Value::Str("oops".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // The input mapping failed: exactly one active IoMapping incident, no job,
+    // and the token is parked (the service task never enacted its behaviour).
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
+    assert_eq!(engine.state().jobs.len(), 0, "no job while parked");
+    assert!(!engine.is_completed(key));
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix `x` to a number and resolve: the activation body re-runs, the mapping
+    // now evaluates (`y = 42`), and the job is created with the mapped variable.
+    engine
+        .apply_command(Command::set_variables(
+            key,
+            HashMap::from([("x".to_string(), Value::Int(41))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    assert!(engine.instance(key).unwrap().incidents.is_empty());
+    assert_eq!(engine.state().jobs.len(), 1, "job created on resolution");
+    let job = &engine.activate_jobs("work", "w", 1, 60_000, 0)[0];
+    assert_eq!(job.variables.get("y"), Some(&Value::Int(42)));
+}
+
+#[test]
+fn output_mapping_eval_failure_raises_incident_and_does_not_complete() {
+    // #939: an output `zeebe:ioMapping` whose SOURCE fails to evaluate at
+    // completion must raise an incident and hold the element in the COMPLETING
+    // phase rather than completing it with the target silently unset. Resolution
+    // re-drives `Complete`, re-evaluating the mapping against the (now-fixed)
+    // variables without re-running the job.
+    let def = ProcessBuilder::new("io-out-fail")
+        .start_event("s")
+        .service_task("t", "work")
+        .with_io(
+            "t",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=bad + 1".to_string(),
+                    target: "approved".to_string(),
+                }],
+            },
+        )
+        .end_event("e")
+        .connect("s", "t")
+        .connect("t", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let key = engine
+        .apply_command(Command::create_instance_with(
+            "io-out-fail",
+            vars(&[("bad", Value::Str("oops".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
+    engine
+        .apply_command(Command::complete_job(job_key))
+        .unwrap();
+
+    // The output mapping failed: one active IoMappingOutput incident (the
+    // output-phase kind, REST `IO_MAPPING_ERROR` — matching Zeebe, which raises
+    // `IO_MAPPING_ERROR` for both input and output mapping failures), and the
+    // element has NOT completed.
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(active[0].kind, state::IncidentKind::IoMappingOutput);
+    assert!(
+        !engine.is_completed(key),
+        "must not complete on eval failure"
+    );
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix `bad` and resolve: `Complete` re-drives, the mapping evaluates
+    // (`approved = 42`), and the instance runs to completion.
+    engine
+        .apply_command(Command::set_variables(
+            key,
+            HashMap::from([("bad".to_string(), Value::Int(41))]),
+        ))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(engine.instance(key).unwrap().incidents.is_empty());
+    assert!(engine.is_completed(key), "completes after resolution");
+    assert_eq!(
+        merged_var(&events, "approved"),
+        Some(Value::Int(42)),
+        "output mapping should surface approved=42; events: {events:?}"
+    );
+}
+
+#[test]
+fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
+    // Regression: an OUTPUT `zeebe:ioMapping` failure on a message intermediate
+    // catch event parks the token in the COMPLETING phase *after* the message
+    // has already been correlated and consumed. Resolving the incident must
+    // re-drive `Complete` (re-projecting the now-fixed output mapping for the
+    // same token), NOT `ReopenCatch` — reopening the subscription would strand
+    // the token waiting for a *second* message that will never arrive.
+    // `ReopenCatch` is reserved for correlation-key (ACTIVATING) failures, which
+    // surface as `ExpressionEvaluation`, never as `IoMappingOutput`.
+    let def = ProcessBuilder::new("msg-out-fail")
+        .start_event("s")
+        .message_intermediate_catch_event("await", "approve", "orderId")
+        .with_io(
+            "await",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=bad + 1".to_string(),
+                    target: "approved".to_string(),
+                }],
+            },
+        )
+        .end_event("e")
+        .connect("s", "await")
+        .connect("await", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let key = engine
+        .apply_command(Command::create_instance_with(
+            "msg-out-fail",
+            vars(&[
+                ("orderId", Value::Str("A".into())),
+                ("bad", Value::Str("oops".into())),
+            ]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Parked on one open message subscription.
+    let subs = engine.message_subscriptions();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].state, state::MessageSubscriptionState::Open);
+
+    // Correlating drives completion, which applies the output mapping
+    // `=bad + 1` (string + int) and fails: one IoMappingOutput incident, the
+    // token held in COMPLETING, and the subscription already consumed.
+    engine.correlate_message("approve", "A", HashMap::new(), 0);
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(active[0].kind, state::IncidentKind::IoMappingOutput);
+    assert!(
+        !engine.is_completed(key),
+        "must not complete on eval failure"
+    );
+    assert!(
+        engine
+            .message_subscriptions()
+            .iter()
+            .all(|s| s.state != state::MessageSubscriptionState::Open),
+        "the correlated subscription is consumed, not left open"
+    );
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix `bad` and resolve. The regression: resolution must re-drive `Complete`
+    // (the token runs to completion), not `ReopenCatch` (which would open a
+    // fresh subscription and never complete for lack of a second message).
+    engine
+        .apply_command(Command::set_variables(
+            key,
+            HashMap::from([("bad".to_string(), Value::Int(41))]),
+        ))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    assert!(engine.instance(key).unwrap().incidents.is_empty());
+    assert!(
+        engine.is_completed(key),
+        "message-catch output-mapping incident must resolve by completing the \
+         token, not reopening the catch; events: {events:?}"
+    );
+    assert!(
+        engine
+            .message_subscriptions()
+            .iter()
+            .all(|s| s.state != state::MessageSubscriptionState::Open),
+        "resolution must not reopen the message subscription"
+    );
+    assert_eq!(
+        merged_var(&events, "approved"),
+        Some(Value::Int(42)),
+        "output mapping should surface approved=42; events: {events:?}"
+    );
+}
+
+#[test]
+fn subprocess_output_mapping_eval_failure_raises_io_mapping_output_incident() {
+    // #939 parity (ports Zeebe `OutputMappingIncidentTest` to a scoped element):
+    // an OUTPUT `zeebe:ioMapping` failure on a *sub-process* (not the mainstream
+    // service-task path) must raise the `IoMappingOutput` incident kind (REST
+    // `IO_MAPPING_ERROR` — the same taxonomy Zeebe raises for both input and
+    // output mapping failures) and hold the sub-process in COMPLETING rather than
+    // completing it with the target silently unset. This locks the taxonomy
+    // relabel across every output path, not just the mainstream element.
+    //
+    // NOTE: the *resolution* re-drive for scoped/specialized completion paths
+    // (sub-process, MI, ad-hoc, call-activity) is tracked as a follow-up to #939
+    // (phase-driven re-drive, dropping the `IncidentKind`→`Step` coupling); the
+    // mainstream service-task output path is fully resolvable and covered by
+    // `output_mapping_eval_failure_raises_incident_and_does_not_complete`.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(vec![
+            crate::model::Mapping {
+                source: "=bad + 1".to_string(),
+                target: "exported".to_string(),
+            },
+        ])))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "sub-scope",
+            vars(&[("seed", Value::Int(4)), ("bad", Value::Str("oops".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    // Completing the inner job drives the sub-process into its output-mapping
+    // projection, which fails on `=bad + 1` (string + int).
+    let _ = complete_one(&mut engine, "work");
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(
+        active[0].kind,
+        state::IncidentKind::IoMappingOutput,
+        "a sub-process output-mapping failure must raise IO_MAPPING_ERROR, not EXTRACT_VALUE_ERROR",
+    );
+    assert_eq!(
+        active[0].element_id, "sub",
+        "the incident parks on the sub-process, not the inner task"
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "the process must not complete while the output mapping is unresolved"
+    );
+}
+
+#[test]
+fn bare_missing_var_input_mapping_assigns_null_without_incident() {
+    // Scope guard for #939: a bare reference to a MISSING variable (`=missing`)
+    // is FEEL `null` (an `Ok`), NOT an evaluation failure — it must still assign
+    // the target as `null` and raise NO incident. Only a source that genuinely
+    // errors (parse/type error, operation on a missing value) halts the element.
+    let def = ProcessBuilder::new("io-in-null")
+        .start_event("s")
+        .service_task("t", "work")
+        .with_io(
+            "t",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=missing".to_string(),
+                    target: "y".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("e")
+        .connect("s", "t")
+        .connect("t", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let _ = create_instance_key(&mut engine, "io-in-null");
+    assert!(
+        engine.active_incidents().is_empty(),
+        "a bare missing-var input (FEEL null) must not raise an incident"
+    );
+    let job = &engine.activate_jobs("work", "w", 1, 60_000, 0)[0];
+    assert_eq!(
+        job.variables.get("y"),
+        Some(&Value::Null),
+        "the target is assigned null, not dropped"
+    );
+}
+
+#[test]
 fn input_mapping_with_dotted_target_builds_nested_context() {
     // A dotted target `order.total` merges into a nested context, preserving the
     // other members of an existing `order`.

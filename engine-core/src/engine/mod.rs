@@ -169,6 +169,13 @@ pub struct Engine {
     cluster_variables: crate::cluster_vars::ClusterVariables,
 }
 
+/// A `zeebe:ioMapping` source expression that failed to evaluate. Carries a
+/// human-readable `reason` for the `IO_MAPPING_ERROR` incident the caller raises
+/// (#939).
+pub(crate) struct IoMappingFailure {
+    pub(crate) reason: String,
+}
+
 /// A unit of internal work in the processing loop — one transition of the BPMN
 /// element lifecycle.
 enum Step {
@@ -203,6 +210,17 @@ enum Step {
     /// `ElementActivating`/`ElementActivated` are not re-emitted — only the
     /// subscription is re-derived once the referenced variables are corrected.
     ReopenCatch {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    },
+    /// Re-run the activation body of an already-active element whose input
+    /// `zeebe:ioMapping` raised an `IoMapping` incident (#939). The element
+    /// instance is already ACTIVATED (its `ElementActivating`/`ElementActivated`
+    /// were emitted on the first pass and are not re-emitted); this re-applies the
+    /// (now-fixed) input mappings and re-enacts the element's behaviour, exactly
+    /// as the first activation would have had the mappings evaluated cleanly.
+    RetryActivation {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
@@ -2164,9 +2182,10 @@ impl Engine {
                     // job to the activatable pool, so a worker retries it via the
                     // normal activate/complete path. Nothing more to enqueue.
                     state::IncidentKind::JobNoRetries => {}
-                    // Exclusive gateway matched no flow, or a condition failed to
-                    // evaluate: re-evaluate the gateway against the (possibly
-                    // updated) variables.
+                    // Exclusive gateway matched no flow, or a condition/decision/
+                    // called-element expression failed to evaluate: re-evaluate the
+                    // element against the (possibly updated) variables by re-driving
+                    // `Complete`.
                     state::IncidentKind::NoMatchingSequenceFlow
                     | state::IncidentKind::ExpressionEvaluation
                     | state::IncidentKind::DecisionEvaluation
@@ -2193,10 +2212,44 @@ impl Engine {
                             });
                         }
                     }
+                    // An *output* `zeebe:ioMapping` that failed at completion parks
+                    // the element in the COMPLETING phase; re-driving `Complete`
+                    // re-projects the now-fixed output mapping without re-running
+                    // the element's behaviour — the same lifecycle as a
+                    // script/decision output failure. This must NOT take the
+                    // message-catch `ReopenCatch` branch above: an output-mapping
+                    // failure occurs *after* the message was already correlated and
+                    // consumed, so reopening the subscription would strand the token
+                    // waiting for a *second* message instead of retrying the mapping.
+                    // `ReopenCatch` is reserved for correlation-key (ACTIVATING)
+                    // failures, which surface as `ExpressionEvaluation`.
+                    state::IncidentKind::IoMappingOutput => {
+                        queue.push_back(Step::Complete {
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                        });
+                    }
                     // Uncaught business error: re-create a job for the still-active
                     // service task so a worker can attempt it again.
                     state::IncidentKind::UnhandledError => {
                         queue.push_back(Step::CreateJob {
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                        });
+                    }
+                    // An input `zeebe:ioMapping` whose source failed to evaluate
+                    // (#939): the element parked ACTIVATED with no behaviour run
+                    // (no job, no scope-local mapped values). Re-driving `Complete`
+                    // would advance the token past the activity without ever
+                    // running it, so instead re-run the activation body — it
+                    // re-applies the now-fixed input mappings and re-enacts the
+                    // element's behaviour (creating the job, opening the scope,
+                    // etc.). Output-mapping failures park in the COMPLETING phase
+                    // as `IoMappingOutput` and are re-driven by `Complete` above.
+                    state::IncidentKind::IoMapping => {
+                        queue.push_back(Step::RetryActivation {
                             instance_key,
                             element_instance_key,
                             element_id,
@@ -3712,7 +3765,25 @@ impl Engine {
                 HashMap::new()
             } else {
                 let visible = self.variables_for_element(instance_key, eik);
-                self.eval_io_mappings_in(&visible, &outputs)
+                match self.eval_io_mappings_in(&visible, &outputs) {
+                    Ok(updates) => updates,
+                    Err(failure) => {
+                        // An output mapping that fails to evaluate halts the
+                        // sub-process in COMPLETING with an incident rather than
+                        // completing it with the target unset (#939). Skip this
+                        // sub-process for the rest of the sweep; it stays active
+                        // parked on the incident (re-driven by `Complete` on
+                        // resolution).
+                        let event = self.io_mapping_output_incident(
+                            instance_key,
+                            eik,
+                            element_id.clone(),
+                            failure,
+                        );
+                        self.emit(log, event);
+                        continue;
+                    }
+                }
             };
             self.emit(
                 log,
@@ -3855,6 +3926,18 @@ impl Engine {
                 let scope = self.scope_of(instance_key, element_instance_key);
                 self.run_activation_body(instance_key, element_id, element_instance_key, scope)
             }
+            Step::RetryActivation {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                // The element instance is already ACTIVATED (parked on the
+                // resolved input-mapping incident); reconstruct its enclosing
+                // scope and re-run the activation body so the now-fixed input
+                // mappings are re-applied before the element's behaviour runs.
+                let scope = self.scope_of(instance_key, element_instance_key);
+                self.activate_body(instance_key, element_id, element_instance_key, scope)
+            }
             Step::ActivateMiChild {
                 instance_key,
                 element_id,
@@ -3961,21 +4044,68 @@ impl Engine {
         ];
         let mut followups = Vec::new();
 
+        // A sub-process is itself a variable scope: it always registers its scope
+        // (so writes inside it can resolve/propagate correctly) and its inputs are
+        // local to that scope, exactly like a leaf activity. An ad-hoc sub-process
+        // container (a job-bearing ServiceTask that appears in the definition's
+        // ad-hoc catalog) is likewise a variable scope — its activated tool
+        // children run inside it and its `outputCollection` accumulates there — so
+        // it always registers a scope (ADR 0023 seam 2). Registered here, on first
+        // activation, BEFORE the input mappings run; a resolved input-mapping
+        // incident re-runs only `activate_body`, which sees the scope already
+        // registered and does not re-create it.
+        let is_sub_process = matches!(kind, Some(ElementKind::SubProcess { .. }));
+        let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
+        let is_adhoc_container = adhoc_def.is_some();
+        if is_sub_process || is_adhoc_container {
+            events.push(Event::VariableScopeCreated {
+                instance_key,
+                scope_key: element_instance_key,
+                parent_scope_key: scope,
+            });
+        }
+
+        let (body_events, body_followups) =
+            self.activate_body(instance_key, element_id, element_instance_key, scope);
+        events.extend(body_events);
+        followups.extend(body_followups);
+        (events, followups)
+    }
+
+    /// The element's activation body: everything between `ElementActivated` and
+    /// the element's own behaviour. Seeds any ad-hoc `outputCollection`, applies
+    /// the input `zeebe:ioMapping`s LOCAL to the element's own scope, runs the
+    /// `start` execution-listener gate, then (listener-free) runs
+    /// [`run_activation_body`]. Split out of [`activate`] so a resolved
+    /// input-mapping incident can re-drive it ([`Step::RetryActivation`]) to
+    /// re-apply the now-fixed mappings and re-enact the behaviour without
+    /// re-emitting `ElementActivating`/`ElementActivated` or re-registering the
+    /// scope.
+    ///
+    /// An input mapping whose source expression fails to evaluate raises an
+    /// `IO_MAPPING_ERROR` incident and halts the element (returning only the
+    /// incident event, no behaviour) rather than silently proceeding with the
+    /// target variable unset — matching Zeebe (#939).
+    fn activate_body(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        element_instance_key: Key,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
         // Input mappings (zeebe:input): evaluate against the variables visible to
         // the activating element and create the mapped values LOCAL to the
         // element's own scope (Zeebe semantics) — visible to the element's job or
         // inner flow, not propagated to the parent, and dropped when the element
-        // completes. A sub-process is itself a variable scope: it always registers
-        // its scope (so writes inside it can resolve/propagate correctly) and its
-        // inputs are local to that scope, exactly like a leaf activity.
+        // completes.
+        let kind = self.element_kind(instance_key, &element_id);
         let is_sub_process = matches!(kind, Some(ElementKind::SubProcess { .. }));
-        // An ad-hoc sub-process container (a job-bearing ServiceTask that appears
-        // in the definition's ad-hoc catalog): like a sub-process it is a variable
-        // scope — its activated tool children run inside it and its
-        // `outputCollection` accumulates there — so it always registers a scope
-        // (ADR 0023 seam 2).
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
         let is_adhoc_container = adhoc_def.is_some();
+        // The element's own scope is registered by `activate` for a
+        // sub-process/ad-hoc container (before this body runs); a leaf activity
+        // registers it lazily below, only if its inputs produce values.
+        let scope_registered = is_sub_process || is_adhoc_container;
         let inputs = self.io_inputs(instance_key, &element_id);
 
         // The scoped variable view the activating element evaluates against: both
@@ -3988,18 +4118,12 @@ impl Engine {
         // scope's locals, so an input mapping that reads an enclosing-scope-local
         // variable resolves correctly (Zeebe parity). A sub-process's own inputs
         // are evaluated here against its *parent* scope and then applied local to
-        // the new sub-process scope below.
+        // the new sub-process scope.
         let element_vars = self.variables_for_element(instance_key, scope);
 
-        let mut scope_registered = false;
-        if is_sub_process || is_adhoc_container {
-            events.push(Event::VariableScopeCreated {
-                instance_key,
-                scope_key: element_instance_key,
-                parent_scope_key: scope,
-            });
-            scope_registered = true;
-        }
+        let mut events: Vec<Event> = Vec::new();
+        let followups: Vec<Step> = Vec::new();
+
         // Seed the ad-hoc container's `outputCollection` to an empty array as a
         // local variable the moment it activates (Zeebe
         // `AdHocSubProcessProcessor.onActivate`), BEFORE the container's own input
@@ -4015,22 +4139,40 @@ impl Engine {
                 variables: HashMap::from([(name, Value::List(Vec::new()))]),
             });
         }
-        if !inputs.is_empty() {
-            let updates = self.eval_io_mappings_in(&element_vars, &inputs);
-            if !updates.is_empty() {
-                if !scope_registered {
-                    events.push(Event::VariableScopeCreated {
-                        instance_key,
-                        scope_key: element_instance_key,
-                        parent_scope_key: scope,
-                    });
+        // A source expression that fails to evaluate raises an `IO_MAPPING_ERROR`
+        // incident and halts the element (no scope write, no behaviour) — the
+        // resolution re-drives this body (#939).
+        let input_updates = if inputs.is_empty() {
+            HashMap::new()
+        } else {
+            match self.eval_io_mappings_in(&element_vars, &inputs) {
+                Ok(updates) => updates,
+                Err(failure) => {
+                    return (
+                        vec![self.io_mapping_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            failure,
+                        )],
+                        Vec::new(),
+                    );
                 }
-                events.push(Event::ScopedVariablesUpdated {
+            }
+        };
+        if !input_updates.is_empty() {
+            if !scope_registered {
+                events.push(Event::VariableScopeCreated {
                     instance_key,
                     scope_key: element_instance_key,
-                    variables: updates,
+                    parent_scope_key: scope,
                 });
             }
+            events.push(Event::ScopedVariablesUpdated {
+                instance_key,
+                scope_key: element_instance_key,
+                variables: input_updates.clone(),
+            });
         }
 
         // Start execution listeners (ADR 0037): before the element enacts its
@@ -4048,10 +4190,7 @@ impl Engine {
         );
         if let Some(first) = start_listeners.first() {
             let mut listener_vars = (*element_vars).clone();
-            if !inputs.is_empty() {
-                let updates = self.eval_io_mappings_in(&element_vars, &inputs);
-                listener_vars.extend(updates);
-            }
+            listener_vars.extend(input_updates);
             let job_key = self.mint_key();
             let job_type = self.resolve_job_type(&listener_vars, &first.job_type);
             let retries = self.resolve_retries(&listener_vars, first.retries.as_deref());
@@ -4073,8 +4212,94 @@ impl Engine {
         let (kind_events, kind_followups) =
             self.run_activation_body(instance_key, element_id, element_instance_key, scope);
         events.extend(kind_events);
-        followups.extend(kind_followups);
-        (events, followups)
+        (events, kind_followups)
+    }
+
+    /// Builds an `IO_MAPPING_ERROR` [`Event::IncidentRaised`] for an input
+    /// `zeebe:ioMapping` whose source expression failed to evaluate on activation
+    /// (#939). Mirrors the script-task / correlation-key incident precedent: the
+    /// element instance stays ACTIVATED and parks on the incident; resolving it
+    /// re-drives `activate_body` ([`Step::RetryActivation`]) to re-apply the
+    /// now-fixed mapping. Used only for elements activated via [`activate`] (the
+    /// mainstream input path); the specialized multi-instance / ad-hoc /
+    /// call-activity activation paths — which do not go through `activate_body` —
+    /// use [`io_mapping_expr_incident`] instead, so a resolution re-drives their
+    /// own completion path rather than the wrong `activate_body`.
+    fn io_mapping_incident(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        failure: IoMappingFailure,
+    ) -> Event {
+        Event::IncidentRaised {
+            incident_key: self.mint_key(),
+            instance_key,
+            element_instance_key,
+            element_id,
+            kind: state::IncidentKind::IoMapping,
+            reason: failure.reason,
+            job_key: None,
+            created_at: self.now,
+        }
+    }
+
+    /// Builds an `IO_MAPPING_ERROR` [`Event::IncidentRaised`] for an **output**
+    /// `zeebe:ioMapping` whose source failed to evaluate at completion, using the
+    /// [`state::IncidentKind::IoMappingOutput`] kind (REST `IO_MAPPING_ERROR`)
+    /// whose resolution re-drives `Complete` (#939). The element halts in the
+    /// COMPLETING phase; resolving it re-projects the now-fixed output mapping
+    /// without re-running the element's behaviour — the same lifecycle as the
+    /// former `ExpressionEvaluation` routing, but reported under the correct
+    /// `IO_MAPPING_ERROR` taxonomy (Zeebe parity: both input and output mapping
+    /// failures raise `IO_MAPPING_ERROR`). Used for every output-mapping failure:
+    /// the mainstream element, sub-processes, multi-instance children, ad-hoc
+    /// tools, and call activities.
+    fn io_mapping_output_incident(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        failure: IoMappingFailure,
+    ) -> Event {
+        Event::IncidentRaised {
+            incident_key: self.mint_key(),
+            instance_key,
+            element_instance_key,
+            element_id,
+            kind: state::IncidentKind::IoMappingOutput,
+            reason: failure.reason,
+            job_key: None,
+            created_at: self.now,
+        }
+    }
+
+    /// Builds an [`Event::IncidentRaised`] for a `zeebe:ioMapping` whose source
+    /// failed to evaluate, using the `ExpressionEvaluation` kind (REST
+    /// `EXTRACT_VALUE_ERROR`) whose resolution re-drives `Complete`. Now used only
+    /// for the specialized multi-instance / ad-hoc / call-activity **input**
+    /// activation paths, which are not re-driven by `activate_body` and whose
+    /// correct context-preserving re-activation (plus `IO_MAPPING_ERROR`
+    /// relabelling) is tracked as a follow-up to #939. Output mappings use
+    /// [`io_mapping_output_incident`]; the mainstream input path uses
+    /// [`io_mapping_incident`].
+    fn io_mapping_expr_incident(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        failure: IoMappingFailure,
+    ) -> Event {
+        Event::IncidentRaised {
+            incident_key: self.mint_key(),
+            instance_key,
+            element_instance_key,
+            element_id,
+            kind: state::IncidentKind::ExpressionEvaluation,
+            reason: failure.reason,
+            job_key: None,
+            created_at: self.now,
+        }
     }
 
     /// Runs an element's own activation behaviour — everything after
@@ -4614,7 +4839,16 @@ impl Engine {
         let input_updates = if inputs.is_empty() {
             HashMap::new()
         } else {
+            // The body overlays the activity's own input mappings only to evaluate
+            // the input COLLECTION expression; the mappings are authoritatively
+            // applied — and their eval failures raised as incidents (#939) — on
+            // each child in `activate_mi_child`, where `inputElement`/`loopCounter`
+            // are bound. At the body level those child bindings do not yet exist,
+            // so a mapping that references them legitimately fails here; tolerate
+            // that and fall back to the un-overlaid scope (the per-child pass still
+            // halts loudly on a genuine failure).
             self.eval_io_mappings_in(&enclosing_vars, &inputs)
+                .unwrap_or_default()
         };
         if !input_updates.is_empty() {
             events.push(Event::ScopedVariablesUpdated {
@@ -4803,17 +5037,52 @@ impl Engine {
         // and, for a sub-process child, to its inner flow.
         let inputs = self.io_inputs(instance_key, &element_id);
         if !inputs.is_empty() {
-            let mut mapped = self.eval_io_mappings_in(&child_vars, &inputs);
-            // `loopCounter` is a reserved MI binding. The child's output-collection
-            // index is now engine-owned runtime state (`MultiInstanceState::
-            // child_indices`, read back by `complete_mi_child`), so a clobbered
-            // counter can no longer misindex a child's output. We still drop any
-            // user `zeebe:input` mapping targeting `loopCounter` so the FEEL-visible
-            // reserved binding (job type, `outputElement`, etc.) keeps reporting the
-            // true engine-owned counter rather than a mapped-over value.
-            mapped.remove("loopCounter");
-            child_vars.extend(mapped.clone());
-            locals.extend(mapped);
+            match self.eval_io_mappings_in(&child_vars, &inputs) {
+                Ok(mut mapped) => {
+                    // `loopCounter` is a reserved MI binding. The child's
+                    // output-collection index is now engine-owned runtime state
+                    // (`MultiInstanceState::child_indices`, read back by
+                    // `complete_mi_child`), so a clobbered counter can no longer
+                    // misindex a child's output. We still drop any user
+                    // `zeebe:input` mapping targeting `loopCounter` so the
+                    // FEEL-visible reserved binding (job type, `outputElement`,
+                    // etc.) keeps reporting the true engine-owned counter rather
+                    // than a mapped-over value.
+                    mapped.remove("loopCounter");
+                    child_vars.extend(mapped.clone());
+                    locals.extend(mapped);
+                }
+                Err(failure) => {
+                    // A per-child input mapping that fails to evaluate halts the
+                    // child with an incident rather than running it against a
+                    // silently-unset variable (#939). The child is activated and
+                    // parked on the incident so the body waits for it.
+                    let mut events = vec![
+                        Event::ElementActivating {
+                            instance_key,
+                            element_instance_key: child_key,
+                            element_id: element_id.clone(),
+                        },
+                        Event::ElementActivated {
+                            instance_key,
+                            element_instance_key: child_key,
+                            element_id: element_id.clone(),
+                            scope: body_key,
+                        },
+                        Event::MultiInstanceChildActivated {
+                            instance_key,
+                            body_key,
+                            child_key,
+                            index,
+                            local_variables: locals,
+                        },
+                    ];
+                    let event =
+                        self.io_mapping_expr_incident(instance_key, child_key, element_id, failure);
+                    events.push(event);
+                    return (events, Vec::new());
+                }
+            }
         }
 
         let mut events = vec![
@@ -4976,18 +5245,37 @@ impl Engine {
         // therefore overlay the mapped values onto the eval context in memory
         // rather than writing them into the (about-to-be-torn-down, non-propagated)
         // child scope.
-        let output = output_element.as_deref().and_then(|expr| {
-            let visible = self.variables_for_element(instance_key, child_eik);
-            let outputs = self.io_outputs(instance_key, &element_id);
-            if outputs.is_empty() {
-                crate::feel::eval(expr, &visible).ok()
-            } else {
-                let mapped = self.eval_io_mappings_in(&visible, &outputs);
-                let mut vars = (*visible).clone();
-                vars.extend(mapped);
-                crate::feel::eval(expr, &vars).ok()
+        let output = match output_element.as_deref() {
+            None => None,
+            Some(expr) => {
+                let visible = self.variables_for_element(instance_key, child_eik);
+                let outputs = self.io_outputs(instance_key, &element_id);
+                if outputs.is_empty() {
+                    crate::feel::eval(expr, &visible).ok()
+                } else {
+                    match self.eval_io_mappings_in(&visible, &outputs) {
+                        Ok(mapped) => {
+                            let mut vars = (*visible).clone();
+                            vars.extend(mapped);
+                            crate::feel::eval(expr, &vars).ok()
+                        }
+                        Err(failure) => {
+                            // An output mapping that fails to evaluate halts the
+                            // child with an incident instead of completing it with
+                            // a silently-unset output (#939). The child does not
+                            // complete; resolution re-drives its completion.
+                            let event = self.io_mapping_output_incident(
+                                instance_key,
+                                child_eik,
+                                element_id,
+                                failure,
+                            );
+                            return (vec![event], Vec::new());
+                        }
+                    }
+                }
             }
-        });
+        };
         events.push(Event::MultiInstanceChildCompleted {
             instance_key,
             body_key,
@@ -5086,7 +5374,15 @@ impl Engine {
             if let Some(map) = &collection_map {
                 ctx.extend(map.clone());
             }
-            self.eval_io_mappings_in(&ctx, &outputs)
+            // The body evaluates the ACTIVITY's own output mappings against the
+            // body scope overlaid with the aggregated `outputCollection`. A mapping
+            // that references per-child bindings (`inputElement`/`loopCounter`) —
+            // which do not exist at the body level — legitimately fails here; it is
+            // authoritatively applied, and its eval failure raised as an incident
+            // (#939), per child in `complete_mi_child`. Tolerate the body-level
+            // failure and fall back to the un-mapped view (the per-child pass still
+            // halts loudly on a genuine failure).
+            self.eval_io_mappings_in(&ctx, &outputs).unwrap_or_default()
         };
 
         let mut events = Vec::new();
@@ -5592,9 +5888,25 @@ impl Engine {
         if let Some(cid) = container_element_id.as_deref() {
             let inputs = self.adhoc_tool_io(instance_key, cid, &element_id).inputs;
             if !inputs.is_empty() {
-                let input_updates = self.eval_io_mappings_in(&child_vars, &inputs);
-                child_vars.extend(input_updates.clone());
-                local_variables.extend(input_updates);
+                match self.eval_io_mappings_in(&child_vars, &inputs) {
+                    Ok(input_updates) => {
+                        child_vars.extend(input_updates.clone());
+                        local_variables.extend(input_updates);
+                    }
+                    Err(failure) => {
+                        // A tool input mapping that fails to evaluate halts the
+                        // ad-hoc container with an incident rather than running the
+                        // tool against a silently-unset variable (#939). The tool
+                        // child is not created; the container parks on the incident.
+                        let event = self.io_mapping_expr_incident(
+                            instance_key,
+                            container_key,
+                            cid.to_string(),
+                            failure,
+                        );
+                        return (vec![event], Vec::new());
+                    }
+                }
             }
         }
 
@@ -5998,7 +6310,22 @@ impl Engine {
                 HashMap::new()
             } else {
                 let vars = self.variables_for_element(instance_key, child_eik);
-                self.eval_io_mappings_in(&vars, &outputs)
+                match self.eval_io_mappings_in(&vars, &outputs) {
+                    Ok(updates) => updates,
+                    Err(failure) => {
+                        // A tool output mapping that fails to evaluate halts the
+                        // tool with an incident instead of completing it with a
+                        // silently-unset output (#939). The tool does not complete;
+                        // resolution re-drives its completion.
+                        let event = self.io_mapping_output_incident(
+                            instance_key,
+                            child_eik,
+                            tool_element_id,
+                            failure,
+                        );
+                        return (vec![event], Vec::new());
+                    }
+                }
             }
         };
         if !output_updates.is_empty() {
@@ -6634,6 +6961,57 @@ impl Engine {
             });
         }
 
+        // Output mappings (zeebe:output): evaluated BEFORE the element completes so
+        // a source expression that fails to evaluate (a FEEL parse/type error, or
+        // an operation on a missing value like `"x" + missingVar`) halts the
+        // element with an incident rather than silently dropping the target and
+        // proceeding with it unset (#939). Evaluate against the variables visible
+        // to this element instance — its own scope (including any input-mapped
+        // locals) layered over the enclosing scopes, plus any job/message result
+        // merged on completion, or a script task's result staged above. None of
+        // the completion events built below are applied to state until this step
+        // returns, so evaluating here sees the same variable view as merging below.
+        let outputs = self.io_outputs(instance_key, &element_id);
+        let output_updates = if outputs.is_empty() {
+            HashMap::new()
+        } else {
+            let visible = self.variables_for_element(instance_key, element_instance_key);
+            let eval = match &script_update {
+                // The script result event is not applied to state until this
+                // step returns, so overlay it onto the eval context by hand.
+                Some(update) => {
+                    let mut vars = (*visible).clone();
+                    vars.extend(update.clone());
+                    self.eval_io_mappings_in(&vars, &outputs)
+                }
+                None => self.eval_io_mappings_in(&visible, &outputs),
+            };
+            match eval {
+                Ok(updates) => updates,
+                Err(failure) => {
+                    // Halt in the COMPLETING phase: the element stays active and
+                    // parks on the incident, re-driven by `Complete` on resolution
+                    // — the same lifecycle as a script/decision output failure in
+                    // this function. `io_mapping_output_incident` uses the
+                    // `IoMappingOutput` kind (REST `IO_MAPPING_ERROR`), whose
+                    // resolution re-drives `Complete` (re-projecting the output),
+                    // rather than the `IoMapping` kind whose resolution re-drives
+                    // the *activation* body (the input-mapping phase). Both surface
+                    // the one `IO_MAPPING_ERROR` taxonomy (Zeebe parity: input and
+                    // output mapping failures share it).
+                    return (
+                        vec![self.io_mapping_output_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            failure,
+                        )],
+                        Vec::new(),
+                    );
+                }
+            }
+        };
+
         // Default behaviour: complete and take every outgoing flow (a single flow
         // for ordinary elements; all flows for a parallel split).
         //
@@ -6693,35 +7071,16 @@ impl Engine {
                 variables: update.clone(),
             });
         }
-        // Output mappings (zeebe:output): evaluate against the variables visible
-        // to this element instance — its own scope (including any input-mapped
-        // locals) layered over the enclosing scopes, plus any job/message result
-        // merged on completion, or a script task's result staged above — and merge
-        // the projected result (at the root scope) before the outgoing flows.
-        let outputs = self.io_outputs(instance_key, &element_id);
-        if !outputs.is_empty() {
-            let visible = self.variables_for_element(instance_key, element_instance_key);
-            let updates = match &script_update {
-                // The script result event is not applied to state until this
-                // step returns, so overlay it onto the eval context by hand.
-                Some(update) => {
-                    let mut vars = (*visible).clone();
-                    vars.extend(update.clone());
-                    self.eval_io_mappings_in(&vars, &outputs)
-                }
-                None => self.eval_io_mappings_in(&visible, &outputs),
-            };
-            if !updates.is_empty() {
-                // Output mappings propagate their result to the element's
-                // enclosing (flow) scope and upward — each name updates the
-                // nearest ancestor scope that defines it, defaulting to root.
-                // The element's own scope is being torn down by `ElementCompleted`
-                // (built earlier in this vec), so propagating from the parent
-                // avoids writing into the dying scope. Root-only instances collapse
-                // to a single flat `VariablesUpdated`, unchanged from the flat engine.
-                let flow_scope = self.scope_of(instance_key, element_instance_key);
-                events.extend(self.propagated_updates(instance_key, flow_scope, updates, false));
-            }
+        // Output mappings (zeebe:output): merge the projection evaluated above
+        // (before the completion events) into the element's enclosing (flow) scope
+        // and upward — each name updates the nearest ancestor scope that defines
+        // it, defaulting to root. The element's own scope is being torn down by
+        // `ElementCompleted` (built earlier in this vec), so propagating from the
+        // parent avoids writing into the dying scope. Root-only instances collapse
+        // to a single flat `VariablesUpdated`, unchanged from the flat engine.
+        if !output_updates.is_empty() {
+            let flow_scope = self.scope_of(instance_key, element_instance_key);
+            events.extend(self.propagated_updates(instance_key, flow_scope, output_updates, false));
         }
         let scope = self.scope_of(instance_key, element_instance_key);
 
@@ -8171,7 +8530,21 @@ impl Engine {
         let child_vars = if inputs.is_empty() {
             HashMap::new()
         } else {
-            self.eval_io_mappings_in(element_vars, &inputs)
+            match self.eval_io_mappings_in(element_vars, &inputs) {
+                Ok(updates) => updates,
+                Err(failure) => {
+                    // A call-activity input mapping that fails to evaluate halts the
+                    // call activity with an incident rather than starting the child
+                    // process against a silently-unset variable (#939).
+                    let event = self.io_mapping_expr_incident(
+                        parent_instance,
+                        call_eik,
+                        element_id.to_string(),
+                        failure,
+                    );
+                    return (vec![event], Vec::new());
+                }
+            }
         };
         let child_key = self.mint_key();
         (
@@ -8236,9 +8609,24 @@ impl Engine {
         events.extend(self.cancel_boundary_conditional_subscriptions_on(element_instance_key));
         let outputs = self.io_outputs(instance_key, &element_id);
         if !outputs.is_empty() {
-            let updates = self.eval_io_mappings_in(&child_variables, &outputs);
-            if !updates.is_empty() {
-                events.extend(self.propagated_updates(instance_key, scope, updates, false));
+            match self.eval_io_mappings_in(&child_variables, &outputs) {
+                Ok(updates) => {
+                    if !updates.is_empty() {
+                        events.extend(self.propagated_updates(instance_key, scope, updates, false));
+                    }
+                }
+                Err(failure) => {
+                    // A call-activity output mapping that fails to evaluate halts the
+                    // call activity with an incident instead of completing it with a
+                    // silently-unset output (#939).
+                    let event = self.io_mapping_output_incident(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        failure,
+                    );
+                    return (vec![event], Vec::new());
+                }
             }
         }
         let mut followups = Vec::new();
