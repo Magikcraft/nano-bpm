@@ -315,7 +315,11 @@ fn status_metric(slot: (u64, Option<u64>)) -> models::StatusMetric {
         Some(dt) => types::Nullable::Present(dt),
         None => types::Nullable::Null,
     };
-    models::StatusMetric::new(slot.0 as i64, last)
+    // The wire type is a signed 64-bit count; a `u64 as i64` would silently
+    // wrap to a negative value past `i64::MAX`. That count can never be reached
+    // by a real job window, but clamp explicitly rather than emit a nonsensical
+    // negative count on the public API.
+    models::StatusMetric::new(i64::try_from(slot.0).unwrap_or(i64::MAX), last)
 }
 
 /// Fold one more contributing instant into a `(count, last_ms)` accumulator,
@@ -366,6 +370,11 @@ fn parse_iso8601_duration_ms(s: &str) -> Option<u64> {
     let mut total: u64 = 0;
     let mut num = String::new();
     let mut saw_component = false;
+    // Enforce the documented `PT[nH][nM][nS]` shape: each unit may appear at
+    // most once and only in canonical descending order (H, then M, then S).
+    // `last_rank` tracks the previous unit's rank so `PT1H2H` (duplicate) and
+    // `PT1S1H` (out of order) are rejected rather than silently summed.
+    let mut last_rank = u8::MAX;
     for c in rest.chars() {
         if c.is_ascii_digit() {
             num.push(c);
@@ -376,12 +385,16 @@ fn parse_iso8601_duration_ms(s: &str) -> Option<u64> {
         }
         let value: u64 = num.parse().ok()?;
         num.clear();
-        let unit_ms = match c {
-            'H' => 3_600_000,
-            'M' => 60_000,
-            'S' => 1_000,
+        let (unit_ms, rank) = match c {
+            'H' => (3_600_000, 3u8),
+            'M' => (60_000, 2u8),
+            'S' => (1_000, 1u8),
             _ => return None,
         };
+        if rank >= last_rank {
+            return None;
+        }
+        last_rank = rank;
         total = total.checked_add(value.checked_mul(unit_ms)?)?;
         saw_component = true;
     }
@@ -389,6 +402,53 @@ fn parse_iso8601_duration_ms(s: &str) -> Option<u64> {
         return None;
     }
     (total > 0).then_some(total)
+}
+
+#[cfg(test)]
+mod duration_and_metric_tests {
+    use super::{parse_iso8601_duration_ms, status_metric, types};
+
+    #[test]
+    fn parses_canonical_components() {
+        assert_eq!(parse_iso8601_duration_ms("PT1H"), Some(3_600_000));
+        assert_eq!(parse_iso8601_duration_ms("PT30M"), Some(1_800_000));
+        assert_eq!(parse_iso8601_duration_ms("PT15S"), Some(15_000));
+        assert_eq!(
+            parse_iso8601_duration_ms("PT1H30M15S"),
+            Some(3_600_000 + 1_800_000 + 15_000)
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_units() {
+        assert_eq!(parse_iso8601_duration_ms("PT1H2H"), None);
+        assert_eq!(parse_iso8601_duration_ms("PT1M1M"), None);
+        assert_eq!(parse_iso8601_duration_ms("PT1S1S"), None);
+    }
+
+    #[test]
+    fn rejects_out_of_order_units() {
+        assert_eq!(parse_iso8601_duration_ms("PT1S1H"), None);
+        assert_eq!(parse_iso8601_duration_ms("PT1M1H"), None);
+        assert_eq!(parse_iso8601_duration_ms("PT1S1M"), None);
+    }
+
+    #[test]
+    fn rejects_malformed_and_empty() {
+        assert_eq!(parse_iso8601_duration_ms("PT"), None);
+        assert_eq!(parse_iso8601_duration_ms("PT0S"), None);
+        assert_eq!(parse_iso8601_duration_ms("P1D"), None);
+        assert_eq!(parse_iso8601_duration_ms("PT1X"), None);
+    }
+
+    #[test]
+    fn status_metric_clamps_count_instead_of_wrapping() {
+        // A `u64 as i64` cast of `u64::MAX` wraps to -1; the clamp must instead
+        // saturate to `i64::MAX` so the public API never returns a negative count.
+        let metric = status_metric((u64::MAX, None));
+        assert_eq!(metric.count, i64::MAX);
+        assert!(matches!(metric.last_updated_at, types::Nullable::Null));
+    }
 }
 
 #[derive(Clone)]
