@@ -90,6 +90,66 @@ export interface ExecResult {
   lastInsertId?: number | bigint;
 }
 
+/// Strip leading whitespace and any leading SQL comments (`-- …` line comments
+/// and `/* … */` block comments) so the read/write classifier can see the real
+/// first token. Only *leading* comments are removed; the remainder is left
+/// intact so the body scans (mutating verb inside a CTE, assigning/call-form
+/// PRAGMA) are unaffected. An unterminated comment consumes the rest of the
+/// input, which then classifies as a (safe) write.
+function stripLeadingSqlComments(sql: string): string {
+  let s = sql.trimStart();
+  for (;;) {
+    if (s.startsWith("--")) {
+      const nl = s.indexOf("\n");
+      s = nl === -1 ? "" : s.slice(nl + 1);
+    } else if (s.startsWith("/*")) {
+      const end = s.indexOf("*/");
+      s = end === -1 ? "" : s.slice(end + 2);
+    } else {
+      break;
+    }
+    s = s.trimStart();
+  }
+  return s;
+}
+
+/// Whether `sql` is a pure *read* (safe to serve through the row-returning
+/// `query` op, and to allow while the app is running). This is the **canonical**
+/// server data-gateway read-vs-write split (issue #889): the console's
+/// `console/src/lib/sqlStatement.ts` is an explicit mirror of it, so the client
+/// routing and this server gate can never drift.
+///
+/// Conservative by construction — anything not provably read-only is a write, so
+/// the dangerous permissive failure (mis-classifying a mutation as a read, e.g.
+/// `INSERT … RETURNING`, a data-modifying CTE, or an assigning `PRAGMA`) can
+/// never slip a write down the `query` path and past the running-app edit gate:
+/// - `SELECT` / `EXPLAIN` are always reads.
+/// - A CTE (`WITH …`) is a read only when it carries no mutating verb; a
+///   `WITH … INSERT/UPDATE/DELETE/REPLACE …` statement mutates.
+/// - `PRAGMA name` reads a setting, but `PRAGMA name = value` mutates. The
+///   call form `PRAGMA name(x)` is often a read (e.g. `table_info(t)`); we
+///   still treat any `=`/`(` as a write, conservatively erring toward the safe
+///   classification rather than enumerating the read-only call-form pragmas.
+/// - Everything else (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, …) is a
+///   write.
+///
+/// Leading SQL comments (`-- …` line and `/* … */` block) are stripped before
+/// the leading-verb check, so a commented read (`-- note\nSELECT 1`) is still a
+/// read rather than being misclassified as a write.
+export function isReadStatement(sql: string): boolean {
+  const s = stripLeadingSqlComments(sql);
+  if (/^(select|explain)\b/i.test(s)) return true;
+  if (/^with\b/i.test(s)) {
+    // A CTE that contains any mutating verb is a data-modifying statement.
+    return !/\b(insert|update|delete|replace)\b/i.test(s);
+  }
+  if (/^pragma\b/i.test(s)) {
+    // `=` (assignment) or `(` (call form) makes the PRAGMA a write.
+    return !/[=(]/.test(s);
+  }
+  return false;
+}
+
 /// The one thin, uniform interface behind every driver (ADR 0024 §2) — the
 /// `TDataSet` equivalent. The driver underneath is interchangeable because every
 /// consumer shares exactly this surface.

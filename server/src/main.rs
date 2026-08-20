@@ -17371,6 +17371,265 @@ mod console_observe_guard_tests {
     }
 }
 
+/// The non-GET, project-scoped console endpoints that stay *allowed* while an
+/// app is running (issue #889). `tail` is the sub-path after the project name,
+/// e.g. `run`, `stop`, `data/main/query`, `triggers/enqueue`, `hooks/abc123`.
+///
+/// These are the lifecycle controls (you must be able to `stop` a running app —
+/// and `run`/start it again), the row-returning read (`query`), the write-free
+/// domain-types `preview`, and the two runtime ingress paths (a manual/synthetic
+/// `triggers/enqueue` and the external webhook `hooks/{id}`). Everything else
+/// that mutates a project's authored surface is gated. Pure, so the allowlist is
+/// unit-testable.
+#[cfg(feature = "console")]
+fn app_running_allows_mutation(tail: &str, method: &axum::http::Method) -> bool {
+    // The runtime/read allowlist is **POST-only**: every entry is an
+    // ingress/control/read endpoint invoked with `POST`. Any *other* non-GET
+    // method (`PUT`/`DELETE`/`PATCH`, …) on the same path is deliberately NOT
+    // allowlisted, so it stays gated — this preserves the "mutations are
+    // blocked by default" property for any future method added under these
+    // prefixes (e.g. a later `PUT /hooks/{id}` can't slip a live update
+    // through).
+    if *method != axum::http::Method::POST {
+        return false;
+    }
+    let segs: Vec<&str> = tail.split('/').filter(|s| !s.is_empty()).collect();
+    matches!(
+        segs.as_slice(),
+        ["run"]
+            | ["stop"]
+            | ["triggers", "enqueue"]
+            | ["hooks", _]
+            | ["data", _, "query"]
+            | ["data", _, "domaintypes", "preview"]
+    )
+}
+
+/// Categorical "stop the app before updating it" gate (issue #889). Given a
+/// console request path + method, returns `Some(project_name)` when the request
+/// is a project-*mutating* endpoint that must be refused (409 `app_running`)
+/// while that project is running, and `None` for everything else: non-project
+/// paths, the project collection (`list`/`create`/`import`), reads
+/// (`GET`/`HEAD`/`OPTIONS`), and the runtime/read allowlist
+/// ([`app_running_allows_mutation`]).
+///
+/// Driving the guard off this single classifier — not a per-handler check — is
+/// what makes it a *defect-class* guard: any **new** mutating endpoint added
+/// under `/projects/{name}/…` is blocked by default until it is deliberately
+/// added to the allowlist, so a future failure class can't slip a live update
+/// through. Pure, so the whole mutation surface is table-testable.
+#[cfg(feature = "console")]
+fn app_running_gate<'a>(path: &'a str, method: &axum::http::Method) -> Option<&'a str> {
+    use axum::http::Method;
+    let rest = path.strip_prefix("/console/api/projects/")?;
+    if rest.is_empty() {
+        // The collection itself (`GET`/`POST /console/api/projects`) — no
+        // specific project to gate.
+        return None;
+    }
+    let (name, tail) = match rest.split_once('/') {
+        Some((n, t)) => (n, Some(t)),
+        None => (rest, None),
+    };
+    // `POST /console/api/projects/import` registers a *new* project by
+    // reference — a collection op, not a mutation of a running app. Scope the
+    // exemption to `POST`: any *other* non-GET method (`DELETE`/`PUT`/`PATCH`, …)
+    // on this exact path targets a real project literally named `import` and
+    // must be gated like any other project, so the collection-op exemption can't
+    // be abused to bypass the running-app gate.
+    if tail.is_none() && name == "import" && *method == Method::POST {
+        return None;
+    }
+    // Reads are always allowed while running.
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return None;
+    }
+    if let Some(tail) = tail
+        && app_running_allows_mutation(tail, method)
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// Console "app must be stopped to edit it" guard (issue #889): the single
+/// server-side chokepoint enforcing that a project cannot be mutated while it
+/// holds a live process. When [`app_running_gate`] flags the request as a
+/// project mutation and the supervisor reports that project as running — i.e.
+/// in any non-terminal lifecycle phase (`starting`/`running`, and any future
+/// draining phase such as `stopping`), everything except the editable terminal
+/// states `stopped`/`crashed` — refuse with **409 Conflict** (`app_running`);
+/// otherwise the request passes through untouched. The running/editable split
+/// is derived from one predicate (`Phase::is_terminal`), mirroring the console's
+/// `appIsRunning`, so the two surfaces can't drift as phases are added. Layered
+/// over the whole console router so it covers every
+/// `/console/api/projects/{name}/…` mutation — including endpoints added
+/// later — from one place.
+#[cfg(feature = "console")]
+async fn console_app_running_guard(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::response::IntoResponse;
+    if let Some(name) = app_running_gate(req.uri().path(), req.method())
+        && crate::console::projects::supervisor()
+            .is_running(name)
+            .await
+    {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "error": "app_running",
+                "message": "Stop the app before updating it.",
+            })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+#[cfg(all(test, feature = "console"))]
+mod console_app_running_guard_tests {
+    use axum::http::Method;
+
+    use super::app_running_gate;
+
+    /// Every mutating `/projects/{name}/…` endpoint is gated while running: the
+    /// classifier returns the project name so the guard can 409 it.
+    #[test]
+    fn mutating_project_endpoints_are_gated() {
+        let cases: &[(Method, &str)] = &[
+            (Method::DELETE, "/console/api/projects/acme"),
+            (Method::PUT, "/console/api/projects/acme/config"),
+            (Method::PUT, "/console/api/projects/acme/file"),
+            (Method::POST, "/console/api/projects/acme/file"),
+            (Method::DELETE, "/console/api/projects/acme/file"),
+            (Method::POST, "/console/api/projects/acme/rename"),
+            (Method::POST, "/console/api/projects/acme/compile"),
+            (
+                Method::POST,
+                "/console/api/projects/acme/update-from-template",
+            ),
+            (Method::PUT, "/console/api/projects/acme/active-run-config"),
+            (Method::POST, "/console/api/projects/acme/data/main/exec"),
+            (Method::POST, "/console/api/projects/acme/data/main/script"),
+            (Method::POST, "/console/api/projects/acme/data/main/migrate"),
+            (
+                Method::POST,
+                "/console/api/projects/acme/data/main/domaintypes",
+            ),
+            (Method::POST, "/console/api/projects/acme/triggers"),
+            (Method::POST, "/console/api/projects/acme/connectors"),
+            // A hypothetical *future* mutating endpoint is gated by default —
+            // the defect-class guarantee.
+            (Method::POST, "/console/api/projects/acme/some-new-mutation"),
+        ];
+        for (method, path) in cases {
+            assert_eq!(
+                app_running_gate(path, method),
+                Some("acme"),
+                "{method} {path} must be gated while running"
+            );
+        }
+    }
+
+    /// Read + runtime endpoints stay allowed while running (never gated).
+    #[test]
+    fn reads_and_runtime_endpoints_are_allowed() {
+        let cases: &[(Method, &str)] = &[
+            // lifecycle controls — you must be able to stop/start a live app
+            (Method::POST, "/console/api/projects/acme/run"),
+            (Method::POST, "/console/api/projects/acme/stop"),
+            // row-returning read + write-free preview
+            (Method::POST, "/console/api/projects/acme/data/main/query"),
+            (
+                Method::POST,
+                "/console/api/projects/acme/data/main/domaintypes/preview",
+            ),
+            // runtime ingress
+            (Method::POST, "/console/api/projects/acme/triggers/enqueue"),
+            (Method::POST, "/console/api/projects/acme/hooks/abc123"),
+            // reads of every shape
+            (Method::GET, "/console/api/projects/acme"),
+            (Method::GET, "/console/api/projects/acme/config"),
+            (Method::GET, "/console/api/projects/acme/files"),
+            (Method::GET, "/console/api/projects/acme/file"),
+            (Method::GET, "/console/api/projects/acme/data/sources"),
+            (Method::GET, "/console/api/projects/acme/data/main/schema"),
+            (
+                Method::GET,
+                "/console/api/projects/acme/data/main/migrations",
+            ),
+            (Method::GET, "/console/api/projects/acme/run-configs"),
+            (Method::GET, "/console/api/projects/acme/triggers"),
+            (Method::GET, "/console/api/projects/acme/triggers/inbox"),
+            (Method::GET, "/console/api/projects/acme/connectors"),
+        ];
+        for (method, path) in cases {
+            assert_eq!(
+                app_running_gate(path, method),
+                None,
+                "{method} {path} must stay allowed while running"
+            );
+        }
+    }
+
+    /// The runtime/read allowlist is POST-only: a *non-POST* mutating method on
+    /// an allowlisted path is NOT part of the allowlist and stays gated. Guards
+    /// the defect class where a future `PUT`/`DELETE` under a runtime prefix
+    /// (e.g. `PUT /hooks/{id}`) would otherwise bypass the "blocked by default"
+    /// guarantee.
+    #[test]
+    fn allowlisted_paths_are_gated_for_non_post_methods() {
+        let cases: &[(Method, &str)] = &[
+            (Method::PUT, "/console/api/projects/acme/hooks/abc123"),
+            (Method::DELETE, "/console/api/projects/acme/hooks/abc123"),
+            (Method::PUT, "/console/api/projects/acme/triggers/enqueue"),
+            (Method::DELETE, "/console/api/projects/acme/data/main/query"),
+            (Method::PATCH, "/console/api/projects/acme/run"),
+        ];
+        for (method, path) in cases {
+            assert_eq!(
+                app_running_gate(path, method),
+                Some("acme"),
+                "{method} {path} must be gated while running (allowlist is POST-only)"
+            );
+        }
+    }
+
+    /// The project *collection* (and unrelated console paths) are never gated —
+    /// creating/importing a project isn't a mutation of a running app.
+    #[test]
+    fn collection_and_non_project_paths_are_not_gated() {
+        for method in [Method::GET, Method::POST] {
+            assert_eq!(app_running_gate("/console/api/projects", &method), None);
+            assert_eq!(
+                app_running_gate("/console/api/projects/import", &method),
+                None
+            );
+        }
+        // A real project literally named `import` must still be gated for any
+        // mutating (non-POST, non-read) method — the collection-import exemption
+        // is POST-only and can't be abused to bypass the running-app gate.
+        for method in [Method::DELETE, Method::PUT, Method::PATCH] {
+            assert_eq!(
+                app_running_gate("/console/api/projects/import", &method),
+                Some("import"),
+                "{method} on a project named `import` must be gated while running"
+            );
+        }
+        assert_eq!(
+            app_running_gate("/console/api/models/order.bpmn", &Method::PUT),
+            None
+        );
+        assert_eq!(
+            app_running_gate("/console/api/topology", &Method::GET),
+            None
+        );
+        assert_eq!(app_running_gate("/console", &Method::POST), None);
+    }
+}
+
 /// Classifies an engine event into an ad-hoc lifecycle metric label
 /// (`nanobpm_adhoc_events_total{kind}`), or `None` for non-ad-hoc events. Pure,
 /// so the event→counter mapping (including the completion-vs-cancellation split)
@@ -18477,6 +18736,18 @@ async fn main() {
                     }),
                 );
             }
+            // "Stop the app before updating it" gate (issue #889): a single
+            // server-side chokepoint that refuses project-mutating requests with
+            // 409 `app_running` while the project is running. Layered over the
+            // console router so it covers every current *and future*
+            // `/console/api/projects/{name}/…` mutation from one place; read and
+            // runtime endpoints pass through (see `app_running_gate`). Applied
+            // *before* the observe guard below so that, when observe mode is also
+            // enabled, its read-only guard wraps outermost: a mutation to a
+            // running project is then refused with observe's documented 403
+            // first, keeping observe mode consistently read-only regardless of
+            // the project's run state (rather than leaking a 409 `app_running`).
+            console = console.layer(axum::middleware::from_fn(console_app_running_guard));
             if obs_config.console_read_only() {
                 // Runtime read-only gate: refuse authoring (mutating) API
                 // requests while still serving the observability views.

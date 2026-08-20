@@ -50,7 +50,13 @@ function actionSummary(action: TriggerInfo["action"]): string {
   return keys.length ? keys.join(", ") : "—";
 }
 
-export default function TriggersPanel({ name }: { name: string }) {
+export default function TriggersPanel({
+  name,
+  appRunning,
+}: {
+  name: string;
+  appRunning: boolean;
+}) {
   const [tab, setTab] = useState<SubTab>("triggers");
   return (
     <div className="flex h-full flex-col">
@@ -78,7 +84,7 @@ export default function TriggersPanel({ name }: { name: string }) {
 
       <div className="min-h-0 flex-1 overflow-auto">
         {tab === "triggers" ? (
-          <TriggersTab name={name} />
+          <TriggersTab name={name} appRunning={appRunning} />
         ) : (
           <InboxTab name={name} />
         )}
@@ -89,7 +95,13 @@ export default function TriggersPanel({ name }: { name: string }) {
 
 // --- Triggers ---------------------------------------------------------------
 
-function TriggersTab({ name }: { name: string }) {
+function TriggersTab({
+  name,
+  appRunning,
+}: {
+  name: string;
+  appRunning: boolean;
+}) {
   const [data, setData] = useState<TriggersResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -129,7 +141,13 @@ function TriggersTab({ name }: { name: string }) {
         {data.triggers.length} trigger{data.triggers.length === 1 ? "" : "s"}
       </span>
       <div className="flex-1" />
-      <Button size="sm" variant="primary" onClick={() => setShowAdd(true)}>
+      <Button
+        size="sm"
+        variant="primary"
+        disabled={appRunning}
+        title={appRunning ? "Stop the app to add a trigger" : undefined}
+        onClick={() => setShowAdd(true)}
+      >
         ＋ Add trigger
       </Button>
     </div>

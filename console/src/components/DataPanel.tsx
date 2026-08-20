@@ -8,6 +8,7 @@ import {
 } from "react";
 
 import CodeEditor from "./CodeEditor";
+import { isReadStatement } from "../lib/sqlStatement";
 import { Button, Input, inputClass } from "./ui";
 import {
   execData,
@@ -373,7 +374,13 @@ function cell(v: unknown): { text: string; muted: boolean } {
   return { text: String(v), muted: false };
 }
 
-export default function DataPanel({ name }: { name: string }) {
+export default function DataPanel({
+  name,
+  appRunning,
+}: {
+  name: string;
+  appRunning: boolean;
+}) {
   const [sources, setSources] = useState<DataSourceInfo[]>([]);
   const [source, setSource] = useState<string>("");
   const [tab, setTab] = useState<SubTab>("tables");
@@ -472,13 +479,28 @@ export default function DataPanel({ name }: { name: string }) {
 
       <div className="min-h-0 flex-1 overflow-hidden">
         {source && tab === "tables" && (
-          <TablesTab key={`t-${source}`} name={name} source={source} />
+          <TablesTab
+            key={`t-${source}`}
+            name={name}
+            source={source}
+            appRunning={appRunning}
+          />
         )}
         {source && tab === "sql" && (
-          <SqlTab key={`s-${source}`} name={name} source={source} />
+          <SqlTab
+            key={`s-${source}`}
+            name={name}
+            source={source}
+            appRunning={appRunning}
+          />
         )}
         {source && tab === "migrations" && (
-          <MigrationsTab key={`m-${source}`} name={name} source={source} />
+          <MigrationsTab
+            key={`m-${source}`}
+            name={name}
+            source={source}
+            appRunning={appRunning}
+          />
         )}
       </div>
     </div>
@@ -487,7 +509,15 @@ export default function DataPanel({ name }: { name: string }) {
 
 // --- Tables -----------------------------------------------------------------
 
-function TablesTab({ name, source }: { name: string; source: string }) {
+function TablesTab({
+  name,
+  source,
+  appRunning,
+}: {
+  name: string;
+  source: string;
+  appRunning: boolean;
+}) {
   const [tables, setTables] = useState<DataTableMeta[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [rows, setRows] = useState<DataQueryResult | null>(null);
@@ -612,16 +642,25 @@ function TablesTab({ name, source }: { name: string; source: string }) {
           <div className="flex items-center gap-1">
             <button
               onClick={() => void regenTypes()}
-              disabled={regenBusy}
+              disabled={regenBusy || appRunning}
               className="rounded px-1.5 py-0.5 text-xs font-medium text-fg-muted hover:bg-hover disabled:opacity-40"
-              title="Regenerate the TypeScript domain types (nano-generated/domain-rows.d.ts) from every datasource"
+              title={
+                appRunning
+                  ? "Stop the app to regenerate domain types"
+                  : "Regenerate the TypeScript domain types (nano-generated/domain-rows.d.ts) from every datasource"
+              }
             >
               {regenBusy ? "…" : "⟳ Types"}
             </button>
             <button
               onClick={() => setShowNew(true)}
-              className="rounded px-1.5 py-0.5 text-xs font-medium text-accent hover:bg-accent/10"
-              title="Create a new table"
+              disabled={appRunning}
+              className="rounded px-1.5 py-0.5 text-xs font-medium text-accent hover:bg-accent/10 disabled:opacity-40"
+              title={
+                appRunning
+                  ? "Stop the app to create a table"
+                  : "Create a new table"
+              }
             >
               ＋ New
             </button>
@@ -660,20 +699,27 @@ function TablesTab({ name, source }: { name: string; source: string }) {
             <div className="flex-1" />
             <button
               onClick={() => setShowAddRow(true)}
-              disabled={!editable}
+              disabled={!editable || appRunning}
               className="rounded px-1.5 py-0.5 text-xs font-medium text-accent hover:bg-accent/10 disabled:opacity-40"
               title={
-                editable
-                  ? "Insert a row"
-                  : "This table has no rowid — add rows from the SQL tab"
+                appRunning
+                  ? "Stop the app to insert rows"
+                  : editable
+                    ? "Insert a row"
+                    : "This table has no rowid — add rows from the SQL tab"
               }
             >
               ＋ Add row
             </button>
             <button
               onClick={() => setShowStructure(true)}
-              className="rounded px-1.5 py-0.5 text-xs font-medium text-fg-muted hover:bg-hover"
-              title="Edit table structure"
+              disabled={appRunning}
+              className="rounded px-1.5 py-0.5 text-xs font-medium text-fg-muted hover:bg-hover disabled:opacity-40"
+              title={
+                appRunning
+                  ? "Stop the app to edit table structure"
+                  : "Edit table structure"
+              }
             >
               ✎ Structure
             </button>
@@ -694,9 +740,13 @@ function TablesTab({ name, source }: { name: string; source: string }) {
             <ResultGrid
               result={rows}
               rowKey={editable ? ROWID_COL : undefined}
-              onEditRow={editable ? (row) => setEditRow(row) : undefined}
+              onEditRow={
+                editable && !appRunning ? (row) => setEditRow(row) : undefined
+              }
               onDeleteRow={
-                editable ? (rowid) => void deleteRow(rowid) : undefined
+                editable && !appRunning
+                  ? (rowid) => void deleteRow(rowid)
+                  : undefined
               }
             />
           ) : (
@@ -1619,11 +1669,15 @@ function EditStructureDialog({
 }
 
 // --- SQL --------------------------------------------------------------------
-function isReadStatement(sql: string): boolean {
-  return /^\s*(select|with|pragma|explain)\b/i.test(sql);
-}
-
-function SqlTab({ name, source }: { name: string; source: string }) {
+function SqlTab({
+  name,
+  source,
+  appRunning,
+}: {
+  name: string;
+  source: string;
+  appRunning: boolean;
+}) {
   const [sql, setSql] = useState("SELECT 1;");
   const [result, setResult] = useState<DataQueryResult | null>(null);
   const [status, setStatus] = useState<string | null>(null);
@@ -1632,9 +1686,19 @@ function SqlTab({ name, source }: { name: string; source: string }) {
   const sqlRef = useRef(sql);
   sqlRef.current = sql;
 
+  // While the app is running the server refuses mutating statements with 409
+  // `app_running` (issue #889); reads stay allowed. `isReadStatement` mirrors
+  // the server's read/write split (see ../lib/sqlStatement) so the UI never
+  // surfaces an avoidable error.
+  const writeBlocked = appRunning && !isReadStatement(sql);
+
   const run = useCallback(async () => {
     const text = sqlRef.current.trim().replace(/;\s*$/, "");
     if (!text) return;
+    if (appRunning && !isReadStatement(text)) {
+      setError("Stop the app before running mutating statements.");
+      return;
+    }
     setRunning(true);
     setError(null);
     setStatus(null);
@@ -1668,7 +1732,7 @@ function SqlTab({ name, source }: { name: string; source: string }) {
     } finally {
       setRunning(false);
     }
-  }, [name, source]);
+  }, [name, source, appRunning]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -1681,10 +1745,23 @@ function SqlTab({ name, source }: { name: string; source: string }) {
         />
       </div>
       <div className="flex items-center gap-3 border-b border-edge bg-panel px-4 py-2">
-        <Button onClick={() => void run()} disabled={running}>
+        <Button
+          onClick={() => void run()}
+          disabled={running || writeBlocked}
+          title={
+            writeBlocked
+              ? "Stop the app before running mutating statements"
+              : undefined
+          }
+        >
           {running ? "Running…" : "▶ Run"}
         </Button>
         <span className="text-xs text-fg-faint">⌘/Ctrl+S runs</span>
+        {writeBlocked && (
+          <span className="text-xs text-warn">
+            Stop the app to run mutating statements
+          </span>
+        )}
         {status && <span className="text-xs text-ok">{status}</span>}
         {error && <span className="truncate text-xs text-danger">{error}</span>}
       </div>
@@ -1704,7 +1781,15 @@ function SqlTab({ name, source }: { name: string; source: string }) {
 
 // --- Migrations -------------------------------------------------------------
 
-function MigrationsTab({ name, source }: { name: string; source: string }) {
+function MigrationsTab({
+  name,
+  source,
+  appRunning,
+}: {
+  name: string;
+  source: string;
+  appRunning: boolean;
+}) {
   const [entries, setEntries] = useState<DataMigrationEntry[]>([]);
   const [dir, setDir] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -1732,6 +1817,10 @@ function MigrationsTab({ name, source }: { name: string; source: string }) {
   const pending = entries.filter((e) => !e.applied).length;
 
   const apply = useCallback(async () => {
+    if (appRunning) {
+      setError("Stop the app before applying migrations.");
+      return;
+    }
     setBusy(true);
     setError(null);
     setNote(null);
@@ -1751,12 +1840,18 @@ function MigrationsTab({ name, source }: { name: string; source: string }) {
     } finally {
       setBusy(false);
     }
-  }, [name, source, load]);
+  }, [name, source, load, appRunning]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center gap-3 border-b border-edge bg-panel px-4 py-2">
-        <Button onClick={() => void apply()} disabled={busy || pending === 0}>
+        <Button
+          onClick={() => void apply()}
+          disabled={busy || pending === 0 || appRunning}
+          title={
+            appRunning ? "Stop the app before applying migrations" : undefined
+          }
+        >
           {busy
             ? "Applying…"
             : pending > 0
@@ -1767,6 +1862,9 @@ function MigrationsTab({ name, source }: { name: string; source: string }) {
           {dir || "db/migrations"} · {entries.length} file
           {entries.length === 1 ? "" : "s"}
         </span>
+        {appRunning && (
+          <span className="text-xs text-warn">Stop the app to migrate</span>
+        )}
         {note && <span className="text-xs text-ok">{note}</span>}
         {error && <span className="truncate text-xs text-danger">{error}</span>}
       </div>

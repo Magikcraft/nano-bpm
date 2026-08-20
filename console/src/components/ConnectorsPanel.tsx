@@ -35,7 +35,13 @@ function errMsg(e: unknown): string {
   return String(e);
 }
 
-export default function ConnectorsPanel({ name }: { name: string }) {
+export default function ConnectorsPanel({
+  name,
+  appRunning,
+}: {
+  name: string;
+  appRunning: boolean;
+}) {
   const [data, setData] = useState<ConnectorsResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -79,6 +85,7 @@ export default function ConnectorsPanel({ name }: { name: string }) {
             onReload={() => void load()}
             showAdd={showAdd}
             setShowAdd={setShowAdd}
+            appRunning={appRunning}
           />
         )}
       </div>
@@ -92,12 +99,14 @@ function ConnectorsTab({
   onReload,
   showAdd,
   setShowAdd,
+  appRunning,
 }: {
   name: string;
   data: ConnectorsResponse;
   onReload: () => void;
   showAdd: boolean;
   setShowAdd: (v: boolean) => void;
+  appRunning: boolean;
 }) {
   const enabledTypes = useMemo(
     () => data.connectors.map((c) => c.taskType),
@@ -115,7 +124,8 @@ function ConnectorsTab({
         <Button
           size="sm"
           variant="primary"
-          disabled={data.available.length === 0}
+          disabled={data.available.length === 0 || appRunning}
+          title={appRunning ? "Stop the app to add a connector" : undefined}
           onClick={() => setShowAdd(true)}
         >
           ＋ Add connector
