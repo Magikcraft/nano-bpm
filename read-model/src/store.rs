@@ -2678,7 +2678,11 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         process_definition_id: r.get(9)?,
         process_definition_key: r.get(10)?,
         kind: job_kind_from(r.get(11)?, r.get(12)?),
-        created_at_ms: r.get::<_, i64>(13)? as u64,
+        // Clamp before the `u64` cast so a negative persisted timestamp (DB
+        // corruption / manual edits / a bad migration) can never wrap to a huge
+        // `u64` and skew `/v2/jobs/statistics/*`. Mirrors `map_message_subscription`
+        // — one canonical convention for every `created_at_ms` mapper.
+        created_at_ms: r.get::<_, i64>(13)?.max(0) as u64,
     })
 }
 
@@ -2697,7 +2701,7 @@ fn map_user_task(r: &rusqlite::Row) -> rusqlite::Result<UserTaskRow> {
         due_date: r.get(8)?,
         follow_up_date: r.get(9)?,
         priority: r.get(10)?,
-        created_at_ms: r.get::<_, i64>(11)? as u64,
+        created_at_ms: r.get::<_, i64>(11)?.max(0) as u64,
         process_definition_id: r.get(12)?,
         process_definition_key: r.get(13)?,
         process_definition_version: r.get(14)?,
@@ -2716,7 +2720,7 @@ fn map_incident(r: &rusqlite::Row) -> rusqlite::Result<IncidentRow> {
         state: incident_state_from(r.get(5)?),
         reason: r.get(6)?,
         job_key: r.get::<_, Option<i64>>(7)?.map(|v| v as Key),
-        created_at_ms: r.get::<_, i64>(8)? as u64,
+        created_at_ms: r.get::<_, i64>(8)?.max(0) as u64,
         process_definition_id: r.get(9)?,
         process_definition_key: r.get(10)?,
     })
@@ -6988,6 +6992,49 @@ mod read_surface_tests {
                 .created_at_ms,
             1_724_000_000_000,
             "ON CONFLICT must refresh created_at_ms so statistics stop under-counting"
+        );
+    }
+
+    /// Defect-class guard: `created_at_ms` is persisted as a signed `INTEGER`,
+    /// so a negative value in the DB (corruption, manual edits, a bad migration)
+    /// must not survive the read-back as a wrapped, enormous `u64` — it would
+    /// badly skew `/v2/jobs/statistics/*` created counts and window filters. The
+    /// mappers clamp with `.max(0)`; this pins that for the job/user-task/incident
+    /// mappers together, since they share the one canonical convention.
+    #[test]
+    fn negative_created_at_ms_clamps_to_zero_on_read() {
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[&Event::JobCreated {
+                job_key: 8100,
+                instance_key: 7100,
+                element_instance_key: 7101,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 1_724_000_000_000,
+                priority: 0,
+                retries: 3,
+            }])
+            .unwrap();
+
+        // Simulate a corrupt / hand-edited row carrying a negative timestamp.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE jobs SET created_at_ms = ?1 WHERE key = ?2",
+                rusqlite::params![-5_i64, 8100_i64],
+            )
+            .unwrap();
+        }
+
+        let job = store
+            .jobs()
+            .into_iter()
+            .find(|j| j.key == 8100)
+            .expect("job present");
+        assert_eq!(
+            job.created_at_ms, 0,
+            "a negative persisted created_at_ms must clamp to 0, not wrap to a huge u64"
         );
     }
 }
