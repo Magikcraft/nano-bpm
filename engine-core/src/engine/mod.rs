@@ -2182,19 +2182,14 @@ impl Engine {
                     // job to the activatable pool, so a worker retries it via the
                     // normal activate/complete path. Nothing more to enqueue.
                     state::IncidentKind::JobNoRetries => {}
-                    // Exclusive gateway matched no flow, or a condition failed to
-                    // evaluate: re-evaluate the gateway against the (possibly
-                    // updated) variables. An `IoMappingOutput` incident (an
-                    // *output* `zeebe:ioMapping` that failed at completion) parks
-                    // the element in the COMPLETING phase; re-driving `Complete`
-                    // re-projects the now-fixed output mapping without re-running
-                    // the element's behaviour — the same lifecycle as a
-                    // script/decision output failure.
+                    // Exclusive gateway matched no flow, or a condition/decision/
+                    // called-element expression failed to evaluate: re-evaluate the
+                    // element against the (possibly updated) variables by re-driving
+                    // `Complete`.
                     state::IncidentKind::NoMatchingSequenceFlow
                     | state::IncidentKind::ExpressionEvaluation
                     | state::IncidentKind::DecisionEvaluation
-                    | state::IncidentKind::CalledElementError
-                    | state::IncidentKind::IoMappingOutput => {
+                    | state::IncidentKind::CalledElementError => {
                         // A message intermediate catch event whose correlation
                         // key failed to evaluate parks ACTIVATED with no
                         // subscription; re-driving `Complete` would advance the
@@ -2216,6 +2211,24 @@ impl Engine {
                                 element_id,
                             });
                         }
+                    }
+                    // An *output* `zeebe:ioMapping` that failed at completion parks
+                    // the element in the COMPLETING phase; re-driving `Complete`
+                    // re-projects the now-fixed output mapping without re-running
+                    // the element's behaviour — the same lifecycle as a
+                    // script/decision output failure. This must NOT take the
+                    // message-catch `ReopenCatch` branch above: an output-mapping
+                    // failure occurs *after* the message was already correlated and
+                    // consumed, so reopening the subscription would strand the token
+                    // waiting for a *second* message instead of retrying the mapping.
+                    // `ReopenCatch` is reserved for correlation-key (ACTIVATING)
+                    // failures, which surface as `ExpressionEvaluation`.
+                    state::IncidentKind::IoMappingOutput => {
+                        queue.push_back(Step::Complete {
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                        });
                     }
                     // Uncaught business error: re-create a job for the still-active
                     // service task so a worker can attempt it again.

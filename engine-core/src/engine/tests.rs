@@ -7877,6 +7877,107 @@ fn output_mapping_eval_failure_raises_incident_and_does_not_complete() {
 }
 
 #[test]
+fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
+    // Regression: an OUTPUT `zeebe:ioMapping` failure on a message intermediate
+    // catch event parks the token in the COMPLETING phase *after* the message
+    // has already been correlated and consumed. Resolving the incident must
+    // re-drive `Complete` (re-projecting the now-fixed output mapping for the
+    // same token), NOT `ReopenCatch` — reopening the subscription would strand
+    // the token waiting for a *second* message that will never arrive.
+    // `ReopenCatch` is reserved for correlation-key (ACTIVATING) failures, which
+    // surface as `ExpressionEvaluation`, never as `IoMappingOutput`.
+    let def = ProcessBuilder::new("msg-out-fail")
+        .start_event("s")
+        .message_intermediate_catch_event("await", "approve", "orderId")
+        .with_io(
+            "await",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=bad + 1".to_string(),
+                    target: "approved".to_string(),
+                }],
+            },
+        )
+        .end_event("e")
+        .connect("s", "await")
+        .connect("await", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let key = engine
+        .apply_command(Command::create_instance_with(
+            "msg-out-fail",
+            vars(&[
+                ("orderId", Value::Str("A".into())),
+                ("bad", Value::Str("oops".into())),
+            ]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Parked on one open message subscription.
+    let subs = engine.message_subscriptions();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].state, state::MessageSubscriptionState::Open);
+
+    // Correlating drives completion, which applies the output mapping
+    // `=bad + 1` (string + int) and fails: one IoMappingOutput incident, the
+    // token held in COMPLETING, and the subscription already consumed.
+    engine.correlate_message("approve", "A", HashMap::new(), 0);
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(active[0].kind, state::IncidentKind::IoMappingOutput);
+    assert!(
+        !engine.is_completed(key),
+        "must not complete on eval failure"
+    );
+    assert!(
+        engine
+            .message_subscriptions()
+            .iter()
+            .all(|s| s.state != state::MessageSubscriptionState::Open),
+        "the correlated subscription is consumed, not left open"
+    );
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix `bad` and resolve. The regression: resolution must re-drive `Complete`
+    // (the token runs to completion), not `ReopenCatch` (which would open a
+    // fresh subscription and never complete for lack of a second message).
+    engine
+        .apply_command(Command::set_variables(
+            key,
+            HashMap::from([("bad".to_string(), Value::Int(41))]),
+        ))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    assert!(engine.instance(key).unwrap().incidents.is_empty());
+    assert!(
+        engine.is_completed(key),
+        "message-catch output-mapping incident must resolve by completing the \
+         token, not reopening the catch; events: {events:?}"
+    );
+    assert!(
+        engine
+            .message_subscriptions()
+            .iter()
+            .all(|s| s.state != state::MessageSubscriptionState::Open),
+        "resolution must not reopen the message subscription"
+    );
+    assert_eq!(
+        merged_var(&events, "approved"),
+        Some(Value::Int(42)),
+        "output mapping should surface approved=42; events: {events:?}"
+    );
+}
+
+#[test]
 fn subprocess_output_mapping_eval_failure_raises_io_mapping_output_incident() {
     // #939 parity (ports Zeebe `OutputMappingIncidentTest` to a scoped element):
     // an OUTPUT `zeebe:ioMapping` failure on a *sub-process* (not the mainstream
