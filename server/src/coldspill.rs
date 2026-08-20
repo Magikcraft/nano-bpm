@@ -287,6 +287,8 @@ mod tests {
             adhoc_instances: HashMap::new(),
             scope_parents: HashMap::new(),
             scope_variables: HashMap::new(),
+            compensable: Vec::new(),
+            compensation_waits: HashMap::new(),
         }
     }
 
