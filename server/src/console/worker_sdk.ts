@@ -265,6 +265,51 @@ export async function publishMessage(
   };
 }
 
+/**
+ * Thrown when an inbound job frame omits an identity field the protocol
+ * guarantees (`jobKey`/`key`, `processInstanceKey`). A worker cannot act on a
+ * keyless job — complete/fail/error all address the job by key — and a job with
+ * no process-instance key is a protocol violation. We surface it loudly here
+ * rather than laundering the gap into `""` and completing/failing against an
+ * empty key (a silent no-op, or worse, cross-instance corruption).
+ */
+export class MalformedJobError extends Error {
+  // Plain field declarations (not TS parameter properties): the Node worker
+  // fallback loads this SDK with `--experimental-strip-types`, whose strip-only
+  // parser rejects `constructor(readonly x)` shorthand. Assign in the body so
+  // the type stays erasable on both Deno and Node.
+  readonly detail: string;
+  readonly raw: unknown;
+  constructor(detail: string, raw: unknown) {
+    super(`malformed job frame: ${detail}`);
+    this.name = "MalformedJobError";
+    this.detail = detail;
+    this.raw = raw;
+  }
+}
+
+/** Coerce a protocol key (string or number) to its string form, or `undefined`
+ * when absent/empty. Never invents a value. */
+function optKey(v: unknown): string | undefined {
+  if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  if (typeof v === "string" && v.length > 0) return v;
+  return undefined;
+}
+
+/**
+ * Strictly decode the identity of an inbound job frame — the single source of
+ * truth for "what a valid job frame must carry". Throws {@link MalformedJobError}
+ * when a required key is missing instead of defaulting it to `""`.
+ */
+export function decodeJobIdentity(raw: unknown): { jobKey: string; processInstanceKey: string } {
+  const r = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const jobKey = optKey(r.jobKey) ?? optKey(r.key);
+  if (jobKey === undefined) throw new MalformedJobError("missing 'jobKey'", raw);
+  const processInstanceKey = optKey(r.processInstanceKey);
+  if (processInstanceKey === undefined) throw new MalformedJobError("missing 'processInstanceKey'", raw);
+  return { jobKey, processInstanceKey };
+}
+
 export function defineWorker<
   In extends object = WorkerVars,
   Out extends object = WorkerVars,
@@ -323,12 +368,12 @@ export function defineWorker<
   }
 
   function enrich(raw: Record<string, unknown>): WorkerJob {
-    const jobKey = String(raw.jobKey ?? raw.key ?? "");
+    const { jobKey, processInstanceKey } = decodeJobIdentity(raw);
     const markActed = () => acted.add(jobKey);
     return {
       jobKey,
       type: String(raw.type ?? opts.type),
-      processInstanceKey: String(raw.processInstanceKey ?? ""),
+      processInstanceKey,
       processDefinitionId: raw.processDefinitionId as string | undefined,
       processDefinitionKey: raw.processDefinitionKey as string | undefined,
       elementId: raw.elementId as string | undefined,
@@ -371,7 +416,19 @@ export function defineWorker<
   };
 
   async function dispatch(raw: Record<string, unknown>): Promise<void> {
-    const job = enrich(raw);
+    let job: WorkerJob;
+    try {
+      job = enrich(raw);
+    } catch (err) {
+      // A job we cannot act on (no key to complete/fail against): surface it
+      // loudly and replenish the credit so the stream keeps flowing rather than
+      // silently stalling.
+      const msg = err instanceof Error ? err.message : String(err);
+      lastError = msg;
+      emit(STATUS, { state: "running", message: msg });
+      send({ type: "jobCredits", jobType: opts.type, n: 1 });
+      return;
+    }
     inFlight += 1;
     try {
       const out = await opts.handle(job, ctx);
@@ -424,7 +481,7 @@ export function defineWorker<
           break;
         }
         case "job":
-          void dispatch((frame.job as Record<string, unknown>) ?? {});
+          void dispatch(frame.job as Record<string, unknown>);
           break;
         case "commandResult": {
           const status = Number(frame.status ?? 0);
