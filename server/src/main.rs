@@ -16879,12 +16879,21 @@ fn batch_operation_item_response(
 /// result is never persisted (e.g. a conditional-evaluation key). The engine's
 /// real partition key generator is reserved for durable state mutated through a
 /// journal command; a stateless evaluation records nothing, so it must not touch
-/// it. A millisecond timestamp times a per-process monotonic sequence yields a
-/// strictly-increasing numeric string that never collides within a run.
+/// it. A millisecond timestamp seeds the low-water mark, but a per-process
+/// monotonic counter is what guarantees the result: each call returns strictly
+/// more than the last one issued, so keys never collide or decrease within a run
+/// no matter how many are minted in the same millisecond.
 fn next_stateless_key() -> u64 {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    now_millis().wrapping_mul(1_000).wrapping_add(seq % 1_000)
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let seed = now_millis().wrapping_mul(1_000);
+    let mut prev = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = seed.max(prev.wrapping_add(1));
+        match LAST.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(observed) => prev = observed,
+        }
+    }
 }
 
 /// The stateless FEEL **expression** and **conditional** evaluation endpoints
@@ -31053,7 +31062,10 @@ mod expression_conditional_tests {
     async fn expression_evaluation_covers_the_feel_matrix() {
         let srv = server();
         // Literals + arithmetic (operator precedence + decimal division).
-        assert_eq!(eval_ok(&srv, "2 + 3 * 4", None).await, serde_json::json!(14));
+        assert_eq!(
+            eval_ok(&srv, "2 + 3 * 4", None).await,
+            serde_json::json!(14)
+        );
         assert_eq!(eval_ok(&srv, "10 / 4", None).await, serde_json::json!(2.5));
         // String concatenation.
         assert_eq!(
@@ -31078,12 +31090,7 @@ mod expression_conditional_tests {
         );
         // Nested / deep property access.
         assert_eq!(
-            eval_ok(
-                &srv,
-                "a.b",
-                vars(&[("a", serde_json::json!({"b": 5}))])
-            )
-            .await,
+            eval_ok(&srv, "a.b", vars(&[("a", serde_json::json!({"b": 5}))])).await,
             serde_json::json!(5)
         );
         // List filter.
@@ -31135,8 +31142,9 @@ mod expression_conditional_tests {
     }
 
     /// An explicit `"variables": null` is accepted as "no variables" (not a
-    /// deserialisation/500), and a reference to a missing variable surfaces as a
-    /// `400` rather than a `500`.
+    /// deserialisation/500), and a reference to a variable that is absent from the
+    /// context resolves to FEEL `null` (unknown variables are `null`, not an
+    /// error), so the evaluation still succeeds with a `200`.
     #[tokio::test]
     async fn expression_variables_null_and_missing_reference() {
         use apis::expression::EvaluateExpressionResponse as Resp;
@@ -31160,6 +31168,55 @@ mod expression_conditional_tests {
             }
             other => panic!("expected 200, got {other:?}"),
         }
+        // A reference to a variable that was never supplied resolves to FEEL
+        // `null` rather than erroring — lock that in so a future change to the
+        // embedded evaluator can't silently start returning 400/500 here.
+        let body = models::ExpressionEvaluationRequest {
+            expression: "missingVar".to_string(),
+            tenant_id: None,
+            scope_key: None,
+            variables: Some(types::Nullable::Null),
+        };
+        match srv.evaluate_expression_impl(&body).await.unwrap() {
+            Resp::Status200_ExpressionEvaluatedSuccessfully(r) => {
+                assert_eq!(
+                    match r.result {
+                        types::Nullable::Present(o) => o.0,
+                        types::Nullable::Null => serde_json::Value::Null,
+                    },
+                    serde_json::Value::Null
+                );
+            }
+            other => panic!("expected 200 with null result for a missing reference, got {other:?}"),
+        }
+    }
+
+    /// `next_stateless_key` must be strictly increasing and collision-free across
+    /// a burst issued within the same millisecond — the defect class the previous
+    /// `seq % 1_000` implementation reintroduced (keys wrapped and collided after
+    /// 1,000 calls per ms). Mint far more than 1,000 keys back-to-back and assert
+    /// every one is unique and greater than its predecessor.
+    #[test]
+    fn stateless_keys_are_strictly_increasing_and_unique() {
+        let n = 10_000;
+        let mut keys = Vec::with_capacity(n);
+        for _ in 0..n {
+            keys.push(next_stateless_key());
+        }
+        for pair in keys.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "stateless keys must strictly increase: {} !> {}",
+                pair[1],
+                pair[0]
+            );
+        }
+        let unique: std::collections::HashSet<u64> = keys.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            n,
+            "stateless keys must never collide within a run"
+        );
     }
 
     /// A conditional evaluation with no targeted definition succeeds with a fresh
@@ -31172,9 +31229,12 @@ mod expression_conditional_tests {
         let body = models::ConditionalEvaluationInstruction {
             tenant_id: Some("tenant-a".to_string()),
             process_definition_key: None,
-            variables: [("orderAmount".to_string(), types::Object(serde_json::json!(1000)))]
-                .into_iter()
-                .collect(),
+            variables: [(
+                "orderAmount".to_string(),
+                types::Object(serde_json::json!(1000)),
+            )]
+            .into_iter()
+            .collect(),
         };
         match srv.evaluate_conditionals_impl(&body).await.unwrap() {
             Resp::Status200_SuccessfullyEvaluatedRoot(r) => {
@@ -31202,7 +31262,9 @@ mod expression_conditional_tests {
                 variables: std::collections::HashMap::new(),
             };
             match srv.evaluate_conditionals_impl(&body).await.unwrap() {
-                Resp::Status404_TheProcessDefinitionWasNotFoundForTheGivenProcessDefinitionKey(p) => {
+                Resp::Status404_TheProcessDefinitionWasNotFoundForTheGivenProcessDefinitionKey(
+                    p,
+                ) => {
                     assert_eq!(p.status, 404);
                 }
                 other => panic!("expected 404 for key '{bad}', got {other:?}"),
