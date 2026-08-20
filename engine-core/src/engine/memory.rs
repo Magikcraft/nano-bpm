@@ -49,6 +49,7 @@ impl Engine {
             dirty_vars: std::collections::HashSet::new(),
             forgotten_vars: std::collections::HashSet::new(),
             retired_tombstones: std::collections::HashSet::new(),
+            cluster_variables: crate::cluster_vars::ClusterVariables::default(),
         }
     }
 

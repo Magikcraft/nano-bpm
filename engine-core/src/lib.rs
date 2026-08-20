@@ -69,6 +69,7 @@
 //! assert!(engine.is_completed(instance_key));
 //! ```
 
+mod cluster_vars;
 mod command;
 mod engine;
 mod event;
@@ -93,6 +94,7 @@ pub use command::form_id_of;
 pub use command::{
     ActivateElementInstruction, Command, FormResource, GenericResource, UserTaskChangeset,
 };
+pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT};
 #[cfg(feature = "serde")]
 pub use engine::EngineSnapshot;
 pub use engine::{adhoc_inner_instance_id, ADHOC_INNER_INSTANCE_ID_POSTFIX};

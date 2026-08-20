@@ -58,9 +58,10 @@ use http::StatusCode;
 use nanobpm_gateway_rest::{apis, models, types};
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    ActivatedJob, AdHocActivateElement, AdHocJobResult, Command, EngineError, Event, IncidentKind,
-    IncidentState, Key, MAX_PARTITION_ID, ProcessBuilder, ProcessDefinition, ProcessInstanceState,
-    TaskListenerJobResult, UserTaskCorrections, Value, partition_of,
+    ActivatedJob, AdHocActivateElement, AdHocJobResult, ClusterVariableSnapshot, ClusterVariables,
+    Command, EngineError, Event, IncidentKind, IncidentState, Key, MAX_PARTITION_ID,
+    ProcessBuilder, ProcessDefinition, ProcessInstanceState, TaskListenerJobResult,
+    UserTaskCorrections, Value, partition_of,
 };
 
 use crate::backpressure::{
@@ -115,9 +116,603 @@ type RetirementBuffer = Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<
 #[allow(dead_code)] // #905 (batch-operations) fills this
 pub struct BatchOperationStore {/* #905 fills this */}
 
-#[derive(Clone, Default)]
-#[allow(dead_code)] // #906 (cluster-variables) fills this
-pub struct ClusterVariableStore {/* #906 fills this */}
+/// #906 cluster-variables state (epic #903).
+///
+/// A cluster variable is an operator-managed value resolvable from FEEL at
+/// runtime. It is either **global** (visible to every tenant) or bound to a
+/// specific **tenant**; a global and a tenant variable may share a name without
+/// clashing, so the store keys each entry by `(tenant, name)` where `tenant` is
+/// `None` for global scope.
+///
+/// The store is the source of truth for the v2 `/cluster-variables` REST
+/// surface. Every mutation also refreshes `runtime` — the shared
+/// [`ClusterVariables`] snapshot the embedded engine overlays *underneath*
+/// instance variables during FEEL evaluation (see `engine-core`
+/// `overlay_cluster_variables`) — so REST state and runtime resolution never
+/// drift. The value is stored as an engine [`Value`] (not the JSON wire string),
+/// which is exactly what both the FEEL overlay and the REST projection need.
+#[derive(Clone)]
+pub struct ClusterVariableStore {
+    entries: Arc<std::sync::RwLock<ClusterVariableEntries>>,
+    runtime: ClusterVariables,
+}
+
+/// The stored entries plus a monotonic id counter. `by_key` is keyed by
+/// `(tenant, name)` (`None` tenant = global); `next_id` hands each entry a
+/// unique, stable id used as the search pagination cursor.
+#[derive(Default)]
+struct ClusterVariableEntries {
+    by_key: std::collections::HashMap<(Option<String>, String), StoredClusterVariable>,
+    next_id: u64,
+}
+
+/// One stored cluster variable. `value` is the engine [`Value`] (source of truth
+/// for both the FEEL overlay and the REST projection); `id` gives search a stable
+/// pagination cursor.
+#[derive(Clone)]
+struct StoredClusterVariable {
+    id: u64,
+    name: String,
+    tenant_id: Option<String>,
+    value: Value,
+}
+
+impl ClusterVariableStore {
+    /// Builds a store backed by the shared runtime snapshot the engine reads for
+    /// FEEL resolution. The two stay in lock-step: every mutation rebuilds the
+    /// snapshot from the current entries.
+    fn new(runtime: ClusterVariables) -> Self {
+        Self {
+            entries: Arc::new(std::sync::RwLock::new(ClusterVariableEntries::default())),
+            runtime,
+        }
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, ClusterVariableEntries> {
+        self.entries.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, ClusterVariableEntries> {
+        self.entries.write().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Returns the stored variable for `(tenant, name)`, if any.
+    fn get(&self, tenant: Option<&str>, name: &str) -> Option<StoredClusterVariable> {
+        self.read()
+            .by_key
+            .get(&(tenant.map(str::to_string), name.to_string()))
+            .cloned()
+    }
+
+    /// Creates a new variable. Returns `false` (creating nothing) when one
+    /// already exists for `(tenant, name)` — the caller maps that to 409.
+    fn create(&self, tenant: Option<&str>, name: &str, value: Value) -> bool {
+        let key = (tenant.map(str::to_string), name.to_string());
+        {
+            let mut e = self.write();
+            if e.by_key.contains_key(&key) {
+                return false;
+            }
+            e.next_id += 1;
+            let id = e.next_id;
+            e.by_key.insert(
+                key,
+                StoredClusterVariable {
+                    id,
+                    name: name.to_string(),
+                    tenant_id: tenant.map(str::to_string),
+                    value,
+                },
+            );
+        }
+        self.sync_runtime();
+        true
+    }
+
+    /// Updates an existing variable's value in place, preserving its id. Returns
+    /// `false` when none exists for `(tenant, name)` — the caller maps that to
+    /// 404.
+    fn update(&self, tenant: Option<&str>, name: &str, value: Value) -> bool {
+        let key = (tenant.map(str::to_string), name.to_string());
+        {
+            let mut e = self.write();
+            match e.by_key.get_mut(&key) {
+                Some(entry) => entry.value = value,
+                None => return false,
+            }
+        }
+        self.sync_runtime();
+        true
+    }
+
+    /// Deletes a variable. Returns `false` when none exists — the caller maps
+    /// that to 404.
+    fn delete(&self, tenant: Option<&str>, name: &str) -> bool {
+        let key = (tenant.map(str::to_string), name.to_string());
+        let removed = self.write().by_key.remove(&key).is_some();
+        if removed {
+            self.sync_runtime();
+        }
+        removed
+    }
+
+    /// Snapshots every stored variable (for search).
+    fn all(&self) -> Vec<StoredClusterVariable> {
+        self.read().by_key.values().cloned().collect()
+    }
+
+    /// Rebuilds the shared runtime snapshot from the current entries so the
+    /// engine's FEEL overlay reflects the latest state after every mutation.
+    fn sync_runtime(&self) {
+        let mut snap = ClusterVariableSnapshot::default();
+        for entry in self.read().by_key.values() {
+            match &entry.tenant_id {
+                None => {
+                    snap.global.insert(entry.name.clone(), entry.value.clone());
+                }
+                Some(tenant) => {
+                    snap.tenants
+                        .entry(tenant.clone())
+                        .or_default()
+                        .insert(entry.name.clone(), entry.value.clone());
+                }
+            }
+        }
+        let mut guard = self.runtime.write().unwrap_or_else(|p| p.into_inner());
+        *guard = snap;
+    }
+}
+
+/// The engine value's JSON wire string, as carried in the REST `value` field.
+fn cluster_variable_value_string(value: &Value) -> String {
+    serde_json::to_string(&value_to_json(value)).unwrap_or_else(|_| "null".to_string())
+}
+
+/// The REST `(scope, tenantId)` projection of a stored variable's tenant.
+fn cluster_variable_scope(
+    tenant_id: &Option<String>,
+) -> (models::ClusterVariableScopeEnum, types::Nullable<String>) {
+    match tenant_id {
+        None => (
+            models::ClusterVariableScopeEnum::Global,
+            types::Nullable::Null,
+        ),
+        Some(t) => (
+            models::ClusterVariableScopeEnum::Tenant,
+            types::Nullable::Present(t.clone()),
+        ),
+    }
+}
+
+/// Projects a stored cluster variable into the create / update / single-get
+/// `ClusterVariableResult` (always the full, untruncated value).
+fn cluster_variable_result(v: &StoredClusterVariable) -> models::ClusterVariableResult {
+    let (scope, tenant_id) = cluster_variable_scope(&v.tenant_id);
+    models::ClusterVariableResult::new(
+        v.name.clone(),
+        scope,
+        tenant_id,
+        cluster_variable_value_string(&v.value),
+    )
+}
+
+/// Projects a stored cluster variable into a `ClusterVariableSearchResult`,
+/// applying value truncation per the request's `truncateValues` setting.
+fn cluster_variable_search_result(
+    v: &StoredClusterVariable,
+    truncate: bool,
+) -> models::ClusterVariableSearchResult {
+    let (scope, tenant_id) = cluster_variable_scope(&v.tenant_id);
+    let (value, is_truncated) = truncate_value(&cluster_variable_value_string(&v.value), truncate);
+    models::ClusterVariableSearchResult::new(v.name.clone(), scope, tenant_id, value, is_truncated)
+}
+
+impl ServerImpl {
+    /// POST /v2/cluster-variables/global — create a global-scoped cluster
+    /// variable. 200 with the created resource, or 409 when one already exists.
+    async fn create_global_cluster_variable_impl(
+        &self,
+        body: &models::CreateClusterVariableRequest,
+    ) -> Result<apis::cluster_variable::CreateGlobalClusterVariableResponse, ()> {
+        use apis::cluster_variable::CreateGlobalClusterVariableResponse as Resp;
+        let value = json_to_value(&body.value.0);
+        if self.cluster_variables.create(None, &body.name, value) {
+            let stored = self
+                .cluster_variables
+                .get(None, &body.name)
+                .expect("just created");
+            Ok(Resp::Status200_ClusterVariableCreated(
+                cluster_variable_result(&stored),
+            ))
+        } else {
+            Ok(Resp::Status409_AClusterVariableWithThisNameAlreadyExists(
+                problem(
+                    "Cluster variable already exists",
+                    409,
+                    format!("A global cluster variable named '{}' already exists.", body.name),
+                ),
+            ))
+        }
+    }
+
+    /// POST /v2/cluster-variables/tenants/{tenantId} — create a tenant-scoped
+    /// cluster variable. 200 with the created resource, or 409 when one already
+    /// exists for that tenant.
+    async fn create_tenant_cluster_variable_impl(
+        &self,
+        path_params: &models::CreateTenantClusterVariablePathParams,
+        body: &models::CreateClusterVariableRequest,
+    ) -> Result<apis::cluster_variable::CreateTenantClusterVariableResponse, ()> {
+        use apis::cluster_variable::CreateTenantClusterVariableResponse as Resp;
+        let tenant = path_params.tenant_id.as_str();
+        let value = json_to_value(&body.value.0);
+        if self.cluster_variables.create(Some(tenant), &body.name, value) {
+            let stored = self
+                .cluster_variables
+                .get(Some(tenant), &body.name)
+                .expect("just created");
+            Ok(Resp::Status200_ClusterVariableCreated(
+                cluster_variable_result(&stored),
+            ))
+        } else {
+            Ok(
+                Resp::Status409_AClusterVariableWithThisNameAlreadyExistsForTheGivenTenant(
+                    problem(
+                        "Cluster variable already exists",
+                        409,
+                        format!(
+                            "A cluster variable named '{}' already exists for tenant '{tenant}'.",
+                            body.name
+                        ),
+                    ),
+                ),
+            )
+        }
+    }
+
+    /// PUT /v2/cluster-variables/global/{name} — update a global-scoped cluster
+    /// variable's value. 200 with the updated resource, or 404 when absent.
+    async fn update_global_cluster_variable_impl(
+        &self,
+        path_params: &models::UpdateGlobalClusterVariablePathParams,
+        body: &models::UpdateClusterVariableRequest,
+    ) -> Result<apis::cluster_variable::UpdateGlobalClusterVariableResponse, ()> {
+        use apis::cluster_variable::UpdateGlobalClusterVariableResponse as Resp;
+        let value = json_to_value(&body.value.0);
+        if self.cluster_variables.update(None, &path_params.name, value) {
+            let stored = self
+                .cluster_variables
+                .get(None, &path_params.name)
+                .expect("just updated");
+            Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
+                cluster_variable_result(&stored),
+            ))
+        } else {
+            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+                "Cluster variable not found",
+                404,
+                format!(
+                    "No global cluster variable named '{}'.",
+                    path_params.name
+                ),
+            )))
+        }
+    }
+
+    /// PUT /v2/cluster-variables/tenants/{tenantId}/{name} — update a
+    /// tenant-scoped cluster variable's value. 200 with the updated resource, or
+    /// 404 when absent for that tenant.
+    async fn update_tenant_cluster_variable_impl(
+        &self,
+        path_params: &models::UpdateTenantClusterVariablePathParams,
+        body: &models::UpdateClusterVariableRequest,
+    ) -> Result<apis::cluster_variable::UpdateTenantClusterVariableResponse, ()> {
+        use apis::cluster_variable::UpdateTenantClusterVariableResponse as Resp;
+        let tenant = path_params.tenant_id.as_str();
+        let value = json_to_value(&body.value.0);
+        if self
+            .cluster_variables
+            .update(Some(tenant), &path_params.name, value)
+        {
+            let stored = self
+                .cluster_variables
+                .get(Some(tenant), &path_params.name)
+                .expect("just updated");
+            Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
+                cluster_variable_result(&stored),
+            ))
+        } else {
+            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+                "Cluster variable not found",
+                404,
+                format!(
+                    "No cluster variable named '{}' for tenant '{tenant}'.",
+                    path_params.name
+                ),
+            )))
+        }
+    }
+
+    /// GET /v2/cluster-variables/global/{name} — fetch a global-scoped cluster
+    /// variable with its full value. 200 or 404.
+    async fn get_global_cluster_variable_impl(
+        &self,
+        path_params: &models::GetGlobalClusterVariablePathParams,
+    ) -> Result<apis::cluster_variable::GetGlobalClusterVariableResponse, ()> {
+        use apis::cluster_variable::GetGlobalClusterVariableResponse as Resp;
+        match self.cluster_variables.get(None, &path_params.name) {
+            Some(v) => Ok(Resp::Status200_ClusterVariableFound(
+                cluster_variable_result(&v),
+            )),
+            None => Ok(Resp::Status404_ClusterVariableNotFound(problem(
+                "Cluster variable not found",
+                404,
+                format!(
+                    "No global cluster variable named '{}'.",
+                    path_params.name
+                ),
+            ))),
+        }
+    }
+
+    /// GET /v2/cluster-variables/tenants/{tenantId}/{name} — fetch a
+    /// tenant-scoped cluster variable with its full value. 200 or 404.
+    async fn get_tenant_cluster_variable_impl(
+        &self,
+        path_params: &models::GetTenantClusterVariablePathParams,
+    ) -> Result<apis::cluster_variable::GetTenantClusterVariableResponse, ()> {
+        use apis::cluster_variable::GetTenantClusterVariableResponse as Resp;
+        let tenant = path_params.tenant_id.as_str();
+        match self.cluster_variables.get(Some(tenant), &path_params.name) {
+            Some(v) => Ok(Resp::Status200_ClusterVariableFound(
+                cluster_variable_result(&v),
+            )),
+            None => Ok(Resp::Status404_ClusterVariableNotFound(problem(
+                "Cluster variable not found",
+                404,
+                format!(
+                    "No cluster variable named '{}' for tenant '{tenant}'.",
+                    path_params.name
+                ),
+            ))),
+        }
+    }
+
+    /// DELETE /v2/cluster-variables/global/{name} — delete a global-scoped
+    /// cluster variable. 204 or 404.
+    async fn delete_global_cluster_variable_impl(
+        &self,
+        path_params: &models::DeleteGlobalClusterVariablePathParams,
+    ) -> Result<apis::cluster_variable::DeleteGlobalClusterVariableResponse, ()> {
+        use apis::cluster_variable::DeleteGlobalClusterVariableResponse as Resp;
+        if self.cluster_variables.delete(None, &path_params.name) {
+            Ok(Resp::Status204_ClusterVariableDeletedSuccessfully)
+        } else {
+            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+                "Cluster variable not found",
+                404,
+                format!(
+                    "No global cluster variable named '{}'.",
+                    path_params.name
+                ),
+            )))
+        }
+    }
+
+    /// DELETE /v2/cluster-variables/tenants/{tenantId}/{name} — delete a
+    /// tenant-scoped cluster variable. 204 or 404.
+    async fn delete_tenant_cluster_variable_impl(
+        &self,
+        path_params: &models::DeleteTenantClusterVariablePathParams,
+    ) -> Result<apis::cluster_variable::DeleteTenantClusterVariableResponse, ()> {
+        use apis::cluster_variable::DeleteTenantClusterVariableResponse as Resp;
+        let tenant = path_params.tenant_id.as_str();
+        if self
+            .cluster_variables
+            .delete(Some(tenant), &path_params.name)
+        {
+            Ok(Resp::Status204_ClusterVariableDeletedSuccessfully)
+        } else {
+            Ok(Resp::Status404_ClusterVariableNotFound(problem(
+                "Cluster variable not found",
+                404,
+                format!(
+                    "No cluster variable named '{}' for tenant '{tenant}'.",
+                    path_params.name
+                ),
+            )))
+        }
+    }
+
+    /// POST /v2/cluster-variables/search — search cluster variables across all
+    /// scopes, applying the name/value/tenantId/scope/isTruncated filters,
+    /// multi-field sort, and cursor/offset pagination. `truncateValues` (query
+    /// param, default true) governs value truncation of the returned items.
+    async fn search_cluster_variables_impl(
+        &self,
+        query_params: &models::SearchClusterVariablesQueryParams,
+        body: &Option<models::ClusterVariableSearchQueryRequest>,
+    ) -> Result<apis::cluster_variable::SearchClusterVariablesResponse, ()> {
+        use apis::cluster_variable::SearchClusterVariablesResponse as Resp;
+
+        let truncate = query_params.truncate_values.unwrap_or(true);
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+
+        let mut matched: Vec<StoredClusterVariable> = self
+            .cluster_variables
+            .all()
+            .into_iter()
+            .filter(|v| match filter {
+                None => true,
+                Some(f) => {
+                    let value_str = cluster_variable_value_string(&v.value);
+                    let (scope_enum, _) = cluster_variable_scope(&v.tenant_id);
+                    let truncated = value_is_truncated(&value_str, truncate);
+                    query::match_string(&f.name, &v.name)
+                        && query::match_string(&f.value, &value_str)
+                        && query::match_string_opt(&f.tenant_id, v.tenant_id.as_deref())
+                        && query::match_cluster_variable_scope(&f.scope, &scope_enum.to_string())
+                        && f.is_truncated.is_none_or(|want| want == truncated)
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::ClusterVariableSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |v, field| match field {
+                "name" => query::SortVal::Str(v.name.clone()),
+                "value" => query::SortVal::Str(cluster_variable_value_string(&v.value)),
+                "tenantId" => {
+                    query::SortVal::Str(v.tenant_id.clone().unwrap_or_default())
+                }
+                "scope" => {
+                    let (scope_enum, _) = cluster_variable_scope(&v.tenant_id);
+                    query::SortVal::Str(scope_enum.to_string())
+                }
+                _ => query::SortVal::Num(v.id as i64),
+            },
+            |v| v.id,
+        );
+
+        let sorted: Vec<(u64, StoredClusterVariable)> =
+            matched.into_iter().map(|v| (v.id, v)).collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::ClusterVariableSearchResult> = page
+            .items
+            .iter()
+            .map(|v| cluster_variable_search_result(v, truncate))
+            .collect();
+
+        Ok(Resp::Status200_TheClusterVariableSearchResult(
+            models::ClusterVariableSearchQueryResult::new(page.response, items),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod cluster_variable_tests {
+    use super::*;
+    use serde_json::json;
+    use nanobpmn_engine_core::DEFAULT_TENANT;
+
+    fn store() -> ClusterVariableStore {
+        ClusterVariableStore::new(ClusterVariables::default())
+    }
+
+    fn val(j: serde_json::Value) -> Value {
+        json_to_value(&j)
+    }
+
+    #[test]
+    fn create_rejects_a_duplicate_scope_and_name() {
+        let s = store();
+        assert!(s.create(None, "region", val(json!("EMEA"))));
+        // Same (scope, name) again -> false, which the handler maps to 409.
+        assert!(!s.create(None, "region", val(json!("APAC"))));
+        // The rejected create left the stored value untouched.
+        assert_eq!(
+            cluster_variable_value_string(&s.get(None, "region").unwrap().value),
+            "\"EMEA\""
+        );
+    }
+
+    #[test]
+    fn global_and_tenant_scopes_are_isolated() {
+        let s = store();
+        assert!(s.create(None, "region", val(json!("global"))));
+        assert!(s.create(Some("acme"), "region", val(json!("acme"))));
+        assert_eq!(s.all().len(), 2);
+        assert_eq!(
+            cluster_variable_value_string(&s.get(None, "region").unwrap().value),
+            "\"global\""
+        );
+        assert_eq!(
+            cluster_variable_value_string(&s.get(Some("acme"), "region").unwrap().value),
+            "\"acme\""
+        );
+        // A lookup never crosses scopes.
+        assert!(s.get(Some("other"), "region").is_none());
+    }
+
+    #[test]
+    fn update_requires_an_existing_entry() {
+        let s = store();
+        // Update of a missing var -> false, which the handler maps to 404.
+        assert!(!s.update(None, "ghost", val(json!(1))));
+        assert!(s.create(None, "ghost", val(json!(1))));
+        assert!(s.update(None, "ghost", val(json!(2))));
+        assert_eq!(
+            cluster_variable_value_string(&s.get(None, "ghost").unwrap().value),
+            "2"
+        );
+    }
+
+    #[test]
+    fn delete_reports_absence() {
+        let s = store();
+        assert!(!s.delete(None, "nope"));
+        assert!(s.create(None, "nope", val(json!(true))));
+        assert!(s.delete(None, "nope"));
+        assert!(s.get(None, "nope").is_none());
+    }
+
+    #[test]
+    fn empty_object_value_round_trips() {
+        let s = store();
+        assert!(s.create(None, "cfg", val(json!({}))));
+        assert_eq!(
+            cluster_variable_value_string(&s.get(None, "cfg").unwrap().value),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn mutations_sync_the_shared_runtime_snapshot() {
+        let runtime = ClusterVariables::default();
+        let s = ClusterVariableStore::new(runtime.clone());
+        s.create(None, "region", val(json!("EMEA")));
+        s.create(Some(DEFAULT_TENANT), "tier", val(json!(2)));
+        {
+            let snap = runtime.read().unwrap();
+            assert_eq!(snap.global.get("region"), Some(&val(json!("EMEA"))));
+            assert_eq!(
+                snap.tenants.get(DEFAULT_TENANT).and_then(|m| m.get("tier")),
+                Some(&val(json!(2)))
+            );
+        }
+        s.delete(None, "region");
+        assert!(runtime.read().unwrap().global.get("region").is_none());
+    }
+
+    #[test]
+    fn result_projection_reports_scope_and_tenant() {
+        let s = store();
+        s.create(None, "g", val(json!("x")));
+        s.create(Some("acme"), "t", val(json!("y")));
+        let g = cluster_variable_result(&s.get(None, "g").unwrap());
+        assert_eq!(g.scope, models::ClusterVariableScopeEnum::Global);
+        assert_eq!(g.tenant_id, types::Nullable::Null);
+        assert_eq!(g.value, "\"x\"");
+        let t = cluster_variable_result(&s.get(Some("acme"), "t").unwrap());
+        assert_eq!(t.scope, models::ClusterVariableScopeEnum::Tenant);
+        assert_eq!(t.tenant_id, types::Nullable::Present("acme".to_string()));
+    }
+
+    #[test]
+    fn search_result_truncates_long_values() {
+        let s = store();
+        let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
+        s.create(None, "big", val(json!(long)));
+        let stored = s.get(None, "big").unwrap();
+        assert!(cluster_variable_search_result(&stored, true).is_truncated);
+        assert!(!cluster_variable_search_result(&stored, false).is_truncated);
+    }
+}
 
 #[derive(Clone, Default)]
 #[allow(dead_code)] // #907 (jobs & job-statistics) fills this
@@ -943,12 +1538,18 @@ impl ServerImpl {
         // command latency — a representative single sample of engine load that
         // sizes the create-admission watermark applied across all partitions.
         let owned_count = journals.len();
+        // Shared cluster-variable handle: one snapshot the gateway's REST layer
+        // mutates and every owned engine reads while resolving FEEL expressions.
+        // Installed on each journal before it is moved onto its engine thread; the
+        // same handle backs `ServerImpl.cluster_variables` below.
+        let cluster_variables = ClusterVariables::default();
         let handles: Vec<DeepthiHandle> = journals
             .into_iter()
             .enumerate()
-            .map(|(i, journal)| {
+            .map(|(i, mut journal)| {
                 let ctrl = if i == 0 { controller.take() } else { None };
                 let partition = journal.partition_id();
+                journal.set_cluster_variables(cluster_variables.clone());
                 DeepthiHandle::spawn(journal, partition, ctrl)
             })
             .collect();
@@ -1034,7 +1635,7 @@ impl ServerImpl {
             peer_pressure: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_swrr: Arc::new(std::sync::Mutex::new(Vec::new())),
             batch_operations: BatchOperationStore::default(),
-            cluster_variables: ClusterVariableStore::default(),
+            cluster_variables: ClusterVariableStore::new(cluster_variables),
             job_statistics: JobStatisticsState::default(),
             #[cfg(feature = "console")]
             trace_store: Arc::new(console::trace::TraceStore::from_env()),
