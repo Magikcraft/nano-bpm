@@ -390,6 +390,28 @@ pub fn match_wait_state_type(
     }
 }
 
+/// Matches a `ClusterVariableScopeFilterProperty` (bare enum or advanced)
+/// against a scope's wire spelling (`GLOBAL`/`TENANT`).
+pub fn match_cluster_variable_scope(
+    filter: &Option<models::ClusterVariableScopeFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::ClusterVariableScopeFilterProperty::ClusterVariableScopeEnum(e)) => {
+            e.to_string() == value
+        }
+        Some(models::ClusterVariableScopeFilterProperty::AdvancedClusterVariableScopeFilter(a)) => {
+            ops!(
+                a,
+                |e: &models::ClusterVariableScopeEnum| e.to_string(),
+                like_no_notin
+            )
+            .matches(Some(value))
+        }
+    }
+}
+
 /// Matches a `BasicStringFilterProperty` (bare string or basic filter — no
 /// `$like`) against a value.
 pub fn match_basic_string(filter: &Option<models::BasicStringFilterProperty>, value: &str) -> bool {

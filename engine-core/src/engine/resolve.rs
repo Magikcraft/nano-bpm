@@ -174,11 +174,13 @@ impl Engine {
     }
 
     pub(crate) fn variables(&self, instance_key: Key) -> Arc<HashMap<String, Value>> {
-        self.state
+        let base = self
+            .state
             .instances
             .get(&instance_key)
             .map(|i| Arc::clone(&i.variables))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.overlay_cluster_variables(base)
     }
 
     /// The variables visible to a specific element instance: its scope's local
@@ -240,7 +242,7 @@ impl Engine {
     ) -> Arc<HashMap<String, Value>> {
         let is_root = scope_key == 0 || scope_key == instance.key;
         if is_root || instance.scope_variables.is_empty() {
-            return Arc::clone(&instance.variables);
+            return self.overlay_cluster_variables(Arc::clone(&instance.variables));
         }
         // Collect the scope chain leaf -> ... -> root, then merge root-first so
         // nearer scopes overwrite (shadow) farther ones.
@@ -260,6 +262,38 @@ impl Engine {
                     merged.insert(k.clone(), v.clone());
                 }
             }
+        }
+        self.overlay_cluster_variables(Arc::new(merged))
+    }
+
+    /// Layers the host-injected [cluster variables](crate::cluster_vars) *beneath*
+    /// an instance's own visible variables, so a FEEL expression evaluated against
+    /// the result reads a cluster variable whenever the instance does not define a
+    /// same-named local (instance/scope variables always shadow cluster ones).
+    ///
+    /// The common case — no cluster variables configured — returns `base`
+    /// unchanged (a refcount bump, no clone), preserving the zero-copy variable
+    /// resolution fast path. Only when the snapshot is non-empty does it pay a
+    /// clone-and-merge. The engine is single-tenant, so the global scope plus the
+    /// [`DEFAULT_TENANT`](crate::cluster_vars::DEFAULT_TENANT) tenant scope are
+    /// overlaid; a variable scoped to any other tenant is not visible here.
+    fn overlay_cluster_variables(
+        &self,
+        base: Arc<HashMap<String, Value>>,
+    ) -> Arc<HashMap<String, Value>> {
+        let guard = match self.cluster_variables.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.is_empty() {
+            return base;
+        }
+        let mut merged: HashMap<String, Value> = HashMap::new();
+        for (k, v) in guard.resolved_for(crate::cluster_vars::DEFAULT_TENANT) {
+            merged.insert(k.clone(), v.clone());
+        }
+        for (k, v) in base.iter() {
+            merged.insert(k.clone(), v.clone());
         }
         Arc::new(merged)
     }
@@ -813,5 +847,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cluster_variable_overlay_empty_returns_base_unchanged() {
+        // The hot path: with no cluster variables configured, the overlay is a
+        // no-op refcount bump — the very same allocation is returned.
+        let engine = Engine::new();
+        let mut base = HashMap::new();
+        base.insert("x".to_string(), Value::Int(1));
+        let base = Arc::new(base);
+        let out = engine.overlay_cluster_variables(Arc::clone(&base));
+        assert!(Arc::ptr_eq(&base, &out), "empty snapshot must not clone");
+    }
+
+    #[test]
+    fn cluster_variable_overlay_layers_under_instance_variables() {
+        use std::sync::{Arc as StdArc, RwLock};
+
+        use crate::cluster_vars::{ClusterVariableSnapshot, DEFAULT_TENANT};
+
+        let mut engine = Engine::new();
+        let mut snap = ClusterVariableSnapshot::default();
+        // A global var, and a same-named var the instance will shadow.
+        snap.global
+            .insert("region".to_string(), Value::Str("EMEA".to_string()));
+        snap.global
+            .insert("shared".to_string(), Value::Str("from-global".to_string()));
+        // A default-tenant var (visible to the single-tenant engine).
+        snap.tenants
+            .entry(DEFAULT_TENANT.to_string())
+            .or_default()
+            .insert("tier".to_string(), Value::Int(2));
+        // A var scoped to some other tenant must NOT be visible.
+        snap.tenants
+            .entry("other".to_string())
+            .or_default()
+            .insert("secret".to_string(), Value::Str("nope".to_string()));
+        engine.set_cluster_variables(StdArc::new(RwLock::new(snap)));
+
+        let mut base = HashMap::new();
+        base.insert(
+            "shared".to_string(),
+            Value::Str("from-instance".to_string()),
+        );
+        let out = engine.overlay_cluster_variables(Arc::new(base));
+
+        assert_eq!(out.get("region"), Some(&Value::Str("EMEA".to_string())));
+        assert_eq!(out.get("tier"), Some(&Value::Int(2)));
+        assert_eq!(
+            out.get("secret"),
+            None,
+            "other-tenant var must be invisible"
+        );
+        assert_eq!(
+            out.get("shared"),
+            Some(&Value::Str("from-instance".to_string())),
+            "instance variable must shadow the same-named cluster variable"
+        );
     }
 }

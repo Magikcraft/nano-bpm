@@ -27,7 +27,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nanobpmn_engine_core::{
-    ActivatedJob, Command, Engine, EngineError, Event, Incident, Key, ProcessInstance, State, Value,
+    ActivatedJob, ClusterVariables, Command, Engine, EngineError, Event, Incident, Key,
+    ProcessInstance, State, Value,
 };
 use tokio::sync::oneshot;
 
@@ -213,6 +214,13 @@ pub struct Journal {
     /// resident set drops back within budget so the next overflow is caught
     /// immediately.
     spill_check_skip: u32,
+    /// Host-injected [`ClusterVariables`] handle shared with this journal's
+    /// engine. Held here (in addition to being installed on the engine) so it can
+    /// be re-installed whenever the engine is rebuilt from a snapshot — cluster
+    /// variables are external configuration, so a `from_snapshot`/replay engine
+    /// starts with an empty set and must be re-linked to the live host handle,
+    /// exactly as `lenient_completion` is preserved across a snapshot load.
+    cluster_variables: ClusterVariables,
 }
 
 /// Cold-spill state held by a [`Journal`]: the shared disk store, the resident
@@ -927,6 +935,7 @@ impl Journal {
             cold: None,
             varstore: None,
             spill_check_skip: 0,
+            cluster_variables: ClusterVariables::default(),
         }
     }
 
@@ -953,6 +962,7 @@ impl Journal {
             cold: None,
             varstore: None,
             spill_check_skip: 0,
+            cluster_variables: ClusterVariables::default(),
         }
     }
 
@@ -989,6 +999,10 @@ impl Journal {
         let lenient = self.engine.lenient_completion();
         self.engine = Engine::from_snapshot(snapshot);
         self.engine.set_lenient_completion(lenient);
+        // Cluster variables are host-injected external config, absent from the
+        // snapshot body: re-link the fresh engine to the live shared handle.
+        self.engine
+            .set_cluster_variables(self.cluster_variables.clone());
         // If lean-snapshot mode is wired, re-enable dirty-var tracking on the
         // fresh engine and re-seed the dirty set so the next checkpoint rewrites
         // the full resident variable state into the authoritative store
@@ -1063,6 +1077,7 @@ impl Journal {
             cold: None,
             varstore: None,
             spill_check_skip: 0,
+            cluster_variables: ClusterVariables::default(),
         })
     }
 
@@ -1094,6 +1109,7 @@ impl Journal {
             cold: None,
             varstore: None,
             spill_check_skip: 0,
+            cluster_variables: ClusterVariables::default(),
         };
         Ok((journal, recovery))
     }
@@ -1129,6 +1145,7 @@ impl Journal {
             cold: None,
             varstore: None,
             spill_check_skip: 0,
+            cluster_variables: ClusterVariables::default(),
         }
     }
 
@@ -1159,6 +1176,7 @@ impl Journal {
             cold: None,
             varstore: None,
             spill_check_skip: 0,
+            cluster_variables: ClusterVariables::default(),
         }
     }
 
@@ -2134,6 +2152,16 @@ impl Journal {
     /// `NANOBPMN_REPLICATE_ACTIVATION=0`.
     pub fn set_lenient_completion(&mut self, lenient: bool) {
         self.engine.set_lenient_completion(lenient);
+    }
+
+    /// Installs the shared [`ClusterVariables`] handle on this journal and its
+    /// engine, so FEEL expressions evaluated during command processing resolve the
+    /// host's live global + per-tenant cluster variables. The handle is retained so
+    /// it can be re-installed after a snapshot restore (see
+    /// [`restore_engine_from_snapshot`](Self::restore_engine_from_snapshot)).
+    pub fn set_cluster_variables(&mut self, cluster_variables: ClusterVariables) {
+        self.cluster_variables = cluster_variables.clone();
+        self.engine.set_cluster_variables(cluster_variables);
     }
 
     /// The currently-held activation leases `(job_key, deadline)` on the
