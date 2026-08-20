@@ -335,6 +335,7 @@ components:
     JobUpdateBatchChangeset:
       description: The changeset to apply to the matched jobs; at least one field must be non-null.
       type: object
+      additionalProperties: false
       properties:
         priority:
           description: The new job-activation priority (0..=100).

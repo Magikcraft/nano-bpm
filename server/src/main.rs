@@ -5443,7 +5443,13 @@ impl ServerImpl {
         // Guard against an unbounded bucket count from a very fine resolution
         // over a wide window.
         let span = to_ms.saturating_sub(from_ms);
-        if span / resolution_ms > 10_000 {
+        // The window is inclusive (`[from, to]`), so the emitted bucket count is
+        // `ceil(span / resolution_ms)` (with a floor of 1). A floor division
+        // (`span / resolution_ms`) undercounts by one whenever the span is not
+        // an exact multiple of the resolution, which would admit up to 10,001
+        // buckets. Use ceiling division so the guard is exact.
+        let bucket_count = (span / resolution_ms) + u64::from(!span.is_multiple_of(resolution_ms));
+        if bucket_count > 10_000 {
             return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                 "Resolution too fine",
                 400,
@@ -29220,6 +29226,48 @@ mod clustered_startup_tests {
         assert_eq!(
             ts.items[0].completed.count, 2,
             "both events, including the one at exactly `to`, land in the inclusive final bucket"
+        );
+    }
+
+    /// Regression guard for the bucket-count off-by-one: the window is inclusive
+    /// (`[from, to]`), so a span that is not an exact multiple of the resolution
+    /// emits `ceil(span / resolution)` buckets. A span of `10_000 * res + 1`
+    /// therefore yields 10_001 buckets and must be rejected, while an exact
+    /// `10_000 * res` span (10_000 buckets) is allowed. A floor-division guard
+    /// wrongly admitted the former.
+    #[tokio::test]
+    async fn rest_job_time_series_bucket_guard_is_exact_at_the_boundary() {
+        use apis::job::GetJobTimeSeriesStatisticsResponse as R;
+        let server = ServerImpl::default();
+        let from_ms: u64 = 1_000_000_000_000;
+        let resolution_ms: u64 = 60_000; // PT1M
+
+        let make_query = |to_ms: u64| {
+            let from = ms_to_dt(from_ms).unwrap();
+            let to = ms_to_dt(to_ms).unwrap();
+            let mut filter = models::JobTimeSeriesStatisticsFilter::new(from, to, "guard".into());
+            filter.resolution = Some("PT1M".into());
+            models::JobTimeSeriesStatisticsQuery::new(filter)
+        };
+
+        // Exactly 10_000 buckets — accepted.
+        let resp = server
+            .get_job_time_series_statistics_impl(&make_query(from_ms + 10_000 * resolution_ms))
+            .await
+            .expect("handler runs");
+        assert!(
+            matches!(resp, R::Status200_TheJobTime(_)),
+            "a span producing exactly 10000 buckets must be accepted"
+        );
+
+        // 10_001 buckets (one extra millisecond of span) — rejected.
+        let resp = server
+            .get_job_time_series_statistics_impl(&make_query(from_ms + 10_000 * resolution_ms + 1))
+            .await
+            .expect("handler runs");
+        assert!(
+            matches!(resp, R::Status400_TheProvidedDataIsNotValid(_)),
+            "a span producing 10001 buckets must be rejected by the guard"
         );
     }
 
