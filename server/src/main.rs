@@ -167,14 +167,36 @@ struct JobErrorEntry {
 /// struct.
 #[derive(Clone, Default)]
 pub struct JobStatisticsState {
-    metrics: Arc<std::sync::Mutex<Vec<JobMetricEntry>>>,
-    errors: Arc<std::sync::Mutex<Vec<JobErrorEntry>>>,
+    metrics: Arc<std::sync::Mutex<std::collections::VecDeque<JobMetricEntry>>>,
+    errors: Arc<std::sync::Mutex<std::collections::VecDeque<JobErrorEntry>>>,
 }
 
+/// Safety ceiling on each in-memory job-statistics log so a long-running gateway
+/// cannot grow them without bound. When a log exceeds this many entries the
+/// oldest are evicted (the aggregations are windowed and recent-biased; durable,
+/// complete history is the sibling durable-tracking slice #905). Kept generous so
+/// realistic query windows are unaffected in practice.
+const MAX_JOB_STAT_ENTRIES: usize = 1_000_000;
+
 impl JobStatisticsState {
+    /// Recover the guard even if a holder panicked: dropping metrics after an
+    /// unrelated panic would silently lose all future statistics, so we take the
+    /// poisoned inner value rather than bailing out.
+    fn lock_metrics(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<JobMetricEntry>> {
+        self.metrics.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_errors(&self) -> std::sync::MutexGuard<'_, std::collections::VecDeque<JobErrorEntry>> {
+        self.errors.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn record(&self, entry: JobMetricEntry) {
-        if let Ok(mut g) = self.metrics.lock() {
-            g.push(entry);
+        let mut g = self.lock_metrics();
+        g.push_back(entry);
+        while g.len() > MAX_JOB_STAT_ENTRIES {
+            g.pop_front();
         }
     }
 
@@ -204,14 +226,16 @@ impl JobStatisticsState {
         error_message: String,
         at_ms: u64,
     ) {
-        if let Ok(mut g) = self.errors.lock() {
-            g.push(JobErrorEntry {
-                at_ms,
-                job_type,
-                worker,
-                error_code,
-                error_message,
-            });
+        let mut g = self.lock_errors();
+        g.push_back(JobErrorEntry {
+            at_ms,
+            job_type,
+            worker,
+            error_code,
+            error_message,
+        });
+        while g.len() > MAX_JOB_STAT_ENTRIES {
+            g.pop_front();
         }
     }
 
@@ -223,10 +247,7 @@ impl JobStatisticsState {
         to_ms: u64,
         job_type: Option<&str>,
     ) -> Vec<JobMetricEntry> {
-        let g = match self.metrics.lock() {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
-        };
+        let g = self.lock_metrics();
         g.iter()
             .filter(|e| e.at_ms >= from_ms && e.at_ms <= to_ms)
             .filter(|e| job_type.map(|t| e.job_type == t).unwrap_or(true))
@@ -235,10 +256,7 @@ impl JobStatisticsState {
     }
 
     fn errors_in_window(&self, from_ms: u64, to_ms: u64, job_type: &str) -> Vec<JobErrorEntry> {
-        let g = match self.errors.lock() {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
-        };
+        let g = self.lock_errors();
         g.iter()
             .filter(|e| e.at_ms >= from_ms && e.at_ms <= to_ms && e.job_type == job_type)
             .cloned()
@@ -246,18 +264,36 @@ impl JobStatisticsState {
     }
 }
 
-/// A monotonic sequence feeding synthesised batch-operation keys (issue #907's
+/// High-water mark backing synthesised batch-operation keys (issue #907's
 /// `/v2/jobs/batch-update`). Durable batch-operation *tracking* is a sibling
 /// slice (#905); this slice only needs a plausible, process-unique 64-bit key to
 /// return, so we synthesise one from the wall clock and this counter without
-/// touching the engine or the shared `ServerImpl` surface.
-static BATCH_OP_KEY_SEQ: AtomicU64 = AtomicU64::new(0);
+/// touching the engine or the shared `ServerImpl` surface. Storing the last key
+/// (rather than a bare sequence) lets us guarantee monotonicity even if the wall
+/// clock steps backwards (NTP correction).
+static LAST_BATCH_OP_KEY: AtomicU64 = AtomicU64::new(0);
 
-/// Mint a process-unique, monotonic, Camunda-shaped (64-bit numeric) key for a
-/// created batch operation.
+/// Mint a process-unique, strictly-monotonic, Camunda-shaped (64-bit numeric) key
+/// for a created batch operation. The high 48 bits carry the wall-clock instant
+/// so keys sort by creation time when the clock advances normally; the low 16
+/// bits disambiguate keys minted within the same millisecond. Monotonicity is
+/// enforced independently of the clock: each key is at least the previous key
+/// plus one, so a backwards clock step can never yield a key that sorts before an
+/// already-returned one.
 fn mint_batch_operation_key() -> u64 {
-    let seq = BATCH_OP_KEY_SEQ.fetch_add(1, Ordering::Relaxed);
-    (now_millis() << 16) | (seq & 0xFFFF)
+    let mut prev = LAST_BATCH_OP_KEY.load(Ordering::Relaxed);
+    loop {
+        let next = (now_millis() << 16).max(prev.saturating_add(1));
+        match LAST_BATCH_OP_KEY.compare_exchange_weak(
+            prev,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => prev = actual,
+        }
+    }
 }
 
 /// An epoch-millis instant as a UTC datetime, or `None` if it can't be
@@ -4839,9 +4875,10 @@ impl ServerImpl {
                 // Job-statistics (epic #903 / #907): a completed job, attributed to
                 // the worker that held it (captured before the command dropped it).
                 self.job_statistics.record_completed(
-                    completed_meta.0.clone().unwrap_or_else(|| {
-                        job_completed_type_from_events(&events)
-                    }),
+                    completed_meta
+                        .0
+                        .clone()
+                        .unwrap_or_else(|| job_completed_type_from_events(&events)),
                     completed_meta.1.clone(),
                     now_millis(),
                 );
@@ -5144,7 +5181,9 @@ impl ServerImpl {
         self.store
             .jobs()
             .into_iter()
-            .filter(|j| j.created_at_ms > 0 && j.created_at_ms >= from_ms && j.created_at_ms <= to_ms)
+            .filter(|j| {
+                j.created_at_ms > 0 && j.created_at_ms >= from_ms && j.created_at_ms <= to_ms
+            })
             .map(|j| (j.job_type, j.created_at_ms))
             .collect()
     }
@@ -5172,24 +5211,17 @@ impl ServerImpl {
                 "The changeset must set at least one of `priority` or `retries`.".to_string(),
             )));
         }
-        if let Some(p) = priority {
-            if !(0..=100).contains(&p) {
-                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Invalid priority",
-                    400,
-                    format!("Job priority must be between 0 and 100, got {p}."),
-                )));
-            }
+        if let Some(p) = priority
+            && !(0..=100).contains(&p)
+        {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid priority",
+                400,
+                format!("Job priority must be between 0 and 100, got {p}."),
+            )));
         }
-        if let Some(r) = retries {
-            if r < 0 {
-                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Invalid retries",
-                    400,
-                    format!("Job retries must not be negative, got {r}."),
-                )));
-            }
-        }
+        // `retries` is a non-negative integer at the schema/type level (its
+        // generated type is unsigned), so a negative value can never reach here.
 
         // Minting a trackable batch-operation key is the contract this endpoint
         // owes its caller; durable execution/tracking of the batch is a separate
@@ -5229,7 +5261,10 @@ impl ServerImpl {
                 bump(&mut created, at);
             }
         }
-        for e in self.job_statistics.metrics_in_window(from_ms, to_ms, job_type) {
+        for e in self
+            .job_statistics
+            .metrics_in_window(from_ms, to_ms, job_type)
+        {
             match e.status {
                 JobMetricStatus::Completed => bump(&mut completed, e.at_ms),
                 JobMetricStatus::Failed => bump(&mut failed, e.at_ms),
@@ -5429,13 +5464,28 @@ impl ServerImpl {
         let mut bucket_start = from_ms;
         loop {
             let bucket_end = bucket_start.saturating_add(resolution_ms);
+            // The last bucket includes `to_ms` inclusively (the query window is
+            // `[from, to]`). Every other bucket is half-open `[start, end)` so
+            // events on a boundary belong to exactly one bucket. Without this, a
+            // `to_ms` landing exactly on a bucket boundary spawned a spurious
+            // extra bucket starting at `to_ms` and pushed events at `to_ms` into
+            // it.
+            let is_last = bucket_end >= to_ms;
+            let in_bucket = |at: u64| {
+                at >= bucket_start
+                    && if is_last {
+                        at <= to_ms
+                    } else {
+                        at < bucket_end
+                    }
+            };
             let mut c = (0u64, None);
             let mut done = (0u64, None);
             let mut fail = (0u64, None);
-            for (_, at) in created.iter().filter(|(_, at)| *at >= bucket_start && *at < bucket_end) {
+            for (_, at) in created.iter().filter(|(_, at)| in_bucket(*at)) {
                 bump(&mut c, *at);
             }
-            for e in metrics.iter().filter(|e| e.at_ms >= bucket_start && e.at_ms < bucket_end) {
+            for e in metrics.iter().filter(|e| in_bucket(e.at_ms)) {
                 match e.status {
                     JobMetricStatus::Completed => bump(&mut done, e.at_ms),
                     JobMetricStatus::Failed => bump(&mut fail, e.at_ms),
@@ -5449,7 +5499,7 @@ impl ServerImpl {
                     status_metric(fail),
                 ));
             }
-            if bucket_end > to_ms {
+            if is_last {
                 break;
             }
             bucket_start = bucket_end;
@@ -5485,8 +5535,10 @@ impl ServerImpl {
 
         // Group thrown business errors by (errorCode, errorMessage), counting the
         // distinct workers that hit each.
-        let mut by_error: std::collections::BTreeMap<(String, String), std::collections::BTreeSet<String>> =
-            std::collections::BTreeMap::new();
+        let mut by_error: std::collections::BTreeMap<
+            (String, String),
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
         for e in self
             .job_statistics
             .errors_in_window(from_ms, to_ms, &filter.job_type)
@@ -28797,8 +28849,7 @@ mod clustered_startup_tests {
         // A valid changeset (priority within 0..=100) mints a trackable batch key.
         let mut changeset = models::JobUpdateBatchChangeset::new();
         changeset.priority = Some(types::Nullable::Present(50));
-        let req =
-            models::JobUpdateBatchOperationRequest::new(models::JobFilter::new(), changeset);
+        let req = models::JobUpdateBatchOperationRequest::new(models::JobFilter::new(), changeset);
         let resp = server
             .batch_update_jobs_impl(&req)
             .await
@@ -28827,9 +28878,8 @@ mod clustered_startup_tests {
 
         // A priority outside 0..=100 is a 400.
         let mut bad = models::JobUpdateBatchChangeset::new();
-        bad.priority = Some(types::Nullable::Present(500));
-        let bad_req =
-            models::JobUpdateBatchOperationRequest::new(models::JobFilter::new(), bad);
+        bad.priority = Some(types::Nullable::Present(200));
+        let bad_req = models::JobUpdateBatchOperationRequest::new(models::JobFilter::new(), bad);
         assert!(
             matches!(
                 server.batch_update_jobs_impl(&bad_req).await.unwrap(),
@@ -28926,13 +28976,18 @@ mod clustered_startup_tests {
             .expect("demo-work row present");
         assert_eq!(row.completed.count, 1);
         assert_eq!(row.created.count, 1);
-        assert_eq!(row.workers, 1, "one distinct worker handled a demo-work job");
+        assert_eq!(
+            row.workers, 1,
+            "one distinct worker handled a demo-work job"
+        );
 
         // By-workers: worker-a carries the completed job.
         use apis::job::GetJobWorkerStatisticsResponse as WResp;
-        let wq = models::JobWorkerStatisticsQuery::new(
-            models::JobWorkerStatisticsFilter::new(from, to, "demo-work".into()),
-        );
+        let wq = models::JobWorkerStatisticsQuery::new(models::JobWorkerStatisticsFilter::new(
+            from,
+            to,
+            "demo-work".into(),
+        ));
         let WResp::Status200_TheJobWorkerStatisticsResult(w) = server
             .get_job_worker_statistics_impl(&wq)
             .await
@@ -28949,8 +29004,7 @@ mod clustered_startup_tests {
 
         // Time-series: the completed job lands in exactly one 1-minute bucket.
         use apis::job::GetJobTimeSeriesStatisticsResponse as TSResp;
-        let mut tsf =
-            models::JobTimeSeriesStatisticsFilter::new(from, to, "demo-work".into());
+        let mut tsf = models::JobTimeSeriesStatisticsFilter::new(from, to, "demo-work".into());
         tsf.resolution = Some("PT1M".into());
         let TSResp::Status200_TheJobTime(ts) = server
             .get_job_time_series_statistics_impl(&models::JobTimeSeriesStatisticsQuery::new(tsf))
@@ -28964,9 +29018,11 @@ mod clustered_startup_tests {
 
         // Errors: none thrown, so a well-formed but empty result.
         use apis::job::GetJobErrorStatisticsResponse as EResp;
-        let eq = models::JobErrorStatisticsQuery::new(
-            models::JobErrorStatisticsFilter::new(from, to, "demo-work".into()),
-        );
+        let eq = models::JobErrorStatisticsQuery::new(models::JobErrorStatisticsFilter::new(
+            from,
+            to,
+            "demo-work".into(),
+        ));
         let EResp::Status200_TheJobErrorStatisticsResult(e) = server
             .get_job_error_statistics_impl(&eq)
             .await
@@ -29079,9 +29135,11 @@ mod clustered_startup_tests {
 
         let to = chrono::Utc::now() + chrono::Duration::hours(1);
         use apis::job::GetJobErrorStatisticsResponse as EResp;
-        let eq = models::JobErrorStatisticsQuery::new(
-            models::JobErrorStatisticsFilter::new(from, to, "err-work".into()),
-        );
+        let eq = models::JobErrorStatisticsQuery::new(models::JobErrorStatisticsFilter::new(
+            from,
+            to,
+            "err-work".into(),
+        ));
         let EResp::Status200_TheJobErrorStatisticsResult(e) = server
             .get_job_error_statistics_impl(&eq)
             .await
@@ -29110,15 +29168,72 @@ mod clustered_startup_tests {
         );
         filter.resolution = Some("nonsense".into());
         let resp = server
-            .get_job_time_series_statistics_impl(&models::JobTimeSeriesStatisticsQuery::new(
-                filter,
-            ))
+            .get_job_time_series_statistics_impl(&models::JobTimeSeriesStatisticsQuery::new(filter))
             .await
             .expect("handler runs");
         assert!(
             matches!(resp, R::Status400_TheProvidedDataIsNotValid(_)),
             "an unparseable ISO-8601 resolution must be rejected"
         );
+    }
+
+    /// Regression guard: when `to` falls exactly on a bucket boundary the query
+    /// window `[from, to]` must not spawn a spurious extra bucket, and an event
+    /// recorded at exactly `to` must be counted in the (inclusive) final bucket
+    /// rather than spilling into a new bucket starting at `to`.
+    #[tokio::test]
+    async fn rest_job_time_series_boundary_to_stays_in_last_bucket() {
+        let server = ServerImpl::default();
+        let from_ms: u64 = 1_000_000_000_000;
+        let resolution_ms: u64 = 60_000;
+        let to_ms = from_ms + resolution_ms; // `to` lands on a bucket boundary.
+
+        // A completed job at exactly `to` and another squarely in the first bucket.
+        server
+            .job_statistics
+            .record_completed("boundary".into(), Some("w".into()), to_ms);
+        server.job_statistics.record_completed(
+            "boundary".into(),
+            Some("w".into()),
+            from_ms + 1_000,
+        );
+
+        let from = ms_to_dt(from_ms).unwrap();
+        let to = ms_to_dt(to_ms).unwrap();
+        let mut filter = models::JobTimeSeriesStatisticsFilter::new(from, to, "boundary".into());
+        filter.resolution = Some("PT1M".into());
+
+        use apis::job::GetJobTimeSeriesStatisticsResponse as R;
+        let R::Status200_TheJobTime(ts) = server
+            .get_job_time_series_statistics_impl(&models::JobTimeSeriesStatisticsQuery::new(filter))
+            .await
+            .expect("handler runs")
+        else {
+            panic!("expected 200 from time-series");
+        };
+
+        assert_eq!(
+            ts.items.len(),
+            1,
+            "a one-resolution window must produce exactly one bucket, not an extra empty one"
+        );
+        assert_eq!(
+            ts.items[0].completed.count, 2,
+            "both events, including the one at exactly `to`, land in the inclusive final bucket"
+        );
+    }
+
+    /// Minted batch-operation keys must be strictly increasing even for many
+    /// same-millisecond calls, so consumers that sort or page by key never see a
+    /// regression or duplicate.
+    #[test]
+    fn mint_batch_operation_key_is_strictly_monotonic() {
+        let mut prev = 0u64;
+        for _ in 0..10_000 {
+            let k = mint_batch_operation_key();
+            assert!(k > prev, "key {k} did not exceed the previous key {prev}");
+            prev = k;
+        }
     }
 }
 

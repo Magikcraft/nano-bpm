@@ -340,12 +340,15 @@ components:
           description: The new job-activation priority (0..=100).
           type: integer
           format: int32
+          minimum: 0
+          maximum: 100
           nullable: true
           example: 50
         retries:
           description: The new number of remaining retries.
           type: integer
           format: int32
+          minimum: 0
           nullable: true
           example: 3
 
