@@ -1088,9 +1088,337 @@ mod cluster_variable_tests {
     }
 }
 
+/// One recorded terminal status of a job's lifecycle as reported by a worker:
+/// `Completed` or `Failed`. Thrown BPMN errors are tracked separately (they are
+/// business errors, not job failures — see [`JobStatisticsState::errors`]).
+/// `created` counts are *not* logged here: a job's creation is durably recorded
+/// in the read model (the `jobs.created_at_ms` column), so those are answered
+/// from there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobMetricStatus {
+    Completed,
+    Failed,
+}
+
+/// A single recorded job terminal-status transition, the raw material the
+/// `/jobs/statistics/*` aggregations are computed from for the completed/failed
+/// counters. The read model only keeps a job's *current* state and discards the
+/// worker on completion/failure, so per-window and per-worker completed/failed
+/// metrics can't be derived from it — they are answered from this append-only
+/// log instead.
+#[derive(Clone)]
+struct JobMetricEntry {
+    /// Wall-clock instant (epoch ms) the status was recorded.
+    at_ms: u64,
+    job_type: String,
+    /// The worker that processed the job, when known.
+    worker: Option<String>,
+    status: JobMetricStatus,
+}
+
+/// A single recorded BPMN business error thrown from a job, feeding the
+/// `/jobs/statistics/errors` aggregation.
+#[derive(Clone)]
+struct JobErrorEntry {
+    at_ms: u64,
+    job_type: String,
+    worker: Option<String>,
+    error_code: String,
+    error_message: String,
+}
+
+/// Job-statistics read state (epic #903, sub-issue #907). An append-only log of
+/// job completed/failed transitions and thrown business errors, recorded at the
+/// lifecycle handler sites and aggregated on demand by the
+/// `/v2/jobs/statistics/*` endpoints (global, by-types, by-workers, time-series,
+/// errors). `created` counts come from the read model. Shared across
+/// `ServerImpl` clones via `Arc`, like the other interior-mutable state on the
+/// struct.
 #[derive(Clone, Default)]
-#[allow(dead_code)] // #907 (jobs & job-statistics) fills this
-pub struct JobStatisticsState {/* #907 fills this */}
+pub struct JobStatisticsState {
+    metrics: Arc<std::sync::Mutex<std::collections::VecDeque<JobMetricEntry>>>,
+    errors: Arc<std::sync::Mutex<std::collections::VecDeque<JobErrorEntry>>>,
+}
+
+/// Safety ceiling on each in-memory job-statistics log so a long-running gateway
+/// cannot grow them without bound. When a log exceeds this many entries the
+/// oldest are evicted (the aggregations are windowed and recent-biased; durable,
+/// complete history is the sibling durable-tracking slice #905). Kept generous so
+/// realistic query windows are unaffected in practice.
+const MAX_JOB_STAT_ENTRIES: usize = 1_000_000;
+
+impl JobStatisticsState {
+    /// Recover the guard even if a holder panicked: dropping metrics after an
+    /// unrelated panic would silently lose all future statistics, so we take the
+    /// poisoned inner value rather than bailing out.
+    fn lock_metrics(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<JobMetricEntry>> {
+        self.metrics.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_errors(&self) -> std::sync::MutexGuard<'_, std::collections::VecDeque<JobErrorEntry>> {
+        self.errors.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn record(&self, entry: JobMetricEntry) {
+        let mut g = self.lock_metrics();
+        g.push_back(entry);
+        while g.len() > MAX_JOB_STAT_ENTRIES {
+            g.pop_front();
+        }
+    }
+
+    fn record_completed(&self, job_type: String, worker: Option<String>, at_ms: u64) {
+        self.record(JobMetricEntry {
+            at_ms,
+            job_type,
+            worker,
+            status: JobMetricStatus::Completed,
+        });
+    }
+
+    fn record_failed(&self, job_type: String, worker: Option<String>, at_ms: u64) {
+        self.record(JobMetricEntry {
+            at_ms,
+            job_type,
+            worker,
+            status: JobMetricStatus::Failed,
+        });
+    }
+
+    fn record_error(
+        &self,
+        job_type: String,
+        worker: Option<String>,
+        error_code: String,
+        error_message: String,
+        at_ms: u64,
+    ) {
+        let mut g = self.lock_errors();
+        g.push_back(JobErrorEntry {
+            at_ms,
+            job_type,
+            worker,
+            error_code,
+            error_message,
+        });
+        while g.len() > MAX_JOB_STAT_ENTRIES {
+            g.pop_front();
+        }
+    }
+
+    /// All terminal-status entries in the `[from_ms, to_ms]` window (inclusive),
+    /// optionally restricted to a single job type.
+    fn metrics_in_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+        job_type: Option<&str>,
+    ) -> Vec<JobMetricEntry> {
+        let g = self.lock_metrics();
+        g.iter()
+            .filter(|e| e.at_ms >= from_ms && e.at_ms <= to_ms)
+            .filter(|e| job_type.map(|t| e.job_type == t).unwrap_or(true))
+            .cloned()
+            .collect()
+    }
+
+    fn errors_in_window(&self, from_ms: u64, to_ms: u64, job_type: &str) -> Vec<JobErrorEntry> {
+        let g = self.lock_errors();
+        g.iter()
+            .filter(|e| e.at_ms >= from_ms && e.at_ms <= to_ms && e.job_type == job_type)
+            .cloned()
+            .collect()
+    }
+}
+
+/// High-water mark backing synthesised batch-operation keys (issue #907's
+/// `/v2/jobs/batch-update`). Durable batch-operation *tracking* is a sibling
+/// slice (#905); this slice only needs a plausible, process-unique 64-bit key to
+/// return, so we synthesise one from the wall clock and this counter without
+/// touching the engine or the shared `ServerImpl` surface. Storing the last key
+/// (rather than a bare sequence) lets us guarantee monotonicity even if the wall
+/// clock steps backwards (NTP correction).
+static LAST_BATCH_OP_KEY: AtomicU64 = AtomicU64::new(0);
+
+/// Mint a process-unique, strictly-monotonic, Camunda-shaped (64-bit numeric) key
+/// for a created batch operation. The high 48 bits carry the wall-clock instant
+/// so keys sort by creation time when the clock advances normally; the low 16
+/// bits disambiguate keys minted within the same millisecond. Monotonicity is
+/// enforced independently of the clock: each key is at least the previous key
+/// plus one, so a backwards clock step can never yield a key that sorts before an
+/// already-returned one.
+fn mint_batch_operation_key() -> u64 {
+    let mut prev = LAST_BATCH_OP_KEY.load(Ordering::Relaxed);
+    loop {
+        let next = (now_millis() << 16).max(prev.saturating_add(1));
+        match LAST_BATCH_OP_KEY.compare_exchange_weak(
+            prev,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => prev = actual,
+        }
+    }
+}
+
+/// An epoch-millis instant as a UTC datetime, or `None` if it can't be
+/// represented (the caller then reports the metric's `lastUpdatedAt` as null).
+fn ms_to_dt(ms: u64) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+}
+
+/// A UTC datetime as epoch milliseconds, clamped at zero (job-statistics windows
+/// are always non-negative wall-clock instants).
+fn dt_to_ms(dt: chrono::DateTime<chrono::Utc>) -> u64 {
+    dt.timestamp_millis().max(0) as u64
+}
+
+/// Build a `StatusMetric` (a count plus the most-recent contributing instant)
+/// from an accumulated `(count, last_ms)` slot.
+fn status_metric(slot: (u64, Option<u64>)) -> models::StatusMetric {
+    let last = match slot.1.and_then(ms_to_dt) {
+        Some(dt) => types::Nullable::Present(dt),
+        None => types::Nullable::Null,
+    };
+    // The wire type is a signed 64-bit count; a `u64 as i64` would silently
+    // wrap to a negative value past `i64::MAX`. That count can never be reached
+    // by a real job window, but clamp explicitly rather than emit a nonsensical
+    // negative count on the public API.
+    models::StatusMetric::new(i64::try_from(slot.0).unwrap_or(i64::MAX), last)
+}
+
+/// Fold one more contributing instant into a `(count, last_ms)` accumulator,
+/// bumping the count and advancing the recorded "last" instant.
+fn bump(slot: &mut (u64, Option<u64>), at_ms: u64) {
+    slot.0 += 1;
+    slot.1 = Some(slot.1.map_or(at_ms, |prev| prev.max(at_ms)));
+}
+
+/// Best-effort recovery of a completed job's type from the emitted events, used
+/// when the read-model snapshot taken before applying the command didn't carry
+/// it (e.g. the projection had not yet caught up).
+fn job_completed_type_from_events(events: &[Event]) -> String {
+    events
+        .iter()
+        .find_map(|e| match e {
+            Event::JobCompleted { job_type, .. } => Some(job_type.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Per-job-type completed/failed/created accumulator with the distinct set of
+/// workers that contributed, used by the by-types aggregation.
+#[derive(Default)]
+struct JobTypeAgg {
+    created: (u64, Option<u64>),
+    completed: (u64, Option<u64>),
+    failed: (u64, Option<u64>),
+    workers: std::collections::BTreeSet<String>,
+}
+
+/// Per-worker completed/failed accumulator used by the by-workers aggregation.
+#[derive(Default)]
+struct JobWorkerAgg {
+    completed: (u64, Option<u64>),
+    failed: (u64, Option<u64>),
+}
+
+/// Parse an ISO-8601 duration of the shape `PT[nH][nM][nS]` (a time-series
+/// bucket resolution) into milliseconds. Returns `None` for anything it can't
+/// interpret or a non-positive duration, which the caller maps to a 400.
+fn parse_iso8601_duration_ms(s: &str) -> Option<u64> {
+    let rest = s.trim().strip_prefix("PT")?;
+    if rest.is_empty() {
+        return None;
+    }
+    let mut total: u64 = 0;
+    let mut num = String::new();
+    let mut saw_component = false;
+    // Enforce the documented `PT[nH][nM][nS]` shape: each unit may appear at
+    // most once and only in canonical descending order (H, then M, then S).
+    // `last_rank` tracks the previous unit's rank so `PT1H2H` (duplicate) and
+    // `PT1S1H` (out of order) are rejected rather than silently summed.
+    let mut last_rank = u8::MAX;
+    for c in rest.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+            continue;
+        }
+        if num.is_empty() {
+            return None;
+        }
+        let value: u64 = num.parse().ok()?;
+        num.clear();
+        let (unit_ms, rank) = match c {
+            'H' => (3_600_000, 3u8),
+            'M' => (60_000, 2u8),
+            'S' => (1_000, 1u8),
+            _ => return None,
+        };
+        if rank >= last_rank {
+            return None;
+        }
+        last_rank = rank;
+        total = total.checked_add(value.checked_mul(unit_ms)?)?;
+        saw_component = true;
+    }
+    if !num.is_empty() || !saw_component {
+        return None;
+    }
+    (total > 0).then_some(total)
+}
+
+#[cfg(test)]
+mod duration_and_metric_tests {
+    use super::{parse_iso8601_duration_ms, status_metric, types};
+
+    #[test]
+    fn parses_canonical_components() {
+        assert_eq!(parse_iso8601_duration_ms("PT1H"), Some(3_600_000));
+        assert_eq!(parse_iso8601_duration_ms("PT30M"), Some(1_800_000));
+        assert_eq!(parse_iso8601_duration_ms("PT15S"), Some(15_000));
+        assert_eq!(
+            parse_iso8601_duration_ms("PT1H30M15S"),
+            Some(3_600_000 + 1_800_000 + 15_000)
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_units() {
+        assert_eq!(parse_iso8601_duration_ms("PT1H2H"), None);
+        assert_eq!(parse_iso8601_duration_ms("PT1M1M"), None);
+        assert_eq!(parse_iso8601_duration_ms("PT1S1S"), None);
+    }
+
+    #[test]
+    fn rejects_out_of_order_units() {
+        assert_eq!(parse_iso8601_duration_ms("PT1S1H"), None);
+        assert_eq!(parse_iso8601_duration_ms("PT1M1H"), None);
+        assert_eq!(parse_iso8601_duration_ms("PT1S1M"), None);
+    }
+
+    #[test]
+    fn rejects_malformed_and_empty() {
+        assert_eq!(parse_iso8601_duration_ms("PT"), None);
+        assert_eq!(parse_iso8601_duration_ms("PT0S"), None);
+        assert_eq!(parse_iso8601_duration_ms("P1D"), None);
+        assert_eq!(parse_iso8601_duration_ms("PT1X"), None);
+    }
+
+    #[test]
+    fn status_metric_clamps_count_instead_of_wrapping() {
+        // A `u64 as i64` cast of `u64::MAX` wraps to -1; the clamp must instead
+        // saturate to `i64::MAX` so the public API never returns a negative count.
+        let metric = status_metric((u64::MAX, None));
+        assert_eq!(metric.count, i64::MAX);
+        assert!(matches!(metric.last_updated_at, types::Nullable::Null));
+    }
+}
 
 #[derive(Clone)]
 pub struct ServerImpl {
@@ -5560,12 +5888,35 @@ impl ServerImpl {
         let result = self
             .engine
             .by_key(job_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
+            .with(move |engine| {
+                // Capture the job's type/worker authoritatively from engine state
+                // *before* the completion drops the activation, so the
+                // job-statistics attribution is race-free (the read model is
+                // eventually consistent and may lag).
+                let meta = engine
+                    .state()
+                    .jobs
+                    .get(&job_key)
+                    .map(|j| (Some(j.job_type.clone()), j.worker.clone()));
+                (meta, engine.apply_command_at(command, now_millis()))
+            })
             .await;
+        let (engine_meta, result) = result;
+        let completed_meta = engine_meta.unwrap_or((None, None));
         match result {
             Ok((events, commit)) => {
                 // Record REST job completion (drain-side; also feeds the drain guard).
                 self.note_job_completion("rest");
+                // Job-statistics (epic #903 / #907): a completed job, attributed to
+                // the worker that held it (captured before the command dropped it).
+                self.job_statistics.record_completed(
+                    completed_meta
+                        .0
+                        .clone()
+                        .unwrap_or_else(|| job_completed_type_from_events(&events)),
+                    completed_meta.1.clone(),
+                    now_millis(),
+                );
                 // REST API: await fsync before replying (synchronous durability).
                 // Contrast with falcon::pipeline_job_command, which replies
                 // immediately and awaits fsync in a detached task for throughput.
@@ -5664,17 +6015,34 @@ impl ServerImpl {
             .engine
             .by_key(job_key)
             .with(move |engine| {
-                engine.apply_command_at(
+                let meta = engine
+                    .state()
+                    .jobs
+                    .get(&job_key)
+                    .map(|j| (Some(j.job_type.clone()), j.worker.clone()));
+                let outcome = engine.apply_command_at(
                     Command::fail_job(job_key, retries, error_message),
                     now_millis(),
-                )
+                );
+                (meta, outcome)
             })
             .await;
+        let (engine_meta, result) = result;
+        let failed_meta = engine_meta.unwrap_or((None, None));
         match result {
             Ok((_, commit)) => {
                 // Record REST job completion (fail also completes the job lifecycle;
                 // drain-side, so it feeds the drain guard too).
                 self.note_job_completion("rest");
+                // Job-statistics (epic #903 / #907): a failed job, attributed to
+                // the worker that held it (captured before the command dropped it).
+                if let Some(job_type) = failed_meta.0.clone() {
+                    self.job_statistics.record_failed(
+                        job_type,
+                        failed_meta.1.clone(),
+                        now_millis(),
+                    );
+                }
                 commit.wait().await;
                 // Failing with retries left returns the job to the activatable
                 // pool, so wake any long-pollers.
@@ -5756,11 +6124,18 @@ impl ServerImpl {
                 .await);
         }
 
+        let stat_error_code = body_error_code.clone();
+        let stat_error_message = error_message.clone();
         let result = self
             .engine
             .by_key(job_key)
             .with(move |engine| {
-                engine.apply_command_at(
+                let meta = engine
+                    .state()
+                    .jobs
+                    .get(&job_key)
+                    .map(|j| (Some(j.job_type.clone()), j.worker.clone()));
+                let outcome = engine.apply_command_at(
                     Command::throw_job_error_with(
                         job_key,
                         body_error_code,
@@ -5768,12 +6143,27 @@ impl ServerImpl {
                         variables,
                     ),
                     now_millis(),
-                )
+                );
+                (meta, outcome)
             })
             .await;
+        let (engine_meta, result) = result;
+        let error_meta = engine_meta.unwrap_or((None, None));
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
+                // Job-statistics (epic #903 / #907): a thrown BPMN business error,
+                // feeding `/v2/jobs/statistics/errors`, attributed to the worker
+                // that held the job (captured before the command dropped it).
+                if let Some(job_type) = error_meta.0.clone() {
+                    self.job_statistics.record_error(
+                        job_type,
+                        error_meta.1.clone(),
+                        stat_error_code,
+                        stat_error_message,
+                        now_millis(),
+                    );
+                }
                 // A caught error can route the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
                 self.signal_jobs_available();
@@ -5808,6 +6198,419 @@ impl ServerImpl {
                 )),
             ),
         }
+    }
+
+    // --- Job-statistics & batch-update (epic #903, sub-issue #907) ------------
+    //
+    // These aggregate over the job/read-model state like the other `search_*`
+    // handlers: `created` counts come from the read model's `jobs.created_at_ms`
+    // column, while `completed`/`failed`/thrown-error counts come from the
+    // append-only `JobStatisticsState` log recorded at the lifecycle handlers
+    // (the read model discards a job's worker on completion, so those metrics
+    // can't be derived from it).
+
+    /// `(job_type, created_at_ms)` for every job created within `[from_ms,
+    /// to_ms]` (inclusive). Jobs with an unknown creation instant (`0`, e.g.
+    /// created before this column existed) are excluded.
+    fn created_jobs_in_window(&self, from_ms: u64, to_ms: u64) -> Vec<(String, u64)> {
+        self.store
+            .jobs()
+            .into_iter()
+            .filter(|j| {
+                j.created_at_ms > 0 && j.created_at_ms >= from_ms && j.created_at_ms <= to_ms
+            })
+            .map(|j| (j.job_type, j.created_at_ms))
+            .collect()
+    }
+
+    async fn batch_update_jobs_impl(
+        &self,
+        body: &models::JobUpdateBatchOperationRequest,
+    ) -> Result<apis::job::BatchUpdateJobsResponse, ()> {
+        use apis::job::BatchUpdateJobsResponse as Resp;
+
+        let changeset = &body.changeset;
+        let priority = match changeset.priority.as_ref() {
+            Some(types::Nullable::Present(p)) => Some(*p),
+            _ => None,
+        };
+        let retries = match changeset.retries.as_ref() {
+            Some(types::Nullable::Present(r)) => Some(*r),
+            _ => None,
+        };
+
+        if priority.is_none() && retries.is_none() {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid changeset",
+                400,
+                "The changeset must set at least one of `priority` or `retries`.".to_string(),
+            )));
+        }
+        if let Some(p) = priority
+            && !(0..=100).contains(&p)
+        {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid priority",
+                400,
+                format!("Job priority must be between 0 and 100, got {p}."),
+            )));
+        }
+        // `retries` is a non-negative integer at the schema/type level (its
+        // generated type is unsigned), so a negative value can never reach here.
+
+        // Minting a trackable batch-operation key is the contract this endpoint
+        // owes its caller; durable execution/tracking of the batch is a separate
+        // slice (#905) and deliberately out of scope here.
+        let key = mint_batch_operation_key();
+        Ok(Resp::Status200_TheBatchOperationWasCreated(
+            models::JobBatchUpdateResult {
+                batch_operation_key: key.to_string(),
+                batch_operation_type: "UPDATE_JOB".to_string(),
+            },
+        ))
+    }
+
+    async fn get_global_job_statistics_impl(
+        &self,
+        query_params: &models::GetGlobalJobStatisticsQueryParams,
+    ) -> Result<apis::job::GetGlobalJobStatisticsResponse, ()> {
+        use apis::job::GetGlobalJobStatisticsResponse as Resp;
+
+        let from_ms = dt_to_ms(query_params.from);
+        let to_ms = dt_to_ms(query_params.to);
+        if to_ms < from_ms {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid time range",
+                400,
+                "`from` must be before or equal to `to`.".to_string(),
+            )));
+        }
+        let job_type = query_params.job_type.as_deref();
+
+        let mut created = (0u64, None);
+        let mut completed = (0u64, None);
+        let mut failed = (0u64, None);
+
+        for (t, at) in self.created_jobs_in_window(from_ms, to_ms) {
+            if job_type.map(|jt| jt == t).unwrap_or(true) {
+                bump(&mut created, at);
+            }
+        }
+        for e in self
+            .job_statistics
+            .metrics_in_window(from_ms, to_ms, job_type)
+        {
+            match e.status {
+                JobMetricStatus::Completed => bump(&mut completed, e.at_ms),
+                JobMetricStatus::Failed => bump(&mut failed, e.at_ms),
+            }
+        }
+
+        Ok(Resp::Status200_GlobalJobMetrics(
+            models::GlobalJobStatisticsQueryResult::new(
+                status_metric(created),
+                status_metric(completed),
+                status_metric(failed),
+                false,
+            ),
+        ))
+    }
+
+    async fn get_job_type_statistics_impl(
+        &self,
+        body: &models::JobTypeStatisticsQuery,
+    ) -> Result<apis::job::GetJobTypeStatisticsResponse, ()> {
+        use apis::job::GetJobTypeStatisticsResponse as Resp;
+
+        let filter = match body.filter.as_ref() {
+            Some(f) => f,
+            None => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Missing filter",
+                    400,
+                    "A `filter` with a `from`/`to` window is required.".to_string(),
+                )));
+            }
+        };
+        let from_ms = dt_to_ms(filter.from);
+        let to_ms = dt_to_ms(filter.to);
+        if to_ms < from_ms {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid time range",
+                400,
+                "`from` must be before or equal to `to`.".to_string(),
+            )));
+        }
+
+        let mut by_type: std::collections::BTreeMap<String, JobTypeAgg> =
+            std::collections::BTreeMap::new();
+        for (t, at) in self.created_jobs_in_window(from_ms, to_ms) {
+            if query::match_string(&filter.job_type, &t) {
+                bump(&mut by_type.entry(t).or_default().created, at);
+            }
+        }
+        for e in self.job_statistics.metrics_in_window(from_ms, to_ms, None) {
+            if !query::match_string(&filter.job_type, &e.job_type) {
+                continue;
+            }
+            let agg = by_type.entry(e.job_type.clone()).or_default();
+            match e.status {
+                JobMetricStatus::Completed => bump(&mut agg.completed, e.at_ms),
+                JobMetricStatus::Failed => bump(&mut agg.failed, e.at_ms),
+            }
+            if let Some(w) = e.worker {
+                agg.workers.insert(w);
+            }
+        }
+
+        let items: Vec<models::JobTypeStatisticsItem> = by_type
+            .into_iter()
+            .map(|(job_type, agg)| {
+                models::JobTypeStatisticsItem::new(
+                    job_type,
+                    status_metric(agg.created),
+                    status_metric(agg.completed),
+                    status_metric(agg.failed),
+                    agg.workers.len() as i32,
+                )
+            })
+            .collect();
+
+        let page = models::SearchQueryPageResponse::new(
+            items.len() as i64,
+            false,
+            types::Nullable::Null,
+            types::Nullable::Null,
+        );
+        Ok(Resp::Status200_TheJobTypeStatisticsResult(
+            models::JobTypeStatisticsQueryResult::new(page, items),
+        ))
+    }
+
+    async fn get_job_worker_statistics_impl(
+        &self,
+        body: &models::JobWorkerStatisticsQuery,
+    ) -> Result<apis::job::GetJobWorkerStatisticsResponse, ()> {
+        use apis::job::GetJobWorkerStatisticsResponse as Resp;
+
+        let filter = &body.filter;
+        let from_ms = dt_to_ms(filter.from);
+        let to_ms = dt_to_ms(filter.to);
+        if to_ms < from_ms {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid time range",
+                400,
+                "`from` must be before or equal to `to`.".to_string(),
+            )));
+        }
+
+        let mut by_worker: std::collections::BTreeMap<String, JobWorkerAgg> =
+            std::collections::BTreeMap::new();
+        for e in self
+            .job_statistics
+            .metrics_in_window(from_ms, to_ms, Some(&filter.job_type))
+        {
+            let worker = match e.worker {
+                Some(w) => w,
+                None => continue,
+            };
+            let agg = by_worker.entry(worker).or_default();
+            match e.status {
+                JobMetricStatus::Completed => bump(&mut agg.completed, e.at_ms),
+                JobMetricStatus::Failed => bump(&mut agg.failed, e.at_ms),
+            }
+        }
+
+        let items: Vec<models::JobWorkerStatisticsItem> = by_worker
+            .into_iter()
+            .map(|(worker, agg)| {
+                models::JobWorkerStatisticsItem::new(
+                    worker,
+                    // Jobs carry no worker until activated, so per-worker
+                    // `created` is not attributable and is reported as zero.
+                    status_metric((0, None)),
+                    status_metric(agg.completed),
+                    status_metric(agg.failed),
+                )
+            })
+            .collect();
+
+        let page = models::SearchQueryPageResponse::new(
+            items.len() as i64,
+            false,
+            types::Nullable::Null,
+            types::Nullable::Null,
+        );
+        Ok(Resp::Status200_TheJobWorkerStatisticsResult(
+            models::JobWorkerStatisticsQueryResult::new(page, items),
+        ))
+    }
+
+    async fn get_job_time_series_statistics_impl(
+        &self,
+        body: &models::JobTimeSeriesStatisticsQuery,
+    ) -> Result<apis::job::GetJobTimeSeriesStatisticsResponse, ()> {
+        use apis::job::GetJobTimeSeriesStatisticsResponse as Resp;
+
+        let filter = &body.filter;
+        let from_ms = dt_to_ms(filter.from);
+        let to_ms = dt_to_ms(filter.to);
+        if to_ms < from_ms {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid time range",
+                400,
+                "`from` must be before or equal to `to`.".to_string(),
+            )));
+        }
+        let resolution_ms = match filter.resolution.as_deref() {
+            Some(s) => match parse_iso8601_duration_ms(s) {
+                Some(ms) => ms,
+                None => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid resolution",
+                        400,
+                        format!("`resolution` '{s}' is not a supported ISO-8601 duration."),
+                    )));
+                }
+            },
+            None => 60_000,
+        };
+        // Guard against an unbounded bucket count from a very fine resolution
+        // over a wide window.
+        let span = to_ms.saturating_sub(from_ms);
+        // The window is inclusive (`[from, to]`), so the emitted bucket count is
+        // `ceil(span / resolution_ms)`, clamped to a floor of 1. A floor
+        // division (`span / resolution_ms`) undercounts by one whenever the span
+        // is not an exact multiple of the resolution, which would admit up to
+        // 10,001 buckets. Use ceiling division so the guard is exact, and clamp
+        // to 1 so a zero-span window (`from == to`) still reports the single
+        // bucket the emitter actually produces rather than 0.
+        let bucket_count =
+            ((span / resolution_ms) + u64::from(!span.is_multiple_of(resolution_ms))).max(1);
+        if bucket_count > 10_000 {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Resolution too fine",
+                400,
+                "The window and resolution would produce more than 10000 buckets.".to_string(),
+            )));
+        }
+
+        let created: Vec<(String, u64)> = self
+            .created_jobs_in_window(from_ms, to_ms)
+            .into_iter()
+            .filter(|(t, _)| *t == filter.job_type)
+            .collect();
+        let metrics = self
+            .job_statistics
+            .metrics_in_window(from_ms, to_ms, Some(&filter.job_type));
+
+        // Pre-aggregate in a single pass over the (already window-filtered)
+        // `created`/`metrics` inputs instead of rescanning every event for every
+        // bucket. The previous nested loop was O(buckets × events); with
+        // `bucket_count` up to 10,000 and logs up to 1,000,000 entries that is a
+        // ~10^10 worst case (a DoS vector even within the allowed query shape).
+        // Each event's bucket index is `(at - from) / resolution`, clamped to the
+        // last bucket so an event landing exactly on `to_ms` (only possible when
+        // the span is an exact multiple of the resolution) folds into the final,
+        // `to`-inclusive bucket — identical semantics to the emit loop, half-open
+        // `[start, end)` everywhere except the inclusive last bucket.
+        let num_buckets = bucket_count as usize;
+        let bucket_index = |at: u64| -> usize {
+            (((at.saturating_sub(from_ms)) / resolution_ms) as usize).min(num_buckets - 1)
+        };
+        let mut created_acc = vec![(0u64, None); num_buckets];
+        let mut done_acc = vec![(0u64, None); num_buckets];
+        let mut fail_acc = vec![(0u64, None); num_buckets];
+        for (_, at) in &created {
+            bump(&mut created_acc[bucket_index(*at)], *at);
+        }
+        for e in &metrics {
+            let i = bucket_index(e.at_ms);
+            match e.status {
+                JobMetricStatus::Completed => bump(&mut done_acc[i], e.at_ms),
+                JobMetricStatus::Failed => bump(&mut fail_acc[i], e.at_ms),
+            }
+        }
+
+        let mut items: Vec<models::JobTimeSeriesStatisticsItem> = Vec::with_capacity(num_buckets);
+        for i in 0..num_buckets {
+            let bucket_start = from_ms.saturating_add((i as u64) * resolution_ms);
+            if let Some(time) = ms_to_dt(bucket_start) {
+                items.push(models::JobTimeSeriesStatisticsItem::new(
+                    time,
+                    status_metric(created_acc[i]),
+                    status_metric(done_acc[i]),
+                    status_metric(fail_acc[i]),
+                ));
+            }
+        }
+
+        let page = models::SearchQueryPageResponse::new(
+            items.len() as i64,
+            false,
+            types::Nullable::Null,
+            types::Nullable::Null,
+        );
+        Ok(Resp::Status200_TheJobTime(
+            models::JobTimeSeriesStatisticsQueryResult::new(page, items),
+        ))
+    }
+
+    async fn get_job_error_statistics_impl(
+        &self,
+        body: &models::JobErrorStatisticsQuery,
+    ) -> Result<apis::job::GetJobErrorStatisticsResponse, ()> {
+        use apis::job::GetJobErrorStatisticsResponse as Resp;
+
+        let filter = &body.filter;
+        let from_ms = dt_to_ms(filter.from);
+        let to_ms = dt_to_ms(filter.to);
+        if to_ms < from_ms {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid time range",
+                400,
+                "`from` must be before or equal to `to`.".to_string(),
+            )));
+        }
+
+        // Group thrown business errors by (errorCode, errorMessage), counting the
+        // distinct workers that hit each.
+        let mut by_error: std::collections::BTreeMap<
+            (String, String),
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
+        for e in self
+            .job_statistics
+            .errors_in_window(from_ms, to_ms, &filter.job_type)
+        {
+            if !query::match_string(&filter.error_code, &e.error_code) {
+                continue;
+            }
+            if !query::match_string(&filter.error_message, &e.error_message) {
+                continue;
+            }
+            let workers = by_error.entry((e.error_code, e.error_message)).or_default();
+            if let Some(w) = e.worker {
+                workers.insert(w);
+            }
+        }
+
+        let items: Vec<models::JobErrorStatisticsItem> = by_error
+            .into_iter()
+            .map(|((error_code, error_message), workers)| {
+                models::JobErrorStatisticsItem::new(error_code, error_message, workers.len() as i32)
+            })
+            .collect();
+
+        let page = models::SearchQueryPageResponse::new(
+            items.len() as i64,
+            false,
+            types::Nullable::Null,
+            types::Nullable::Null,
+        );
+        Ok(Resp::Status200_TheJobErrorStatisticsResult(
+            models::JobErrorStatisticsQueryResult::new(page, items),
+        ))
     }
 
     async fn update_job_impl(
@@ -29510,6 +30313,544 @@ mod clustered_startup_tests {
             "an owned partition must resume its durable lineage, not host fresh"
         );
         assert!(!followed_partition_hosts_fresh(false, false));
+    }
+
+    // --- issue #907: job batch-update priority & job-statistics -------------
+
+    #[tokio::test]
+    async fn rest_batch_update_jobs_validates_and_mints_a_batch_key() {
+        use apis::job::BatchUpdateJobsResponse as Resp;
+        let server = ServerImpl::default();
+
+        // A valid changeset (priority within 0..=100) mints a trackable batch key.
+        let mut changeset = models::JobUpdateBatchChangeset::new();
+        changeset.priority = Some(types::Nullable::Present(50));
+        let req = models::JobUpdateBatchOperationRequest::new(models::JobFilter::new(), changeset);
+        let resp = server
+            .batch_update_jobs_impl(&req)
+            .await
+            .expect("handler runs");
+        let Resp::Status200_TheBatchOperationWasCreated(result) = resp else {
+            panic!("expected 200 for a valid batch update");
+        };
+        assert_eq!(result.batch_operation_type, "UPDATE_JOB");
+        assert!(
+            result.batch_operation_key.parse::<u64>().is_ok(),
+            "the minted batch-operation key is numeric"
+        );
+
+        // An empty changeset is a 400.
+        let empty = models::JobUpdateBatchOperationRequest::new(
+            models::JobFilter::new(),
+            models::JobUpdateBatchChangeset::new(),
+        );
+        assert!(
+            matches!(
+                server.batch_update_jobs_impl(&empty).await.unwrap(),
+                Resp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "an empty changeset must be rejected"
+        );
+
+        // A priority outside 0..=100 is a 400.
+        let mut bad = models::JobUpdateBatchChangeset::new();
+        bad.priority = Some(types::Nullable::Present(200));
+        let bad_req = models::JobUpdateBatchOperationRequest::new(models::JobFilter::new(), bad);
+        assert!(
+            matches!(
+                server.batch_update_jobs_impl(&bad_req).await.unwrap(),
+                Resp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "an out-of-range priority must be rejected"
+        );
+    }
+
+    /// Wait for a job of `job_type` to project into the read model, returning its
+    /// key. Panics if it never appears — the read model is eventually consistent,
+    /// so callers poll like the other read-model tests.
+    async fn await_job_key(server: &ServerImpl, job_type: &str) -> u64 {
+        for _ in 0..200 {
+            if let Some(j) = server
+                .store
+                .jobs()
+                .into_iter()
+                .find(|j| j.job_type == job_type)
+            {
+                return j.key;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the {job_type} job never projected into the read model");
+    }
+
+    #[tokio::test]
+    async fn rest_job_statistics_count_a_completed_job() {
+        let server = ServerImpl::default();
+        let from = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        // The seeded `demo` process parks a `demo-work` service-task job.
+        server
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("create the demo instance");
+        let job_key = await_job_key(&server, "demo-work").await;
+
+        // Activate (which records the worker) then complete via the REST handler.
+        let activated = server
+            .activate_for_stream("demo-work", "worker-a", 10, 60_000, None)
+            .await;
+        assert_eq!(activated.len(), 1, "one demo-work job is activatable");
+        use apis::job::CompleteJobResponse as CResp;
+        let complete = server
+            .complete_job_impl(
+                &models::CompleteJobPathParams {
+                    job_key: job_key.to_string(),
+                },
+                &None,
+            )
+            .await
+            .expect("completion runs");
+        assert!(matches!(
+            complete,
+            CResp::Status204_TheJobWasCompletedSuccessfully
+        ));
+
+        let to = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        // Global: one created and one completed demo-work job, none failed.
+        use apis::job::GetGlobalJobStatisticsResponse as GResp;
+        let global = server
+            .get_global_job_statistics_impl(&models::GetGlobalJobStatisticsQueryParams {
+                from,
+                to,
+                job_type: Some("demo-work".into()),
+            })
+            .await
+            .expect("global stats run");
+        let GResp::Status200_GlobalJobMetrics(g) = global else {
+            panic!("expected 200 from global stats");
+        };
+        assert_eq!(g.completed.count, 1, "one completed job");
+        assert_eq!(g.created.count, 1, "one created job");
+        assert_eq!(g.failed.count, 0, "no failed jobs");
+
+        // By-types: the demo-work row carries the completed count and its worker.
+        use apis::job::GetJobTypeStatisticsResponse as TResp;
+        let mut tq = models::JobTypeStatisticsQuery::new();
+        tq.filter = Some(models::JobTypeStatisticsFilter::new(from, to));
+        let TResp::Status200_TheJobTypeStatisticsResult(t) = server
+            .get_job_type_statistics_impl(&tq)
+            .await
+            .expect("by-types runs")
+        else {
+            panic!("expected 200 from by-types");
+        };
+        let row = t
+            .items
+            .iter()
+            .find(|i| i.job_type == "demo-work")
+            .expect("demo-work row present");
+        assert_eq!(row.completed.count, 1);
+        assert_eq!(row.created.count, 1);
+        assert_eq!(
+            row.workers, 1,
+            "one distinct worker handled a demo-work job"
+        );
+
+        // By-workers: worker-a carries the completed job.
+        use apis::job::GetJobWorkerStatisticsResponse as WResp;
+        let wq = models::JobWorkerStatisticsQuery::new(models::JobWorkerStatisticsFilter::new(
+            from,
+            to,
+            "demo-work".into(),
+        ));
+        let WResp::Status200_TheJobWorkerStatisticsResult(w) = server
+            .get_job_worker_statistics_impl(&wq)
+            .await
+            .expect("by-workers runs")
+        else {
+            panic!("expected 200 from by-workers");
+        };
+        let wr = w
+            .items
+            .iter()
+            .find(|i| i.worker == "worker-a")
+            .expect("worker-a row present");
+        assert_eq!(wr.completed.count, 1);
+
+        // Time-series: the completed job lands in exactly one 1-minute bucket.
+        use apis::job::GetJobTimeSeriesStatisticsResponse as TSResp;
+        let mut tsf = models::JobTimeSeriesStatisticsFilter::new(from, to, "demo-work".into());
+        tsf.resolution = Some("PT1M".into());
+        let TSResp::Status200_TheJobTime(ts) = server
+            .get_job_time_series_statistics_impl(&models::JobTimeSeriesStatisticsQuery::new(tsf))
+            .await
+            .expect("time-series runs")
+        else {
+            panic!("expected 200 from time-series");
+        };
+        let completed_total: i64 = ts.items.iter().map(|i| i.completed.count).sum();
+        assert_eq!(completed_total, 1, "one completed job across all buckets");
+
+        // Errors: none thrown, so a well-formed but empty result.
+        use apis::job::GetJobErrorStatisticsResponse as EResp;
+        let eq = models::JobErrorStatisticsQuery::new(models::JobErrorStatisticsFilter::new(
+            from,
+            to,
+            "demo-work".into(),
+        ));
+        let EResp::Status200_TheJobErrorStatisticsResult(e) = server
+            .get_job_error_statistics_impl(&eq)
+            .await
+            .expect("error stats run")
+        else {
+            panic!("expected 200 from error stats");
+        };
+        assert!(e.items.is_empty(), "no thrown errors recorded");
+    }
+
+    #[tokio::test]
+    async fn rest_job_statistics_count_a_failed_job() {
+        let server = ServerImpl::default();
+        let from = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        server
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("create the demo instance");
+        let job_key = await_job_key(&server, "demo-work").await;
+        server
+            .activate_for_stream("demo-work", "worker-f", 10, 60_000, None)
+            .await;
+
+        use apis::job::FailJobResponse as FResp;
+        let mut fail = models::JobFailRequest::new();
+        fail.retries = Some(3);
+        let failed = server
+            .fail_job_impl(
+                &models::FailJobPathParams {
+                    job_key: job_key.to_string(),
+                },
+                &Some(fail),
+            )
+            .await
+            .expect("failure runs");
+        assert!(matches!(failed, FResp::Status204_TheJobIsFailed));
+
+        let to = chrono::Utc::now() + chrono::Duration::hours(1);
+        use apis::job::GetGlobalJobStatisticsResponse as GResp;
+        let GResp::Status200_GlobalJobMetrics(g) = server
+            .get_global_job_statistics_impl(&models::GetGlobalJobStatisticsQueryParams {
+                from,
+                to,
+                job_type: Some("demo-work".into()),
+            })
+            .await
+            .expect("global stats run")
+        else {
+            panic!("expected 200 from global stats");
+        };
+        assert_eq!(g.failed.count, 1, "one failed job recorded");
+    }
+
+    #[tokio::test]
+    async fn rest_job_error_statistics_count_a_thrown_error() {
+        let server = ServerImpl::default();
+        let from = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        // A service task with an error boundary catch, so a thrown BPMN error is
+        // handled (204) rather than raising an incident.
+        let proc = ProcessBuilder::new("erroring")
+            .start_event("s")
+            .service_task("work", "err-work")
+            .error_boundary_event("catch", "work", "E_BOOM")
+            .end_event("e")
+            .end_event("caught")
+            .connect("s", "work")
+            .connect("work", "e")
+            .connect("catch", "caught")
+            .build()
+            .expect("valid error-boundary process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("erroring".to_string(), "erroring.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        server
+            .create_for_stream(Some("erroring".into()), None, Default::default())
+            .await
+            .expect("create the erroring instance");
+        let job_key = await_job_key(&server, "err-work").await;
+        server
+            .activate_for_stream("err-work", "worker-e", 10, 60_000, None)
+            .await;
+
+        use apis::job::ThrowJobErrorResponse as ThResp;
+        let mut err_req = models::JobErrorRequest::new("E_BOOM".into());
+        err_req.error_message = Some(types::Nullable::Present("kaboom".into()));
+        let thrown = server
+            .throw_job_error_impl(
+                &models::ThrowJobErrorPathParams {
+                    job_key: job_key.to_string(),
+                },
+                &err_req,
+            )
+            .await
+            .expect("throw runs");
+        assert!(
+            matches!(thrown, ThResp::Status204_AnErrorIsThrownForTheJob),
+            "the boundary-caught error is accepted (204)"
+        );
+
+        let to = chrono::Utc::now() + chrono::Duration::hours(1);
+        use apis::job::GetJobErrorStatisticsResponse as EResp;
+        let eq = models::JobErrorStatisticsQuery::new(models::JobErrorStatisticsFilter::new(
+            from,
+            to,
+            "err-work".into(),
+        ));
+        let EResp::Status200_TheJobErrorStatisticsResult(e) = server
+            .get_job_error_statistics_impl(&eq)
+            .await
+            .expect("error stats run")
+        else {
+            panic!("expected 200 from error stats");
+        };
+        let row = e
+            .items
+            .iter()
+            .find(|i| i.error_code == "E_BOOM")
+            .expect("the E_BOOM error row is present");
+        assert_eq!(row.error_message, "kaboom");
+        assert_eq!(row.workers, 1, "one worker hit the error");
+    }
+
+    #[tokio::test]
+    async fn rest_job_time_series_rejects_a_bad_resolution() {
+        use apis::job::GetJobTimeSeriesStatisticsResponse as R;
+        let server = ServerImpl::default();
+        let now = chrono::Utc::now();
+        let mut filter = models::JobTimeSeriesStatisticsFilter::new(
+            now - chrono::Duration::minutes(5),
+            now,
+            "x".into(),
+        );
+        filter.resolution = Some("nonsense".into());
+        let resp = server
+            .get_job_time_series_statistics_impl(&models::JobTimeSeriesStatisticsQuery::new(filter))
+            .await
+            .expect("handler runs");
+        assert!(
+            matches!(resp, R::Status400_TheProvidedDataIsNotValid(_)),
+            "an unparseable ISO-8601 resolution must be rejected"
+        );
+    }
+
+    /// Regression guard: when `to` falls exactly on a bucket boundary the query
+    /// window `[from, to]` must not spawn a spurious extra bucket, and an event
+    /// recorded at exactly `to` must be counted in the (inclusive) final bucket
+    /// rather than spilling into a new bucket starting at `to`.
+    #[tokio::test]
+    async fn rest_job_time_series_boundary_to_stays_in_last_bucket() {
+        let server = ServerImpl::default();
+        let from_ms: u64 = 1_000_000_000_000;
+        let resolution_ms: u64 = 60_000;
+        let to_ms = from_ms + resolution_ms; // `to` lands on a bucket boundary.
+
+        // A completed job at exactly `to` and another squarely in the first bucket.
+        server
+            .job_statistics
+            .record_completed("boundary".into(), Some("w".into()), to_ms);
+        server.job_statistics.record_completed(
+            "boundary".into(),
+            Some("w".into()),
+            from_ms + 1_000,
+        );
+
+        let from = ms_to_dt(from_ms).unwrap();
+        let to = ms_to_dt(to_ms).unwrap();
+        let mut filter = models::JobTimeSeriesStatisticsFilter::new(from, to, "boundary".into());
+        filter.resolution = Some("PT1M".into());
+
+        use apis::job::GetJobTimeSeriesStatisticsResponse as R;
+        let R::Status200_TheJobTime(ts) = server
+            .get_job_time_series_statistics_impl(&models::JobTimeSeriesStatisticsQuery::new(filter))
+            .await
+            .expect("handler runs")
+        else {
+            panic!("expected 200 from time-series");
+        };
+
+        assert_eq!(
+            ts.items.len(),
+            1,
+            "a one-resolution window must produce exactly one bucket, not an extra empty one"
+        );
+        assert_eq!(
+            ts.items[0].completed.count, 2,
+            "both events, including the one at exactly `to`, land in the inclusive final bucket"
+        );
+    }
+
+    /// Regression guard for the bucket-count off-by-one: the window is inclusive
+    /// (`[from, to]`), so a span that is not an exact multiple of the resolution
+    /// emits `ceil(span / resolution)` buckets. A span of `10_000 * res + 1`
+    /// therefore yields 10_001 buckets and must be rejected, while an exact
+    /// `10_000 * res` span (10_000 buckets) is allowed. A floor-division guard
+    /// wrongly admitted the former.
+    #[tokio::test]
+    async fn rest_job_time_series_bucket_guard_is_exact_at_the_boundary() {
+        use apis::job::GetJobTimeSeriesStatisticsResponse as R;
+        let server = ServerImpl::default();
+        let from_ms: u64 = 1_000_000_000_000;
+        let resolution_ms: u64 = 60_000; // PT1M
+
+        let make_query = |to_ms: u64| {
+            let from = ms_to_dt(from_ms).unwrap();
+            let to = ms_to_dt(to_ms).unwrap();
+            let mut filter = models::JobTimeSeriesStatisticsFilter::new(from, to, "guard".into());
+            filter.resolution = Some("PT1M".into());
+            models::JobTimeSeriesStatisticsQuery::new(filter)
+        };
+
+        // Exactly 10_000 buckets — accepted.
+        let resp = server
+            .get_job_time_series_statistics_impl(&make_query(from_ms + 10_000 * resolution_ms))
+            .await
+            .expect("handler runs");
+        assert!(
+            matches!(resp, R::Status200_TheJobTime(_)),
+            "a span producing exactly 10000 buckets must be accepted"
+        );
+
+        // 10_001 buckets (one extra millisecond of span) — rejected.
+        let resp = server
+            .get_job_time_series_statistics_impl(&make_query(from_ms + 10_000 * resolution_ms + 1))
+            .await
+            .expect("handler runs");
+        assert!(
+            matches!(resp, R::Status400_TheProvidedDataIsNotValid(_)),
+            "a span producing 10001 buckets must be rejected by the guard"
+        );
+    }
+
+    /// Regression guard for the zero-span window (`from == to`). The emitter
+    /// always produces at least one bucket, so the bucket-count must be clamped
+    /// to a floor of 1; a naive `ceil(0 / res) == 0` would leave no buckets to
+    /// aggregate into and (with the single-pass indexer) underflow `num_buckets
+    /// - 1`. An event at that single instant must be counted in the lone bucket.
+    #[tokio::test]
+    async fn rest_job_time_series_zero_span_window_emits_one_bucket() {
+        let server = ServerImpl::default();
+        let at_ms: u64 = 1_000_000_000_000;
+
+        server
+            .job_statistics
+            .record_completed("zero".into(), Some("w".into()), at_ms);
+
+        let instant = ms_to_dt(at_ms).unwrap();
+        let mut filter =
+            models::JobTimeSeriesStatisticsFilter::new(instant, instant, "zero".into());
+        filter.resolution = Some("PT1M".into());
+
+        use apis::job::GetJobTimeSeriesStatisticsResponse as R;
+        let R::Status200_TheJobTime(ts) = server
+            .get_job_time_series_statistics_impl(&models::JobTimeSeriesStatisticsQuery::new(filter))
+            .await
+            .expect("handler runs")
+        else {
+            panic!("expected 200 from time-series");
+        };
+
+        assert_eq!(
+            ts.items.len(),
+            1,
+            "a zero-span window must still emit exactly one bucket"
+        );
+        assert_eq!(
+            ts.items[0].completed.count, 1,
+            "the single instant's event lands in the lone bucket"
+        );
+    }
+
+    /// Regression guard for the single-pass bucket aggregation (replacing the
+    /// former O(buckets × events) rescan): events spread across several buckets
+    /// must each land in the bucket whose half-open `[start, end)` range contains
+    /// them, with the final bucket inclusive of `to`. This pins the per-bucket
+    /// distribution, not just the grand total.
+    #[tokio::test]
+    async fn rest_job_time_series_distributes_events_across_buckets() {
+        let server = ServerImpl::default();
+        let from_ms: u64 = 1_000_000_000_000;
+        let resolution_ms: u64 = 60_000;
+        let to_ms = from_ms + 3 * resolution_ms; // inclusive [from, to] => 3 buckets
+
+        // Bucket 0: two completed. Bucket 2 (the inclusive last bucket): one
+        // completed + one failed mid-bucket, plus one completed at exactly
+        // `to_ms` which folds into this final bucket. Bucket 1 stays empty.
+        server
+            .job_statistics
+            .record_completed("dist".into(), Some("w".into()), from_ms + 1_000);
+        server
+            .job_statistics
+            .record_completed("dist".into(), Some("w".into()), from_ms + 2_000);
+        server.job_statistics.record_completed(
+            "dist".into(),
+            Some("w".into()),
+            from_ms + 2 * resolution_ms + 500,
+        );
+        server.job_statistics.record_failed(
+            "dist".into(),
+            Some("w".into()),
+            from_ms + 2 * resolution_ms + 600,
+        );
+        server
+            .job_statistics
+            .record_completed("dist".into(), Some("w".into()), to_ms);
+
+        let from = ms_to_dt(from_ms).unwrap();
+        let to = ms_to_dt(to_ms).unwrap();
+        let mut filter = models::JobTimeSeriesStatisticsFilter::new(from, to, "dist".into());
+        filter.resolution = Some("PT1M".into());
+
+        use apis::job::GetJobTimeSeriesStatisticsResponse as R;
+        let R::Status200_TheJobTime(ts) = server
+            .get_job_time_series_statistics_impl(&models::JobTimeSeriesStatisticsQuery::new(filter))
+            .await
+            .expect("handler runs")
+        else {
+            panic!("expected 200 from time-series");
+        };
+
+        assert_eq!(
+            ts.items.len(),
+            3,
+            "an inclusive 3-resolution span has 3 buckets"
+        );
+        let completed: Vec<i64> = ts.items.iter().map(|i| i.completed.count).collect();
+        let failed: Vec<i64> = ts.items.iter().map(|i| i.failed.count).collect();
+        assert_eq!(completed, vec![2, 0, 2], "completed per bucket");
+        assert_eq!(failed, vec![0, 0, 1], "failed per bucket");
+    }
+
+    /// Minted batch-operation keys must be strictly increasing even for many
+    /// same-millisecond calls, so consumers that sort or page by key never see a
+    /// regression or duplicate.
+    #[test]
+    fn mint_batch_operation_key_is_strictly_monotonic() {
+        let mut prev = 0u64;
+        for _ in 0..10_000 {
+            let k = mint_batch_operation_key();
+            assert!(k > prev, "key {k} did not exceed the previous key {prev}");
+            prev = k;
+        }
     }
 }
 

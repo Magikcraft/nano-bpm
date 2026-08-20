@@ -273,10 +273,102 @@ paths:
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.6"
 
+  /jobs/batch-update:
+    post:
+      x-eventually-consistent: false
+      tags:
+        - Job
+      operationId: batchUpdateJobs
+      security:
+        - bearerAuth: []
+        - basicAuth: []
+      summary: Update jobs (batch)
+      description: |
+        Creates a batch operation to update jobs matching the given filter. At least one
+        changeset field must be non-null. This is done asynchronously; the progress can be
+        tracked using the batchOperationKey from the response and the batch operation status
+        endpoint (`/batch-operations/{batchOperationKey}`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobUpdateBatchOperationRequest'
+      responses:
+        "200":
+          description: The batch operation was created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobBatchUpdateResult'
+        "400":
+          $ref: 'common-responses.yaml#/components/responses/InvalidData'
+        "401":
+          $ref: 'common-responses.yaml#/components/responses/Unauthorized'
+        "500":
+          $ref: 'common-responses.yaml#/components/responses/InternalServerError'
+        "503":
+          $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
+      x-added-in-version: "8.10"
+
 ## Schema definitions
 
 components:
   schemas:
+    JobUpdateBatchOperationRequest:
+      description: Batch update job request selecting the jobs to update and the new values.
+      type: object
+      additionalProperties: false
+      required:
+        - filter
+        - changeset
+      properties:
+        filter:
+          allOf:
+            - $ref: '#/components/schemas/JobFilter'
+          description: Filter selecting the jobs to update.
+        changeset:
+          $ref: '#/components/schemas/JobUpdateBatchChangeset'
+        operationReference:
+          $ref: 'keys.yaml#/components/schemas/OperationReference'
+
+    JobUpdateBatchChangeset:
+      description: The changeset to apply to the matched jobs; at least one field must be non-null.
+      type: object
+      additionalProperties: false
+      properties:
+        priority:
+          description: The new job-activation priority (0..=100).
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+          nullable: true
+          example: 50
+        retries:
+          description: The new number of remaining retries.
+          type: integer
+          format: int32
+          minimum: 0
+          nullable: true
+          example: 3
+
+    JobBatchUpdateResult:
+      description: The created batch operation for the job update.
+      type: object
+      required:
+        - batchOperationKey
+        - batchOperationType
+      properties:
+        batchOperationKey:
+          allOf:
+            - $ref: 'keys.yaml#/components/schemas/BatchOperationKey'
+          description: Key of the created batch operation.
+        batchOperationType:
+          description: The type of the batch operation.
+          type: string
+          example: UPDATE_JOB
+
     JobActivationRequest:
       type: object
       additionalProperties: false

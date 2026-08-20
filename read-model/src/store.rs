@@ -36,7 +36,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -46,7 +46,7 @@ const SCHEMA_VERSION: i64 = 2;
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -1950486211382609378;
+const SCHEMA_FINGERPRINT: i64 = -8497225416382442826;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -127,7 +127,8 @@ CREATE TABLE jobs (
     process_definition_id  TEXT NOT NULL,
     process_definition_key TEXT NOT NULL,
     job_kind               INTEGER NOT NULL DEFAULT 0,
-    listener_event_type    INTEGER NOT NULL DEFAULT 0
+    listener_event_type    INTEGER NOT NULL DEFAULT 0,
+    created_at_ms          INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE incidents (
     key                    INTEGER PRIMARY KEY,
@@ -956,6 +957,10 @@ pub struct JobRow {
     /// the display-relevant discriminant (kind + listener event type) is
     /// preserved in the read model; the listener index/scope are not projected.
     pub kind: JobKind,
+    /// Wall-clock instant (epoch ms) the job was created, carried from
+    /// [`crate::Event::JobCreated`]. `0` for jobs created before the engine
+    /// recorded the field. Feeds the `/v2/jobs/statistics/*` `created` counters.
+    pub created_at_ms: u64,
 }
 
 pub struct UserTaskRow {
@@ -2162,7 +2167,7 @@ impl ReadStore {
             .prepare(
                 "SELECT key, instance_key, element_instance_key, element_id, job_type, state, \
                  retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 job_kind, listener_event_type \
+                 job_kind, listener_event_type, created_at_ms \
                  FROM jobs",
             )
             .expect("prepare jobs");
@@ -2673,6 +2678,11 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         process_definition_id: r.get(9)?,
         process_definition_key: r.get(10)?,
         kind: job_kind_from(r.get(11)?, r.get(12)?),
+        // Clamp before the `u64` cast so a negative persisted timestamp (DB
+        // corruption / manual edits / a bad migration) can never wrap to a huge
+        // `u64` and skew `/v2/jobs/statistics/*`. Mirrors `map_message_subscription`
+        // — one canonical convention for every `created_at_ms` mapper.
+        created_at_ms: r.get::<_, i64>(13)?.max(0) as u64,
     })
 }
 
@@ -2691,7 +2701,7 @@ fn map_user_task(r: &rusqlite::Row) -> rusqlite::Result<UserTaskRow> {
         due_date: r.get(8)?,
         follow_up_date: r.get(9)?,
         priority: r.get(10)?,
-        created_at_ms: r.get::<_, i64>(11)? as u64,
+        created_at_ms: r.get::<_, i64>(11)?.max(0) as u64,
         process_definition_id: r.get(12)?,
         process_definition_key: r.get(13)?,
         process_definition_version: r.get(14)?,
@@ -2710,7 +2720,7 @@ fn map_incident(r: &rusqlite::Row) -> rusqlite::Result<IncidentRow> {
         state: incident_state_from(r.get(5)?),
         reason: r.get(6)?,
         job_key: r.get::<_, Option<i64>>(7)?.map(|v| v as Key),
-        created_at_ms: r.get::<_, i64>(8)? as u64,
+        created_at_ms: r.get::<_, i64>(8)?.max(0) as u64,
         process_definition_id: r.get(9)?,
         process_definition_key: r.get(10)?,
     })
@@ -3844,15 +3854,17 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             element_id,
             job_type,
             retries,
+            created_at,
             ..
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
             tx.cexecute(
                 "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
-                 state, retries, worker, deadline_ms, process_definition_id, process_definition_key) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9) \
+                 state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
+                 created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-                 worker = NULL, deadline_ms = NULL",
+                 worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms",
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -3863,6 +3875,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     *retries,
                     def_id,
                     def_key,
+                    *created_at as i64,
                 ],
             )?;
         }
@@ -3875,6 +3888,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             job_type,
             event_type,
             retries,
+            created_at,
             ..
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
@@ -3886,10 +3900,10 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             tx.cexecute(
                 "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 job_kind, listener_event_type) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11) \
+                 job_kind, listener_event_type, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-                 worker = NULL, deadline_ms = NULL",
+                 worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms",
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -3902,6 +3916,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     def_key,
                     kind_code,
                     event_code,
+                    *created_at as i64,
                 ],
             )?;
         }
@@ -6917,5 +6932,109 @@ mod read_surface_tests {
             .map(|t| t.key)
             .collect();
         assert_eq!(completed_only, vec![101]);
+    }
+
+    /// Defect-class guard: a `JobCreated` replay/repair must *refresh*
+    /// `created_at_ms`, not leave it stuck at a stale value. The
+    /// `/v2/jobs/statistics/*` aggregations count `created` jobs off
+    /// `created_at_ms`, so a row whose `created_at_ms` was persisted as `0` by an
+    /// older projection (predating the column) would be under-counted forever if
+    /// the upsert's `ON CONFLICT` clause did not overwrite it. Re-projecting the
+    /// same job with its real timestamp must repair the stale `0`.
+    #[test]
+    fn job_created_replay_repairs_stale_created_at_ms() {
+        let store = ReadStore::open(None).unwrap();
+        // Initial projection lands the row with a stale created_at_ms of 0, as an
+        // old DB predating the column would have.
+        store
+            .export(&[&Event::JobCreated {
+                job_key: 8001,
+                instance_key: 7000,
+                element_instance_key: 7001,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 0,
+                priority: 0,
+                retries: 3,
+            }])
+            .unwrap();
+        assert_eq!(
+            store
+                .jobs()
+                .into_iter()
+                .find(|j| j.key == 8001)
+                .unwrap()
+                .created_at_ms,
+            0,
+            "precondition: stale row starts at created_at_ms = 0"
+        );
+
+        // A repair/replay re-projects the same job carrying its real creation time.
+        store
+            .export(&[&Event::JobCreated {
+                job_key: 8001,
+                instance_key: 7000,
+                element_instance_key: 7001,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 1_724_000_000_000,
+                priority: 0,
+                retries: 3,
+            }])
+            .unwrap();
+
+        assert_eq!(
+            store
+                .jobs()
+                .into_iter()
+                .find(|j| j.key == 8001)
+                .unwrap()
+                .created_at_ms,
+            1_724_000_000_000,
+            "ON CONFLICT must refresh created_at_ms so statistics stop under-counting"
+        );
+    }
+
+    /// Defect-class guard: `created_at_ms` is persisted as a signed `INTEGER`,
+    /// so a negative value in the DB (corruption, manual edits, a bad migration)
+    /// must not survive the read-back as a wrapped, enormous `u64` — it would
+    /// badly skew `/v2/jobs/statistics/*` created counts and window filters. The
+    /// mappers clamp with `.max(0)`; this pins that for the job/user-task/incident
+    /// mappers together, since they share the one canonical convention.
+    #[test]
+    fn negative_created_at_ms_clamps_to_zero_on_read() {
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[&Event::JobCreated {
+                job_key: 8100,
+                instance_key: 7100,
+                element_instance_key: 7101,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 1_724_000_000_000,
+                priority: 0,
+                retries: 3,
+            }])
+            .unwrap();
+
+        // Simulate a corrupt / hand-edited row carrying a negative timestamp.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE jobs SET created_at_ms = ?1 WHERE key = ?2",
+                rusqlite::params![-5_i64, 8100_i64],
+            )
+            .unwrap();
+        }
+
+        let job = store
+            .jobs()
+            .into_iter()
+            .find(|j| j.key == 8100)
+            .expect("job present");
+        assert_eq!(
+            job.created_at_ms, 0,
+            "a negative persisted created_at_ms must clamp to 0, not wrap to a huge u64"
+        );
     }
 }

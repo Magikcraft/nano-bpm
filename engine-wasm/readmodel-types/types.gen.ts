@@ -5083,6 +5083,20 @@ export type JobActivationResult = {
 };
 
 /**
+ * The created batch operation for the job update.
+ */
+export type JobBatchUpdateResult = {
+    /**
+     * Key of the created batch operation.
+     */
+    batchOperationKey: BatchOperationKey;
+    /**
+     * The type of the batch operation.
+     */
+    batchOperationType: string;
+};
+
+/**
  * JSON object with changed job attribute values. The job cannot be completed or failed with this endpoint, use the complete job or fail job endpoints instead.
  */
 export type JobChangeset = {
@@ -5517,6 +5531,32 @@ export type JobStateEnum = 'CANCELED' | 'COMPLETED' | 'CREATED' | 'ERROR_THROWN'
  */
 export type JobStateFilterProperty = JobStateEnum | AdvancedJobStateFilter;
 
+/**
+ * The changeset to apply to the matched jobs; at least one field must be non-null.
+ */
+export type JobUpdateBatchChangeset = {
+    /**
+     * The new job-activation priority (0..=100).
+     */
+    priority?: number | null;
+    /**
+     * The new number of remaining retries.
+     */
+    retries?: number | null;
+};
+
+/**
+ * Batch update job request selecting the jobs to update and the new values.
+ */
+export type JobUpdateBatchOperationRequest = {
+    /**
+     * Filter selecting the jobs to update.
+     */
+    filter: JobFilter;
+    changeset: JobUpdateBatchChangeset;
+    operationReference?: OperationReference;
+};
+
 export type JobUpdateRequest = {
     changeset: JobChangeset;
     operationReference?: OperationReference;
@@ -5575,6 +5615,8 @@ export type UserTaskProperties = {
 };
 
 export type _1Jobs1Activation = unknown;
+
+export type _1Jobs1BatchUpdate = unknown;
 
 export type _1Jobs1Search = unknown;
 
@@ -13342,6 +13384,44 @@ export type FailJobResponses = {
 };
 
 export type FailJobResponse = FailJobResponses[keyof FailJobResponses];
+
+export type BatchUpdateJobsData = {
+    body: JobUpdateBatchOperationRequest;
+    path?: never;
+    query?: never;
+    url: '/jobs/batch-update';
+};
+
+export type BatchUpdateJobsErrors = {
+    /**
+     * The provided data is not valid.
+     */
+    400: ProblemDetail;
+    /**
+     * The request lacks valid authentication credentials.
+     */
+    401: ProblemDetail;
+    /**
+     * An internal error occurred while processing the request.
+     */
+    500: ProblemDetail;
+    /**
+     * The service is currently unavailable. This may happen only on some requests where the system creates backpressure to prevent the server's compute resources from being exhausted, avoiding more severe failures. In this case, the title of the error object contains `RESOURCE_EXHAUSTED`. Clients are recommended to eventually retry those requests after a backoff period. You can learn more about the backpressure mechanism here: https://docs.camunda.io/docs/components/zeebe/technical-concepts/internal-processing/#handling-backpressure .
+     *
+     */
+    503: ProblemDetail;
+};
+
+export type BatchUpdateJobsError = BatchUpdateJobsErrors[keyof BatchUpdateJobsErrors];
+
+export type BatchUpdateJobsResponses = {
+    /**
+     * The batch operation was created.
+     */
+    200: JobBatchUpdateResult;
+};
+
+export type BatchUpdateJobsResponse = BatchUpdateJobsResponses[keyof BatchUpdateJobsResponses];
 
 export type GetGlobalJobStatisticsData = {
     body?: never;
