@@ -30,8 +30,8 @@ import { fileURLToPath } from "node:url";
 
 /** The directory holding the DSL implementation + this guard. Derived from the
  *  module URL via `fileURLToPath`/`dirname` (widely-supported ESM primitives)
- *  rather than the Node-specific `import.meta.dirname`, so it works identically
- *  under `node --test` and `deno test`. */
+ *  rather than the Node-specific `import.meta.dirname`, keeping the derivation on
+ *  standard ESM URL semantics rather than a runtime-specific extension. */
 const SRC_DIR = dirname(fileURLToPath(import.meta.url));
 
 /** The forbidden non-deterministic APIs, as they appear in code. Each is matched
@@ -46,12 +46,51 @@ const FORBIDDEN: readonly { readonly token: string; readonly why: string }[] = [
 
 /** Remove line comments and block comments so a token mentioned only in prose
  *  (e.g. the determinism-contract header every matcher carries) does not trip the
- *  guard. Deliberately simple: the DSL implementation files contain no `//`
- *  sequences inside string literals, so this cannot over-strip real code. */
+ *  guard. String and template literals are copied verbatim: a `//` or `/*` that
+ *  lives INSIDE a string is never mistaken for a comment start (which would let a
+ *  forbidden call after it slip through the scan), and real code inside a
+ *  template `${…}` interpolation stays visible to the scan. */
 function stripComments(source: string): string {
-  return source
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  let out = "";
+  let i = 0;
+  const n = source.length;
+  while (i < n) {
+    const c = source[i];
+    const next = source[i + 1];
+    if (c === "/" && next === "/") {
+      i += 2;
+      while (i < n && source[i] !== "\n") i++;
+      out += " ";
+      continue;
+    }
+    if (c === "/" && next === "*") {
+      i += 2;
+      while (i < n && !(source[i] === "*" && source[i + 1] === "/")) i++;
+      i += 2;
+      out += " ";
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      const quote = c;
+      out += c;
+      i++;
+      while (i < n) {
+        const d = source[i];
+        out += d;
+        if (d === "\\") {
+          if (i + 1 < n) out += source[i + 1];
+          i += 2;
+          continue;
+        }
+        i++;
+        if (d === quote) break;
+      }
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
 }
 
 /** The implementation files under `src/**`: every `.ts` that is not a test and
@@ -114,4 +153,28 @@ test("the comment stripper does not mask a real forbidden call", () => {
   const stripped = stripComments(disguised);
   assert.ok(!stripped.includes("Math.random"), "prose mention of Math.random should be stripped");
   assert.ok(stripped.includes("setTimeout"), "a real setTimeout call must survive comment stripping");
+});
+
+test("the comment stripper does not treat `//` inside a string literal as a comment", () => {
+  // Regression guard for the defect class: a `//` (or `/*`) that lives inside a
+  // string or template literal is string CONTENT, not a comment start. Treating
+  // it as a comment would strip the rest of the line and hide any forbidden call
+  // after it, silently bypassing the determinism guard.
+  const inString = 'const s = "foo//bar"; const t = Date.now();';
+  assert.ok(
+    stripComments(inString).includes("Date.now"),
+    "a forbidden call after an in-string `//` must survive stripping",
+  );
+
+  const inTemplate = "const u = `x/*y`; const r = Math.random();";
+  assert.ok(
+    stripComments(inTemplate).includes("Math.random"),
+    "a forbidden call after an in-template `/*` must survive stripping",
+  );
+
+  const interpolated = "const v = `${Date.now()}`;";
+  assert.ok(
+    stripComments(interpolated).includes("Date.now"),
+    "a forbidden call inside a template `${…}` interpolation must stay visible",
+  );
 });
