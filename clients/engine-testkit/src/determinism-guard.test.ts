@@ -65,51 +65,118 @@ const FORBIDDEN_SCAN: readonly {
 
 /** Remove line comments and block comments so a token mentioned only in prose
  *  (e.g. the determinism-contract header every matcher carries) does not trip the
- *  guard. String and template literals are copied verbatim: a `//` or `/*` that
- *  lives INSIDE a string is never mistaken for a comment start (which would let a
- *  forbidden call after it slip through the scan), and real code inside a
- *  template `${…}` interpolation stays visible to the scan. */
+ *  guard. String literals are copied verbatim: a `//` or `/*` that lives INSIDE a
+ *  string is string CONTENT, never a comment start (stripping it would let a
+ *  forbidden call after it slip through the scan). Template literals copy their
+ *  text spans verbatim for the same reason, but a `${…}` interpolation is real
+ *  CODE, so we recurse into it — stripping comments and handling nested
+ *  strings/templates there too. A comment wedged inside an interpolation (e.g.
+ *  `` `${Date/* x *​/.now()}` ``) is therefore removed, so the whitespace-tolerant
+ *  scan pattern still catches the forbidden call rather than being defeated by a
+ *  `/*…*​/` the scan can't span. */
 function stripComments(source: string): string {
-  let out = "";
-  let i = 0;
   const n = source.length;
-  while (i < n) {
-    const c = source[i];
-    const next = source[i + 1];
-    if (c === "/" && next === "/") {
-      i += 2;
-      while (i < n && source[i] !== "\n") i++;
-      out += " ";
-      continue;
-    }
-    if (c === "/" && next === "*") {
-      i += 2;
-      while (i < n && !(source[i] === "*" && source[i + 1] === "/")) i++;
-      i += 2;
-      out += " ";
-      continue;
-    }
-    if (c === '"' || c === "'" || c === "`") {
-      const quote = c;
+
+  // Process code from `start`. Comments are stripped; string literals copied
+  // verbatim; template literals recurse into their `${…}` interpolations. When
+  // `inInterpolation` is true we are scanning an interpolation body and stop at
+  // (without consuming) the matching `}` that closes it, tracking nested braces.
+  function processCode(start: number, inInterpolation: boolean): { out: string; end: number } {
+    let out = "";
+    let i = start;
+    let depth = 0;
+    while (i < n) {
+      const c = source[i];
+      const next = source[i + 1];
+      if (c === "/" && next === "/") {
+        i += 2;
+        while (i < n && source[i] !== "\n") i++;
+        out += " ";
+        continue;
+      }
+      if (c === "/" && next === "*") {
+        i += 2;
+        while (i < n && !(source[i] === "*" && source[i + 1] === "/")) i++;
+        i += 2;
+        out += " ";
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        const quote = c;
+        out += c;
+        i++;
+        while (i < n) {
+          const d = source[i];
+          out += d;
+          if (d === "\\") {
+            if (i + 1 < n) out += source[i + 1];
+            i += 2;
+            continue;
+          }
+          i++;
+          if (d === quote) break;
+        }
+        continue;
+      }
+      if (c === "`") {
+        out += c;
+        i++;
+        const t = processTemplate(i);
+        out += t.out;
+        i = t.end;
+        continue;
+      }
+      if (inInterpolation) {
+        if (c === "{") {
+          depth++;
+        } else if (c === "}") {
+          if (depth === 0) return { out, end: i };
+          depth--;
+        }
+      }
       out += c;
       i++;
-      while (i < n) {
-        const d = source[i];
-        out += d;
-        if (d === "\\") {
-          if (i + 1 < n) out += source[i + 1];
-          i += 2;
-          continue;
-        }
-        i++;
-        if (d === quote) break;
-      }
-      continue;
     }
-    out += c;
-    i++;
+    return { out, end: i };
   }
-  return out;
+
+  // Process a template-literal body (after the opening backtick). Text spans are
+  // copied verbatim; each `${…}` interpolation recurses through `processCode`.
+  function processTemplate(start: number): { out: string; end: number } {
+    let out = "";
+    let i = start;
+    while (i < n) {
+      const c = source[i];
+      if (c === "\\") {
+        out += c;
+        if (i + 1 < n) out += source[i + 1];
+        i += 2;
+        continue;
+      }
+      if (c === "`") {
+        out += c;
+        i++;
+        return { out, end: i };
+      }
+      if (c === "$" && source[i + 1] === "{") {
+        out += "${";
+        i += 2;
+        const body = processCode(i, true);
+        out += body.out;
+        i = body.end;
+        if (i < n && source[i] === "}") {
+          out += "}";
+          i++;
+        }
+        continue;
+      }
+      out += c;
+      i++;
+    }
+    return { out, end: i };
+  }
+
+  return processCode(0, false).out;
 }
 
 /** Source files EXCLUDED from the published build (`tsconfig.build.json`'s
@@ -219,6 +286,20 @@ test("the comment stripper does not treat `//` inside a string literal as a comm
     stripComments(interpolated).includes("Date.now"),
     "a forbidden call inside a template `${…}` interpolation must stay visible",
   );
+
+  // A comment INSIDE an interpolation is real code being commented, not template
+  // text — it must be stripped, or `Date/* x */.now()` would defeat the
+  // whitespace-tolerant scan (which cannot span a `/*…*/`).
+  const interpComment = "const w = `${Date/* sneaky */.now()}`;";
+  const strippedInterp = stripComments(interpComment);
+  assert.ok(
+    !strippedInterp.includes("/* sneaky */"),
+    "a comment inside a template `${…}` interpolation must be stripped",
+  );
+  assert.ok(
+    FORBIDDEN_SCAN.some(({ pattern }) => pattern.test(strippedInterp)),
+    "a forbidden call comment-obscured inside a `${…}` interpolation must be detected",
+  );
 });
 
 test("a forbidden call obscured by whitespace/comments across the dot is still caught", () => {
@@ -233,6 +314,7 @@ test("a forbidden call obscured by whitespace/comments across the dot is still c
     "Date\n.now()",
     "performance/**/.now()",
     "Math . random()",
+    "`${Date/* sneaky */.now()}`",
   ];
   for (const raw of bypasses) {
     const stripped = stripComments(raw);
