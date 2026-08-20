@@ -5444,11 +5444,14 @@ impl ServerImpl {
         // over a wide window.
         let span = to_ms.saturating_sub(from_ms);
         // The window is inclusive (`[from, to]`), so the emitted bucket count is
-        // `ceil(span / resolution_ms)` (with a floor of 1). A floor division
-        // (`span / resolution_ms`) undercounts by one whenever the span is not
-        // an exact multiple of the resolution, which would admit up to 10,001
-        // buckets. Use ceiling division so the guard is exact.
-        let bucket_count = (span / resolution_ms) + u64::from(!span.is_multiple_of(resolution_ms));
+        // `ceil(span / resolution_ms)`, clamped to a floor of 1. A floor
+        // division (`span / resolution_ms`) undercounts by one whenever the span
+        // is not an exact multiple of the resolution, which would admit up to
+        // 10,001 buckets. Use ceiling division so the guard is exact, and clamp
+        // to 1 so a zero-span window (`from == to`) still reports the single
+        // bucket the emitter actually produces rather than 0.
+        let bucket_count =
+            ((span / resolution_ms) + u64::from(!span.is_multiple_of(resolution_ms))).max(1);
         if bucket_count > 10_000 {
             return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                 "Resolution too fine",
@@ -5466,49 +5469,45 @@ impl ServerImpl {
             .job_statistics
             .metrics_in_window(from_ms, to_ms, Some(&filter.job_type));
 
-        let mut items: Vec<models::JobTimeSeriesStatisticsItem> = Vec::new();
-        let mut bucket_start = from_ms;
-        loop {
-            let bucket_end = bucket_start.saturating_add(resolution_ms);
-            // The last bucket includes `to_ms` inclusively (the query window is
-            // `[from, to]`). Every other bucket is half-open `[start, end)` so
-            // events on a boundary belong to exactly one bucket. Without this, a
-            // `to_ms` landing exactly on a bucket boundary spawned a spurious
-            // extra bucket starting at `to_ms` and pushed events at `to_ms` into
-            // it.
-            let is_last = bucket_end >= to_ms;
-            let in_bucket = |at: u64| {
-                at >= bucket_start
-                    && if is_last {
-                        at <= to_ms
-                    } else {
-                        at < bucket_end
-                    }
-            };
-            let mut c = (0u64, None);
-            let mut done = (0u64, None);
-            let mut fail = (0u64, None);
-            for (_, at) in created.iter().filter(|(_, at)| in_bucket(*at)) {
-                bump(&mut c, *at);
+        // Pre-aggregate in a single pass over the (already window-filtered)
+        // `created`/`metrics` inputs instead of rescanning every event for every
+        // bucket. The previous nested loop was O(buckets × events); with
+        // `bucket_count` up to 10,000 and logs up to 1,000,000 entries that is a
+        // ~10^10 worst case (a DoS vector even within the allowed query shape).
+        // Each event's bucket index is `(at - from) / resolution`, clamped to the
+        // last bucket so an event landing exactly on `to_ms` (only possible when
+        // the span is an exact multiple of the resolution) folds into the final,
+        // `to`-inclusive bucket — identical semantics to the emit loop, half-open
+        // `[start, end)` everywhere except the inclusive last bucket.
+        let num_buckets = bucket_count as usize;
+        let bucket_index = |at: u64| -> usize {
+            (((at.saturating_sub(from_ms)) / resolution_ms) as usize).min(num_buckets - 1)
+        };
+        let mut created_acc = vec![(0u64, None); num_buckets];
+        let mut done_acc = vec![(0u64, None); num_buckets];
+        let mut fail_acc = vec![(0u64, None); num_buckets];
+        for (_, at) in &created {
+            bump(&mut created_acc[bucket_index(*at)], *at);
+        }
+        for e in &metrics {
+            let i = bucket_index(e.at_ms);
+            match e.status {
+                JobMetricStatus::Completed => bump(&mut done_acc[i], e.at_ms),
+                JobMetricStatus::Failed => bump(&mut fail_acc[i], e.at_ms),
             }
-            for e in metrics.iter().filter(|e| in_bucket(e.at_ms)) {
-                match e.status {
-                    JobMetricStatus::Completed => bump(&mut done, e.at_ms),
-                    JobMetricStatus::Failed => bump(&mut fail, e.at_ms),
-                }
-            }
+        }
+
+        let mut items: Vec<models::JobTimeSeriesStatisticsItem> = Vec::with_capacity(num_buckets);
+        for i in 0..num_buckets {
+            let bucket_start = from_ms.saturating_add((i as u64) * resolution_ms);
             if let Some(time) = ms_to_dt(bucket_start) {
                 items.push(models::JobTimeSeriesStatisticsItem::new(
                     time,
-                    status_metric(c),
-                    status_metric(done),
-                    status_metric(fail),
+                    status_metric(created_acc[i]),
+                    status_metric(done_acc[i]),
+                    status_metric(fail_acc[i]),
                 ));
             }
-            if is_last {
-                break;
-            }
-            bucket_start = bucket_end;
         }
 
         let page = models::SearchQueryPageResponse::new(
@@ -29269,6 +29268,105 @@ mod clustered_startup_tests {
             matches!(resp, R::Status400_TheProvidedDataIsNotValid(_)),
             "a span producing 10001 buckets must be rejected by the guard"
         );
+    }
+
+    /// Regression guard for the zero-span window (`from == to`). The emitter
+    /// always produces at least one bucket, so the bucket-count must be clamped
+    /// to a floor of 1; a naive `ceil(0 / res) == 0` would leave no buckets to
+    /// aggregate into and (with the single-pass indexer) underflow `num_buckets
+    /// - 1`. An event at that single instant must be counted in the lone bucket.
+    #[tokio::test]
+    async fn rest_job_time_series_zero_span_window_emits_one_bucket() {
+        let server = ServerImpl::default();
+        let at_ms: u64 = 1_000_000_000_000;
+
+        server
+            .job_statistics
+            .record_completed("zero".into(), Some("w".into()), at_ms);
+
+        let instant = ms_to_dt(at_ms).unwrap();
+        let mut filter =
+            models::JobTimeSeriesStatisticsFilter::new(instant, instant, "zero".into());
+        filter.resolution = Some("PT1M".into());
+
+        use apis::job::GetJobTimeSeriesStatisticsResponse as R;
+        let R::Status200_TheJobTime(ts) = server
+            .get_job_time_series_statistics_impl(&models::JobTimeSeriesStatisticsQuery::new(filter))
+            .await
+            .expect("handler runs")
+        else {
+            panic!("expected 200 from time-series");
+        };
+
+        assert_eq!(
+            ts.items.len(),
+            1,
+            "a zero-span window must still emit exactly one bucket"
+        );
+        assert_eq!(
+            ts.items[0].completed.count, 1,
+            "the single instant's event lands in the lone bucket"
+        );
+    }
+
+    /// Regression guard for the single-pass bucket aggregation (replacing the
+    /// former O(buckets × events) rescan): events spread across several buckets
+    /// must each land in the bucket whose half-open `[start, end)` range contains
+    /// them, with the final bucket inclusive of `to`. This pins the per-bucket
+    /// distribution, not just the grand total.
+    #[tokio::test]
+    async fn rest_job_time_series_distributes_events_across_buckets() {
+        let server = ServerImpl::default();
+        let from_ms: u64 = 1_000_000_000_000;
+        let resolution_ms: u64 = 60_000;
+        let to_ms = from_ms + 3 * resolution_ms; // inclusive [from, to] => 3 buckets
+
+        // Bucket 0: two completed. Bucket 2 (the inclusive last bucket): one
+        // completed + one failed mid-bucket, plus one completed at exactly
+        // `to_ms` which folds into this final bucket. Bucket 1 stays empty.
+        server
+            .job_statistics
+            .record_completed("dist".into(), Some("w".into()), from_ms + 1_000);
+        server
+            .job_statistics
+            .record_completed("dist".into(), Some("w".into()), from_ms + 2_000);
+        server.job_statistics.record_completed(
+            "dist".into(),
+            Some("w".into()),
+            from_ms + 2 * resolution_ms + 500,
+        );
+        server.job_statistics.record_failed(
+            "dist".into(),
+            Some("w".into()),
+            from_ms + 2 * resolution_ms + 600,
+        );
+        server
+            .job_statistics
+            .record_completed("dist".into(), Some("w".into()), to_ms);
+
+        let from = ms_to_dt(from_ms).unwrap();
+        let to = ms_to_dt(to_ms).unwrap();
+        let mut filter = models::JobTimeSeriesStatisticsFilter::new(from, to, "dist".into());
+        filter.resolution = Some("PT1M".into());
+
+        use apis::job::GetJobTimeSeriesStatisticsResponse as R;
+        let R::Status200_TheJobTime(ts) = server
+            .get_job_time_series_statistics_impl(&models::JobTimeSeriesStatisticsQuery::new(filter))
+            .await
+            .expect("handler runs")
+        else {
+            panic!("expected 200 from time-series");
+        };
+
+        assert_eq!(
+            ts.items.len(),
+            3,
+            "an inclusive 3-resolution span has 3 buckets"
+        );
+        let completed: Vec<i64> = ts.items.iter().map(|i| i.completed.count).collect();
+        let failed: Vec<i64> = ts.items.iter().map(|i| i.failed.count).collect();
+        assert_eq!(completed, vec![2, 0, 2], "completed per bucket");
+        assert_eq!(failed, vec![0, 0, 1], "failed per bucket");
     }
 
     /// Minted batch-operation keys must be strictly increasing even for many
