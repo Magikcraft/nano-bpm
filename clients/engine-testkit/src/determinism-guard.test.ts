@@ -34,8 +34,7 @@ import { fileURLToPath } from "node:url";
  *  standard ESM URL semantics rather than a runtime-specific extension. */
 const SRC_DIR = dirname(fileURLToPath(import.meta.url));
 
-/** The forbidden non-deterministic APIs, as they appear in code. Each is matched
- *  literally against comment-stripped source. */
+/** The forbidden non-deterministic APIs, as they appear in code. */
 const FORBIDDEN: readonly { readonly token: string; readonly why: string }[] = [
   { token: "Date.now", why: "wall-clock read" },
   { token: "setTimeout", why: "real-time scheduling / polling" },
@@ -43,6 +42,26 @@ const FORBIDDEN: readonly { readonly token: string; readonly why: string }[] = [
   { token: "Math.random", why: "entropy source" },
   { token: "performance.now", why: "high-resolution wall-clock read" },
 ];
+
+/** Build a whitespace-tolerant matcher for a (possibly dotted) forbidden token.
+ *  `stripComments()` replaces a comment with a single space and preserves
+ *  newlines, so a bypass like `Date/* x *​/.now()` collapses to `Date .now()` and
+ *  `Date// x\n.now()` to `Date \n.now()`. A literal `source.includes("Date.now")`
+ *  would miss both, undermining the guard — so we match each dotted segment with
+ *  `\s*\.\s*` between the parts, catching any whitespace (or stripped comment)
+ *  wedged between the identifier, the dot, and the property. Single-identifier
+ *  tokens (`setTimeout`, `setInterval`) carry no dot and stay literal. */
+function forbiddenPattern(token: string): RegExp {
+  const escape = (part: string) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(token.split(".").map(escape).join("\\s*\\.\\s*"));
+}
+
+/** The forbidden tokens paired with their whitespace-tolerant scan patterns. */
+const FORBIDDEN_SCAN: readonly {
+  readonly token: string;
+  readonly why: string;
+  readonly pattern: RegExp;
+}[] = FORBIDDEN.map(({ token, why }) => ({ token, why, pattern: forbiddenPattern(token) }));
 
 /** Remove line comments and block comments so a token mentioned only in prose
  *  (e.g. the determinism-contract header every matcher carries) does not trip the
@@ -151,8 +170,8 @@ test("the assertion DSL implementation scans clean of wall-clock / entropy APIs"
   const offenders: string[] = [];
   for (const name of files) {
     const source = stripComments(await readFile(join(SRC_DIR, name), "utf8"));
-    for (const { token, why } of FORBIDDEN) {
-      if (source.includes(token)) {
+    for (const { token, why, pattern } of FORBIDDEN_SCAN) {
+      if (pattern.test(source)) {
         offenders.push(`${name}: uses \`${token}\` (${why})`);
       }
     }
@@ -200,4 +219,26 @@ test("the comment stripper does not treat `//` inside a string literal as a comm
     stripComments(interpolated).includes("Date.now"),
     "a forbidden call inside a template `${…}` interpolation must stay visible",
   );
+});
+
+test("a forbidden call obscured by whitespace/comments across the dot is still caught", () => {
+  // Defect class: `stripComments()` replaces a comment with a space and preserves
+  // newlines, so `Date/*x*​/.now()` collapses to `Date .now()` and `Date// x\n.now()`
+  // to `Date \n.now()`. A literal `includes("Date.now")` would miss both, silently
+  // bypassing the determinism guard — the whitespace-tolerant scan pattern must
+  // catch them.
+  const bypasses = [
+    "Date/* sneaky */.now()",
+    "Date .now()",
+    "Date\n.now()",
+    "performance/**/.now()",
+    "Math . random()",
+  ];
+  for (const raw of bypasses) {
+    const stripped = stripComments(raw);
+    assert.ok(
+      FORBIDDEN_SCAN.some(({ pattern }) => pattern.test(stripped)),
+      `whitespace/comment-separated forbidden call must be detected: ${JSON.stringify(raw)}`,
+    );
+  }
 });
