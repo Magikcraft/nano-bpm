@@ -863,8 +863,9 @@ mod tests {
 
     #[test]
     fn cluster_variable_overlay_layers_under_instance_variables() {
-        use crate::cluster_vars::{ClusterVariableSnapshot, DEFAULT_TENANT};
         use std::sync::{Arc as StdArc, RwLock};
+
+        use crate::cluster_vars::{ClusterVariableSnapshot, DEFAULT_TENANT};
 
         let mut engine = Engine::new();
         let mut snap = ClusterVariableSnapshot::default();
@@ -886,12 +887,19 @@ mod tests {
         engine.set_cluster_variables(StdArc::new(RwLock::new(snap)));
 
         let mut base = HashMap::new();
-        base.insert("shared".to_string(), Value::Str("from-instance".to_string()));
+        base.insert(
+            "shared".to_string(),
+            Value::Str("from-instance".to_string()),
+        );
         let out = engine.overlay_cluster_variables(Arc::new(base));
 
         assert_eq!(out.get("region"), Some(&Value::Str("EMEA".to_string())));
         assert_eq!(out.get("tier"), Some(&Value::Int(2)));
-        assert_eq!(out.get("secret"), None, "other-tenant var must be invisible");
+        assert_eq!(
+            out.get("secret"),
+            None,
+            "other-tenant var must be invisible"
+        );
         assert_eq!(
             out.get("shared"),
             Some(&Value::Str("from-instance".to_string())),

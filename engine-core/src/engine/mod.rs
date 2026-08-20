@@ -356,7 +356,10 @@ impl Engine {
     /// variables are external configuration, so this is host-side wiring that never
     /// affects replay/snapshot determinism — the host re-installs the handle after
     /// every engine rebuild (replay / snapshot restore) so the link survives.
-    pub fn set_cluster_variables(&mut self, cluster_variables: crate::cluster_vars::ClusterVariables) {
+    pub fn set_cluster_variables(
+        &mut self,
+        cluster_variables: crate::cluster_vars::ClusterVariables,
+    ) {
         self.cluster_variables = cluster_variables;
     }
 

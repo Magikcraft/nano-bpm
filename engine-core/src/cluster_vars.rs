@@ -46,7 +46,10 @@ impl ClusterVariableSnapshot {
     /// `(name, value)` pairs: every global variable first, then the tenant's own
     /// variables (which shadow a same-named global). The caller layers the
     /// instance's own variables on top so they shadow both.
-    pub fn resolved_for<'a>(&'a self, tenant: &str) -> impl Iterator<Item = (&'a String, &'a Value)> {
+    pub fn resolved_for<'a>(
+        &'a self,
+        tenant: &str,
+    ) -> impl Iterator<Item = (&'a String, &'a Value)> {
         self.global
             .iter()
             .chain(self.tenants.get(tenant).into_iter().flatten())
