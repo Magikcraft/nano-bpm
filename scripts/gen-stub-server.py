@@ -86,7 +86,6 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("user_task", "get_user_task_form"): "self.get_user_task_form_impl(path_params).await",
     ("user_task", "unassign_user_task"): "self.unassign_user_task_impl(path_params).await",
     ("user_task", "update_user_task"): "self.update_user_task_impl(path_params, body).await",
-    ("ad_hoc_sub_process", "activate_ad_hoc_sub_process_activities"): "self.activate_ad_hoc_sub_process_activities_impl(path_params, body).await",
     # --- BEGIN issue-905 batch-operations delegations ---
     ("batch_operation", "get_batch_operation"): "self.get_batch_operation_impl(path_params).await",
     ("batch_operation", "search_batch_operations"): "self.search_batch_operations_impl(body).await",
@@ -121,7 +120,7 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("conditional", "evaluate_conditionals"): "self.evaluate_conditionals_impl(body).await",
     # --- END issue-908 expression & conditional delegations ---
     # --- BEGIN issue-909 ad-hoc activities delegations ---
-    # (issue-909 adds its ad-hoc activities entries here)
+    ("ad_hoc_sub_process", "activate_ad_hoc_sub_process_activities"): "self.activate_ad_hoc_sub_process_activities_impl(path_params, body).await",
     # --- END issue-909 ad-hoc activities delegations ---
 }
 
