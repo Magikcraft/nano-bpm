@@ -72,6 +72,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0060](0060-institutional-memory-context-grounding.md) | Institutional memory: model-grounded context for agent sessions | Proposed | 2026-08-17 |
 | [0061](0061-ecosystem-knowledge-plane.md) | Ecosystem knowledge plane: the context/memory split above AGENTS.md | Proposed | 2026-08-17 |
 | [0062](0062-durable-agent-session-resume.md) | Durable agent-session resume: authoritative session log, mind/world checkpoint, and the ACP/stream-json harness seam | Proposed | 2026-08-19 |
+| [0063](0063-nano-controlled-embedded-harness.md) | Nano-controlled embedded coding-agent harness: an adopted wasm agent whose capability-nil boundary is the mind/world split | Proposed | 2026-08-21 |
 
 ## Reading paths
 
