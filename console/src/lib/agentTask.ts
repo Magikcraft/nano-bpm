@@ -166,6 +166,10 @@ function extRank(type: string | undefined): number {
   return i === -1 ? EXT_CHILD_ORDER.length : i;
 }
 
+function isKnownExtChild(type: string | undefined): boolean {
+  return EXT_CHILD_ORDER.includes(type ?? "");
+}
+
 function attachExtChild(
   moddle: AgentModdle,
   modeling: AgentModeling,
@@ -177,9 +181,15 @@ function attachExtChild(
   if (ext) {
     const existing = ext.values ?? [];
     const rank = extRank(child.$type);
-    // Insert before the first child that ranks after this one (stable), so
-    // LinkedResources lands ahead of any existing IoMapping.
-    const at = existing.findIndex((v) => extRank(v.$type) > rank);
+    // Order only relative to the child types we enumerate (LinkedResources,
+    // IoMapping). Unknown children the toolchain also emits — e.g.
+    // zeebe:TaskDefinition, which is canonically *before* linkedResources — are
+    // skipped when picking the insertion point, so we never reorder them ahead
+    // of their canonical position. LinkedResources still lands before any
+    // existing IoMapping without our having to enumerate every extension type.
+    const at = existing.findIndex(
+      (v) => isKnownExtChild(v.$type) && extRank(v.$type) > rank,
+    );
     const values =
       at === -1
         ? [...existing, child]

@@ -342,6 +342,44 @@ test("writePromptLink keeps LinkedResources before an existing IoMapping", () =>
   );
 });
 
+test("writePromptLink keeps an existing zeebe:TaskDefinition before the new LinkedResources", () => {
+  // A service task that already carries a zeebe:TaskDefinition (an extension
+  // child the toolchain emits *before* linkedResources, but one this module does
+  // not enumerate). Attaching the prompt link must leave the taskDefinition in
+  // place and append LinkedResources after it — never reorder an unknown child
+  // ahead of its canonical position.
+  const taskDefinition: AgentModdleElement = {
+    $type: "zeebe:TaskDefinition",
+    type: "my-worker",
+  };
+  const bo = serviceTaskBo([taskDefinition]);
+  writePromptLink(moddle, applyingModeling(), {}, bo, "feature.md", "latest");
+  assert.deepEqual(
+    bo.extensionElements?.values?.map((v) => v.$type),
+    ["zeebe:TaskDefinition", "zeebe:LinkedResources"],
+  );
+});
+
+test("writePromptLink slots LinkedResources between an existing TaskDefinition and IoMapping", () => {
+  // taskDefinition (canonical: first) and ioMapping (canonical: last) already
+  // present. The new LinkedResources must land between them — after the unknown
+  // taskDefinition, before the known ioMapping.
+  const taskDefinition: AgentModdleElement = {
+    $type: "zeebe:TaskDefinition",
+    type: "my-worker",
+  };
+  const io: AgentModdleElement = {
+    $type: "zeebe:IoMapping",
+    inputParameters: [{ $type: "zeebe:Input", source: "=repo", target: "repo" }],
+  };
+  const bo = serviceTaskBo([taskDefinition, io]);
+  writePromptLink(moddle, applyingModeling(), {}, bo, "feature.md", "latest");
+  assert.deepEqual(
+    bo.extensionElements?.values?.map((v) => v.$type),
+    ["zeebe:TaskDefinition", "zeebe:LinkedResources", "zeebe:IoMapping"],
+  );
+});
+
 test("removing the last extension child tears down the empty wrapper", () => {
   // The only extension child is the prompt link's container; stripping the
   // binding must leave no orphan bpmn:extensionElements wrapper behind.
