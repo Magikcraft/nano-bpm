@@ -41,6 +41,9 @@ declare module "bpmn-js-properties-panel" {
   const BpmnPropertiesProviderModule: unknown;
   const ZeebePropertiesProviderModule: unknown;
   const CamundaPlatformPropertiesProviderModule: unknown;
+  /** Resolve a modeler service (e.g. `debounceInput`) from within an entry
+   *  component's render, the established properties-panel hook. */
+  export function useService(name: string): unknown;
   export {
     BpmnPropertiesPanelModule,
     BpmnPropertiesProviderModule,
@@ -53,10 +56,22 @@ declare module "@bpmn-io/properties-panel" {
   /** A properties-panel entry component (preact). Called directly as a function
    *  in the established provider pattern, returning a vnode. */
   export const SelectEntry: (props: unknown) => unknown;
+  /** Single-line text entry component. */
+  export const TextFieldEntry: (props: unknown) => unknown;
+  /** Multi-line text entry component. */
+  export const TextAreaEntry: (props: unknown) => unknown;
+  /** On/off toggle entry component. */
+  export const ToggleSwitchEntry: (props: unknown) => unknown;
   /** Default group renderer used as a group's `component`. */
   export const Group: unknown;
   /** `isEdited` predicate for a select entry (dirty dot). */
   export function isSelectEntryEdited(node: unknown): boolean;
+  /** `isEdited` predicate for a text field entry (dirty dot). */
+  export function isTextFieldEntryEdited(node: unknown): boolean;
+  /** `isEdited` predicate for a text area entry (dirty dot). */
+  export function isTextAreaEntryEdited(node: unknown): boolean;
+  /** `isEdited` predicate for a toggle-switch entry (dirty dot). */
+  export function isToggleSwitchEntryEdited(node: unknown): boolean;
 }
 
 declare module "zeebe-bpmn-moddle/resources/zeebe.json" {
