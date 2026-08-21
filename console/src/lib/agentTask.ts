@@ -215,8 +215,10 @@ function removeExtChild(
 }
 
 /** Add or update the prompt `linkedResource` (`resourceType="GenericScript"`,
- *  `linkName="prompt"`) with `resourceId` + `bindingType`. Any non-prompt linked
- *  resources are preserved. */
+ *  `linkName="prompt"`) with `resourceId` + `bindingType`. A blank `resourceId`
+ *  is written as an *omitted* attribute (never `resourceId=""`, which the engine
+ *  rejects on deploy) so an in-progress agent task stays a valid document. Any
+ *  non-prompt linked resources are preserved. */
 export function writePromptLink(
   moddle: AgentModdle,
   modeling: AgentModeling,
@@ -229,12 +231,19 @@ export function writePromptLink(
   const kept = (container?.values ?? []).filter(
     (v) => v.linkName !== PROMPT_LINK_NAME,
   );
-  const link = moddle.create("zeebe:LinkedResource", {
-    resourceId,
+  // Only emit `resourceId` when the user has actually chosen a resource. A blank
+  // (or whitespace-only) id — e.g. the moment the toggle is switched on, or when
+  // the resource field is cleared — must NOT serialize as `resourceId=""`: the
+  // engine rejects a linkedResource with a missing/empty resourceId on deploy.
+  // Omitting the attribute keeps the `linkName="prompt"` marker (so the task is
+  // still a recognizable, in-progress agent task) without emitting an invalid one.
+  const attrs: Record<string, unknown> = {
     bindingType: bindingType || PROMPT_DEFAULT_BINDING_TYPE,
     resourceType: PROMPT_RESOURCE_TYPE,
     linkName: PROMPT_LINK_NAME,
-  });
+  };
+  if (resourceId.trim()) attrs.resourceId = resourceId;
+  const link = moddle.create("zeebe:LinkedResource", attrs);
   const values = [...kept, link];
   if (container) {
     for (const v of values) v.$parent = container;
