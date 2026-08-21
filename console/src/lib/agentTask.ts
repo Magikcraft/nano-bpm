@@ -227,7 +227,11 @@ function removeExtChild(
 /** Add or update the prompt `linkedResource` (`resourceType="GenericScript"`,
  *  `linkName="prompt"`) with `resourceId` + `bindingType`. A blank `resourceId`
  *  is written as an *omitted* attribute (never `resourceId=""`, which the engine
- *  rejects on deploy) so an in-progress agent task stays a valid document. Any
+ *  rejects on deploy) so an in-progress agent task stays a well-formed, editable
+ *  model instead of one carrying an invalid `resourceId=""`. Note the marker-only
+ *  shape (no `resourceId`) is deliberately still **not** deploy-valid — the engine
+ *  also requires a non-empty `resourceId` — until the user picks a prompt resource;
+ *  it is an in-modeller work-in-progress state, not a deployable document. Any
  *  non-prompt linked resources are preserved. */
 export function writePromptLink(
   moddle: AgentModdle,
@@ -246,7 +250,10 @@ export function writePromptLink(
   // the resource field is cleared — must NOT serialize as `resourceId=""`: the
   // engine rejects a linkedResource with a missing/empty resourceId on deploy.
   // Omitting the attribute keeps the `linkName="prompt"` marker (so the task is
-  // still a recognizable, in-progress agent task) without emitting an invalid one.
+  // still a recognizable, in-progress agent task in the modeller). This marker-only
+  // shape is deliberately **not** yet deploy-valid — the engine equally rejects a
+  // missing resourceId — but it avoids the strictly-worse `resourceId=""` and keeps
+  // the model editable until the user selects a prompt resource.
   const attrs: Record<string, unknown> = {
     bindingType: bindingType || PROMPT_DEFAULT_BINDING_TYPE,
     resourceType: PROMPT_RESOURCE_TYPE,
