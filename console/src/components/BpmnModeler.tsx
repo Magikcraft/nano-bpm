@@ -7,15 +7,28 @@ import {
   useState,
 } from "react";
 import Modeler from "bpmn-js/lib/Modeler";
+import BaseRenderer from "diagram-js/lib/draw/BaseRenderer";
+import {
+  append as svgAppend,
+  create as svgCreate,
+  attr as svgAttr,
+} from "tiny-svg";
 import {
   BpmnPropertiesPanelModule,
   BpmnPropertiesProviderModule,
   ZeebePropertiesProviderModule,
+  useService,
 } from "bpmn-js-properties-panel";
 import {
   SelectEntry,
+  TextFieldEntry,
+  TextAreaEntry,
+  ToggleSwitchEntry,
   Group,
   isSelectEntryEdited,
+  isTextFieldEntryEdited,
+  isTextAreaEntryEdited,
+  isToggleSwitchEntryEdited,
 } from "@bpmn-io/properties-panel";
 import ZeebeModdle from "zeebe-bpmn-moddle/resources/zeebe.json";
 import { nanoShapesModdle } from "../moddle/nanoShapes";
@@ -51,6 +64,21 @@ import {
   type ShapeModdleElement,
   type ShapeModeling,
 } from "../lib/shapeCarrier";
+import {
+  PROMPT_BINDING_TYPES,
+  PROMPT_DEFAULT_BINDING_TYPE,
+  PROMPT_LINK_NAME,
+  PROMPT_RESOURCE_TYPE,
+  AGENT_TASK_ELEMENT_TYPE,
+  isAgentTask,
+  readPromptBinding,
+  writePromptLink,
+  writeAppendPrompt,
+  removePromptBinding,
+  type AgentModdle,
+  type AgentModdleElement,
+  type AgentModeling,
+} from "../lib/agentTask";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import "bpmn-js/dist/assets/bpmn-js.css";
@@ -172,6 +200,113 @@ function collectComponentOutputs(registry: ElementRegistry): ComponentOutput[] {
   }
   return outputs;
 }
+
+// --- Agent-task rendering (issue #950) ---------------------------------------
+// An agent task is a service task carrying a `linkName="prompt"` linked resource
+// (the `@nanobpm/agentic` signal — see `lib/agentTask.ts`, the single source of
+// truth for the shape). A plain `bpmn-js` service task renders it identically to
+// any other, so this custom renderer decorates prompt-bearing service tasks with
+// a distinguishing badge plus a caption of the bound `resourceId` / `bindingType`
+// — making the binding a first-class, visible citizen on the canvas. It carries
+// DI (the model already has it; the renderer only augments the shape graphics).
+const AGENT_BADGE_FILL = "#6d28d9";
+const AGENT_CAPTION_FILL = "#6d28d9";
+
+interface BpmnShapeRenderer {
+  drawShape(parentNode: SVGElement, element: DiagramElement): SVGElement;
+  getShapePath(shape: DiagramElement): string;
+}
+interface DiagramElement {
+  type?: string;
+  width?: number;
+  height?: number;
+  businessObject?: AgentModdleElement;
+  labelTarget?: unknown;
+}
+
+// A high render priority so this decorator wins over the default BpmnRenderer for
+// agent tasks; the default rendering is still produced (delegated to) and then
+// augmented, so the task shell can never drift from bpmn-js.
+const AGENT_RENDER_PRIORITY = 1500;
+
+class AgentTaskRenderer extends BaseRenderer {
+  // Explicit annotation so didi injection survives Vite minification.
+  static $inject = ["eventBus", "bpmnRenderer"];
+  private readonly bpmnRenderer: BpmnShapeRenderer;
+  constructor(eventBus: unknown, bpmnRenderer: BpmnShapeRenderer) {
+    super(
+      eventBus as ConstructorParameters<typeof BaseRenderer>[0],
+      AGENT_RENDER_PRIORITY,
+    );
+    this.bpmnRenderer = bpmnRenderer;
+  }
+  canRender(element: DiagramElement): boolean {
+    // Only the task shape itself, never its external label.
+    return !element.labelTarget && isAgentTask(element);
+  }
+  drawShape(parentNode: SVGElement, element: DiagramElement): SVGElement {
+    const shape = this.bpmnRenderer.drawShape(parentNode, element);
+    const width = typeof element.width === "number" ? element.width : 100;
+    const height = typeof element.height === "number" ? element.height : 80;
+    const binding = readPromptBinding(element.businessObject);
+
+    // Corner badge (top-right) marking the task as agentic.
+    const badgeW = 40;
+    const badgeH = 15;
+    const badgeX = width - badgeW - 4;
+    const badge = svgCreate("rect");
+    svgAttr(badge, {
+      x: badgeX,
+      y: 4,
+      width: badgeW,
+      height: badgeH,
+      rx: 3,
+      ry: 3,
+      fill: AGENT_BADGE_FILL,
+    });
+    svgAppend(parentNode, badge);
+    const badgeText = svgCreate("text");
+    svgAttr(badgeText, {
+      x: badgeX + badgeW / 2,
+      y: 4 + badgeH / 2,
+      "text-anchor": "middle",
+      "dominant-baseline": "central",
+      "font-size": "9px",
+      "font-family": "Arial, sans-serif",
+      "font-weight": "bold",
+      fill: "#ffffff",
+    });
+    badgeText.textContent = "AGENT";
+    svgAppend(parentNode, badgeText);
+
+    // Caption below the shape: the bound prompt resource + binding type, so the
+    // binding is inspectable at a glance without opening the properties panel.
+    const caption = svgCreate("text");
+    svgAttr(caption, {
+      x: width / 2,
+      y: height + 14,
+      "text-anchor": "middle",
+      "font-size": "11px",
+      "font-family": "Arial, sans-serif",
+      fill: AGENT_CAPTION_FILL,
+    });
+    const resource = binding?.resourceId ? binding.resourceId : "(no prompt)";
+    caption.textContent = `${PROMPT_LINK_NAME}: ${resource} · ${
+      binding?.bindingType ?? PROMPT_DEFAULT_BINDING_TYPE
+    }`;
+    svgAppend(parentNode, caption);
+
+    return shape;
+  }
+  getShapePath(shape: DiagramElement): string {
+    return this.bpmnRenderer.getShapePath(shape);
+  }
+}
+
+const agentTaskRendererModule = {
+  __init__: ["agentTaskRenderer"],
+  agentTaskRenderer: ["type", AgentTaskRenderer],
+};
 
 // --- Urban components palette (ADR 0033) -------------------------------------
 // A diagram-js palette provider that adds an entry per installed Urban component
@@ -675,6 +810,215 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           UrbanDomainTypePropertiesProvider,
         ],
       };
+      // Agent-task properties (issue #950): an "Agent task" group on every
+      // service task. A toggle adds/removes the prompt binding; when bound, the
+      // group surfaces (and edits) the `zeebe:linkedResource` fields — resourceId,
+      // bindingType, the fixed resourceType/linkName — plus the optional
+      // `appendPrompt` ioMapping addendum. Every read/write derives the emitted
+      // shape from `lib/agentTask.ts` (the single source of truth), so the
+      // modeler can never drift from the toolchain. Writes run through the live
+      // modeler services so they are ordinary undoable modeling commands.
+      const agentServices = (): {
+        moddle: AgentModdle;
+        modeling: AgentModeling;
+      } | null => {
+        const m = modelerRef.current;
+        if (!m || disposedRef.current) return null;
+        return {
+          moddle: m.get<AgentModdle>("moddle"),
+          modeling: m.get<AgentModeling>("modeling"),
+        };
+      };
+      type AgentElement = {
+        type?: string;
+        businessObject?: AgentModdleElement;
+      };
+      const AgentToggleEntry = (props: { element: AgentElement }) => {
+        const { element } = props;
+        return ToggleSwitchEntry({
+          element,
+          id: "nano-agent-toggle",
+          label: "Agent task",
+          switcherLabel: "Prompt-bound worker",
+          getValue: () => isAgentTask(element),
+          setValue: (value: boolean) => {
+            const svc = agentServices();
+            const bo = element.businessObject;
+            if (!svc || !bo) return;
+            if (value)
+              writePromptLink(
+                svc.moddle,
+                svc.modeling,
+                element,
+                bo,
+                "",
+                PROMPT_DEFAULT_BINDING_TYPE,
+              );
+            else removePromptBinding(svc.moddle, svc.modeling, element, bo);
+          },
+          description:
+            "Bind an LLM prompt resource so an agent worker services this task.",
+        });
+      };
+      const AgentResourceIdEntry = (props: { element: AgentElement }) => {
+        const { element } = props;
+        const debounce = useService("debounceInput");
+        return TextFieldEntry({
+          element,
+          id: "nano-agent-resourceId",
+          label: "Prompt resource",
+          debounce,
+          getValue: () =>
+            readPromptBinding(element.businessObject)?.resourceId ?? "",
+          setValue: (value?: string) => {
+            const svc = agentServices();
+            const bo = element.businessObject;
+            if (!svc || !bo) return;
+            const current = readPromptBinding(bo);
+            writePromptLink(
+              svc.moddle,
+              svc.modeling,
+              element,
+              bo,
+              value ?? "",
+              current?.bindingType ?? PROMPT_DEFAULT_BINDING_TYPE,
+            );
+          },
+          description: `The ${PROMPT_RESOURCE_TYPE} resource bound as the agent's prompt (e.g. "feature.md").`,
+        });
+      };
+      const AgentBindingTypeEntry = (props: { element: AgentElement }) => {
+        const { element } = props;
+        return SelectEntry({
+          element,
+          id: "nano-agent-bindingType",
+          label: "Binding type",
+          getValue: () =>
+            readPromptBinding(element.businessObject)?.bindingType ??
+            PROMPT_DEFAULT_BINDING_TYPE,
+          setValue: (value: string) => {
+            const svc = agentServices();
+            const bo = element.businessObject;
+            if (!svc || !bo) return;
+            const current = readPromptBinding(bo);
+            writePromptLink(
+              svc.moddle,
+              svc.modeling,
+              element,
+              bo,
+              current?.resourceId ?? "",
+              value || PROMPT_DEFAULT_BINDING_TYPE,
+            );
+          },
+          getOptions: () =>
+            PROMPT_BINDING_TYPES.map((id) => ({ value: id, label: id })),
+          description:
+            "How the engine resolves the prompt resource version at deploy time.",
+        });
+      };
+      const AgentResourceTypeEntry = (props: { element: AgentElement }) =>
+        TextFieldEntry({
+          element: props.element,
+          id: "nano-agent-resourceType",
+          label: "Resource type",
+          disabled: true,
+          getValue: () => PROMPT_RESOURCE_TYPE,
+          setValue: () => {},
+          description: "Fixed — the agentic prompt side-car marker.",
+        });
+      const AgentLinkNameEntry = (props: { element: AgentElement }) =>
+        TextFieldEntry({
+          element: props.element,
+          id: "nano-agent-linkName",
+          label: "Link name",
+          disabled: true,
+          getValue: () => PROMPT_LINK_NAME,
+          setValue: () => {},
+          description: "Fixed — the agentic signal consumers detect.",
+        });
+      const AgentAppendEntry = (props: { element: AgentElement }) => {
+        const { element } = props;
+        const debounce = useService("debounceInput");
+        return TextAreaEntry({
+          element,
+          id: "nano-agent-append",
+          label: "Append prompt (FEEL)",
+          debounce,
+          getValue: () =>
+            readPromptBinding(element.businessObject)?.append ?? "",
+          setValue: (value?: string) => {
+            const svc = agentServices();
+            const bo = element.businessObject;
+            if (!svc || !bo) return;
+            writeAppendPrompt(
+              svc.moddle,
+              svc.modeling,
+              element,
+              bo,
+              value ?? "",
+            );
+          },
+          description:
+            "Optional FEEL expression appended to the bound prompt at runtime (appendPrompt input).",
+        });
+      };
+      class AgentTaskPropertiesProvider {
+        // Explicit annotation so didi injection survives Vite minification.
+        static $inject = ["propertiesPanel"];
+        constructor(propertiesPanel: PropertiesPanelService) {
+          propertiesPanel.registerProvider(500, this);
+        }
+        getGroups(element: AgentElement) {
+          return (groups: unknown[]): unknown[] => {
+            if (element.type !== AGENT_TASK_ELEMENT_TYPE) return groups;
+            const entries: unknown[] = [
+              {
+                id: "nano-agent-toggle",
+                component: AgentToggleEntry,
+                isEdited: isToggleSwitchEntryEdited,
+              },
+            ];
+            if (isAgentTask(element)) {
+              entries.push(
+                {
+                  id: "nano-agent-resourceId",
+                  component: AgentResourceIdEntry,
+                  isEdited: isTextFieldEntryEdited,
+                },
+                {
+                  id: "nano-agent-bindingType",
+                  component: AgentBindingTypeEntry,
+                  isEdited: isSelectEntryEdited,
+                },
+                {
+                  id: "nano-agent-resourceType",
+                  component: AgentResourceTypeEntry,
+                },
+                {
+                  id: "nano-agent-linkName",
+                  component: AgentLinkNameEntry,
+                },
+                {
+                  id: "nano-agent-append",
+                  component: AgentAppendEntry,
+                  isEdited: isTextAreaEntryEdited,
+                },
+              );
+            }
+            groups.push({
+              id: "nano-agent-task",
+              label: "Agent task",
+              component: Group,
+              entries,
+            });
+            return groups;
+          };
+        }
+      }
+      const agentTaskPropertiesModule = {
+        __init__: ["agentTaskPropertiesProvider"],
+        agentTaskPropertiesProvider: ["type", AgentTaskPropertiesProvider],
+      };
       const modeler = new Modeler({
         container: containerRef.current,
         propertiesPanel: { parent: panelRef.current },
@@ -691,6 +1035,8 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           CloudBehaviorsModule,
           urbanComponentsPaletteModule,
           urbanDomainTypePropertiesModule,
+          agentTaskRendererModule,
+          agentTaskPropertiesModule,
           domainVariableResolverModule,
         ],
         moddleExtensions: { zeebe: ZeebeModdle, nano: nanoShapesModdle },
