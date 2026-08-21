@@ -366,12 +366,15 @@ function homeHtml() {
 
 <section class="band problem">
   <div class="wrap">
-    <h2>Autonomous agents generate entropy. Nano is the sink.</h2>
-    <p>You're already orchestrating agents to write, review, and test code — but the wiring is a
-    pile of shell scripts and retries. When the machine reboots overnight — a crash, or an
-    IT-forced update — the run dies, the state is gone, and the tokens are re-spent. Left
-    unmanaged, that disorder compounds with every agent you add. Nano is where it goes — durable,
-    inspectable primitives that drive work to convergence instead of drift.</p>
+    <h2>Reasoning is an LLM concern. Durability isn't.</h2>
+    <p>A primary agent orchestrating subagents is a good pattern — reasoning about what to run
+    next is exactly what an LLM is for. But <em>holding</em> the dependency graph and the run state
+    <b>in context</b> is not. That's durable state living in the most volatile, most expensive place
+    you have: one compaction and the plan is gone; one overnight reboot and the run dies, the state
+    with it, the tokens re-spent. And every token spent bookkeeping <em>what's done, what's blocked,
+    what's next</em> is a token not spent on the code. It degrades both. Nano takes the orchestration
+    out of context — durable, inspectable primitives that drive work to convergence instead of drift.
+    The agent designs the graph; the engine runs it.</p>
   </div>
 </section>
 
