@@ -216,12 +216,8 @@ test("removePromptLink drops the container when no other links remain", () => {
   const bo = serviceTaskBo([linkedResources(promptLink())]);
   removePromptLink(applyingModeling(), {}, bo);
   assert.equal(promptLinkedResource(bo), undefined);
-  assert.equal(
-    bo.extensionElements?.values?.some(
-      (v) => v.$type === "zeebe:LinkedResources",
-    ),
-    false,
-  );
+  // It was the only extension child, so the wrapper is torn down entirely.
+  assert.equal(bo.extensionElements, undefined);
 });
 
 test("removePromptLink keeps the container when other links remain", () => {
@@ -293,6 +289,30 @@ test("writeAppendPrompt trails explicit inputs and keeps other io on clear", () 
   );
 });
 
+test("writePromptLink keeps LinkedResources before an existing IoMapping", () => {
+  // A task that already carries an ioMapping (e.g. an explicit input) but no
+  // prompt link. Adding the link must slot LinkedResources BEFORE IoMapping to
+  // match the toolchain's canonical extensionElements ordering.
+  const io: AgentModdleElement = {
+    $type: "zeebe:IoMapping",
+    inputParameters: [{ $type: "zeebe:Input", source: "=repo", target: "repo" }],
+  };
+  const bo = serviceTaskBo([io]);
+  writePromptLink(moddle, applyingModeling(), {}, bo, "feature.md", "latest");
+  assert.deepEqual(
+    bo.extensionElements?.values?.map((v) => v.$type),
+    ["zeebe:LinkedResources", "zeebe:IoMapping"],
+  );
+});
+
+test("removing the last extension child tears down the empty wrapper", () => {
+  // The only extension child is the prompt link's container; stripping the
+  // binding must leave no orphan bpmn:extensionElements wrapper behind.
+  const bo = serviceTaskBo([linkedResources(promptLink())]);
+  removePromptBinding(moddle, applyingModeling(), {}, bo);
+  assert.equal(bo.extensionElements, undefined);
+});
+
 test("removePromptBinding strips both the link and the append addendum", () => {
   const bo = serviceTaskBo([linkedResources(promptLink())]);
   const modeling = applyingModeling();
@@ -307,8 +327,6 @@ test("removePromptBinding strips both the link and the append addendum", () => {
     isAgentTask({ type: AGENT_TASK_ELEMENT_TYPE, businessObject: bo }),
     false,
   );
-  assert.equal(
-    bo.extensionElements?.values?.some((v) => v.$type === "zeebe:IoMapping"),
-    false,
-  );
+  // Both children gone, so the wrapper is torn down entirely — no orphan.
+  assert.equal(bo.extensionElements, undefined);
 });

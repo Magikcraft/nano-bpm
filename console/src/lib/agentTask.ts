@@ -156,6 +156,16 @@ export function isAgentTask(
 // created on demand and torn down when they empty out, so a round-trip through
 // the modeler leaves no orphan wrappers.
 
+// The canonical order of the extension-element children the toolchain emits, so
+// a newly attached child slots into its stable position (e.g. LinkedResources
+// before IoMapping) and the serialized XML never drifts on insertion order.
+const EXT_CHILD_ORDER = ["zeebe:LinkedResources", "zeebe:IoMapping"];
+
+function extRank(type: string | undefined): number {
+  const i = EXT_CHILD_ORDER.indexOf(type ?? "");
+  return i === -1 ? EXT_CHILD_ORDER.length : i;
+}
+
 function attachExtChild(
   moddle: AgentModdle,
   modeling: AgentModeling,
@@ -165,10 +175,17 @@ function attachExtChild(
 ): void {
   const ext = bo.extensionElements;
   if (ext) {
+    const existing = ext.values ?? [];
+    const rank = extRank(child.$type);
+    // Insert before the first child that ranks after this one (stable), so
+    // LinkedResources lands ahead of any existing IoMapping.
+    const at = existing.findIndex((v) => extRank(v.$type) > rank);
+    const values =
+      at === -1
+        ? [...existing, child]
+        : [...existing.slice(0, at), child, ...existing.slice(at)];
     child.$parent = ext;
-    modeling.updateModdleProperties(element, ext, {
-      values: [...(ext.values ?? []), child],
-    });
+    modeling.updateModdleProperties(element, ext, { values });
     return;
   }
   const newExt = moddle.create("bpmn:ExtensionElements", { values: [child] });
@@ -185,9 +202,16 @@ function removeExtChild(
 ): void {
   const ext = bo.extensionElements;
   if (!ext) return;
-  modeling.updateModdleProperties(element, ext, {
-    values: (ext.values ?? []).filter((v) => v !== child),
-  });
+  const values = (ext.values ?? []).filter((v) => v !== child);
+  // Tear down the wrapper itself once it empties out, so a round-trip through
+  // the modeler leaves no orphan bpmn:extensionElements behind.
+  if (values.length === 0) {
+    modeling.updateModdleProperties(element, bo, {
+      extensionElements: undefined,
+    });
+    return;
+  }
+  modeling.updateModdleProperties(element, ext, { values });
 }
 
 /** Add or update the prompt `linkedResource` (`resourceType="GenericScript"`,
