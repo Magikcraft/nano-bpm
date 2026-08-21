@@ -7843,10 +7843,10 @@ fn output_mapping_eval_failure_raises_incident_and_does_not_complete() {
         .apply_command(Command::complete_job(job_key))
         .unwrap();
 
-    // The output mapping failed: one active IoMappingOutput incident (the
-    // output-phase kind, REST `IO_MAPPING_ERROR` — matching Zeebe, which raises
-    // `IO_MAPPING_ERROR` for both input and output mapping failures), and the
-    // element has NOT completed.
+    // The output mapping failed: one active `IoMapping` incident (output-phase,
+    // distinguished by `redrive: Completion`; REST `IO_MAPPING_ERROR` — matching
+    // Zeebe, which raises `IO_MAPPING_ERROR` for both input and output mapping
+    // failures), and the element has NOT completed.
     let active = engine.active_incidents();
     assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
     assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
@@ -7885,7 +7885,7 @@ fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
     // same token), NOT `ReopenCatch` — reopening the subscription would strand
     // the token waiting for a *second* message that will never arrive.
     // `ReopenCatch` is reserved for correlation-key (ACTIVATING) failures, which
-    // surface as `ExpressionEvaluation`, never as `IoMappingOutput`.
+    // surface as `ExpressionEvaluation`, never as an output-phase `IoMapping`.
     let def = ProcessBuilder::new("msg-out-fail")
         .start_event("s")
         .message_intermediate_catch_event("await", "approve", "orderId")
@@ -7925,8 +7925,8 @@ fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
     assert_eq!(subs[0].state, state::MessageSubscriptionState::Open);
 
     // Correlating drives completion, which applies the output mapping
-    // `=bad + 1` (string + int) and fails: one IoMappingOutput incident, the
-    // token held in COMPLETING, and the subscription already consumed.
+    // `=bad + 1` (string + int) and fails: one output-phase `IoMapping` incident,
+    // the token held in COMPLETING, and the subscription already consumed.
     engine.correlate_message("approve", "A", HashMap::new(), 0);
     let active = engine.active_incidents();
     assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
@@ -7978,7 +7978,7 @@ fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
 }
 
 #[test]
-fn subprocess_output_mapping_eval_failure_raises_io_mapping_output_incident() {
+fn subprocess_output_mapping_eval_failure_raises_io_mapping_incident() {
     // #939 parity (ports Zeebe `OutputMappingIncidentTest` to a scoped element):
     // an OUTPUT `zeebe:ioMapping` failure on a *sub-process* (not the mainstream
     // service-task path) must raise the `IoMapping` incident kind (REST
