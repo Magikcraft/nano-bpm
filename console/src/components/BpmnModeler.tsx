@@ -916,26 +916,38 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
             "How the engine resolves the prompt resource version at deploy time.",
         });
       };
-      const AgentResourceTypeEntry = (props: { element: AgentElement }) =>
-        TextFieldEntry({
+      // The two fixed fields are disabled, but `@bpmn-io/properties-panel`'s
+      // `TextField` still evaluates `debounce(onInput)` in a `useMemo` on every
+      // render regardless of `disabled`, so a `TextFieldEntry` without a
+      // `debounce` throws "is not a function" and — the console has no error
+      // boundary — unmounts the whole properties panel. Supply the service like
+      // the editable entries above so a bound agent task inspects cleanly.
+      const AgentResourceTypeEntry = (props: { element: AgentElement }) => {
+        const debounce = useService("debounceInput");
+        return TextFieldEntry({
           element: props.element,
           id: "nano-agent-resourceType",
           label: "Resource type",
+          debounce,
           disabled: true,
           getValue: () => PROMPT_RESOURCE_TYPE,
           setValue: () => {},
           description: "Fixed — the agentic prompt side-car marker.",
         });
-      const AgentLinkNameEntry = (props: { element: AgentElement }) =>
-        TextFieldEntry({
+      };
+      const AgentLinkNameEntry = (props: { element: AgentElement }) => {
+        const debounce = useService("debounceInput");
+        return TextFieldEntry({
           element: props.element,
           id: "nano-agent-linkName",
           label: "Link name",
+          debounce,
           disabled: true,
           getValue: () => PROMPT_LINK_NAME,
           setValue: () => {},
           description: "Fixed — the agentic signal consumers detect.",
         });
+      };
       const AgentAppendEntry = (props: { element: AgentElement }) => {
         const { element } = props;
         const debounce = useService("debounceInput");
