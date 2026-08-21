@@ -171,10 +171,12 @@ pub struct Engine {
 
 /// A `zeebe:ioMapping` source expression that failed to evaluate. Carries a
 /// human-readable `reason` for the `IO_MAPPING_ERROR` incident the caller raises
-/// (#939), plus the failing mapping's `source` expression so a caller can
-/// discriminate an *expected* body-level per-child-binding failure
-/// (`loopCounter` / the configured `inputElement`, absent at the body level)
-/// from a *genuine* failure (#946).
+/// (#939); the `reason` text embeds the failing mapping's `source` expression and
+/// `target`. Discrimination of an *expected* body-level per-child-binding failure
+/// (`loopCounter` / the configured `inputElement`, absent at the body level) from
+/// a *genuine* failure is done inside [`Engine::eval_io_mappings_tolerating`] by
+/// re-checking the mapping's referenced variables — not by the caller reading a
+/// field off this struct (#946).
 pub(crate) struct IoMappingFailure {
     pub(crate) reason: String,
 }

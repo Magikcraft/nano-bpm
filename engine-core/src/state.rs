@@ -612,6 +612,15 @@ pub enum IncidentKind {
     /// re-drives ioMapping failures uniformly by lifecycle phase. Recoverable
     /// once the mapping (or the missing variable it reads) is fixed and the
     /// incident is resolved.
+    ///
+    /// The `serde(alias = "IoMappingOutput")` keeps JSON journals written by the
+    /// intermediate `IoMappingOutput` taxonomy (#939, never shipped in a release)
+    /// deserializable so replay never fails to boot — mirroring the legacy
+    /// numeric-code-7 → `IoMapping` mapping the read-model already carries. Such a
+    /// legacy entry carries no `redrive`, so it replays via the activation phase
+    /// (`redrive: None`); a still-open legacy *output* incident is the only case
+    /// that differs, and can only exist in an intermediate-version dev journal.
+    #[cfg_attr(feature = "serde", serde(alias = "IoMappingOutput"))]
     IoMapping,
 }
 
@@ -3160,5 +3169,48 @@ mod version_lookup_tests {
         assert_eq!(state.process_by_key(20).expect("v2 retained").version, 2);
         assert_eq!(state.process_version("order", 1).expect("v1").key, 10);
         assert_eq!(state.process_version("order", 2).expect("v2").key, 20);
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod incident_kind_serde_compat_tests {
+    use super::IncidentKind;
+    use crate::event::Event;
+
+    /// The `IoMappingOutput` taxonomy (#939) was collapsed into the single
+    /// `IoMapping` kind (#946). JSON journals written by that intermediate code
+    /// carry `"kind":"IoMappingOutput"`; without the `serde(alias)` they would
+    /// fail to deserialize and prevent the server from booting on replay. Guard
+    /// the whole defect class: the legacy name must still deserialize.
+    #[test]
+    fn legacy_io_mapping_output_kind_deserializes_to_io_mapping() {
+        let kind: IncidentKind =
+            serde_json::from_str("\"IoMappingOutput\"").expect("legacy kind deserializes");
+        assert_eq!(kind, IncidentKind::IoMapping);
+    }
+
+    /// The alias is deserialize-only: we must never *emit* the retired name, so
+    /// new journals stay on the canonical `IoMapping` taxonomy.
+    #[test]
+    fn io_mapping_kind_serializes_to_canonical_name() {
+        let json = serde_json::to_string(&IncidentKind::IoMapping).expect("serializes");
+        assert_eq!(json, "\"IoMapping\"");
+    }
+
+    /// A full legacy `IncidentRaised` journal line — retired `IoMappingOutput`
+    /// kind and no `redrive` field — must replay, mapping to `IoMapping` with a
+    /// defaulted `redrive: None`, so boot never fails on an intermediate-version
+    /// journal.
+    #[test]
+    fn legacy_incident_raised_event_replays() {
+        let line = r#"{"IncidentRaised":{"incident_key":7,"instance_key":1,"element_instance_key":2,"element_id":"task","kind":"IoMappingOutput","reason":"boom","job_key":null,"created_at":42}}"#;
+        let event: Event = serde_json::from_str(line).expect("legacy event deserializes");
+        match event {
+            Event::IncidentRaised { kind, redrive, .. } => {
+                assert_eq!(kind, IncidentKind::IoMapping);
+                assert!(redrive.is_none());
+            }
+            other => panic!("expected IncidentRaised, got {other:?}"),
+        }
     }
 }
