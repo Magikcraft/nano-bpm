@@ -142,18 +142,25 @@ async function stubProjectFiles(page: Page): Promise<void> {
   // The file endpoint returns the raw file text (not JSON) — see
   // `lib/api.getProjectFile`. `nano.app.json` is probed and legitimately absent
   // here (non-App project), so 404 it; the requested `.bpmn` serves our model.
-  await page.route(`**/console/api/projects/${PROJECT}/file*`, (route) => {
-    const path = new URL(route.request().url()).searchParams.get("path") ?? "";
-    if (path === BPMN_PATH) {
-      return route.fulfill({
-        status: 200,
-        contentType: "application/xml",
-        headers: { "X-File-Size": String(AGENT_TASK_BPMN.length) },
-        body: AGENT_TASK_BPMN,
-      });
-    }
-    return route.fulfill({ status: 404, body: "not found" });
-  });
+  // Anchor on the singular `file?` query endpoint so this handler can't shadow
+  // the `/files` tree listing registered above (a `/file*` glob also matches
+  // `/files`, and the later route wins).
+  await page.route(
+    new RegExp(`/console/api/projects/${PROJECT}/file\\?`),
+    (route) => {
+      const path =
+        new URL(route.request().url()).searchParams.get("path") ?? "";
+      if (path === BPMN_PATH) {
+        return route.fulfill({
+          status: 200,
+          contentType: "application/xml",
+          headers: { "X-File-Size": String(AGENT_TASK_BPMN.length) },
+          body: AGENT_TASK_BPMN,
+        });
+      }
+      return route.fulfill({ status: 404, body: "not found" });
+    },
+  );
   // Workspace side panels the modeler view fans out to; empty shapes keep them
   // from crashing the (error-boundary-less) SPA.
   await page.route(`**/console/api/projects/${PROJECT}/connectors`, (route) =>
