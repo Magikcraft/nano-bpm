@@ -164,7 +164,11 @@ async function stubProjectFiles(page: Page): Promise<void> {
   // Workspace side panels the modeler view fans out to; empty shapes keep them
   // from crashing the (error-boundary-less) SPA.
   await page.route(`**/console/api/projects/${PROJECT}/connectors`, (route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: "[]" }),
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ connectors: [] }),
+    }),
   );
   await page.route(`**/console/api/projects/${PROJECT}/logs`, (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: "[]" }),
