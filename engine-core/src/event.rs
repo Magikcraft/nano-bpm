@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::model::{ElementId, ProcessDefinition, Value};
-use crate::state::{IncidentKind, Key, MessageSubscriptionKind, TimerKind};
+use crate::state::{IncidentKind, IoMappingRedrive, Key, MessageSubscriptionKind, TimerKind};
 
 /// A fact emitted by the engine. The ordering of a command's returned events is
 /// the order in which they occurred.
@@ -507,6 +507,12 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
         kind: IncidentKind,
+        /// For an `IncidentKind::IoMapping` incident, the lifecycle phase to
+        /// replay on resolution (phase-driven recovery). `None` for every other
+        /// kind. `serde(default)` so events journaled before phase-driven
+        /// ioMapping recovery replay as `None`.
+        #[cfg_attr(feature = "serde", serde(default))]
+        redrive: Option<IoMappingRedrive>,
         reason: String,
         job_key: Option<Key>,
         created_at: u64,

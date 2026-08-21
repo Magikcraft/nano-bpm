@@ -606,6 +606,7 @@ mod tests {
             reason: "boom".to_string(),
             job_key: Some(42),
             created_at: 5,
+            redrive: None,
         };
 
         let per_partition: Vec<Vec<Event>> = vec![

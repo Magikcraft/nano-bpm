@@ -112,8 +112,8 @@ pub use model::{
 pub use read_query::ReadQuery;
 pub use state::{
     compose_key, local_of, partition_of, stable_hash, subscription_partition, DeployedProcess,
-    Incident, IncidentKind, IncidentState, InstanceSnapshot, Job, JobKind, JobState, Key,
-    MessageStartSubscription, MessageSubscription, MessageSubscriptionKind,
+    Incident, IncidentKind, IncidentState, InstanceSnapshot, IoMappingRedrive, Job, JobKind,
+    JobState, Key, MessageStartSubscription, MessageSubscription, MessageSubscriptionKind,
     MessageSubscriptionState, ProcessInstance, ProcessInstanceState, SignalSubscription,
     StartTimer, State, Timer, TimerKind, TimerState, UserTask, UserTaskState, DEFAULT_JOB_PRIORITY,
     DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID, PARTITION_BITS,

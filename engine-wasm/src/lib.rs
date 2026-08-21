@@ -1986,11 +1986,11 @@ fn incident_kind_tag(kind: &IncidentKind) -> &'static str {
         IncidentKind::UnhandledError => "unhandledError",
         IncidentKind::DecisionEvaluation => "decisionEvaluation",
         IncidentKind::CalledElementError => "calledElementError",
+        // Every `zeebe:ioMapping` failure (input or output, any element type)
+        // shares the one external `ioMapping` taxonomy (REST `IO_MAPPING_ERROR`);
+        // the internal resolution re-drive is phase-driven off the incident's
+        // `redrive`, not a distinct kind (#946).
         IncidentKind::IoMapping => "ioMapping",
-        // Output-mapping failures share the one external `ioMapping` taxonomy
-        // (REST `IO_MAPPING_ERROR`); they differ from `IoMapping` only in the
-        // engine's internal resolution re-drive (completion vs activation).
-        IncidentKind::IoMappingOutput => "ioMapping",
     }
 }
 
