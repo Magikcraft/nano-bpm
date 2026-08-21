@@ -53,6 +53,7 @@ export const PROMPT_BINDING_TYPES = [
 // `ModdleElement` is a superset and assigns structurally.
 export interface AgentModdleElement {
   $type?: string;
+  type?: string;
   resourceId?: string;
   resourceType?: string;
   linkName?: string;

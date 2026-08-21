@@ -176,13 +176,20 @@ test("writePromptLink creates extensionElements when the task has none", () => {
   assert.equal(readPromptBinding(bo)?.resourceId, "a.md");
 });
 
-test("writePromptLink omits resourceId when it is blank (never emits resourceId=\"\")", () => {
+test('writePromptLink omits resourceId when it is blank (never emits resourceId="")', () => {
   // Toggling the agent-task switch on (or clearing the resource field) writes a
   // blank resourceId. An empty `resourceId=""` is an invalid linkedResource the
   // engine rejects on deploy, so we must omit the attribute rather than serialize
   // it empty — the linkName="prompt" marker still identifies the agent task.
   const bo = serviceTaskBo();
-  writePromptLink(moddle, applyingModeling(), {}, bo, "", PROMPT_DEFAULT_BINDING_TYPE);
+  writePromptLink(
+    moddle,
+    applyingModeling(),
+    {},
+    bo,
+    "",
+    PROMPT_DEFAULT_BINDING_TYPE,
+  );
   const link = promptLinkedResource(bo);
   assert.ok(link, "the prompt marker link is created");
   assert.equal(
@@ -197,19 +204,34 @@ test("writePromptLink omits resourceId when it is blank (never emits resourceId=
   );
   // Whitespace-only is treated as blank too.
   const bo2 = serviceTaskBo();
-  writePromptLink(moddle, applyingModeling(), {}, bo2, "   ", PROMPT_DEFAULT_BINDING_TYPE);
+  writePromptLink(
+    moddle,
+    applyingModeling(),
+    {},
+    bo2,
+    "   ",
+    PROMPT_DEFAULT_BINDING_TYPE,
+  );
   assert.equal(
-    Object.prototype.hasOwnProperty.call(promptLinkedResource(bo2)!, "resourceId"),
+    Object.prototype.hasOwnProperty.call(
+      promptLinkedResource(bo2)!,
+      "resourceId",
+    ),
     false,
   );
 });
 
 test("writePromptLink drops resourceId when an existing binding's resource is cleared", () => {
-  const bo = serviceTaskBo([linkedResources(promptLink("feature.md", "latest"))]);
+  const bo = serviceTaskBo([
+    linkedResources(promptLink("feature.md", "latest")),
+  ]);
   writePromptLink(moddle, applyingModeling(), {}, bo, "", "latest");
   const link = promptLinkedResource(bo);
   assert.ok(link);
-  assert.equal(Object.prototype.hasOwnProperty.call(link!, "resourceId"), false);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(link!, "resourceId"),
+    false,
+  );
   assert.equal(readPromptBinding(bo)?.resourceId, "");
 });
 
@@ -332,7 +354,9 @@ test("writePromptLink keeps LinkedResources before an existing IoMapping", () =>
   // match the toolchain's canonical extensionElements ordering.
   const io: AgentModdleElement = {
     $type: "zeebe:IoMapping",
-    inputParameters: [{ $type: "zeebe:Input", source: "=repo", target: "repo" }],
+    inputParameters: [
+      { $type: "zeebe:Input", source: "=repo", target: "repo" },
+    ],
   };
   const bo = serviceTaskBo([io]);
   writePromptLink(moddle, applyingModeling(), {}, bo, "feature.md", "latest");
@@ -370,7 +394,9 @@ test("writePromptLink slots LinkedResources between an existing TaskDefinition a
   };
   const io: AgentModdleElement = {
     $type: "zeebe:IoMapping",
-    inputParameters: [{ $type: "zeebe:Input", source: "=repo", target: "repo" }],
+    inputParameters: [
+      { $type: "zeebe:Input", source: "=repo", target: "repo" },
+    ],
   };
   const bo = serviceTaskBo([taskDefinition, io]);
   writePromptLink(moddle, applyingModeling(), {}, bo, "feature.md", "latest");
