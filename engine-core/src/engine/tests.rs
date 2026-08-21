@@ -7849,7 +7849,7 @@ fn output_mapping_eval_failure_raises_incident_and_does_not_complete() {
     // element has NOT completed.
     let active = engine.active_incidents();
     assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
-    assert_eq!(active[0].kind, state::IncidentKind::IoMappingOutput);
+    assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
     assert!(
         !engine.is_completed(key),
         "must not complete on eval failure"
@@ -7930,7 +7930,7 @@ fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
     engine.correlate_message("approve", "A", HashMap::new(), 0);
     let active = engine.active_incidents();
     assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
-    assert_eq!(active[0].kind, state::IncidentKind::IoMappingOutput);
+    assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
     assert!(
         !engine.is_completed(key),
         "must not complete on eval failure"
@@ -7981,17 +7981,15 @@ fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
 fn subprocess_output_mapping_eval_failure_raises_io_mapping_output_incident() {
     // #939 parity (ports Zeebe `OutputMappingIncidentTest` to a scoped element):
     // an OUTPUT `zeebe:ioMapping` failure on a *sub-process* (not the mainstream
-    // service-task path) must raise the `IoMappingOutput` incident kind (REST
+    // service-task path) must raise the `IoMapping` incident kind (REST
     // `IO_MAPPING_ERROR` — the same taxonomy Zeebe raises for both input and
     // output mapping failures) and hold the sub-process in COMPLETING rather than
     // completing it with the target silently unset. This locks the taxonomy
     // relabel across every output path, not just the mainstream element.
     //
-    // NOTE: the *resolution* re-drive for scoped/specialized completion paths
-    // (sub-process, MI, ad-hoc, call-activity) is tracked as a follow-up to #939
-    // (phase-driven re-drive, dropping the `IncidentKind`→`Step` coupling); the
-    // mainstream service-task output path is fully resolvable and covered by
-    // `output_mapping_eval_failure_raises_incident_and_does_not_complete`.
+    // Recovery is phase-driven (#946): the incident's `Completion` re-drive
+    // re-projects the now-fixed output mapping via `Complete` — the same
+    // lifecycle as the mainstream output path — without re-running the inner job.
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(subprocess_with_input_mapping(vec![
@@ -8018,16 +8016,452 @@ fn subprocess_output_mapping_eval_failure_raises_io_mapping_output_incident() {
     assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
     assert_eq!(
         active[0].kind,
-        state::IncidentKind::IoMappingOutput,
+        state::IncidentKind::IoMapping,
         "a sub-process output-mapping failure must raise IO_MAPPING_ERROR, not EXTRACT_VALUE_ERROR",
     );
     assert_eq!(
         active[0].element_id, "sub",
         "the incident parks on the sub-process, not the inner task"
     );
+    assert_eq!(
+        active[0].redrive,
+        Some(state::IoMappingRedrive::Completion),
+        "a sub-process output failure re-drives the completion phase",
+    );
     assert!(
         !engine.is_completed(inst),
         "the process must not complete while the output mapping is unresolved"
+    );
+
+    // Fix `bad` in the sub-process's own scope and resolve. A sub-process
+    // projects its output mapping in the drain sweep
+    // (`complete_drained_subprocesses`), not `complete`, so its `Completion`
+    // re-drive is owned by that sweep rather than a `Complete` step: resolution
+    // clears the incident (it does NOT re-drive `Complete`, which would
+    // re-evaluate against the already-torn-down inner scope and re-raise a bogus
+    // incident) and the instance runs to completion.
+    let sub_scope = active[0].element_instance_key;
+    let incident_key = active[0].key;
+    engine
+        .apply_command(Command::set_variables_scoped(
+            sub_scope,
+            HashMap::from([("bad".to_string(), Value::Int(41))]),
+            true,
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(engine.instance(inst).unwrap().incidents.is_empty());
+    assert!(
+        engine.is_completed(inst),
+        "resolving the sub-process output incident clears the block and the \
+         instance completes without a spurious re-raised incident"
+    );
+}
+
+#[test]
+fn call_activity_input_mapping_failure_raises_io_mapping_and_respawns_on_resolve() {
+    // #946 item 1 (call-activity input): an input `zeebe:ioMapping` on a call
+    // activity that fails to evaluate must raise `IO_MAPPING_ERROR` (NOT
+    // `ExpressionEvaluation`) and PARK the call activity without spawning the
+    // child — not skip straight to `Complete`. Resolution re-drives the *spawn*
+    // (`CallActivitySpawn`): the now-fixed input mapping is re-applied and the
+    // child process is created, running the orchestration to completion.
+    let child = ProcessBuilder::new("phase")
+        .start_event("pstart")
+        .end_event("pend")
+        .connect("pstart", "pend")
+        .build()
+        .unwrap();
+    let io = crate::model::IoMapping {
+        inputs: vec![crate::model::Mapping {
+            source: "=orderId + 1".to_string(),
+            target: "childOrder".to_string(),
+        }],
+        outputs: Vec::new(),
+    };
+    let mut engine = deploy_native_call(io, child);
+    let parent = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("orderId", Value::Str("oops".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
+    assert_eq!(
+        active[0].redrive,
+        Some(state::IoMappingRedrive::CallActivitySpawn),
+        "a call-activity input failure re-drives the child spawn, not a generic complete",
+    );
+    assert_eq!(active[0].element_id, "c1");
+    assert!(
+        !engine.is_completed(parent),
+        "parked before the child spawns"
+    );
+    // No child process instance was created.
+    assert_eq!(
+        engine.state().instances.len(),
+        1,
+        "no child spawned while the input mapping is unresolved"
+    );
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix `orderId` and resolve: the spawn re-drives, the child is created and
+    // (being a pass-through) completes, and the orchestration finishes.
+    engine
+        .apply_command(Command::set_variables(
+            parent,
+            HashMap::from([("orderId".to_string(), Value::Int(41))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(engine.instance(parent).unwrap().incidents.is_empty());
+    assert!(
+        engine.is_completed(parent),
+        "the orchestration completes once the child spawns and finishes"
+    );
+    assert_eq!(
+        engine.state().instances.len(),
+        2,
+        "the child process instance was spawned on resolution"
+    );
+}
+
+#[test]
+fn call_activity_output_mapping_failure_preserves_child_context_on_redrive() {
+    // #946 item 3 (call-activity output): an output `zeebe:ioMapping` on a call
+    // activity that fails must raise `IO_MAPPING_ERROR`, hold the call activity in
+    // COMPLETING, and — critically — *preserve the completed child's variables* on
+    // the incident so the re-drive re-projects them (`CallActivityCompletion`).
+    // The old generic `Complete` re-drive neither carried the child result nor
+    // called `complete_call_activity`, silently dropping the callee context.
+    let child = ProcessBuilder::new("phase")
+        .start_event("pstart")
+        .end_event("pend")
+        .connect("pstart", "pend")
+        .build()
+        .unwrap();
+    let io = crate::model::IoMapping {
+        inputs: vec![crate::model::Mapping {
+            source: "=tag".to_string(),
+            target: "childTag".to_string(),
+        }],
+        outputs: vec![crate::model::Mapping {
+            // `childTag` is a string; `string + 1` is a FEEL type error.
+            source: "=childTag + 1".to_string(),
+            target: "echoed".to_string(),
+        }],
+    };
+    let mut engine = deploy_native_call(io, child);
+    let parent = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("tag", Value::Str("gamma".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
+    assert_eq!(active[0].element_id, "c1");
+    assert!(
+        !engine.is_completed(parent),
+        "must not complete while the output mapping is unresolved"
+    );
+    // The completed child's variables are preserved on the incident's re-drive
+    // descriptor so completion can be retried against them after the gone child.
+    match &active[0].redrive {
+        Some(state::IoMappingRedrive::CallActivityCompletion { child_variables }) => {
+            assert_eq!(
+                child_variables.get("childTag"),
+                Some(&Value::Str("gamma".into())),
+                "the callee result is captured on the incident for the re-drive"
+            );
+        }
+        other => panic!("expected CallActivityCompletion redrive, got {other:?}"),
+    }
+}
+
+#[test]
+fn multi_instance_child_input_mapping_failure_raises_io_mapping_and_reactivates() {
+    // #946 item 1 (MI child input): a per-child input `zeebe:ioMapping` that fails
+    // must raise `IO_MAPPING_ERROR` and park the child (NOT skip to `Complete`).
+    // Resolution re-drives the child's *activation* (`MiChildActivation`),
+    // re-applying the now-fixed input and minting the child's job.
+    let def = ProcessBuilder::new("mi-child-io")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                // References the per-child binding `item` (tolerated at the body
+                // level) and the root `factor` (a string ⇒ per-child eval fails).
+                inputs: vec![crate::model::Mapping {
+                    source: "=factor + item".to_string(),
+                    target: "weighted".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "mi-child-io",
+            vars(&[
+                ("items", Value::List(vec![Value::Int(10)])),
+                ("factor", Value::Str("oops".into())),
+            ]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
+    assert!(
+        matches!(
+            active[0].redrive,
+            Some(state::IoMappingRedrive::MiChildActivation { .. })
+        ),
+        "a MI child input failure re-drives the child's activation, got {:?}",
+        active[0].redrive
+    );
+    assert_eq!(active[0].element_id, "each");
+    assert_eq!(
+        engine.state().jobs.len(),
+        0,
+        "no job while the child is parked"
+    );
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix `factor` and resolve: the child re-activates, the input maps
+    // (`weighted = 5 + 10 = 15`), and its job is created.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("factor".to_string(), Value::Int(5))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(engine.instance(inst).unwrap().incidents.is_empty());
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 1, "the child's job is minted on resolution");
+    assert_eq!(jobs[0].variables.get("weighted"), Some(&Value::Int(15)));
+}
+
+#[test]
+fn multi_instance_body_input_mapping_genuine_failure_raises_incident_and_recovers() {
+    // #946 item 2a: a MI *body* input mapping that fails for a reason NOT tied to
+    // a per-child binding (`loopCounter` / `inputElement`) is a GENUINE failure —
+    // it must raise `IO_MAPPING_ERROR` and spawn no children, rather than
+    // `.unwrap_or_default()`-swallowing the error into an empty collection.
+    // Resolution re-drives the body activation (`MiBodyActivation`).
+    let def = ProcessBuilder::new("mi-body-in")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                // Does NOT reference a per-child binding ⇒ evaluated at the body
+                // level; `badFactor` is a string, so it fails genuinely.
+                inputs: vec![crate::model::Mapping {
+                    source: "=badFactor + 1".to_string(),
+                    target: "scaled".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "mi-body-in",
+            vars(&[
+                ("items", Value::List(vec![Value::Int(10), Value::Int(20)])),
+                ("badFactor", Value::Str("oops".into())),
+            ]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
+    assert_eq!(
+        active[0].redrive,
+        Some(state::IoMappingRedrive::MiBodyActivation),
+        "a genuine MI body input failure re-drives the body activation",
+    );
+    assert_eq!(active[0].element_id, "each");
+    assert_eq!(
+        engine.state().jobs.len(),
+        0,
+        "no children fanned out on a genuine body input failure"
+    );
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix `badFactor` and resolve: the body fans out its two children (jobs).
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("badFactor".to_string(), Value::Int(5))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(engine.instance(inst).unwrap().incidents.is_empty());
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(
+        jobs.len(),
+        2,
+        "both children fan out once the body re-drives"
+    );
+}
+
+#[test]
+fn multi_instance_body_output_mapping_genuine_failure_raises_incident_and_recovers() {
+    // #946 item 2b: a MI *body* output mapping that fails at BODY completion —
+    // reached when the loop has no children to evaluate it per-child (an EMPTY
+    // input collection: the body drains straight to completion) — is a GENUINE
+    // failure. It must raise `IO_MAPPING_ERROR` and hold the body in COMPLETING,
+    // rather than `.unwrap_or_default()`-completing with the output silently
+    // unset. Resolution re-drives the body completion (`MiBodyCompletion`).
+    //
+    // (A non-empty loop evaluates the activity's output mapping per-child in
+    // `complete_mi_child` — Zeebe applies `zeebe:output` in each child's scope —
+    // so a broken source there raises the per-child `Completion` re-drive first;
+    // the body-level `MiBodyCompletion` path is the zero-child aggregation case.)
+    let def = ProcessBuilder::new("mi-body-out")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=item".to_string()),
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                // Evaluated at body completion; `badOut` is a string ⇒ fails.
+                outputs: vec![crate::model::Mapping {
+                    source: "=badOut + 1".to_string(),
+                    target: "summary".to_string(),
+                }],
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    // An EMPTY input collection: the body drains straight to its output
+    // aggregation with no per-child evaluation in between.
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "mi-body-out",
+            vars(&[
+                ("items", Value::List(Vec::new())),
+                ("badOut", Value::Str("oops".into())),
+            ]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
+    assert_eq!(
+        active[0].redrive,
+        Some(state::IoMappingRedrive::MiBodyCompletion),
+        "a genuine MI body output failure re-drives the body completion",
+    );
+    assert_eq!(active[0].element_id, "each");
+    assert!(!engine.is_completed(inst), "body held in COMPLETING");
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix `badOut` and resolve: the body completion re-drives (`summary = 6`) and
+    // the process finishes.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("badOut".to_string(), Value::Int(5))]),
+        ))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(engine.instance(inst).unwrap().incidents.is_empty());
+    assert!(
+        engine.is_completed(inst),
+        "the body completes once its output mapping re-drives"
+    );
+    assert_eq!(
+        merged_var(&events, "summary"),
+        Some(Value::Int(6)),
+        "the re-driven body output mapping projects summary=6; events: {events:?}"
     );
 }
 
@@ -10852,6 +11286,111 @@ fn adhoc_agent_named_tools_process() -> ProcessDefinition {
         </bpmn:process>
       </bpmn:definitions>"#;
     crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+fn adhoc_agent_with_tool_input_mapping() -> ProcessDefinition {
+    // A JOB_WORKER ad-hoc container whose `toolA` carries an input
+    // `zeebe:ioMapping` (`weighted = base + 1`). `base` is resolved from the
+    // container scope, so a bad `base` fails the tool's input mapping on
+    // activation — the #946 ad-hoc-tool input path.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=base + 1" target="weighted" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+#[test]
+fn adhoc_tool_input_mapping_failure_raises_io_mapping_and_reactivates() {
+    // #946 item 1 (ad-hoc tool input): a tool's own input `zeebe:ioMapping` that
+    // fails to evaluate must raise `IO_MAPPING_ERROR` on the container and NOT
+    // create the tool child (no skip-to-`Complete`). Resolution re-drives the
+    // tool's *activation* (`AdHocToolActivation`), re-applying the now-fixed input
+    // and minting the tool job.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_with_tool_input_mapping()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("base", Value::Str("oops".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    // Activate the tool: its input mapping `=base + 1` fails (string + int).
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
+    assert!(
+        matches!(
+            active[0].redrive,
+            Some(state::IoMappingRedrive::AdHocToolActivation { .. })
+        ),
+        "an ad-hoc tool input failure re-drives the tool activation, got {:?}",
+        active[0].redrive
+    );
+    assert_eq!(
+        engine.activate_jobs("tool", "W", 10, 1_000, 0).len(),
+        0,
+        "no tool job while the tool is parked on the input-mapping incident"
+    );
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix `base` and resolve: the tool re-activates, its input maps
+    // (`weighted = 5 + 1 = 6`), and its job is minted.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("base".to_string(), Value::Int(5))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(engine.instance(inst).unwrap().incidents.is_empty());
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(tool_jobs.len(), 1, "the tool job is minted on resolution");
+    assert_eq!(tool_jobs[0].variables.get("weighted"), Some(&Value::Int(6)));
 }
 
 fn activate_element(id: &str) -> crate::model::AdHocActivateElement {

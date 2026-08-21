@@ -908,7 +908,6 @@ fn incident_kind_code(k: IncidentKind) -> i64 {
         IncidentKind::DecisionEvaluation => 4,
         IncidentKind::CalledElementError => 5,
         IncidentKind::IoMapping => 6,
-        IncidentKind::IoMappingOutput => 7,
     }
 }
 fn incident_kind_from(code: i64) -> IncidentKind {
@@ -918,8 +917,9 @@ fn incident_kind_from(code: i64) -> IncidentKind {
         3 => IncidentKind::ExpressionEvaluation,
         4 => IncidentKind::DecisionEvaluation,
         5 => IncidentKind::CalledElementError,
-        6 => IncidentKind::IoMapping,
-        7 => IncidentKind::IoMappingOutput,
+        // 6 and the legacy 7 (formerly `IoMappingOutput`, collapsed into the one
+        // `IoMapping` kind in #946) both map to `IoMapping`.
+        6 | 7 => IncidentKind::IoMapping,
         _ => IncidentKind::JobNoRetries,
     }
 }
@@ -4139,6 +4139,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             reason,
             job_key,
             created_at,
+            redrive: _,
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
             tx.cexecute(
@@ -5900,6 +5901,7 @@ mod definition_xml_tests {
                 reason: "boom".to_string(),
                 job_key: Some(42),
                 created_at: 5,
+                redrive: None,
             }])
             .unwrap();
         // Final states: 1=Terminated, 2=Completed, 3=Active, 4=Completed,
@@ -6293,6 +6295,7 @@ mod element_instance_tests {
                 reason: "boom".to_string(),
                 job_key: Some(42),
                 created_at: 5,
+                redrive: None,
             }])
             .unwrap();
         let row = store.element_instance(TASK_EI).unwrap();

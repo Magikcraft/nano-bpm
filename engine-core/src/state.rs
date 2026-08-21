@@ -596,33 +596,74 @@ pub enum IncidentKind {
     /// Recoverable once the callee is deployed (or the recursion fixed) and the
     /// incident is resolved.
     CalledElementError,
-    /// An **input** `zeebe:ioMapping` source expression failed to evaluate on
-    /// activation — a FEEL parse error, a type error, or an operation on a
-    /// missing value (e.g. `"x" + missingVar`). The element halts with the target
-    /// variable unset rather than proceeding with a silent blank, matching
-    /// Zeebe's `IO_MAPPING_ERROR`. Raised for the mainstream activation path
-    /// (elements activated via [`crate::engine`]'s `activate_body`); resolution
-    /// re-drives the **activation** body ([`crate::engine`] `Step::RetryActivation`)
-    /// so the now-fixed mapping is re-applied before the element's behaviour runs.
-    /// Recoverable once the mapping (or the missing variable it reads) is fixed
-    /// and the incident is resolved.
+    /// A `zeebe:ioMapping` source expression failed to evaluate — a FEEL parse
+    /// error, a type error, or an operation on a missing value (e.g.
+    /// `"x" + missingVar`). The element halts with the target variable unset
+    /// rather than proceeding with a silent blank, matching Zeebe's
+    /// `IO_MAPPING_ERROR`. This is the **single** taxonomy for every ioMapping
+    /// failure — input (on activation) and output (on completion), on every
+    /// element type (mainstream leaf activities, sub-processes, multi-instance
+    /// bodies/children, ad-hoc tools and call activities).
     ///
-    /// The specialized multi-instance / ad-hoc / call-activity **input**
-    /// activation paths do not yet route through this kind — they still raise
-    /// [`IncidentKind::ExpressionEvaluation`] pending the phase-driven re-drive
-    /// refactor tracked as a follow-up to #939.
+    /// Recovery is **phase-driven**, not kind-driven: the incident carries an
+    /// [`IoMappingRedrive`] descriptor recording the exact lifecycle phase to
+    /// replay on resolution (`ACTIVATING` re-applies inputs, `COMPLETING`
+    /// re-applies outputs), matching Zeebe's `BpmnVariableMappingBehavior`, which
+    /// re-drives ioMapping failures uniformly by lifecycle phase. Recoverable
+    /// once the mapping (or the missing variable it reads) is fixed and the
+    /// incident is resolved.
     IoMapping,
-    /// An **output** `zeebe:ioMapping` source expression failed to evaluate at
-    /// completion — same FEEL failure modes as [`IncidentKind::IoMapping`]. The
-    /// element halts in the COMPLETING phase with the target unset rather than
-    /// completing with a silent blank, matching Zeebe's `IO_MAPPING_ERROR` (both
-    /// input and output mapping failures share the one `IO_MAPPING_ERROR`
-    /// taxonomy). Distinct from [`IncidentKind::IoMapping`] only in its re-drive:
-    /// resolution re-drives **completion** ([`crate::engine`] `Step::Complete`),
-    /// re-evaluating the output mapping against the now-fixed variables without
-    /// re-running the element's behaviour. Recoverable once the mapping (or the
-    /// missing variable it reads) is fixed and the incident is resolved.
-    IoMappingOutput,
+}
+
+/// The lifecycle re-drive an [`IncidentKind::IoMapping`] incident replays when it
+/// is resolved. Recovery is **phase-driven** — the re-drive is chosen from the
+/// element's lifecycle phase (activation vs completion) recorded here, not from
+/// the incident *kind* — so a single `IoMapping` taxonomy can cover every
+/// ioMapping failure (uniform `IO_MAPPING_ERROR`) while each specialized path
+/// (multi-instance child/body, ad-hoc tool, call activity) still replays the
+/// correct context-preserving step. Mirrors Zeebe's uniform re-drive of
+/// ioMapping failures by lifecycle phase in `BpmnVariableMappingBehavior`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum IoMappingRedrive {
+    /// Mainstream **input**-mapping failure: re-run the element's activation body
+    /// (re-apply inputs, then re-enact its behaviour) without re-emitting its
+    /// `ElementActivating`/`ElementActivated` (engine `Step::RetryActivation`).
+    Activation,
+    /// **Output**-mapping failure that re-projects on completion: the mainstream
+    /// leaf activity, a sub-process, a multi-instance child, an ad-hoc tool —
+    /// anything parked in COMPLETING whose output re-projects via the element's
+    /// normal completion (engine `Step::Complete`).
+    Completion,
+    /// A multi-instance **child** input-mapping failure: re-apply the child's
+    /// inputs against its already-bound `inputElement`/`loopCounter` scope and
+    /// re-enact its behaviour for the same (already-activated) child instance.
+    MiChildActivation { body_key: Key, index: usize },
+    /// A multi-instance **body** input-collection / body-input failure: re-run the
+    /// body's fan-out (re-apply body input mappings, re-evaluate the input
+    /// collection, spawn the children) for the same already-activated body.
+    MiBodyActivation,
+    /// A multi-instance **body** output-aggregation failure: re-run the body's
+    /// completion (aggregate + re-apply the activity's output mappings).
+    MiBodyCompletion,
+    /// An ad-hoc **tool** input-mapping failure: re-activate the tool child with
+    /// its original seed `variables` (no tool child was created on the failed
+    /// pass, so re-activation is a clean retry).
+    AdHocToolActivation {
+        element_id: ElementId,
+        variables: HashMap<String, Value>,
+    },
+    /// A call-activity **input**-mapping failure: re-attempt spawning the child
+    /// process for the already-activated call activity (its boundary events were
+    /// armed on the first pass and must not be re-armed).
+    CallActivitySpawn,
+    /// A call-activity **output**-mapping failure: re-project the captured child
+    /// result through the call activity's output mappings and complete it. The
+    /// child variables are captured here because the completed child instance
+    /// that produced them is gone by resolution time.
+    CallActivityCompletion {
+        child_variables: HashMap<String, Value>,
+    },
 }
 
 /// Lifecycle state of an incident. Incidents are retained after resolution (as
@@ -650,6 +691,11 @@ pub struct Incident {
     pub element_id: ElementId,
     /// What went wrong.
     pub kind: IncidentKind,
+    /// For an [`IncidentKind::IoMapping`] incident, the lifecycle phase to replay
+    /// on resolution (phase-driven recovery — see [`IoMappingRedrive`]). `None`
+    /// for every other incident kind (whose recovery is derived from the kind).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub redrive: Option<IoMappingRedrive>,
     /// Human-readable explanation of why the incident was raised.
     pub reason: String,
     /// The job whose retry exhaustion caused this incident, if any. Only
@@ -2122,6 +2168,7 @@ pub fn apply(state: &mut State, event: &Event) {
             reason,
             job_key,
             created_at,
+            redrive,
         } => {
             state.incidents.insert(
                 *incident_key,
@@ -2131,6 +2178,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     element_instance_key: *element_instance_key,
                     element_id: element_id.clone(),
                     kind: *kind,
+                    redrive: redrive.clone(),
                     reason: reason.clone(),
                     job_key: *job_key,
                     created_at: *created_at,

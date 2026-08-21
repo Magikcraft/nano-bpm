@@ -171,7 +171,10 @@ pub struct Engine {
 
 /// A `zeebe:ioMapping` source expression that failed to evaluate. Carries a
 /// human-readable `reason` for the `IO_MAPPING_ERROR` incident the caller raises
-/// (#939).
+/// (#939), plus the failing mapping's `source` expression so a caller can
+/// discriminate an *expected* body-level per-child-binding failure
+/// (`loopCounter` / the configured `inputElement`, absent at the body level)
+/// from a *genuine* failure (#946).
 pub(crate) struct IoMappingFailure {
     pub(crate) reason: String,
 }
@@ -294,6 +297,38 @@ enum Step {
         element_instance_key: Key,
         element_id: ElementId,
         child_variables: HashMap<String, Value>,
+    },
+    /// Re-drive a multi-instance **child**'s activation after its input-mapping
+    /// incident is resolved (#946): re-apply the child's inputs against its
+    /// already-bound `inputElement`/`loopCounter` scope and re-enact its
+    /// behaviour, for the same already-activated child instance (its activation
+    /// events are not re-emitted). See [`Engine::retry_mi_child_activation`].
+    RetryMiChildActivation {
+        instance_key: Key,
+        element_id: ElementId,
+        body_key: Key,
+        child_key: Key,
+        index: usize,
+    },
+    /// Re-drive a multi-instance **body**'s activation (fan-out) after its body
+    /// input-mapping incident is resolved (#946): re-apply the body input
+    /// mappings, re-evaluate the input collection and spawn the children, for the
+    /// same already-activated body (its activation/scope events are not
+    /// re-emitted). See [`Engine::run_mi_body_activation`].
+    RetryMiBodyActivation {
+        instance_key: Key,
+        element_id: ElementId,
+        body_key: Key,
+        scope: Key,
+    },
+    /// Re-drive a call activity's child-process **spawn** after its input-mapping
+    /// incident is resolved (#946): re-attempt seeding and creating the child
+    /// process for the already-activated call activity (its boundary events were
+    /// armed on the first pass and are not re-armed).
+    RetryCallActivitySpawn {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
     },
 }
 
@@ -1929,6 +1964,7 @@ impl Engine {
                             element_instance_key,
                             element_id,
                             kind: state::IncidentKind::JobNoRetries,
+                            redrive: None,
                             reason: error_message,
                             job_key: Some(job_key),
                             created_at: self.now,
@@ -2059,6 +2095,7 @@ impl Engine {
                                 element_instance_key,
                                 element_id: task_element_id,
                                 kind: state::IncidentKind::UnhandledError,
+                                redrive: None,
                                 reason,
                                 job_key: None,
                                 created_at: self.now,
@@ -2150,6 +2187,7 @@ impl Engine {
                 let element_instance_key = incident.element_instance_key;
                 let element_id = incident.element_id.clone();
                 let kind = incident.kind;
+                let redrive = incident.redrive.clone();
                 let job_key = incident.job_key;
                 // A job-incident can only be resolved once the parked job has
                 // retries again; otherwise it would immediately re-fail.
@@ -2223,13 +2261,6 @@ impl Engine {
                     // waiting for a *second* message instead of retrying the mapping.
                     // `ReopenCatch` is reserved for correlation-key (ACTIVATING)
                     // failures, which surface as `ExpressionEvaluation`.
-                    state::IncidentKind::IoMappingOutput => {
-                        queue.push_back(Step::Complete {
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                        });
-                    }
                     // Uncaught business error: re-create a job for the still-active
                     // service task so a worker can attempt it again.
                     state::IncidentKind::UnhandledError => {
@@ -2239,21 +2270,119 @@ impl Engine {
                             element_id,
                         });
                     }
-                    // An input `zeebe:ioMapping` whose source failed to evaluate
-                    // (#939): the element parked ACTIVATED with no behaviour run
-                    // (no job, no scope-local mapped values). Re-driving `Complete`
-                    // would advance the token past the activity without ever
-                    // running it, so instead re-run the activation body — it
-                    // re-applies the now-fixed input mappings and re-enacts the
-                    // element's behaviour (creating the job, opening the scope,
-                    // etc.). Output-mapping failures park in the COMPLETING phase
-                    // as `IoMappingOutput` and are re-driven by `Complete` above.
+                    // A `zeebe:ioMapping` failure (input or output, any element
+                    // type): recovery is **phase-driven** (#946). The re-drive is
+                    // chosen from the [`state::IoMappingRedrive`] recorded on the
+                    // incident — the element's lifecycle phase — rather than from
+                    // the incident *kind*, so a single `IoMapping` taxonomy covers
+                    // every ioMapping failure while each specialized path replays
+                    // its correct context-preserving step (Zeebe parity: ioMapping
+                    // failures re-drive uniformly by lifecycle phase — `ACTIVATING`
+                    // re-applies inputs, `COMPLETING` re-applies outputs).
                     state::IncidentKind::IoMapping => {
-                        queue.push_back(Step::RetryActivation {
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                        });
+                        let step: Option<Step> = match redrive {
+                            // Mainstream input: re-run the activation body so the
+                            // now-fixed inputs are re-applied before the element's
+                            // behaviour runs (re-driving `Complete` would advance the
+                            // token past the activity without ever running it).
+                            Some(state::IoMappingRedrive::Activation) | None => {
+                                Some(Step::RetryActivation {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                })
+                            }
+                            // Output re-projection. A mainstream leaf element
+                            // (service task, etc.) re-drives `Complete`, which
+                            // re-evaluates its output mapping against its own
+                            // still-live scope. A *sub-process*, however, projects
+                            // its output mapping in the drain sweep
+                            // (`complete_drained_subprocesses`), not `complete` —
+                            // by the time a resolve runs, its inner scope is torn
+                            // down, so `Complete` would re-evaluate against an empty
+                            // view. Enqueue nothing for it: `IncidentResolved`
+                            // touches the instance, so the drain sweep that runs
+                            // after this command's queue empties re-detects the
+                            // still-drained sub-process and re-projects the
+                            // now-fixed output mapping.
+                            Some(state::IoMappingRedrive::Completion) => {
+                                if matches!(
+                                    self.element_kind(instance_key, &element_id),
+                                    Some(ElementKind::SubProcess { .. })
+                                ) {
+                                    // Re-driven by the drain sweep, not a step.
+                                    None
+                                } else {
+                                    Some(Step::Complete {
+                                        instance_key,
+                                        element_instance_key,
+                                        element_id,
+                                    })
+                                }
+                            }
+                            // MI child input: re-apply the child's inputs and
+                            // re-enact its behaviour for the same child instance.
+                            Some(state::IoMappingRedrive::MiChildActivation {
+                                body_key,
+                                index,
+                            }) => Some(Step::RetryMiChildActivation {
+                                instance_key,
+                                element_id,
+                                body_key,
+                                child_key: element_instance_key,
+                                index,
+                            }),
+                            // MI body input/collection: re-run the body fan-out.
+                            Some(state::IoMappingRedrive::MiBodyActivation) => {
+                                let scope = self.scope_of(instance_key, element_instance_key);
+                                Some(Step::RetryMiBodyActivation {
+                                    instance_key,
+                                    element_id,
+                                    body_key: element_instance_key,
+                                    scope,
+                                })
+                            }
+                            // MI body output aggregation: re-run body completion.
+                            Some(state::IoMappingRedrive::MiBodyCompletion) => {
+                                Some(Step::CompleteMiBody {
+                                    instance_key,
+                                    body_key: element_instance_key,
+                                })
+                            }
+                            // Ad-hoc tool input: re-activate the tool child with its
+                            // original seed variables (a clean retry).
+                            Some(state::IoMappingRedrive::AdHocToolActivation {
+                                element_id: tool_element_id,
+                                variables,
+                            }) => Some(Step::ActivateAdHocTool {
+                                instance_key,
+                                container_key: element_instance_key,
+                                element_id: tool_element_id,
+                                variables,
+                            }),
+                            // Call-activity input: re-attempt the child-process spawn
+                            // (boundary events stay armed; not re-emitted).
+                            Some(state::IoMappingRedrive::CallActivitySpawn) => {
+                                Some(Step::RetryCallActivitySpawn {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                })
+                            }
+                            // Call-activity output: re-project the captured child
+                            // result through the output mappings and complete.
+                            Some(state::IoMappingRedrive::CallActivityCompletion {
+                                child_variables,
+                            }) => Some(Step::CompleteCallActivity {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                child_variables,
+                            }),
+                        };
+                        if let Some(step) = step {
+                            queue.push_back(step);
+                        }
                     }
                 }
             }
@@ -3774,11 +3903,12 @@ impl Engine {
                         // sub-process for the rest of the sweep; it stays active
                         // parked on the incident (re-driven by `Complete` on
                         // resolution).
-                        let event = self.io_mapping_output_incident(
+                        let event = self.io_mapping_incident(
                             instance_key,
                             eik,
                             element_id.clone(),
                             failure,
+                            state::IoMappingRedrive::Completion,
                         );
                         self.emit(log, event);
                         continue;
@@ -3990,6 +4120,35 @@ impl Engine {
                 element_id,
                 child_variables,
             ),
+            Step::RetryMiChildActivation {
+                instance_key,
+                element_id,
+                body_key,
+                child_key,
+                index,
+            } => {
+                self.retry_mi_child_activation(instance_key, element_id, body_key, child_key, index)
+            }
+            Step::RetryMiBodyActivation {
+                instance_key,
+                element_id,
+                body_key,
+                scope,
+            } => {
+                // Re-derive the activity's multi-instance model from the (immutable)
+                // process definition, mirroring the first activation.
+                match self.multi_instance_of(instance_key, &element_id) {
+                    Some(mi) => {
+                        self.run_mi_body_activation(instance_key, element_id, body_key, scope, mi)
+                    }
+                    None => (Vec::new(), Vec::new()),
+                }
+            }
+            Step::RetryCallActivitySpawn {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => self.retry_call_activity_spawn(instance_key, element_instance_key, element_id),
         }
     }
 
@@ -4100,13 +4259,24 @@ impl Engine {
         // completes.
         let kind = self.element_kind(instance_key, &element_id);
         let is_sub_process = matches!(kind, Some(ElementKind::SubProcess { .. }));
+        let is_call_activity = matches!(kind, Some(ElementKind::CallActivity { .. }));
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
         let is_adhoc_container = adhoc_def.is_some();
         // The element's own scope is registered by `activate` for a
         // sub-process/ad-hoc container (before this body runs); a leaf activity
         // registers it lazily below, only if its inputs produce values.
         let scope_registered = is_sub_process || is_adhoc_container;
-        let inputs = self.io_inputs(instance_key, &element_id);
+        // A call activity's input mappings seed only its isolated child process
+        // scope (applied in `spawn_call_activity_child`) — never the call
+        // activity's own element scope — so they are NOT projected here. Routing
+        // them through the spawn also means a failure re-drives the spawn
+        // (`CallActivitySpawn`) rather than re-running this whole activation body
+        // (which would re-arm the already-armed boundary events).
+        let inputs = if is_call_activity {
+            Vec::new()
+        } else {
+            self.io_inputs(instance_key, &element_id)
+        };
 
         // The scoped variable view the activating element evaluates against: both
         // its input-mapping *source* expressions and its own FEEL attributes (job
@@ -4154,6 +4324,7 @@ impl Engine {
                             element_instance_key,
                             element_id,
                             failure,
+                            state::IoMappingRedrive::Activation,
                         )],
                         Vec::new(),
                     );
@@ -4215,22 +4386,23 @@ impl Engine {
         (events, kind_followups)
     }
 
-    /// Builds an `IO_MAPPING_ERROR` [`Event::IncidentRaised`] for an input
-    /// `zeebe:ioMapping` whose source expression failed to evaluate on activation
-    /// (#939). Mirrors the script-task / correlation-key incident precedent: the
-    /// element instance stays ACTIVATED and parks on the incident; resolving it
-    /// re-drives `activate_body` ([`Step::RetryActivation`]) to re-apply the
-    /// now-fixed mapping. Used only for elements activated via [`activate`] (the
-    /// mainstream input path); the specialized multi-instance / ad-hoc /
-    /// call-activity activation paths — which do not go through `activate_body` —
-    /// use [`io_mapping_expr_incident`] instead, so a resolution re-drives their
-    /// own completion path rather than the wrong `activate_body`.
+    /// Builds an `IO_MAPPING_ERROR` [`Event::IncidentRaised`] for a
+    /// `zeebe:ioMapping` (input **or** output) whose source expression failed to
+    /// evaluate (#939 / #946). A single taxonomy ([`state::IncidentKind::IoMapping`],
+    /// REST `IO_MAPPING_ERROR`) covers every ioMapping failure on every element
+    /// type — the element parks on the incident and the recovery is chosen by the
+    /// `redrive` **phase**, not the incident kind (Zeebe parity: ioMapping
+    /// failures re-drive uniformly by lifecycle phase in
+    /// `BpmnVariableMappingBehavior`). The caller passes the
+    /// [`state::IoMappingRedrive`] describing the lifecycle phase to replay when
+    /// the incident is resolved.
     fn io_mapping_incident(
         &mut self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
         failure: IoMappingFailure,
+        redrive: state::IoMappingRedrive,
     ) -> Event {
         Event::IncidentRaised {
             incident_key: self.mint_key(),
@@ -4238,64 +4410,7 @@ impl Engine {
             element_instance_key,
             element_id,
             kind: state::IncidentKind::IoMapping,
-            reason: failure.reason,
-            job_key: None,
-            created_at: self.now,
-        }
-    }
-
-    /// Builds an `IO_MAPPING_ERROR` [`Event::IncidentRaised`] for an **output**
-    /// `zeebe:ioMapping` whose source failed to evaluate at completion, using the
-    /// [`state::IncidentKind::IoMappingOutput`] kind (REST `IO_MAPPING_ERROR`)
-    /// whose resolution re-drives `Complete` (#939). The element halts in the
-    /// COMPLETING phase; resolving it re-projects the now-fixed output mapping
-    /// without re-running the element's behaviour — the same lifecycle as the
-    /// former `ExpressionEvaluation` routing, but reported under the correct
-    /// `IO_MAPPING_ERROR` taxonomy (Zeebe parity: both input and output mapping
-    /// failures raise `IO_MAPPING_ERROR`). Used for every output-mapping failure:
-    /// the mainstream element, sub-processes, multi-instance children, ad-hoc
-    /// tools, and call activities.
-    fn io_mapping_output_incident(
-        &mut self,
-        instance_key: Key,
-        element_instance_key: Key,
-        element_id: String,
-        failure: IoMappingFailure,
-    ) -> Event {
-        Event::IncidentRaised {
-            incident_key: self.mint_key(),
-            instance_key,
-            element_instance_key,
-            element_id,
-            kind: state::IncidentKind::IoMappingOutput,
-            reason: failure.reason,
-            job_key: None,
-            created_at: self.now,
-        }
-    }
-
-    /// Builds an [`Event::IncidentRaised`] for a `zeebe:ioMapping` whose source
-    /// failed to evaluate, using the `ExpressionEvaluation` kind (REST
-    /// `EXTRACT_VALUE_ERROR`) whose resolution re-drives `Complete`. Now used only
-    /// for the specialized multi-instance / ad-hoc / call-activity **input**
-    /// activation paths, which are not re-driven by `activate_body` and whose
-    /// correct context-preserving re-activation (plus `IO_MAPPING_ERROR`
-    /// relabelling) is tracked as a follow-up to #939. Output mappings use
-    /// [`io_mapping_output_incident`]; the mainstream input path uses
-    /// [`io_mapping_incident`].
-    fn io_mapping_expr_incident(
-        &mut self,
-        instance_key: Key,
-        element_instance_key: Key,
-        element_id: String,
-        failure: IoMappingFailure,
-    ) -> Event {
-        Event::IncidentRaised {
-            incident_key: self.mint_key(),
-            instance_key,
-            element_instance_key,
-            element_id,
-            kind: state::IncidentKind::ExpressionEvaluation,
+            redrive: Some(redrive),
             reason: failure.reason,
             job_key: None,
             created_at: self.now,
@@ -4605,6 +4720,7 @@ impl Engine {
                             element_instance_key,
                             element_id,
                             kind: state::IncidentKind::ExpressionEvaluation,
+                            redrive: None,
                             reason,
                             job_key: None,
                             created_at: self.now,
@@ -4828,6 +4944,37 @@ impl Engine {
                 parent_scope_key: scope,
             },
         ];
+        let (fanout_events, followups) =
+            self.run_mi_body_activation(instance_key, element_id, body_key, scope, mi);
+        events.extend(fanout_events);
+        (events, followups)
+    }
+
+    /// Runs a multi-instance body's activation body: applies the activity's own
+    /// input mappings (local to the body scope), evaluates the input collection,
+    /// emits `MultiInstanceActivated`, gates on the body's `start` listeners, and
+    /// fans out the children. Split out of [`activate_multi_instance_body`] so a
+    /// resolved body input-mapping incident can re-drive it
+    /// ([`Step::RetryMiBodyActivation`]) without re-emitting the body's
+    /// `ElementActivating`/`ElementActivated`/`VariableScopeCreated`.
+    ///
+    /// The body evaluates the activity's mappings only to feed the input
+    /// collection; the mappings are authoritatively applied — and their eval
+    /// failures raised as incidents — per child in [`activate_mi_child`], where
+    /// `inputElement`/`loopCounter` are bound. A body-level mapping that fails
+    /// **because** it references those not-yet-bound per-child bindings is
+    /// *tolerated* (skipped); a mapping that fails for any other reason is a
+    /// *genuine* failure and raises an `IO_MAPPING_ERROR` incident rather than
+    /// silently projecting an empty collection (#946).
+    fn run_mi_body_activation(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        body_key: Key,
+        scope: Key,
+        mi: crate::model::MultiInstance,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let mut events = Vec::new();
         // Input mappings on the activity apply once, on body activation, LOCAL to
         // the body scope (Zeebe semantics), so they feed the input collection and
         // the children without leaking to the parent scope. Their source
@@ -4839,16 +4986,30 @@ impl Engine {
         let input_updates = if inputs.is_empty() {
             HashMap::new()
         } else {
-            // The body overlays the activity's own input mappings only to evaluate
-            // the input COLLECTION expression; the mappings are authoritatively
-            // applied — and their eval failures raised as incidents (#939) — on
-            // each child in `activate_mi_child`, where `inputElement`/`loopCounter`
-            // are bound. At the body level those child bindings do not yet exist,
-            // so a mapping that references them legitimately fails here; tolerate
-            // that and fall back to the un-overlaid scope (the per-child pass still
-            // halts loudly on a genuine failure).
-            self.eval_io_mappings_in(&enclosing_vars, &inputs)
-                .unwrap_or_default()
+            // Tolerate a mapping that fails because it references a per-child
+            // binding (`loopCounter` / the configured `inputElement`) absent at the
+            // body level — it is applied authoritatively per child. A mapping that
+            // fails for any other reason is a genuine failure: park the body on an
+            // `IO_MAPPING_ERROR` incident whose resolution re-drives this body
+            // activation (#946).
+            let mut tolerated = std::collections::HashSet::new();
+            tolerated.insert("loopCounter".to_string());
+            if let Some(name) = &mi.input_element {
+                tolerated.insert(name.clone());
+            }
+            match self.eval_io_mappings_tolerating(&enclosing_vars, &inputs, &tolerated) {
+                Ok(updates) => updates,
+                Err(failure) => {
+                    let event = self.io_mapping_incident(
+                        instance_key,
+                        body_key,
+                        element_id,
+                        failure,
+                        state::IoMappingRedrive::MiBodyActivation,
+                    );
+                    return (vec![event], Vec::new());
+                }
+            }
         };
         if !input_updates.is_empty() {
             events.push(Event::ScopedVariablesUpdated {
@@ -5054,9 +5215,13 @@ impl Engine {
                 }
                 Err(failure) => {
                     // A per-child input mapping that fails to evaluate halts the
-                    // child with an incident rather than running it against a
-                    // silently-unset variable (#939). The child is activated and
-                    // parked on the incident so the body waits for it.
+                    // child with an `IO_MAPPING_ERROR` incident rather than running
+                    // it against a silently-unset variable (#939/#946). The child
+                    // is activated and parked on the incident so the body waits for
+                    // it; resolution re-drives the child's *activation* phase
+                    // (`MiChildActivation`), re-applying the now-fixed inputs and
+                    // re-enacting its behaviour for the same child instance —
+                    // without re-emitting its activation events.
                     let mut events = vec![
                         Event::ElementActivating {
                             instance_key,
@@ -5077,15 +5242,20 @@ impl Engine {
                             local_variables: locals,
                         },
                     ];
-                    let event =
-                        self.io_mapping_expr_incident(instance_key, child_key, element_id, failure);
+                    let event = self.io_mapping_incident(
+                        instance_key,
+                        child_key,
+                        element_id,
+                        failure,
+                        state::IoMappingRedrive::MiChildActivation { body_key, index },
+                    );
                     events.push(event);
                     return (events, Vec::new());
                 }
             }
         }
 
-        let mut events = vec![
+        let events = vec![
             Event::ElementActivating {
                 instance_key,
                 element_instance_key: child_key,
@@ -5105,16 +5275,40 @@ impl Engine {
                 local_variables: locals,
             },
         ];
+        let (behaviour_events, followups) =
+            self.run_mi_child_behaviour(instance_key, element_id, body_key, child_key, &child_vars);
+        let mut events = events;
+        events.extend(behaviour_events);
+        (events, followups)
+    }
+
+    /// Runs a multi-instance child's own behaviour once its `inputElement` /
+    /// `loopCounter` bindings and per-child input mappings have been applied
+    /// (`child_vars` is the child's resolved scope view): a service-task child
+    /// mints its job, an embedded-sub-process child opens its scope and activates
+    /// its inner start event, any other kind passes straight through to
+    /// completion. Shared by the first activation ([`activate_mi_child`]) and the
+    /// incident re-drive ([`retry_mi_child_activation`]) so both enact identical
+    /// behaviour.
+    fn run_mi_child_behaviour(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        body_key: Key,
+        child_key: Key,
+        child_vars: &HashMap<String, Value>,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let mut events = Vec::new();
         let mut followups = Vec::new();
         match self.element_kind(instance_key, &element_id) {
             Some(ElementKind::ServiceTask {
                 job_type, priority, ..
             }) => {
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(&child_vars, &job_type);
-                let priority = self.resolve_priority(&child_vars, priority.as_deref());
+                let job_type = self.resolve_job_type(child_vars, &job_type);
+                let priority = self.resolve_priority(child_vars, priority.as_deref());
                 let retries = self.resolve_retries(
-                    &child_vars,
+                    child_vars,
                     self.retries_of(instance_key, &element_id).as_deref(),
                 );
                 events.push(Event::JobCreated {
@@ -5159,6 +5353,58 @@ impl Engine {
                 });
             }
         }
+        (events, followups)
+    }
+
+    /// Re-drives a multi-instance child's *activation* phase after its
+    /// input-mapping incident is resolved (#946): the child element instance is
+    /// already ACTIVATED (its `ElementActivating`/`ElementActivated`/
+    /// `MultiInstanceChildActivated` were emitted and are not re-emitted). Reads
+    /// the child's already-bound scope (which carries `inputElement`/`loopCounter`
+    /// from `MultiInstanceChildActivated`), re-applies the now-fixed input
+    /// mappings — writing them into the child scope — and re-enacts the child's
+    /// behaviour, exactly as a clean first activation would have. A mapping that
+    /// still fails re-raises the same incident.
+    fn retry_mi_child_activation(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        body_key: Key,
+        child_key: Key,
+        index: usize,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let mut child_vars = (*self.variables_for_element(instance_key, child_key)).clone();
+        let mut events = Vec::new();
+        let inputs = self.io_inputs(instance_key, &element_id);
+        if !inputs.is_empty() {
+            match self.eval_io_mappings_in(&child_vars, &inputs) {
+                Ok(mut mapped) => {
+                    // `loopCounter` stays engine-owned (see `activate_mi_child`).
+                    mapped.remove("loopCounter");
+                    if !mapped.is_empty() {
+                        child_vars.extend(mapped.clone());
+                        events.push(Event::ScopedVariablesUpdated {
+                            instance_key,
+                            scope_key: child_key,
+                            variables: mapped,
+                        });
+                    }
+                }
+                Err(failure) => {
+                    let event = self.io_mapping_incident(
+                        instance_key,
+                        child_key,
+                        element_id,
+                        failure,
+                        state::IoMappingRedrive::MiChildActivation { body_key, index },
+                    );
+                    return (vec![event], Vec::new());
+                }
+            }
+        }
+        let (behaviour_events, followups) =
+            self.run_mi_child_behaviour(instance_key, element_id, body_key, child_key, &child_vars);
+        events.extend(behaviour_events);
         (events, followups)
     }
 
@@ -5264,11 +5510,12 @@ impl Engine {
                             // child with an incident instead of completing it with
                             // a silently-unset output (#939). The child does not
                             // complete; resolution re-drives its completion.
-                            let event = self.io_mapping_output_incident(
+                            let event = self.io_mapping_incident(
                                 instance_key,
                                 child_eik,
                                 element_id,
                                 failure,
+                                state::IoMappingRedrive::Completion,
                             );
                             return (vec![event], Vec::new());
                         }
@@ -5336,8 +5583,9 @@ impl Engine {
         instance_key: Key,
         body_key: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let (element_id, output_collection, output_values, active): (
+        let (element_id, input_element, output_collection, output_values, active): (
             ElementId,
+            Option<String>,
             Option<String>,
             Vec<Value>,
             Vec<Key>,
@@ -5349,6 +5597,7 @@ impl Engine {
         {
             Some(mi) => (
                 mi.element_id.clone(),
+                mi.input_element.clone(),
                 mi.output_collection.clone(),
                 mi.output_values
                     .iter()
@@ -5376,13 +5625,31 @@ impl Engine {
             }
             // The body evaluates the ACTIVITY's own output mappings against the
             // body scope overlaid with the aggregated `outputCollection`. A mapping
-            // that references per-child bindings (`inputElement`/`loopCounter`) —
-            // which do not exist at the body level — legitimately fails here; it is
-            // authoritatively applied, and its eval failure raised as an incident
-            // (#939), per child in `complete_mi_child`. Tolerate the body-level
-            // failure and fall back to the un-mapped view (the per-child pass still
-            // halts loudly on a genuine failure).
-            self.eval_io_mappings_in(&ctx, &outputs).unwrap_or_default()
+            // that fails because it references a per-child binding
+            // (`inputElement`/`loopCounter`) — absent at the body level — is
+            // tolerated (skipped); it is authoritatively applied, and its eval
+            // failure raised, per child in `complete_mi_child`. A mapping that fails
+            // for any other reason is a genuine failure: park the body on an
+            // `IO_MAPPING_ERROR` incident whose resolution re-drives this body
+            // completion (#946), rather than silently completing with no incident.
+            let mut tolerated = std::collections::HashSet::new();
+            tolerated.insert("loopCounter".to_string());
+            if let Some(name) = &input_element {
+                tolerated.insert(name.clone());
+            }
+            match self.eval_io_mappings_tolerating(&ctx, &outputs, &tolerated) {
+                Ok(updates) => updates,
+                Err(failure) => {
+                    let event = self.io_mapping_incident(
+                        instance_key,
+                        body_key,
+                        element_id,
+                        failure,
+                        state::IoMappingRedrive::MiBodyCompletion,
+                    );
+                    return (vec![event], Vec::new());
+                }
+            }
         };
 
         let mut events = Vec::new();
@@ -5895,14 +6162,22 @@ impl Engine {
                     }
                     Err(failure) => {
                         // A tool input mapping that fails to evaluate halts the
-                        // ad-hoc container with an incident rather than running the
-                        // tool against a silently-unset variable (#939). The tool
-                        // child is not created; the container parks on the incident.
-                        let event = self.io_mapping_expr_incident(
+                        // ad-hoc container with an `IO_MAPPING_ERROR` incident
+                        // rather than running the tool against a silently-unset
+                        // variable (#939/#946). The tool child is not created; the
+                        // container parks on the incident, and resolution re-drives
+                        // the tool's *activation* (`AdHocToolActivation`) with its
+                        // original seed variables — a clean retry, since nothing was
+                        // created on this pass.
+                        let event = self.io_mapping_incident(
                             instance_key,
                             container_key,
                             cid.to_string(),
                             failure,
+                            state::IoMappingRedrive::AdHocToolActivation {
+                                element_id: element_id.clone(),
+                                variables: local_variables.clone(),
+                            },
                         );
                         return (vec![event], Vec::new());
                     }
@@ -6246,6 +6521,7 @@ impl Engine {
                             element_instance_key: child_eik,
                             element_id: tool_element_id,
                             kind: state::IncidentKind::ExpressionEvaluation,
+                            redrive: None,
                             reason,
                             job_key: None,
                             created_at: self.now,
@@ -6317,11 +6593,12 @@ impl Engine {
                         // tool with an incident instead of completing it with a
                         // silently-unset output (#939). The tool does not complete;
                         // resolution re-drives its completion.
-                        let event = self.io_mapping_output_incident(
+                        let event = self.io_mapping_incident(
                             instance_key,
                             child_eik,
                             tool_element_id,
                             failure,
+                            state::IoMappingRedrive::Completion,
                         );
                         return (vec![event], Vec::new());
                     }
@@ -6862,6 +7139,7 @@ impl Engine {
                             element_instance_key,
                             element_id,
                             kind: state::IncidentKind::ExpressionEvaluation,
+                            redrive: None,
                             reason,
                             job_key: None,
                             created_at: self.now,
@@ -6897,6 +7175,7 @@ impl Engine {
                         element_instance_key,
                         element_id,
                         kind: state::IncidentKind::DecisionEvaluation,
+                        redrive: None,
                         reason: format!(
                             "no deployed decision with id '{resolved_id}' for business rule task \
                              '{}'",
@@ -6918,6 +7197,7 @@ impl Engine {
                         element_instance_key,
                         element_id: element_id.clone(),
                         kind: state::IncidentKind::DecisionEvaluation,
+                        redrive: None,
                         reason: format!(
                             "failed to evaluate decision '{}' at business rule task '{element_id}': \
                              {}",
@@ -6991,20 +7271,22 @@ impl Engine {
                 Err(failure) => {
                     // Halt in the COMPLETING phase: the element stays active and
                     // parks on the incident, re-driven by `Complete` on resolution
-                    // — the same lifecycle as a script/decision output failure in
-                    // this function. `io_mapping_output_incident` uses the
-                    // `IoMappingOutput` kind (REST `IO_MAPPING_ERROR`), whose
-                    // resolution re-drives `Complete` (re-projecting the output),
-                    // rather than the `IoMapping` kind whose resolution re-drives
-                    // the *activation* body (the input-mapping phase). Both surface
-                    // the one `IO_MAPPING_ERROR` taxonomy (Zeebe parity: input and
-                    // output mapping failures share it).
+                    // (the `Completion` re-drive) — the same lifecycle as a
+                    // script/decision output failure in this function. The single
+                    // `IoMapping` kind (REST `IO_MAPPING_ERROR`) carries the
+                    // `Completion` phase so resolution re-projects the output
+                    // without re-running the element's behaviour, whereas an
+                    // input-mapping failure carries `Activation` and re-drives the
+                    // activation body. Both surface the one `IO_MAPPING_ERROR`
+                    // taxonomy (Zeebe parity: input and output mapping failures
+                    // share it, re-driven uniformly by lifecycle phase).
                     return (
-                        vec![self.io_mapping_output_incident(
+                        vec![self.io_mapping_incident(
                             instance_key,
                             element_instance_key,
                             element_id,
                             failure,
+                            state::IoMappingRedrive::Completion,
                         )],
                         Vec::new(),
                     );
@@ -8108,6 +8390,7 @@ impl Engine {
                         element_instance_key,
                         element_id,
                         kind: state::IncidentKind::ExpressionEvaluation,
+                        redrive: None,
                         reason,
                         job_key: None,
                         created_at: self.now,
@@ -8168,6 +8451,7 @@ impl Engine {
                     element_instance_key,
                     element_id: element_id.clone(),
                     kind: state::IncidentKind::NoMatchingSequenceFlow,
+                    redrive: None,
                     reason: format!(
                         "no matching outgoing sequence flow at exclusive gateway '{element_id}'"
                     ),
@@ -8225,6 +8509,7 @@ impl Engine {
                         element_instance_key,
                         element_id: element_id.clone(),
                         kind: state::IncidentKind::NoMatchingSequenceFlow,
+                        redrive: None,
                         reason: format!(
                             "no matching outgoing sequence flow at exclusive gateway '{element_id}'"
                         ),
@@ -8243,6 +8528,7 @@ impl Engine {
                         element_instance_key,
                         element_id,
                         kind: state::IncidentKind::ExpressionEvaluation,
+                        redrive: None,
                         reason,
                         job_key: None,
                         created_at: self.now,
@@ -8427,6 +8713,34 @@ impl Engine {
         depth
     }
 
+    /// Re-drives a call activity's child-process spawn after its input-mapping
+    /// incident is resolved (#946). The call-activity element instance is already
+    /// ACTIVATED with its boundary events armed (they were armed on the first
+    /// pass, before the input mapping failed); this re-derives the callee id and
+    /// the activating variable view and re-attempts only the spawn — re-applying
+    /// the now-fixed input mappings and creating the child — without re-arming the
+    /// boundary events or re-emitting the element's activation.
+    fn retry_call_activity_spawn(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let called = match self.element_kind(instance_key, &element_id) {
+            Some(ElementKind::CallActivity { called_process_id }) => called_process_id,
+            _ => return (Vec::new(), Vec::new()),
+        };
+        let scope = self.scope_of(instance_key, element_instance_key);
+        let element_vars = (*self.variables_for_element(instance_key, scope)).clone();
+        self.spawn_call_activity_child(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            &called,
+            &element_vars,
+        )
+    }
+
     /// Spawns the child process instance for an activating call activity and
     /// links it back to the parent (`parentProcessInstanceKey` /
     /// `parentElementInstanceKey`). The parent's call-activity element instance
@@ -8463,6 +8777,7 @@ impl Engine {
                                 element_instance_key: call_eik,
                                 element_id: element_id.to_string(),
                                 kind: state::IncidentKind::ExpressionEvaluation,
+                                redrive: None,
                                 reason: format!(
                                     "call activity '{element_id}' could not evaluate \
                                      calledElement expression '{called_process_id}': {err}"
@@ -8488,6 +8803,7 @@ impl Engine {
                     element_instance_key: call_eik,
                     element_id: element_id.to_string(),
                     kind: state::IncidentKind::CalledElementError,
+                    redrive: None,
                     reason: format!(
                         "call activity '{element_id}' exceeded the maximum child-instance depth \
                          of {MAX_CALL_ACTIVITY_DEPTH} calling '{called}' (possible unbounded \
@@ -8515,6 +8831,7 @@ impl Engine {
                     element_instance_key: call_eik,
                     element_id: element_id.to_string(),
                     kind: state::IncidentKind::CalledElementError,
+                    redrive: None,
                     reason: format!(
                         "call activity '{element_id}' references unknown called process '{called}'"
                     ),
@@ -8534,13 +8851,18 @@ impl Engine {
                 Ok(updates) => updates,
                 Err(failure) => {
                     // A call-activity input mapping that fails to evaluate halts the
-                    // call activity with an incident rather than starting the child
-                    // process against a silently-unset variable (#939).
-                    let event = self.io_mapping_expr_incident(
+                    // call activity with an `IO_MAPPING_ERROR` incident rather than
+                    // starting the child process against a silently-unset variable
+                    // (#939/#946). Resolution re-drives only the *spawn*
+                    // (`CallActivitySpawn`) for the already-activated call activity —
+                    // its boundary events were armed on the first pass and must not
+                    // be re-armed.
+                    let event = self.io_mapping_incident(
                         parent_instance,
                         call_eik,
                         element_id.to_string(),
                         failure,
+                        state::IoMappingRedrive::CallActivitySpawn,
                     );
                     return (vec![event], Vec::new());
                 }
@@ -8617,13 +8939,21 @@ impl Engine {
                 }
                 Err(failure) => {
                     // A call-activity output mapping that fails to evaluate halts the
-                    // call activity with an incident instead of completing it with a
-                    // silently-unset output (#939).
-                    let event = self.io_mapping_output_incident(
+                    // call activity with an `IO_MAPPING_ERROR` incident instead of
+                    // completing it with a silently-unset output (#939/#946).
+                    // Resolution re-drives its *completion* against the captured
+                    // child variables (`CallActivityCompletion`) — the completed
+                    // child that produced them is gone by resolution time, so they
+                    // are preserved on the incident and re-projected through the
+                    // output mappings.
+                    let event = self.io_mapping_incident(
                         instance_key,
                         element_instance_key,
                         element_id,
                         failure,
+                        state::IoMappingRedrive::CallActivityCompletion {
+                            child_variables: child_variables.clone(),
+                        },
                     );
                     return (vec![event], Vec::new());
                 }
