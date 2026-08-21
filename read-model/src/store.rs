@@ -2962,6 +2962,26 @@ pub fn dmn_decision_type_name(kind: &nanobpmn_engine_core::dmn::DecisionType) ->
     }
 }
 
+/// The Camunda 8 element-instance `type` an element is exposed as in the read
+/// model, derived from the deployed element as the single source of truth.
+///
+/// This wraps [`ElementKind::type_name`](nanobpmn_engine_core::ElementKind::type_name)
+/// and overrides the one case the kind alone cannot disambiguate:
+/// `CompensationThrowEvent` covers both the `<intermediateThrowEvent>` and
+/// `<endEvent>` compensation-throw flavours (the engine infers the end-event
+/// flavour purely from having no outgoing flow — runtime routing is unaffected).
+/// `type_name()` hard-codes it to `INTERMEDIATE_THROW_EVENT`; a terminal
+/// (no-outgoing-flow) compensation throw is an end event, so classify it as
+/// `END_EVENT` here (#917). Every other kind passes through unchanged.
+fn element_type_name(element: &nanobpmn_engine_core::Element) -> &'static str {
+    match element.kind {
+        nanobpmn_engine_core::ElementKind::CompensationThrowEvent if element.outgoing.is_empty() => {
+            "END_EVENT"
+        }
+        _ => element.kind.type_name(),
+    }
+}
+
 /// Upserts a batch of variables into a single variable scope. For a root-scope
 /// write (`VariablesUpdated`) the caller passes `scope_key == instance_key`; for
 /// a nested scope (`ScopedVariablesUpdated` — a sub-process, multi-instance body
@@ -3176,7 +3196,7 @@ fn project_engine_state(
                 params![
                     deployed.key as i64,
                     element_id,
-                    element.kind.type_name(),
+                    element_type_name(element),
                     element.name.as_ref(),
                 ],
             )?;
@@ -3525,7 +3545,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     params![
                         *process_definition_key as i64,
                         element_id,
-                        element.kind.type_name(),
+                        element_type_name(element),
                         element.name.as_ref(),
                     ],
                 )?;
@@ -6386,6 +6406,72 @@ mod element_instance_tests {
         let row = store.element_instance(2003).unwrap();
         assert_eq!(row.element_type, "AD_HOC_SUB_PROCESS_INNER_INSTANCE");
         assert_eq!(row.element_name, None);
+    }
+
+    /// #917: `ElementKind::CompensationThrowEvent` covers both the
+    /// `<intermediateThrowEvent>` and `<endEvent>` compensation-throw flavours,
+    /// disambiguated at runtime purely by outgoing-flow emptiness. The read model
+    /// must expose a terminal (no-outgoing-flow) compensation throw as
+    /// `END_EVENT`, and one with an outgoing flow as `INTERMEDIATE_THROW_EVENT`,
+    /// rather than hard-coding both to `INTERMEDIATE_THROW_EVENT`.
+    #[test]
+    fn compensation_throw_end_event_flavour_classifies_as_end_event() {
+        const COMP_DEF_KEY: u64 = 600;
+        const COMP_INST: u64 = 1100;
+        let def = ProcessBuilder::new("comp")
+            .start_event("s")
+            .compensation_throw_event("mid")
+            .compensation_throw_event("term")
+            .connect("s", "mid")
+            .connect("mid", "term")
+            .build()
+            .unwrap();
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[
+                &Event::ProcessDeployed {
+                    deployment_key: 2,
+                    process_definition_key: COMP_DEF_KEY,
+                    version: 1,
+                    process: def,
+                },
+                &Event::ProcessInstanceCreated {
+                    instance_key: COMP_INST,
+                    process_id: "comp".to_string(),
+                    variables: HashMap::new(),
+                    created_at: 1,
+                    tags: Vec::new(),
+                    business_id: None,
+                    process_definition_key: COMP_DEF_KEY,
+                    version: 1,
+                    parent_process_instance_key: None,
+                    parent_element_instance_key: None,
+                },
+                // Intermediate flavour: has an outgoing flow.
+                &Event::ElementActivated {
+                    instance_key: COMP_INST,
+                    element_instance_key: 3001,
+                    element_id: "mid".to_string(),
+                    scope: 0,
+                },
+                // Terminal flavour: no outgoing flow.
+                &Event::ElementActivated {
+                    instance_key: COMP_INST,
+                    element_instance_key: 3002,
+                    element_id: "term".to_string(),
+                    scope: 0,
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(
+            store.element_instance(3001).unwrap().element_type,
+            "INTERMEDIATE_THROW_EVENT"
+        );
+        assert_eq!(
+            store.element_instance(3002).unwrap().element_type,
+            "END_EVENT"
+        );
     }
 
     /// `active_element_instances` returns only the `Active` rows for the given
