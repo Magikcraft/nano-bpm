@@ -2975,7 +2975,9 @@ pub fn dmn_decision_type_name(kind: &nanobpmn_engine_core::dmn::DecisionType) ->
 /// `END_EVENT` here (#917). Every other kind passes through unchanged.
 fn element_type_name(element: &nanobpmn_engine_core::Element) -> &'static str {
     match element.kind {
-        nanobpmn_engine_core::ElementKind::CompensationThrowEvent if element.outgoing.is_empty() => {
+        nanobpmn_engine_core::ElementKind::CompensationThrowEvent
+            if element.outgoing.is_empty() =>
+        {
             "END_EVENT"
         }
         _ => element.kind.type_name(),
