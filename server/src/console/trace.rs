@@ -1310,6 +1310,7 @@ mod tests {
             reason: "FEEL: '+'(amount, null)".to_string(),
             job_key: None,
             created_at: 200,
+            redrive: None,
         }
     }
 

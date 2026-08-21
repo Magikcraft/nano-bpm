@@ -177,6 +177,47 @@ impl Engine {
         Ok(result)
     }
 
+    /// Like [`Self::eval_io_mappings_in`], but *tolerates* a mapping whose source
+    /// references any name in `tolerated` when it fails to evaluate — that mapping
+    /// is skipped rather than raising a failure. Used at the multi-instance
+    /// **body** level, where the activity's own mappings legitimately reference
+    /// per-child bindings (`loopCounter` / the configured `inputElement`) that do
+    /// not exist until a child is instantiated: those are authoritatively applied
+    /// (and their failures raised) per child. A mapping that fails **without**
+    /// referencing a tolerated binding is a *genuine* failure and is returned as
+    /// `Err`, so the body raises an `IO_MAPPING_ERROR` incident rather than
+    /// silently projecting an empty result (#946).
+    pub(crate) fn eval_io_mappings_tolerating(
+        &self,
+        vars: &HashMap<String, Value>,
+        mappings: &[crate::model::Mapping],
+        tolerated: &std::collections::HashSet<String>,
+    ) -> Result<HashMap<String, Value>, IoMappingFailure> {
+        let mut result: HashMap<String, Value> = HashMap::new();
+        for m in mappings {
+            match crate::feel::eval(m.source.trim(), vars) {
+                Ok(value) => Self::assign_io_target(&mut result, vars, &m.target, value),
+                Err(err) => {
+                    let refs = crate::feel::referenced_variables(m.source.trim());
+                    if refs.iter().any(|r| tolerated.contains(r)) {
+                        // An expected per-child-binding failure at the body level:
+                        // skip it; the per-child pass applies it authoritatively.
+                        continue;
+                    }
+                    return Err(IoMappingFailure {
+                        reason: format!(
+                            "failed to evaluate io mapping source '{}' for target '{}': {}",
+                            m.source.trim(),
+                            m.target,
+                            err.0
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(result)
+    }
+
     pub(crate) fn outgoing(&self, instance_key: Key, element_id: &str) -> Vec<SequenceFlow> {
         self.process_of_instance(instance_key)
             .and_then(|p| p.element(element_id))
