@@ -164,6 +164,10 @@ manifest — pure declared data, no code in the manifest. The manifest binds:
   a process — invoked from a button, webhook or trigger.
 - **`surfaces` / `pages`** — forms and Page-Composer pages over the domain.
 
+An optional top-level **`entrypoint`** (e.g. `"src/main.ts"`) overrides the default
+`main.ts` the Studio supervisor runs/compiles, so an app whose real entrypoint is not a
+root `main.ts` is self-describing and needs no placeholder root shim (#957).
+
 The manifest is the source of truth; the TypeScript types and the `$schema` an
 editor uses for autocompletion are generated from it. Point your `$schema` at
 `{APP_SCHEMA_URL}` for validation and completion.

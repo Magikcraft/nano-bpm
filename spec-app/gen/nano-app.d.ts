@@ -132,6 +132,10 @@ export interface AppManifest {
    * Informational codename, surfaced as App.CODENAME (ADR 0015). Optional.
    */
   codename?: string;
+  /**
+   * App-declared entrypoint module the Studio supervisor runs/compiles, resolved relative to the app root (issue #957). Overrides the default `main.ts` convention so an app whose real entrypoint lives elsewhere (e.g. `src/main.ts`) is self-describing and runnable without a placeholder root shim. Precedence: an explicit project-config `main` (nanobpm.project.json) > this `entrypoint` > the `main.ts` default. Omit to keep the `main.ts` convention (zero regression).
+   */
+  entrypoint?: string;
   runtime?: Runtime;
   models?: Models;
   data?: Data;
