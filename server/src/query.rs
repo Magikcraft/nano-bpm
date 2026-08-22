@@ -241,8 +241,18 @@ pub fn match_string_opt(
 ) -> bool {
     match filter {
         None => true,
-        Some(models::StringFilterProperty::String(s)) => value == Some(s.as_str()),
-        Some(models::StringFilterProperty::AdvancedStringFilter(a)) => {
+        Some(f) => match_string_property(f, value),
+    }
+}
+
+/// Matches a required (non-optional) `StringFilterProperty` against a
+/// possibly-absent string value — the shape carried by nested filters where the
+/// property itself is mandatory (e.g. `VariableValueFilterProperty.value`).
+/// Shares its semantics with [`match_string_opt`] so the two cannot drift.
+pub fn match_string_property(filter: &models::StringFilterProperty, value: Option<&str>) -> bool {
+    match filter {
+        models::StringFilterProperty::String(s) => value == Some(s.as_str()),
+        models::StringFilterProperty::AdvancedStringFilter(a) => {
             ops!(a, |s: &String| s.clone(), like).matches(value)
         }
     }
