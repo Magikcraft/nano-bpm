@@ -1287,6 +1287,78 @@ pub fn write_config(name: &str, cfg: &ProjectConfig) -> std::io::Result<()> {
     std::fs::write(dir.join(CONFIG_FILE), format!("{json}\n"))
 }
 
+/// The App manifest's declared entrypoint (`entrypoint` in `nano.app.json`), if
+/// present and non-empty. This is the app-owned, portable entrypoint override
+/// from #957 — it travels with the app so a path-linked app whose real
+/// entrypoint is not a root `main.ts` (e.g. `src/main.ts`) runs in Studio
+/// without a placeholder root shim. Best-effort: a missing/malformed manifest
+/// yields `None`, falling back to the `main.ts` default. A non-relative or
+/// `..`-traversing entrypoint is rejected (also `None`) so an app cannot point
+/// the supervisor outside its own root.
+fn manifest_entrypoint(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("nano.app.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let ep = v.get("entrypoint")?.as_str()?.trim();
+    if ep.is_empty() {
+        return None;
+    }
+    // The manifest is app-owned, portable data whose entrypoint is resolved
+    // against the app root and handed straight to Node / `deno compile`. An
+    // absolute path or a `..` traversal would escape the project root (and
+    // `Path::join` silently *ignores* `dir` for an absolute path), so reject
+    // any non-relative/traversing value and fall back to the default rather
+    // than trust the manifest.
+    let path = Path::new(ep);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    Some(ep.to_string())
+}
+
+/// Whether `nanobpm.project.json` *explicitly* declares `main`. Serde defaults
+/// `ProjectConfig::main` to `main.ts` when the key is absent, which would hide
+/// the difference between "the console pinned main.ts" and "unset"; the
+/// entrypoint precedence (#957) needs to know so an explicit project-config
+/// `main` can outrank the manifest.
+///
+/// A `main` that is present but empty/whitespace (`"main": ""`) is **not** an
+/// explicit pin — mirroring `manifest_entrypoint`'s trim/empty handling — so a
+/// blank value neither outranks a valid manifest `entrypoint` nor produces a
+/// confusing `entrypoint  not found` at runtime.
+fn config_declares_main(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(CONFIG_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.get("main")
+                .and_then(|m| m.as_str())
+                .map(|s| !s.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+/// Resolve the entrypoint module the supervisor runs/compiles for a project
+/// (#957). Precedence, default-preserving:
+///
+/// 1. an **explicit** project-config `main` (console-generated
+///    `nanobpm.project.json`) — highest, so a pack scaffold or a hand-pin wins;
+/// 2. the App manifest's `entrypoint` (`nano.app.json`) — self-describing and
+///    portable, so an app declares its own entrypoint and it travels with it;
+/// 3. the `main.ts` default — today's convention, zero regression.
+///
+/// The returned path is project-relative (resolved against the app root by the
+/// caller), exactly like `cfg.main` was before.
+pub(crate) fn resolve_entrypoint(dir: &Path, cfg: &ProjectConfig) -> String {
+    if config_declares_main(dir) {
+        return cfg.main.clone();
+    }
+    manifest_entrypoint(dir).unwrap_or_else(|| cfg.main.clone())
+}
+
 // ---------------------------------------------------------------------------
 // Scaffolding
 // ---------------------------------------------------------------------------
@@ -6877,6 +6949,14 @@ impl ProjectSupervisor {
             return Err("no such project".into());
         }
         let cfg = read_config(name).ok_or("no such project")?;
+        // Entrypoint precedence (#957): an app can declare its own entrypoint in
+        // `nano.app.json`, overriding the `main.ts` default without a root shim,
+        // while an explicit project-config `main` still wins. Resolved on the
+        // in-memory cfg only (never persisted), so it stays app-owned.
+        let cfg = ProjectConfig {
+            main: resolve_entrypoint(&dir, &cfg),
+            ..cfg
+        };
         // Boot gate (ADR 0027 §4 / ADR 0050 §2 seam): fail closed if the manifest
         // enables a connector whose pack is uninstalled, unlaunchable, or missing
         // its backing component — otherwise the task would parse but hang.
@@ -6934,7 +7014,11 @@ impl ProjectSupervisor {
         let entry = dir.join(&cfg.main);
         if !entry.is_file() {
             *inner.phase.lock().await = Phase::Stopped;
-            return Err(format!("entrypoint {} not found", cfg.main));
+            return Err(format!(
+                "entrypoint {} not found (resolved to {})",
+                cfg.main,
+                entry.display()
+            ));
         }
         // Canonicalize so the --allow-read/-write scope matches the path Deno
         // resolves (e.g. macOS /tmp -> /private/tmp), otherwise access is denied.
@@ -7342,7 +7426,13 @@ impl ProjectSupervisor {
             return Err("no such project".into());
         }
         let cfg = read_config(name).ok_or("no such project")?;
-        // Export/compile hook: refresh the generated domain types so the packaged
+        // Entrypoint precedence (#957): honour an app-declared `nano.app.json`
+        // entrypoint for Compile too, so a packaged binary uses the same
+        // resolved module Run does. Explicit project-config `main` still wins.
+        let cfg = ProjectConfig {
+            main: resolve_entrypoint(&dir, &cfg),
+            ..cfg
+        };
         // binary bundles source that types against the current schema + manifest
         // `types` registry (ADR 0029 §6). Best-effort and erased at `deno compile`
         // — a failure never blocks the build.
@@ -9253,6 +9343,124 @@ mod tests {
         assert_eq!(ex_hits[0]["pack"].as_str(), Some("thing-example"));
         assert_eq!(ex_hits[0]["label"].as_str(), Some("Thing example"));
         assert_eq!(ex_hits[0]["description"].as_str(), Some("Runs the thing"));
+    }
+
+    // --- Entrypoint resolution (#957) ---------------------------------------
+
+    #[test]
+    fn resolve_entrypoint_defaults_to_main_ts_without_overrides() {
+        // No manifest, no explicit project-config main: the convention holds.
+        let dir = scratch_dir("entry-default");
+        let cfg = ProjectConfig::new("p", "");
+        assert_eq!(resolve_entrypoint(&dir, &cfg), "main.ts");
+    }
+
+    #[test]
+    fn resolve_entrypoint_honours_manifest_entrypoint() {
+        // A path-linked app whose real entrypoint is src/main.ts declares it in
+        // nano.app.json — no root main.ts shim, and no nanobpm.project.json.
+        let dir = scratch_dir("entry-manifest");
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"app","name":"App","entrypoint":"src/main.ts"}"#,
+        )
+        .unwrap();
+        let cfg = ProjectConfig::new("p", "");
+        assert_eq!(resolve_entrypoint(&dir, &cfg), "src/main.ts");
+    }
+
+    #[test]
+    fn resolve_entrypoint_rejects_absolute_manifest_entrypoint() {
+        // A manifest entrypoint is resolved against the app root and handed to
+        // the runtime, so an absolute path (which `Path::join` would honour
+        // wholesale, escaping the root) must not be trusted — fall back.
+        let dir = scratch_dir("entry-absolute");
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"app","name":"App","entrypoint":"/etc/passwd"}"#,
+        )
+        .unwrap();
+        let cfg = ProjectConfig::new("p", "");
+        assert_eq!(resolve_entrypoint(&dir, &cfg), "main.ts");
+    }
+
+    #[test]
+    fn resolve_entrypoint_rejects_traversal_manifest_entrypoint() {
+        // A `..`-traversing entrypoint could escape the app root — reject it and
+        // fall back to the default rather than trust the manifest.
+        let dir = scratch_dir("entry-traversal");
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"app","name":"App","entrypoint":"../../secrets.ts"}"#,
+        )
+        .unwrap();
+        let cfg = ProjectConfig::new("p", "");
+        assert_eq!(resolve_entrypoint(&dir, &cfg), "main.ts");
+    }
+
+    #[test]
+    fn resolve_entrypoint_explicit_project_main_outranks_manifest() {
+        // An explicit project-config main wins over the manifest entrypoint.
+        let dir = scratch_dir("entry-precedence");
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"app","name":"App","entrypoint":"src/main.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(CONFIG_FILE),
+            r#"{"name":"p","main":"app/entry.ts"}"#,
+        )
+        .unwrap();
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.main = "app/entry.ts".to_string();
+        assert_eq!(resolve_entrypoint(&dir, &cfg), "app/entry.ts");
+    }
+
+    #[test]
+    fn resolve_entrypoint_manifest_wins_when_project_config_lacks_main_key() {
+        // A nanobpm.project.json that omits `main` (serde defaults it) does NOT
+        // count as an explicit pin — the manifest entrypoint still travels.
+        let dir = scratch_dir("entry-implicit");
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"app","name":"App","entrypoint":"src/main.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(CONFIG_FILE), r#"{"name":"p"}"#).unwrap();
+        let cfg = ProjectConfig::new("p", "");
+        assert_eq!(resolve_entrypoint(&dir, &cfg), "src/main.ts");
+    }
+
+    #[test]
+    fn resolve_entrypoint_ignores_blank_manifest_entrypoint() {
+        // A whitespace/empty entrypoint is treated as absent (falls back to main.ts).
+        let dir = scratch_dir("entry-blank");
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"app","name":"App","entrypoint":"   "}"#,
+        )
+        .unwrap();
+        let cfg = ProjectConfig::new("p", "");
+        assert_eq!(resolve_entrypoint(&dir, &cfg), "main.ts");
+    }
+
+    #[test]
+    fn resolve_entrypoint_blank_project_main_does_not_outrank_manifest() {
+        // A `nanobpm.project.json` whose `main` is present but empty/whitespace
+        // is NOT an explicit pin: it must not outrank a valid manifest
+        // `entrypoint`, nor collapse to a confusing `entrypoint  not found`.
+        let dir = scratch_dir("entry-blank-main");
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"app","name":"App","entrypoint":"src/main.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(CONFIG_FILE), r#"{"name":"p","main":"   "}"#).unwrap();
+        // Mirror how the caller would deserialize a blank `main` from disk.
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.main = "   ".to_string();
+        assert_eq!(resolve_entrypoint(&dir, &cfg), "src/main.ts");
     }
 
     #[test]

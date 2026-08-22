@@ -57,6 +57,14 @@ Keep **two** files with disjoint ownership; neither duplicates the other.
 (embedded|remote|cluster, the *shipping* topology) is manifest. An `app: "urban"` project carries
 both.
 
+The **entrypoint** is the one field that lives on both sides of the boundary, by design (#957). The
+supervisor's run/compile entrypoint defaults to `main.ts`; an app may declare its own `entrypoint`
+in `nano.app.json` so the run contract *travels with the app* (e.g. a code-first app whose bootstrap
+is `src/main.ts`) rather than depending on a console-generated `nanobpm.project.json`. Precedence,
+default-preserving: an **explicit** project-config `main` > the manifest `entrypoint` > the `main.ts`
+default. The declared path resolves relative to the app root and Run fails with the resolved path
+named if it is missing.
+
 ### 2. The manifest is declared data, versioned
 
 `nano.app.json` is pure declared data (ADR 0007 — the host drives it; no `eval`, no code in the
@@ -69,6 +77,7 @@ manifest; handlers/workers are referenced *files*, not inline code). It carries 
   "id": "home-heating",              // required, slug
   "name": "Home Heating",            // required
   "codename": "Urban",               // optional, informational (App.CODENAME)
+  "entrypoint": "src/main.ts",       // optional, #957; overrides the main.ts run/compile default
   "runtime": { "engine": "embedded", "node": "single" },  // ADR 0005; ship topology
 
   "models":   { "processes": [...], "decisions": [...], "forms": [...] }, // glob refs
