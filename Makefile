@@ -269,6 +269,8 @@ console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine
 		echo "  -> read-model (pkg/readmodel, --features read-model)"; \
 		$(WASM_READ_MODEL_ENV) wasm-pack build --target web --release --no-pack --out-dir pkg/readmodel --out-name nanobpmn_engine -- --features read-model; \
 		rm -f $(PROJECT_ROOT)/engine-wasm/pkg/readmodel/.gitignore; \
+		echo "  -> use-after-free DX guard (scripts/inject-free-guard.mjs)"; \
+		node $(PROJECT_ROOT)/engine-wasm/scripts/inject-free-guard.mjs $(PROJECT_ROOT)/engine-wasm/pkg/lean/nanobpmn_engine.js $(PROJECT_ROOT)/engine-wasm/pkg/readmodel/nanobpmn_engine.js; \
 		cp $(PROJECT_ROOT)/engine-wasm/pkg.package.json $(PROJECT_ROOT)/engine-wasm/pkg/package.json; \
 		cp $(PROJECT_ROOT)/engine-wasm/README.md $(PROJECT_ROOT)/engine-wasm/pkg/README.md; \
 		echo "  -> readmodel-types (pkg/readmodel-types, derived DTO types)"; \

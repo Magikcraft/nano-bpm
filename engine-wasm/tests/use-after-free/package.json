@@ -1,0 +1,13 @@
+{
+  "name": "engine-wasm-use-after-free-test",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Asserts @nanobpm/engine-wasm throws a self-describing \"TestEngine used after free()\" (not the opaque wasm-bindgen \"null pointer passed to rust\") when a method is called on a freed handle, for both subpath variants (lean + readmodel).",
+  "scripts": {
+    "test": "node verify.mjs"
+  },
+  "dependencies": {
+    "@nanobpm/engine-wasm": "file:../../pkg"
+  }
+}

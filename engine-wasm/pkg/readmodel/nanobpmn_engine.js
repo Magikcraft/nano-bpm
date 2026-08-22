@@ -1594,3 +1594,25 @@ async function __wbg_init(module_or_path) {
 }
 
 export { initSync, __wbg_init as default };
+
+// --- nanobpm: use-after-free DX guard (scripts/inject-free-guard.mjs) ---
+// wasm-bindgen throws the opaque "null pointer passed to rust" when a method is
+// called on a freed handle (__wbg_ptr === 0). Re-describe that as a clear
+// use-after-free so a host lifecycle bug is diagnosable at the call site. The
+// call is still refused — this only changes the message, not the behaviour.
+for (const __name of Object.getOwnPropertyNames(TestEngine.prototype)) {
+    if (__name === "constructor" || __name === "free" || __name === "__destroy_into_raw") continue;
+    const __desc = Object.getOwnPropertyDescriptor(TestEngine.prototype, __name);
+    if (!__desc || typeof __desc.value !== "function") continue;
+    const __orig = __desc.value;
+    const __guarded = {
+        [__name](...__args) {
+            if (this.__wbg_ptr === 0) {
+                throw new Error("TestEngine used after free(): '" + __name + "' called on a released engine handle");
+            }
+            return __orig.apply(this, __args);
+        },
+    }[__name];
+    Object.defineProperty(TestEngine.prototype, __name, { ...__desc, value: __guarded });
+}
+// --- end nanobpm use-after-free DX guard ---
