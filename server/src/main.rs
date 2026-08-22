@@ -10460,6 +10460,15 @@ impl ServerImpl {
             std::collections::HashMap<String, String>,
         > = match filter {
             Some(f) if f.variables.as_ref().is_some_and(|v| !v.is_empty()) => {
+                // Only the variable names referenced by the filter can affect
+                // the match, so restrict the index to that set. This keeps the
+                // scan a single pass while avoiding HashMap churn for unrelated
+                // variable names in a large store.
+                let requested: std::collections::HashSet<&str> = f
+                    .variables
+                    .as_ref()
+                    .map(|v| v.iter().map(|entry| entry.name.as_str()).collect())
+                    .unwrap_or_default();
                 let mut idx: std::collections::HashMap<
                     u64,
                     std::collections::HashMap<String, String>,
@@ -10468,7 +10477,7 @@ impl ServerImpl {
                     // Root-scope (process-instance) variables only: a variable
                     // held under a nested scope has `scope_key != instance_key`
                     // and is not a process-instance-level variable.
-                    if v.scope_key == v.instance_key {
+                    if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
                         idx.entry(v.instance_key)
                             .or_default()
                             .insert(v.name, v.value);
