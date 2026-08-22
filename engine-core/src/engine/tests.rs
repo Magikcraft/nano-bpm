@@ -3865,6 +3865,49 @@ fn should_preserve_the_activating_worker_on_a_job_that_throws_an_error_terminall
 }
 
 #[test]
+fn should_recover_the_activating_worker_of_a_terminally_failed_job_via_replay() {
+    // #959 — activation is a volatile lease that is *not* journaled/exported, so a
+    // restart replays `JobCreated` then the terminal event with no intervening
+    // `JobActivated`. The worker is therefore carried *on* the terminal event so
+    // it survives replay (durable across restart), not merely held in live state.
+    let mut engine = Engine::new();
+    let mut log: Vec<Event> = Vec::new();
+    log.extend(
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    log.extend(
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap(),
+    );
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+    let fail_log = engine
+        .apply_command(Command::fail_job(job_key, 0, "boom"))
+        .unwrap();
+
+    // The exported terminal event carries the activating worker (and, being
+    // volatile, `activate_jobs` emitted no `JobActivated` into the durable log).
+    assert!(fail_log.iter().any(|e| matches!(
+        e,
+        Event::JobFailed { worker: Some(w), .. } if w == "w1"
+    )));
+    log.extend(fail_log);
+    assert!(!log.iter().any(|e| matches!(e, Event::JobActivated { .. })));
+
+    // Replaying the durable stream — exactly as after a restart, with the volatile
+    // activation lock gone — still attributes the parked job to `w1`.
+    let mut replayed = State::new();
+    for event in &log {
+        state::apply(&mut replayed, event);
+    }
+    let job = replayed.jobs.get(&job_key).unwrap();
+    assert_eq!(job.state, state::JobState::Failed);
+    assert_eq!(job.worker.as_deref(), Some("w1"));
+}
+
+#[test]
 fn should_reject_failing_a_job_that_was_never_activated() {
     let mut engine = Engine::new();
     engine

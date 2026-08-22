@@ -164,7 +164,12 @@ pub struct Job {
     pub element_id: ElementId,
     pub job_type: String,
     pub state: JobState,
-    /// Name of the worker currently holding the activation lock, if any.
+    /// Name of the worker holding the activation lock, if any — **except** on a
+    /// terminal, incident-bearing park (`Failed`/`Errored`), where it is retained
+    /// as the *last activating* worker for incident attribution (Zeebe parity), so
+    /// a non-empty value on such a record is historical, not an active lock. It is
+    /// cleared when the job returns to the activatable pool (`JobLockExpired`, or a
+    /// `JobFailed` with retries remaining).
     pub worker: Option<String>,
     /// Logical instant at which the current activation lock expires, if locked.
     /// Compared against the caller-supplied `now`; the engine never reads a
@@ -2046,7 +2051,10 @@ pub fn apply(state: &mut State, event: &Event) {
         }
 
         Event::JobFailed {
-            job_key, retries, ..
+            job_key,
+            retries,
+            worker,
+            ..
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.retries = *retries;
@@ -2061,25 +2069,38 @@ pub fn apply(state: &mut State, event: &Event) {
                     job.worker = None;
                     job.state = JobState::Created;
                 } else {
-                    // Terminal, incident-bearing park: preserve the activating
+                    // Terminal, incident-bearing park: retain the activating
                     // `worker` so the incident (joined by `jobKey`) can attribute
                     // the failure to the worker/host that was running it (Zeebe
-                    // parity — a failed JobRecord retains its `worker`).
+                    // parity — a failed JobRecord retains its `worker`). The event
+                    // carries the worker so this survives a restart replay (where
+                    // the volatile, unexported `JobActivated` lock is gone); fall
+                    // back to any live value for events serialized before the field
+                    // existed.
+                    if worker.is_some() {
+                        job.worker = worker.clone();
+                    }
                     job.state = JobState::Failed;
                 }
             }
             resync_job_index(state, *job_key);
         }
 
-        Event::JobErrorThrown { job_key, .. } => {
+        Event::JobErrorThrown {
+            job_key, worker, ..
+        } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.state = JobState::Errored;
                 job.deadline = None;
                 job.activated_at = None;
                 job.activation_timeout = None;
-                // Terminal, incident-bearing transition: preserve the activating
+                // Terminal, incident-bearing transition: retain the activating
                 // `worker` for attribution (Zeebe parity — throwError retains the
-                // record incl. `worker`).
+                // record incl. `worker`). Carried on the event so it survives a
+                // restart replay; fall back to any live value for pre-field events.
+                if worker.is_some() {
+                    job.worker = worker.clone();
+                }
             }
             resync_job_index(state, *job_key);
         }

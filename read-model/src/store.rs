@@ -3977,7 +3977,10 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         }
 
         Event::JobFailed {
-            job_key, retries, ..
+            job_key,
+            retries,
+            worker,
+            ..
         } => {
             if *retries > 0 {
                 // Back to the activatable pool — drop the last activating worker.
@@ -3987,21 +3990,39 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     params![*job_key as i64, job_state_code(JobState::Created), retries],
                 )?;
             } else {
-                // Terminal, incident-bearing park: retain `worker` so the incident
-                // (joined by `jobKey`) can attribute the failure (Zeebe parity).
+                // Terminal, incident-bearing park: set `worker` from the event so
+                // the incident (joined by `jobKey`) can attribute the failure even
+                // on the leader-local path, where `JobActivated` is never exported
+                // and the row's `worker` was therefore still NULL (Zeebe parity).
+                // `COALESCE(?4, worker)` keeps any existing value for events
+                // serialized before the field existed (`worker == NULL`).
                 tx.cexecute(
-                    "UPDATE jobs SET state = ?2, retries = ?3, deadline_ms = NULL \
-                     WHERE key = ?1",
-                    params![*job_key as i64, job_state_code(JobState::Failed), retries],
+                    "UPDATE jobs SET state = ?2, retries = ?3, worker = COALESCE(?4, worker), \
+                     deadline_ms = NULL WHERE key = ?1",
+                    params![
+                        *job_key as i64,
+                        job_state_code(JobState::Failed),
+                        retries,
+                        worker.as_deref()
+                    ],
                 )?;
             }
         }
 
-        Event::JobErrorThrown { job_key, .. } => {
-            // Terminal, incident-bearing transition: retain `worker` for attribution.
+        Event::JobErrorThrown {
+            job_key, worker, ..
+        } => {
+            // Terminal, incident-bearing transition: set `worker` from the event
+            // for attribution (see `JobFailed`); `COALESCE` keeps any existing
+            // value for pre-field events.
             tx.cexecute(
-                "UPDATE jobs SET state = ?2, deadline_ms = NULL WHERE key = ?1",
-                params![*job_key as i64, job_state_code(JobState::Errored)],
+                "UPDATE jobs SET state = ?2, worker = COALESCE(?3, worker), deadline_ms = NULL \
+                 WHERE key = ?1",
+                params![
+                    *job_key as i64,
+                    job_state_code(JobState::Errored),
+                    worker.as_deref()
+                ],
             )?;
         }
 
@@ -6776,6 +6797,7 @@ mod element_instance_tests {
                     job_key: 7001,
                     instance_key: INST,
                     retries: 0,
+                    worker: None,
                 },
                 // A terminal errored job on the same source element.
                 &Event::JobCreated {
@@ -6792,6 +6814,7 @@ mod element_instance_tests {
                     job_key: 7002,
                     instance_key: INST,
                     error_code: "BOOM".to_string(),
+                    worker: None,
                 },
             ])
             .unwrap();
@@ -6856,6 +6879,7 @@ mod element_instance_tests {
                     job_key: 8001,
                     instance_key: INST,
                     retries: 0,
+                    worker: Some("w1".to_string()),
                 },
                 // A job that throws a terminal (uncaught) error after activation by `w2`.
                 &Event::JobCreated {
@@ -6879,6 +6903,7 @@ mod element_instance_tests {
                     job_key: 8002,
                     instance_key: INST,
                     error_code: "BOOM".to_string(),
+                    worker: Some("w2".to_string()),
                 },
                 // A job that fails with retries left, returning to the pool after `w3`.
                 &Event::JobCreated {
@@ -6902,6 +6927,7 @@ mod element_instance_tests {
                     job_key: 8003,
                     instance_key: INST,
                     retries: 1,
+                    worker: Some("w3".to_string()),
                 },
             ])
             .unwrap();
@@ -6920,6 +6946,69 @@ mod element_instance_tests {
         let requeued = &jobs[&8003];
         assert_eq!(requeued.state, JobState::Created);
         assert_eq!(requeued.worker, None);
+    }
+
+    #[test]
+    fn attributes_the_worker_on_terminal_jobs_from_the_event_without_a_projected_activation() {
+        // #959 — regression guard for the *leader-local* activation path: under
+        // leader-local activation `Journal::activate_jobs` never exports
+        // `JobActivated`, so the read-model row's `worker` is still NULL when the
+        // terminal event arrives. Preserving the existing (NULL) column was a
+        // no-op there — `/v2/jobs` still showed an empty worker. The terminal
+        // event now *carries* the activating worker, so the projection sets it
+        // even with no preceding `JobActivated`, making the incident attributable.
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                // Failed terminally — NO JobActivated was exported (leader-local).
+                &Event::JobCreated {
+                    job_key: 9001,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobFailed {
+                    job_key: 9001,
+                    instance_key: INST,
+                    retries: 0,
+                    worker: Some("host-a-senior".to_string()),
+                },
+                // Errored terminally — again no JobActivated projection.
+                &Event::JobCreated {
+                    job_key: 9002,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobErrorThrown {
+                    job_key: 9002,
+                    instance_key: INST,
+                    error_code: "BOOM".to_string(),
+                    worker: Some("host-b-senior".to_string()),
+                },
+            ])
+            .unwrap();
+
+        let jobs: HashMap<Key, super::JobRow> =
+            store.jobs().into_iter().map(|j| (j.key, j)).collect();
+
+        let failed = &jobs[&9001];
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.worker.as_deref(), Some("host-a-senior"));
+
+        let errored = &jobs[&9002];
+        assert_eq!(errored.state, JobState::Errored);
+        assert_eq!(errored.worker.as_deref(), Some("host-b-senior"));
     }
 
     #[test]

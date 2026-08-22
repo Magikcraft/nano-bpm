@@ -332,6 +332,14 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         retries: i32,
+        /// The worker that was holding the activation lock at fail time. Carried
+        /// on the event so a terminal (retries == 0) park durably retains it for
+        /// incident attribution across engine restart *and* on the read-model
+        /// leader-local path (where `JobActivated` is never exported, so the row
+        /// would otherwise have `worker = NULL`). `None` for events serialized
+        /// before this field existed, and when the job had no activating worker.
+        #[cfg_attr(feature = "serde", serde(default))]
+        worker: Option<String>,
     },
     /// A worker threw a business error from a job. The job is consumed; either a
     /// matching error boundary event interrupts the activity, or an
@@ -340,6 +348,14 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         error_code: String,
+        /// The worker that was holding the activation lock when the error was
+        /// thrown. Carried on the event so the terminal `Errored` park durably
+        /// retains it for incident attribution across engine restart *and* on the
+        /// read-model leader-local path (see [`Event::JobFailed::worker`]). `None`
+        /// for events serialized before this field existed, and when the job had
+        /// no activating worker.
+        #[cfg_attr(feature = "serde", serde(default))]
+        worker: Option<String>,
     },
     /// A job was completed. `created_at` is the logical instant the job was
     /// created (carried through from job state) so the server can observe the
