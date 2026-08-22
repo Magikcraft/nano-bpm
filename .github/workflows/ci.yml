@@ -259,6 +259,14 @@ jobs:
         # that wasm32 type-checks can't see.
         run: npm install && npm test
         working-directory: engine-wasm/tests/bundle-split
+      - name: Use-after-free DX guard (friendly "used after free()" message)
+        # Freezes the DX contract (#968): a method call on a freed TestEngine
+        # handle throws a self-describing "TestEngine used after free()" — not the
+        # opaque wasm-bindgen "null pointer passed to rust" — for both the lean
+        # (`.`) and read-model (`/readmodel`) entrypoints of the committed
+        # engine-wasm/pkg. Guards the guard injected by scripts/inject-free-guard.mjs.
+        run: npm install && npm test
+        working-directory: engine-wasm/tests/use-after-free
       - name: Read-model DTO types are derived, not hand-written (drift guard)
         # `@nanobpm/engine-wasm/readmodel-types` ships DTO types for the engine's
         # read-model query results (searchUserTasks, …). They are DERIVED from the
