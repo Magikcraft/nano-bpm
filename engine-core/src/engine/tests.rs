@@ -3908,6 +3908,51 @@ fn should_recover_the_activating_worker_of_a_terminally_failed_job_via_replay() 
 }
 
 #[test]
+fn should_recover_the_activating_worker_of_a_terminally_errored_job_via_replay() {
+    // #959 — mirror of the failed-job replay guard for the `throwError` path: an
+    // uncaught thrown error parks the job in `Errored`, and (like `JobFailed`) the
+    // activating `worker` is carried *on* `JobErrorThrown` so it survives a restart
+    // replay where the volatile, unexported `JobActivated` lock is gone. This guards
+    // against a serialization/replay regression silently making errored jobs
+    // anonymous.
+    let mut engine = Engine::new();
+    let mut log: Vec<Event> = Vec::new();
+    log.extend(
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    log.extend(
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap(),
+    );
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+    let throw_log = engine
+        .apply_command(Command::throw_job_error(job_key, "UNCAUGHT", "kaboom"))
+        .unwrap();
+
+    // The exported terminal event carries the activating worker (and, being
+    // volatile, `activate_jobs` emitted no `JobActivated` into the durable log).
+    assert!(throw_log.iter().any(|e| matches!(
+        e,
+        Event::JobErrorThrown { worker: Some(w), .. } if w == "w1"
+    )));
+    log.extend(throw_log);
+    assert!(!log.iter().any(|e| matches!(e, Event::JobActivated { .. })));
+
+    // Replaying the durable stream — exactly as after a restart, with the volatile
+    // activation lock gone — still attributes the errored job to `w1`.
+    let mut replayed = State::new();
+    for event in &log {
+        state::apply(&mut replayed, event);
+    }
+    let job = replayed.jobs.get(&job_key).unwrap();
+    assert_eq!(job.state, state::JobState::Errored);
+    assert_eq!(job.worker.as_deref(), Some("w1"));
+}
+
+#[test]
 fn should_reject_failing_a_job_that_was_never_activated() {
     let mut engine = Engine::new();
     engine
