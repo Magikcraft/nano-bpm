@@ -18114,7 +18114,6 @@ fn decision_instance_get_result(
     )
 }
 
-/// Projects a [`ProcessInstanceRow`] into the generated `ProcessInstanceResult`.
 /// Evaluates a process-instance `variables` filter against an instance's
 /// process-scoped (root) variables, provided as a `name → serialized-JSON value`
 /// map (absent when the instance has no root variables). Each
@@ -18137,6 +18136,7 @@ fn match_instance_variables(
     }
 }
 
+/// Projects a [`ProcessInstanceRow`] into the generated `ProcessInstanceResult`.
 fn process_instance_result(
     instance: &readstore::ProcessInstanceRow,
 ) -> models::ProcessInstanceResult {
