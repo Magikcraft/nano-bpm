@@ -10451,6 +10451,43 @@ impl ServerImpl {
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let instances = self.store.process_instances();
 
+        // The `variables` filter constrains results to instances whose
+        // process-scoped (root) variables match. Pre-index those variables by
+        // instance only when a variable filter is actually present, so the
+        // common (no variable-filter) path pays nothing for the extra scan.
+        let variables_index: std::collections::HashMap<
+            u64,
+            std::collections::HashMap<String, String>,
+        > = match filter {
+            Some(f) if f.variables.as_ref().is_some_and(|v| !v.is_empty()) => {
+                // Only the variable names referenced by the filter can affect
+                // the match, so restrict the index to that set. This keeps the
+                // scan a single pass while avoiding HashMap churn for unrelated
+                // variable names in a large store.
+                let requested: std::collections::HashSet<&str> = f
+                    .variables
+                    .as_ref()
+                    .map(|v| v.iter().map(|entry| entry.name.as_str()).collect())
+                    .unwrap_or_default();
+                let mut idx: std::collections::HashMap<
+                    u64,
+                    std::collections::HashMap<String, String>,
+                > = std::collections::HashMap::new();
+                for v in self.store.variables() {
+                    // Root-scope (process-instance) variables only: a variable
+                    // held under a nested scope has `scope_key != instance_key`
+                    // and is not a process-instance-level variable.
+                    if v.scope_key == v.instance_key && requested.contains(v.name.as_str()) {
+                        idx.entry(v.instance_key)
+                            .or_default()
+                            .insert(v.name, v.value);
+                    }
+                }
+                idx
+            }
+            _ => std::collections::HashMap::new(),
+        };
+
         let mut matched: Vec<&readstore::ProcessInstanceRow> = instances
             .iter()
             .filter(|inst| match filter {
@@ -10478,6 +10515,10 @@ impl ServerImpl {
                         // still matches.
                         && query::match_date_time_ms(&f.end_date, None)
                         && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
+                        && match_instance_variables(
+                            &f.variables,
+                            variables_index.get(&inst.key),
+                        )
                 }
             })
             .collect();
@@ -18080,6 +18121,28 @@ fn decision_instance_get_result(
         decision_instance_inputs(&row.inputs_json),
         decision_instance_rules(&row.rules_json),
     )
+}
+
+/// Evaluates a process-instance `variables` filter against an instance's
+/// process-scoped (root) variables, provided as a `name → serialized-JSON value`
+/// map (absent when the instance has no root variables). Each
+/// [`models::VariableValueFilterProperty`] selects a variable by `name` and
+/// matches its value with the entry's `StringFilterProperty`; multiple entries
+/// are ANDed (Camunda semantics). A variable absent from the instance is matched
+/// against `None`, so an equality/`$like`/`$in` operator honestly excludes it
+/// (rather than the field being silently ignored) while `$exists: false` still
+/// matches — mirroring the `endDate` / `searchClusterVariables` convention.
+fn match_instance_variables(
+    filter: &Option<Vec<models::VariableValueFilterProperty>>,
+    vars: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    match filter {
+        None => true,
+        Some(entries) => entries.iter().all(|entry| {
+            let value = vars.and_then(|m| m.get(&entry.name)).map(String::as_str);
+            query::match_string_property(&entry.value, value)
+        }),
+    }
 }
 
 /// Projects a [`ProcessInstanceRow`] into the generated `ProcessInstanceResult`.
@@ -33096,6 +33159,189 @@ mod batch_operation_tests {
         assert_eq!(
             created.batch_operation_type,
             models::BatchOperationTypeEnum::ResolveIncident
+        );
+    }
+}
+
+#[cfg(test)]
+mod search_process_instances_variable_filter_tests {
+    //! Regression coverage for the `variables` filter on
+    //! `POST /v2/process-instances/search` (issue #954). The handler previously
+    //! parsed `filter.variables` off the wire and discarded it, returning the
+    //! full unfiltered set — the worst failure mode, since a client that asked
+    //! to narrow got *wrong* results that looked correct. These drive the actual
+    //! handler against a populated read model so the join can't silently regress.
+    use nanobpmn_engine_core::{Event, Value};
+
+    use super::*;
+
+    fn created_with_vars(instance_key: u64, vars: &[(&str, Value)]) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: vars
+                .iter()
+                .map(|(n, v)| ((*n).to_string(), v.clone()))
+                .collect(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        }
+    }
+
+    async fn run(
+        server: &ServerImpl,
+        filter: models::ProcessInstanceFilter,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    /// A single `name = json_value` variable filter entry.
+    fn var_filter(name: &str, json_value: &str) -> models::ProcessInstanceFilter {
+        models::ProcessInstanceFilter {
+            variables: Some(vec![models::VariableValueFilterProperty {
+                name: name.to_string(),
+                value: models::StringFilterProperty::String(json_value.to_string()),
+            }]),
+            ..models::ProcessInstanceFilter::new()
+        }
+    }
+
+    fn keys(result: &models::ProcessInstanceSearchQueryResult) -> Vec<String> {
+        let mut ks: Vec<String> = result
+            .items
+            .iter()
+            .map(|i| i.process_instance_key.0.clone())
+            .collect();
+        ks.sort();
+        ks
+    }
+
+    fn seed(server: &ServerImpl) {
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created_with_vars(1, &[("batch", Value::Str("alpha".into()))]),
+                &created_with_vars(2, &[("batch", Value::Str("beta".into()))]),
+                &created_with_vars(3, &[("batch", Value::Str("alpha".into()))]),
+                // Carries no `batch` variable at all.
+                &created_with_vars(4, &[("other", Value::Str("alpha".into()))]),
+            ])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn variable_filter_isolates_matching_instances() {
+        let server = ServerImpl::default();
+        seed(&server);
+
+        // Baseline: no filter returns every seeded instance.
+        let all = run(&server, models::ProcessInstanceFilter::new()).await;
+        assert_eq!(all.page.total_items, 4, "baseline should see all instances");
+
+        // The variable filter narrows to exactly the two instances whose
+        // process-scoped `batch` equals the JSON-encoded string "alpha" — not
+        // the full set (the pre-fix bug returned all 4).
+        let matched = run(&server, var_filter("batch", "\"alpha\"")).await;
+        assert_eq!(matched.page.total_items, 2);
+        assert_eq!(keys(&matched), vec!["1".to_string(), "3".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn non_matching_value_excludes_all() {
+        let server = ServerImpl::default();
+        seed(&server);
+        let matched = run(&server, var_filter("batch", "\"nope\"")).await;
+        assert_eq!(matched.page.total_items, 0);
+    }
+
+    #[tokio::test]
+    async fn absent_variable_name_fails_honestly() {
+        // A filter on a variable no instance carries must exclude everything
+        // (matched against an absent value) rather than being silently ignored.
+        let server = ServerImpl::default();
+        seed(&server);
+        let matched = run(&server, var_filter("ghost", "\"alpha\"")).await;
+        assert_eq!(matched.page.total_items, 0);
+    }
+
+    #[tokio::test]
+    async fn multiple_entries_are_anded() {
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created_with_vars(
+                    10,
+                    &[
+                        ("batch", Value::Str("alpha".into())),
+                        ("region", Value::Str("emea".into())),
+                    ],
+                ),
+                &created_with_vars(
+                    11,
+                    &[
+                        ("batch", Value::Str("alpha".into())),
+                        ("region", Value::Str("apac".into())),
+                    ],
+                ),
+            ])
+            .unwrap();
+
+        let filter = models::ProcessInstanceFilter {
+            variables: Some(vec![
+                models::VariableValueFilterProperty {
+                    name: "batch".to_string(),
+                    value: models::StringFilterProperty::String("\"alpha\"".to_string()),
+                },
+                models::VariableValueFilterProperty {
+                    name: "region".to_string(),
+                    value: models::StringFilterProperty::String("\"emea\"".to_string()),
+                },
+            ]),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let matched = run(&server, filter).await;
+        assert_eq!(matched.page.total_items, 1);
+        assert_eq!(keys(&matched), vec!["10".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn advanced_string_operator_on_variable_value() {
+        // The entry value is a full `StringFilterProperty`, so advanced operators
+        // (`$in`, `$like`, …) apply to the variable's serialized-JSON value.
+        let server = ServerImpl::default();
+        seed(&server);
+
+        let filter = models::ProcessInstanceFilter {
+            variables: Some(vec![models::VariableValueFilterProperty {
+                name: "batch".to_string(),
+                value: models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_in: Some(vec!["\"alpha\"".to_string(), "\"beta\"".to_string()]),
+                        ..models::AdvancedStringFilter::new()
+                    },
+                ),
+            }]),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let matched = run(&server, filter).await;
+        assert_eq!(matched.page.total_items, 3);
+        assert_eq!(
+            keys(&matched),
+            vec!["1".to_string(), "2".to_string(), "3".to_string()]
         );
     }
 }
