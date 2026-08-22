@@ -1292,12 +1292,31 @@ pub fn write_config(name: &str, cfg: &ProjectConfig) -> std::io::Result<()> {
 /// from #957 — it travels with the app so a path-linked app whose real
 /// entrypoint is not a root `main.ts` (e.g. `src/main.ts`) runs in Studio
 /// without a placeholder root shim. Best-effort: a missing/malformed manifest
-/// yields `None`, falling back to the `main.ts` default.
+/// yields `None`, falling back to the `main.ts` default. A non-relative or
+/// `..`-traversing entrypoint is rejected (also `None`) so an app cannot point
+/// the supervisor outside its own root.
 fn manifest_entrypoint(dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(dir.join("nano.app.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let ep = v.get("entrypoint")?.as_str()?.trim();
-    (!ep.is_empty()).then(|| ep.to_string())
+    if ep.is_empty() {
+        return None;
+    }
+    // The manifest is app-owned, portable data whose entrypoint is resolved
+    // against the app root and handed straight to Node / `deno compile`. An
+    // absolute path or a `..` traversal would escape the project root (and
+    // `Path::join` silently *ignores* `dir` for an absolute path), so reject
+    // any non-relative/traversing value and fall back to the default rather
+    // than trust the manifest.
+    let path = Path::new(ep);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    Some(ep.to_string())
 }
 
 /// Whether `nanobpm.project.json` *explicitly* declares `main`. Serde defaults
@@ -9339,6 +9358,35 @@ mod tests {
         .unwrap();
         let cfg = ProjectConfig::new("p", "");
         assert_eq!(resolve_entrypoint(&dir, &cfg), "src/main.ts");
+    }
+
+    #[test]
+    fn resolve_entrypoint_rejects_absolute_manifest_entrypoint() {
+        // A manifest entrypoint is resolved against the app root and handed to
+        // the runtime, so an absolute path (which `Path::join` would honour
+        // wholesale, escaping the root) must not be trusted — fall back.
+        let dir = scratch_dir("entry-absolute");
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"app","name":"App","entrypoint":"/etc/passwd"}"#,
+        )
+        .unwrap();
+        let cfg = ProjectConfig::new("p", "");
+        assert_eq!(resolve_entrypoint(&dir, &cfg), "main.ts");
+    }
+
+    #[test]
+    fn resolve_entrypoint_rejects_traversal_manifest_entrypoint() {
+        // A `..`-traversing entrypoint could escape the app root — reject it and
+        // fall back to the default rather than trust the manifest.
+        let dir = scratch_dir("entry-traversal");
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"app","name":"App","entrypoint":"../../secrets.ts"}"#,
+        )
+        .unwrap();
+        let cfg = ProjectConfig::new("p", "");
+        assert_eq!(resolve_entrypoint(&dir, &cfg), "main.ts");
     }
 
     #[test]
