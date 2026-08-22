@@ -2050,17 +2050,23 @@ pub fn apply(state: &mut State, event: &Event) {
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.retries = *retries;
-                job.worker = None;
                 job.deadline = None;
                 job.activated_at = None;
                 job.activation_timeout = None;
                 // With retries left the job returns to the activatable pool; with
                 // none it parks (an incident is raised alongside this event).
-                job.state = if *retries > 0 {
-                    JobState::Created
+                if *retries > 0 {
+                    // Back to the activatable pool — no longer held, so drop the
+                    // last activating worker (mirrors JobLockExpired).
+                    job.worker = None;
+                    job.state = JobState::Created;
                 } else {
-                    JobState::Failed
-                };
+                    // Terminal, incident-bearing park: preserve the activating
+                    // `worker` so the incident (joined by `jobKey`) can attribute
+                    // the failure to the worker/host that was running it (Zeebe
+                    // parity — a failed JobRecord retains its `worker`).
+                    job.state = JobState::Failed;
+                }
             }
             resync_job_index(state, *job_key);
         }
@@ -2068,10 +2074,12 @@ pub fn apply(state: &mut State, event: &Event) {
         Event::JobErrorThrown { job_key, .. } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.state = JobState::Errored;
-                job.worker = None;
                 job.deadline = None;
                 job.activated_at = None;
                 job.activation_timeout = None;
+                // Terminal, incident-bearing transition: preserve the activating
+                // `worker` for attribution (Zeebe parity — throwError retains the
+                // record incl. `worker`).
             }
             resync_job_index(state, *job_key);
         }

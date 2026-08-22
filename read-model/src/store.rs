@@ -3979,21 +3979,28 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         Event::JobFailed {
             job_key, retries, ..
         } => {
-            let state = if *retries > 0 {
-                JobState::Created
+            if *retries > 0 {
+                // Back to the activatable pool — drop the last activating worker.
+                tx.cexecute(
+                    "UPDATE jobs SET state = ?2, retries = ?3, worker = NULL, deadline_ms = NULL \
+                     WHERE key = ?1",
+                    params![*job_key as i64, job_state_code(JobState::Created), retries],
+                )?;
             } else {
-                JobState::Failed
-            };
-            tx.cexecute(
-                "UPDATE jobs SET state = ?2, retries = ?3, worker = NULL, deadline_ms = NULL \
-                 WHERE key = ?1",
-                params![*job_key as i64, job_state_code(state), retries],
-            )?;
+                // Terminal, incident-bearing park: retain `worker` so the incident
+                // (joined by `jobKey`) can attribute the failure (Zeebe parity).
+                tx.cexecute(
+                    "UPDATE jobs SET state = ?2, retries = ?3, deadline_ms = NULL \
+                     WHERE key = ?1",
+                    params![*job_key as i64, job_state_code(JobState::Failed), retries],
+                )?;
+            }
         }
 
         Event::JobErrorThrown { job_key, .. } => {
+            // Terminal, incident-bearing transition: retain `worker` for attribution.
             tx.cexecute(
-                "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL WHERE key = ?1",
+                "UPDATE jobs SET state = ?2, deadline_ms = NULL WHERE key = ?1",
                 params![*job_key as i64, job_state_code(JobState::Errored)],
             )?;
         }
@@ -6813,6 +6820,106 @@ mod element_instance_tests {
             assert_eq!(job.process_definition_id, "p2");
             assert_eq!(job.process_definition_key, target_key.to_string());
         }
+    }
+
+    #[test]
+    fn preserves_the_activating_worker_on_terminal_failed_and_errored_jobs() {
+        // #959 — the read model must mirror the engine: a terminal, incident-bearing
+        // job transition (`JobFailed` with 0 retries → Failed, `JobErrorThrown` →
+        // Errored) retains the last activating `worker` so an incident joined by
+        // `jobKey` can attribute the failure. A job that returns to the activatable
+        // pool (retries remaining) drops its worker.
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                // A job that fails terminally after activation by `w1`.
+                &Event::JobCreated {
+                    job_key: 8001,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobActivated {
+                    job_key: 8001,
+                    instance_key: INST,
+                    worker: "w1".to_string(),
+                    deadline: 60_000,
+                    activated_at: Some(1),
+                },
+                &Event::JobFailed {
+                    job_key: 8001,
+                    instance_key: INST,
+                    retries: 0,
+                },
+                // A job that throws a terminal (uncaught) error after activation by `w2`.
+                &Event::JobCreated {
+                    job_key: 8002,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobActivated {
+                    job_key: 8002,
+                    instance_key: INST,
+                    worker: "w2".to_string(),
+                    deadline: 60_000,
+                    activated_at: Some(1),
+                },
+                &Event::JobErrorThrown {
+                    job_key: 8002,
+                    instance_key: INST,
+                    error_code: "BOOM".to_string(),
+                },
+                // A job that fails with retries left, returning to the pool after `w3`.
+                &Event::JobCreated {
+                    job_key: 8003,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 2,
+                },
+                &Event::JobActivated {
+                    job_key: 8003,
+                    instance_key: INST,
+                    worker: "w3".to_string(),
+                    deadline: 60_000,
+                    activated_at: Some(1),
+                },
+                &Event::JobFailed {
+                    job_key: 8003,
+                    instance_key: INST,
+                    retries: 1,
+                },
+            ])
+            .unwrap();
+
+        let jobs: HashMap<Key, super::JobRow> =
+            store.jobs().into_iter().map(|j| (j.key, j)).collect();
+
+        let failed = &jobs[&8001];
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.worker.as_deref(), Some("w1"));
+
+        let errored = &jobs[&8002];
+        assert_eq!(errored.state, JobState::Errored);
+        assert_eq!(errored.worker.as_deref(), Some("w2"));
+
+        let requeued = &jobs[&8003];
+        assert_eq!(requeued.state, JobState::Created);
+        assert_eq!(requeued.worker, None);
     }
 
     #[test]

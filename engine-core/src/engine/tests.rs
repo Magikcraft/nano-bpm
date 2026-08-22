@@ -3788,6 +3788,83 @@ fn should_raise_an_incident_when_a_job_fails_with_no_retries_left() {
 }
 
 #[test]
+fn should_preserve_the_activating_worker_on_a_job_that_fails_with_no_retries() {
+    // #959 — a terminal, incident-bearing failure must keep the last activating
+    // `worker` so the incident (joined by `jobKey`) can attribute the failure to
+    // the worker/host that was running it (Zeebe parity — a failed JobRecord
+    // retains its `worker`).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+
+    // when the worker fails it with no retries left
+    let events = engine
+        .apply_command(Command::fail_job(job_key, 0, "boom"))
+        .unwrap();
+
+    // then the parked job still reports its activating worker
+    let job = engine.job(job_key).unwrap();
+    assert_eq!(job.state, state::JobState::Failed);
+    assert_eq!(job.worker.as_deref(), Some("w1"));
+
+    // and an incident is raised referencing this job's key
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::IncidentRaised { job_key: Some(k), .. } if *k == job_key
+    )));
+}
+
+#[test]
+fn should_drop_the_worker_when_a_failed_job_returns_to_the_activatable_pool() {
+    // #959 — with retries remaining the job is genuinely no longer held (it goes
+    // back to the activatable pool), so the activating `worker` must be cleared.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+
+    engine
+        .apply_command(Command::fail_job(job_key, 2, "transient"))
+        .unwrap();
+
+    let job = engine.job(job_key).unwrap();
+    assert_eq!(job.state, state::JobState::Created);
+    assert_eq!(job.worker, None);
+}
+
+#[test]
+fn should_preserve_the_activating_worker_on_a_job_that_throws_an_error_terminally() {
+    // #959 — throwError with no catching boundary parks the job in `Errored` and
+    // raises an incident; the activating `worker` must be retained for attribution
+    // (Zeebe parity — throwError keeps the record incl. `worker`).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+
+    engine
+        .apply_command(Command::throw_job_error(job_key, "UNCAUGHT", "kaboom"))
+        .unwrap();
+
+    let job = engine.job(job_key).unwrap();
+    assert_eq!(job.state, state::JobState::Errored);
+    assert_eq!(job.worker.as_deref(), Some("w1"));
+}
+
+#[test]
 fn should_reject_failing_a_job_that_was_never_activated() {
     let mut engine = Engine::new();
     engine
