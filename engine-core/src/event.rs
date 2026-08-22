@@ -332,6 +332,14 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         retries: i32,
+        /// The worker that was holding the activation lock at fail time. Carried
+        /// on the event so a terminal (retries == 0) park durably retains it for
+        /// incident attribution across engine restart *and* on the read-model
+        /// leader-local path (where `JobActivated` is never exported, so the row
+        /// would otherwise have `worker = NULL`). `None` for events serialized
+        /// before this field existed, and when the job had no activating worker.
+        #[cfg_attr(feature = "serde", serde(default))]
+        worker: Option<String>,
     },
     /// A worker threw a business error from a job. The job is consumed; either a
     /// matching error boundary event interrupts the activity, or an
@@ -340,6 +348,14 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         error_code: String,
+        /// The worker that was holding the activation lock when the error was
+        /// thrown. Carried on the event so the terminal `Errored` park durably
+        /// retains it for incident attribution across engine restart *and* on the
+        /// read-model leader-local path (see [`Event::JobFailed::worker`]). `None`
+        /// for events serialized before this field existed, and when the job had
+        /// no activating worker.
+        #[cfg_attr(feature = "serde", serde(default))]
+        worker: Option<String>,
     },
     /// A job was completed. `created_at` is the logical instant the job was
     /// created (carried through from job state) so the server can observe the
@@ -1361,5 +1377,39 @@ impl Event {
             _ => {}
         }
         m
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod terminal_worker_serde_compat_tests {
+    use super::Event;
+
+    /// The `worker` field carried on `JobFailed` (#959) is the durable
+    /// attribution contract, but it was added after journals already existed.
+    /// A legacy `JobFailed` line — written before the field existed — has no
+    /// `worker` key; without the `serde(default)` it would fail to deserialize
+    /// and prevent the server from booting on replay. Guard the defect class:
+    /// the legacy shape must still deserialize, defaulting `worker` to `None`.
+    #[test]
+    fn legacy_job_failed_without_worker_defaults_to_none() {
+        let line = r#"{"JobFailed":{"job_key":7,"instance_key":1,"retries":0}}"#;
+        let event: Event = serde_json::from_str(line).expect("legacy event deserializes");
+        match event {
+            Event::JobFailed { worker, .. } => assert!(worker.is_none()),
+            other => panic!("expected JobFailed, got {other:?}"),
+        }
+    }
+
+    /// Same compatibility contract for `JobErrorThrown` (#959): a legacy line
+    /// without `worker` must replay with a defaulted `worker: None` rather than
+    /// failing journal boot.
+    #[test]
+    fn legacy_job_error_thrown_without_worker_defaults_to_none() {
+        let line = r#"{"JobErrorThrown":{"job_key":7,"instance_key":1,"error_code":"BOOM"}}"#;
+        let event: Event = serde_json::from_str(line).expect("legacy event deserializes");
+        match event {
+            Event::JobErrorThrown { worker, .. } => assert!(worker.is_none()),
+            other => panic!("expected JobErrorThrown, got {other:?}"),
+        }
     }
 }

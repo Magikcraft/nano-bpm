@@ -3788,6 +3788,171 @@ fn should_raise_an_incident_when_a_job_fails_with_no_retries_left() {
 }
 
 #[test]
+fn should_preserve_the_activating_worker_on_a_job_that_fails_with_no_retries() {
+    // #959 — a terminal, incident-bearing failure must keep the last activating
+    // `worker` so the incident (joined by `jobKey`) can attribute the failure to
+    // the worker/host that was running it (Zeebe parity — a failed JobRecord
+    // retains its `worker`).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+
+    // when the worker fails it with no retries left
+    let events = engine
+        .apply_command(Command::fail_job(job_key, 0, "boom"))
+        .unwrap();
+
+    // then the parked job still reports its activating worker
+    let job = engine.job(job_key).unwrap();
+    assert_eq!(job.state, state::JobState::Failed);
+    assert_eq!(job.worker.as_deref(), Some("w1"));
+
+    // and an incident is raised referencing this job's key
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::IncidentRaised { job_key: Some(k), .. } if *k == job_key
+    )));
+}
+
+#[test]
+fn should_drop_the_worker_when_a_failed_job_returns_to_the_activatable_pool() {
+    // #959 — with retries remaining the job is genuinely no longer held (it goes
+    // back to the activatable pool), so the activating `worker` must be cleared.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+
+    engine
+        .apply_command(Command::fail_job(job_key, 2, "transient"))
+        .unwrap();
+
+    let job = engine.job(job_key).unwrap();
+    assert_eq!(job.state, state::JobState::Created);
+    assert_eq!(job.worker, None);
+}
+
+#[test]
+fn should_preserve_the_activating_worker_on_a_job_that_throws_an_error_terminally() {
+    // #959 — throwError with no catching boundary parks the job in `Errored` and
+    // raises an incident; the activating `worker` must be retained for attribution
+    // (Zeebe parity — throwError keeps the record incl. `worker`).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+
+    engine
+        .apply_command(Command::throw_job_error(job_key, "UNCAUGHT", "kaboom"))
+        .unwrap();
+
+    let job = engine.job(job_key).unwrap();
+    assert_eq!(job.state, state::JobState::Errored);
+    assert_eq!(job.worker.as_deref(), Some("w1"));
+}
+
+#[test]
+fn should_recover_the_activating_worker_of_a_terminally_failed_job_via_replay() {
+    // #959 — activation is a volatile lease that is *not* journaled/exported, so a
+    // restart replays `JobCreated` then the terminal event with no intervening
+    // `JobActivated`. The worker is therefore carried *on* the terminal event so
+    // it survives replay (durable across restart), not merely held in live state.
+    let mut engine = Engine::new();
+    let mut log: Vec<Event> = Vec::new();
+    log.extend(
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    log.extend(
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap(),
+    );
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+    let fail_log = engine
+        .apply_command(Command::fail_job(job_key, 0, "boom"))
+        .unwrap();
+
+    // The exported terminal event carries the activating worker (and, being
+    // volatile, `activate_jobs` emitted no `JobActivated` into the durable log).
+    assert!(fail_log.iter().any(|e| matches!(
+        e,
+        Event::JobFailed { worker: Some(w), .. } if w == "w1"
+    )));
+    log.extend(fail_log);
+    assert!(!log.iter().any(|e| matches!(e, Event::JobActivated { .. })));
+
+    // Replaying the durable stream — exactly as after a restart, with the volatile
+    // activation lock gone — still attributes the parked job to `w1`.
+    let mut replayed = State::new();
+    for event in &log {
+        state::apply(&mut replayed, event);
+    }
+    let job = replayed.jobs.get(&job_key).unwrap();
+    assert_eq!(job.state, state::JobState::Failed);
+    assert_eq!(job.worker.as_deref(), Some("w1"));
+}
+
+#[test]
+fn should_recover_the_activating_worker_of_a_terminally_errored_job_via_replay() {
+    // #959 — mirror of the failed-job replay guard for the `throwError` path: an
+    // uncaught thrown error parks the job in `Errored`, and (like `JobFailed`) the
+    // activating `worker` is carried *on* `JobErrorThrown` so it survives a restart
+    // replay where the volatile, unexported `JobActivated` lock is gone. This guards
+    // against a serialization/replay regression silently making errored jobs
+    // anonymous.
+    let mut engine = Engine::new();
+    let mut log: Vec<Event> = Vec::new();
+    log.extend(
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    log.extend(
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap(),
+    );
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+    let throw_log = engine
+        .apply_command(Command::throw_job_error(job_key, "UNCAUGHT", "kaboom"))
+        .unwrap();
+
+    // The exported terminal event carries the activating worker (and, being
+    // volatile, `activate_jobs` emitted no `JobActivated` into the durable log).
+    assert!(throw_log.iter().any(|e| matches!(
+        e,
+        Event::JobErrorThrown { worker: Some(w), .. } if w == "w1"
+    )));
+    log.extend(throw_log);
+    assert!(!log.iter().any(|e| matches!(e, Event::JobActivated { .. })));
+
+    // Replaying the durable stream — exactly as after a restart, with the volatile
+    // activation lock gone — still attributes the errored job to `w1`.
+    let mut replayed = State::new();
+    for event in &log {
+        state::apply(&mut replayed, event);
+    }
+    let job = replayed.jobs.get(&job_key).unwrap();
+    assert_eq!(job.state, state::JobState::Errored);
+    assert_eq!(job.worker.as_deref(), Some("w1"));
+}
+
+#[test]
 fn should_reject_failing_a_job_that_was_never_activated() {
     let mut engine = Engine::new();
     engine

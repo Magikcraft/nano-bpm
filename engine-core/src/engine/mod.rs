@@ -1944,6 +1944,7 @@ impl Engine {
                 let instance_key = job.instance_key;
                 let element_instance_key = job.element_instance_key;
                 let element_id = job.element_id.clone();
+                let worker = job.worker.clone();
                 let retries = retries.max(0);
 
                 self.emit(
@@ -1952,6 +1953,7 @@ impl Engine {
                         job_key,
                         instance_key,
                         retries,
+                        worker,
                     },
                 );
                 // No retries left: park the job and raise an incident so the
@@ -2001,6 +2003,7 @@ impl Engine {
                 let instance_key = job.instance_key;
                 let element_instance_key = job.element_instance_key;
                 let task_element_id = job.element_id.clone();
+                let worker = job.worker.clone();
 
                 // The job is consumed by the thrown error either way.
                 self.emit(
@@ -2009,6 +2012,7 @@ impl Engine {
                         job_key,
                         instance_key,
                         error_code: error_code.clone(),
+                        worker,
                     },
                 );
 
