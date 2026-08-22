@@ -1379,3 +1379,37 @@ impl Event {
         m
     }
 }
+
+#[cfg(all(test, feature = "serde"))]
+mod terminal_worker_serde_compat_tests {
+    use super::Event;
+
+    /// The `worker` field carried on `JobFailed` (#959) is the durable
+    /// attribution contract, but it was added after journals already existed.
+    /// A legacy `JobFailed` line — written before the field existed — has no
+    /// `worker` key; without the `serde(default)` it would fail to deserialize
+    /// and prevent the server from booting on replay. Guard the defect class:
+    /// the legacy shape must still deserialize, defaulting `worker` to `None`.
+    #[test]
+    fn legacy_job_failed_without_worker_defaults_to_none() {
+        let line = r#"{"JobFailed":{"job_key":7,"instance_key":1,"retries":0}}"#;
+        let event: Event = serde_json::from_str(line).expect("legacy event deserializes");
+        match event {
+            Event::JobFailed { worker, .. } => assert!(worker.is_none()),
+            other => panic!("expected JobFailed, got {other:?}"),
+        }
+    }
+
+    /// Same compatibility contract for `JobErrorThrown` (#959): a legacy line
+    /// without `worker` must replay with a defaulted `worker: None` rather than
+    /// failing journal boot.
+    #[test]
+    fn legacy_job_error_thrown_without_worker_defaults_to_none() {
+        let line = r#"{"JobErrorThrown":{"job_key":7,"instance_key":1,"error_code":"BOOM"}}"#;
+        let event: Event = serde_json::from_str(line).expect("legacy event deserializes");
+        match event {
+            Event::JobErrorThrown { worker, .. } => assert!(worker.is_none()),
+            other => panic!("expected JobErrorThrown, got {other:?}"),
+        }
+    }
+}
