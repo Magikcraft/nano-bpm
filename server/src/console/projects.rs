@@ -1324,11 +1324,20 @@ fn manifest_entrypoint(dir: &Path) -> Option<String> {
 /// the difference between "the console pinned main.ts" and "unset"; the
 /// entrypoint precedence (#957) needs to know so an explicit project-config
 /// `main` can outrank the manifest.
+///
+/// A `main` that is present but empty/whitespace (`"main": ""`) is **not** an
+/// explicit pin — mirroring `manifest_entrypoint`'s trim/empty handling — so a
+/// blank value neither outranks a valid manifest `entrypoint` nor produces a
+/// confusing `entrypoint  not found` at runtime.
 fn config_declares_main(dir: &Path) -> bool {
     std::fs::read_to_string(dir.join(CONFIG_FILE))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| v.get("main").map(|m| m.is_string()))
+        .and_then(|v| {
+            v.get("main")
+                .and_then(|m| m.as_str())
+                .map(|s| !s.trim().is_empty())
+        })
         .unwrap_or(false)
 }
 
@@ -9434,6 +9443,24 @@ mod tests {
         .unwrap();
         let cfg = ProjectConfig::new("p", "");
         assert_eq!(resolve_entrypoint(&dir, &cfg), "main.ts");
+    }
+
+    #[test]
+    fn resolve_entrypoint_blank_project_main_does_not_outrank_manifest() {
+        // A `nanobpm.project.json` whose `main` is present but empty/whitespace
+        // is NOT an explicit pin: it must not outrank a valid manifest
+        // `entrypoint`, nor collapse to a confusing `entrypoint  not found`.
+        let dir = scratch_dir("entry-blank-main");
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"app","name":"App","entrypoint":"src/main.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(CONFIG_FILE), r#"{"name":"p","main":"   "}"#).unwrap();
+        // Mirror how the caller would deserialize a blank `main` from disk.
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.main = "   ".to_string();
+        assert_eq!(resolve_entrypoint(&dir, &cfg), "src/main.ts");
     }
 
     #[test]
