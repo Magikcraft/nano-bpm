@@ -77,7 +77,7 @@ test("unknown types and non-object payloads are ignored", () => {
 });
 
 test("nano-navigate to definitionPreview stashes the XML and routes to the preview view", () => {
-  const xml = '<bpmn:definitions><bpmndi:BPMNDiagram/></bpmn:definitions>';
+  const xml = "<bpmn:definitions><bpmndi:BPMNDiagram/></bpmn:definitions>";
   assert.deepEqual(
     decideAppViewMessage({
       type: "nano-navigate",
@@ -113,7 +113,10 @@ test("definitionPreview rejects non-XML, non-string, oversized, or missing paylo
   );
   // missing params
   assert.equal(
-    decideAppViewMessage({ type: "nano-navigate", target: "definitionPreview" }),
+    decideAppViewMessage({
+      type: "nano-navigate",
+      target: "definitionPreview",
+    }),
     null,
   );
   // oversized
