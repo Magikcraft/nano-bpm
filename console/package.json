@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Web console for the self-contained single-node nanobpmn distribution: cluster/topology view, BPMN modeler, process-instance explorer, and embedded workers.",
+  "engines": {
+    "node": ">=22.6"
+  },
   "scripts": {
     "dev": "vite",
     "gen:api": "openapi-ts",
