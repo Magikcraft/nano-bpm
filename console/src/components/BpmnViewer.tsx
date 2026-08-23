@@ -15,6 +15,14 @@ interface BpmnViewerProps {
   activeElementIds?: string[];
   /// Element ids to highlight as having an incident.
   incidentElementIds?: string[];
+  /// Called when bpmn-js fails to import the supplied XML (malformed /
+  /// unsupported), so a caller can surface an explicit error instead of the
+  /// otherwise-blank canvas. Optional; omitting it preserves the prior
+  /// silently-blank behaviour.
+  onImportError?: (err: unknown) => void;
+  /// Called after the XML imports cleanly (pairs with onImportError so a caller
+  /// can clear a previous error when a later, valid document loads).
+  onImportSuccess?: () => void;
 }
 
 /// Renders a deployed BPMN definition with diagram-js (read-only), overlaying
@@ -24,9 +32,18 @@ export default function BpmnViewer({
   xml,
   activeElementIds = [],
   incidentElementIds = [],
+  onImportError,
+  onImportSuccess,
 }: BpmnViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<NavigatedViewer | null>(null);
+  // Keep the latest import callbacks in refs so the import effect can call them
+  // without listing them in its deps (a new inline callback identity each render
+  // must not re-fire the effect / re-import).
+  const onImportErrorRef = useRef(onImportError);
+  onImportErrorRef.current = onImportError;
+  const onImportSuccessRef = useRef(onImportSuccess);
+  onImportSuccessRef.current = onImportSuccess;
   // Set once the viewer has been destroyed, so async work already in flight (an
   // importXML, a marker pass) doesn't touch a dead instance.
   const disposedRef = useRef(false);
@@ -80,12 +97,17 @@ export default function BpmnViewer({
       if (importedXmlRef.current !== xml) {
         try {
           await viewer.importXML(xml);
-        } catch {
-          // malformed/unsupported XML — leave the canvas blank
+        } catch (err) {
+          // malformed/unsupported XML — leave the canvas blank and let the
+          // caller surface an explicit error (default: silently blank).
+          if (!disposedRef.current && viewerRef.current === viewer) {
+            onImportErrorRef.current?.(err);
+          }
           return;
         }
         if (disposedRef.current || viewerRef.current !== viewer) return;
         importedXmlRef.current = xml;
+        onImportSuccessRef.current?.();
         // A fresh import clears every marker, so drop our bookkeeping too.
         markedActiveRef.current = [];
         markedIncidentRef.current = [];

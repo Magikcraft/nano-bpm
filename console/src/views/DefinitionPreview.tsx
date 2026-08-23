@@ -42,6 +42,9 @@ export default function DefinitionPreview() {
   // Read once on mount: the stash is a one-shot handoff, and re-reading on every
   // render would fight a later navigation that clears it.
   const [xml] = useState<string | null>(readStashedXml);
+  // Set when bpmn-js can't import the stashed XML, so we show an explicit error
+  // instead of a silently blank canvas.
+  const [importFailed, setImportFailed] = useState(false);
 
   // Enforce the one-shot contract: once we've captured the XML into component
   // state, drop it from sessionStorage so it can't leak (a laid-out diagram is
@@ -75,13 +78,26 @@ export default function DefinitionPreview() {
         </Link>
       </header>
       <div className="relative min-h-0 flex-1">
-        {xml ? (
-          <BpmnViewer xml={xml} />
+        {xml && !importFailed ? (
+          <BpmnViewer
+            xml={xml}
+            onImportError={() => setImportFailed(true)}
+            onImportSuccess={() => setImportFailed(false)}
+          />
         ) : (
           <div className="flex h-full items-center justify-center px-6 text-center text-sm text-fg-faint">
-            No definition to preview. Open this from a staged delivery-graph
-            proposal&rsquo;s <span className="mx-1 font-medium">Preview DI</span>{" "}
-            action.
+            {importFailed ? (
+              <>
+                This model could not be rendered — the compiled BPMN failed to
+                load. Re-stage the proposal and try again.
+              </>
+            ) : (
+              <>
+                No definition to preview. Open this from a staged delivery-graph
+                proposal&rsquo;s{" "}
+                <span className="mx-1 font-medium">Preview DI</span> action.
+              </>
+            )}
           </div>
         )}
       </div>
