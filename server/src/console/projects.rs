@@ -13372,6 +13372,83 @@ mod tests {
         assert_eq!(read(&proj, "f.txt"), "user version\n");
     }
 
+    /// Take-upstream conflict resolution must never be able to punch through the
+    /// destination symlink guard: even when a file is explicitly requested via
+    /// `take_theirs` *or* the blanket `all_theirs`, a write through a symlinked
+    /// path component must still fail closed — surfaced as a conflict, never
+    /// written, and the host file behind the symlink left intact. The symlink
+    /// guard runs *before* the take-upstream branch, so this holds on both the
+    /// 3-way (base present) and 2-way (no base) code paths; assert both, and in
+    /// both dry-run and apply, so a future refactor that reorders the checks or
+    /// adds a new resolution write path can't silently regress escape safety.
+    #[cfg(unix)]
+    #[test]
+    fn overlay_plan_take_upstream_cannot_override_symlink_guard() {
+        let _g = lock();
+        unsafe { std::env::set_var("NANO_APP_DB_URL", "file:./app.db") };
+        for take_theirs in [true, false] {
+            for all_theirs in [true, false] {
+                for base_present in [true, false] {
+                    for apply in [true, false] {
+                        // A symlink inside the project points at a host dir the
+                        // update must never write into.
+                        let outside = tree(&[("secret.txt", "DO NOT TOUCH\n")]);
+                        let proj = tree(&[("keep.ts", "x\n")]);
+                        std::os::unix::fs::symlink(&outside, proj.join("resources")).unwrap();
+                        // The pack ships a file whose destination path traverses
+                        // the symlinked `resources/` component.
+                        let new = tree(&[("resources/secret.txt", "clobbered\n")]);
+                        // A base that would make this a "both changed" 3-way
+                        // conflict, routing through the take-upstream branch.
+                        let base = tree(&[("resources/secret.txt", "shared\n")]);
+                        let resolution = ConflictResolution {
+                            take_theirs: if take_theirs {
+                                ["resources/secret.txt".to_string()].into_iter().collect()
+                            } else {
+                                BTreeSet::new()
+                            },
+                            all_theirs,
+                        };
+                        let plan = overlay_plan(
+                            &proj,
+                            &new,
+                            base_present.then_some(base.as_path()),
+                            apply,
+                            "p",
+                            None,
+                            None,
+                            &resolution,
+                        )
+                        .unwrap();
+                        let case = format!(
+                            "take_theirs={take_theirs} all_theirs={all_theirs} \
+                             base_present={base_present} apply={apply}"
+                        );
+                        // Fail closed regardless of the requested resolution.
+                        assert_eq!(
+                            plan.conflicts,
+                            vec!["resources/secret.txt"],
+                            "must stay a conflict ({case}): {plan:?}"
+                        );
+                        assert!(
+                            plan.overwrite.is_empty()
+                                && plan.create.is_empty()
+                                && plan.merged.is_empty(),
+                            "no write path taken ({case}): {plan:?}"
+                        );
+                        // The host file behind the symlink is never clobbered.
+                        assert_eq!(
+                            read(&outside, "secret.txt"),
+                            "DO NOT TOUCH\n",
+                            "outside file intact ({case})"
+                        );
+                    }
+                }
+            }
+        }
+        unsafe { std::env::remove_var("NANO_APP_DB_URL") };
+    }
+
     #[test]
     fn overlay_plan_without_base_treats_any_local_change_as_conflict() {
         let _g = lock();
