@@ -17093,3 +17093,90 @@ fn nested_adhoc_cancel_child_skips_already_completed_inner_instance() {
         "the already-completed inner instance is not torn down again; events: {events:?}"
     );
 }
+
+#[test]
+fn subprocess_end_event_output_propagates_reached_branch_not_last_defined() {
+    // Regression: several end events inside one sub-process, each carrying a
+    // `zeebe:output` for the SAME target, must each attach to their own end
+    // event — so when a token reaches ONE of them, only that branch's output
+    // propagates to the parent scope. Previously the parser hoisted every
+    // end-event mapping onto the enclosing sub-process, so the last-parsed one
+    // ("escalate") clobbered the rest at sub-process completion, and a "fixed"
+    // outcome routed as "escalate" (nano-workforce merge-loop #466). Driven
+    // through a job so the token completes across a drain boundary, as the real
+    // model does.
+    let xml = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="sp-ends" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="sub" />
+          <bpmn:subProcess id="sub">
+            <bpmn:startEvent id="ss" />
+            <bpmn:sequenceFlow id="f1" sourceRef="ss" targetRef="work" />
+            <bpmn:serviceTask id="work">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="work" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="g" />
+            <bpmn:exclusiveGateway id="g" default="fB" />
+            <bpmn:sequenceFlow id="fA" sourceRef="g" targetRef="endA">
+              <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">=pick = "A"</bpmn:conditionExpression>
+            </bpmn:sequenceFlow>
+            <bpmn:sequenceFlow id="fB" sourceRef="g" targetRef="endB" />
+            <bpmn:endEvent id="endA">
+              <bpmn:extensionElements>
+                <zeebe:ioMapping><zeebe:output source="=&#34;A&#34;" target="outcome" /></zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:endEvent>
+            <bpmn:endEvent id="endB">
+              <bpmn:extensionElements>
+                <zeebe:ioMapping><zeebe:output source="=&#34;B&#34;" target="outcome" /></zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:endEvent>
+          </bpmn:subProcess>
+          <bpmn:sequenceFlow id="f3" sourceRef="sub" targetRef="done" />
+          <bpmn:endEvent id="done" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    // Parser-level guard: each end event owns its mapping; the sub-process owns none.
+    assert!(
+        def.element("sub").unwrap().io.outputs.is_empty(),
+        "mapping must NOT hoist onto the sub-process"
+    );
+    assert_eq!(def.element("endA").unwrap().io.outputs.len(), 1);
+    assert_eq!(def.element("endB").unwrap().io.outputs.len(), 1);
+
+    for (pick, want, unwanted) in [("A", "A", "B"), ("B", "B", "A")] {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(def.clone()))
+            .unwrap();
+        let mut vars = HashMap::new();
+        vars.insert("pick".to_string(), Value::Str(pick.to_string()));
+        engine
+            .apply_command(Command::create_instance_with("sp-ends", vars))
+            .unwrap();
+        let events = complete_one(&mut engine, "work");
+        assert!(
+            events.iter().any(|e| matches!(e,
+                Event::VariablesUpdated { variables, .. }
+                    if variables.get("outcome") == Some(&Value::Str(want.to_string())))),
+            "pick={pick}: reached end event must propagate outcome={want}; events: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e,
+                Event::VariablesUpdated { variables, .. }
+                    if variables.get("outcome") == Some(&Value::Str(unwanted.to_string())))),
+            "pick={pick}: unreached end event must NOT propagate outcome={unwanted}; events: {events:?}"
+        );
+    }
+}
