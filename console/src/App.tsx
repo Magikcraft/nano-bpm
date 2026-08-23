@@ -75,7 +75,9 @@ const DefinitionPreview = lazyImport(() => import("./views/DefinitionPreview"));
 /// never run in preview mode.
 function ExplorerRoute() {
   const [params] = useSearchParams();
-  return params.has("preview") ? <DefinitionPreview /> : <Explorer />;
+  // Match the bridge contract exactly (`?preview=1`): checking only presence
+  // would let an unrelated `preview=0` (or any value) force preview mode.
+  return params.get("preview") === "1" ? <DefinitionPreview /> : <Explorer />;
 }
 const Config = lazyImport(() => import("./views/Config"));
 const Credits = lazyImport(() => import("./views/Credits"));

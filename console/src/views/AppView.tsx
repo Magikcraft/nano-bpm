@@ -221,8 +221,14 @@ export default function AppView() {
           try {
             sessionStorage.setItem(action.stash.key, action.stash.value);
           } catch {
-            // sessionStorage may be full/unavailable — the preview view falls
-            // back to its empty state, which is a graceful no-op.
+            // sessionStorage may be full/unavailable. Drop any prior stash so a
+            // failed write can't leave a STALE handoff behind for the preview
+            // view to render — it must degrade cleanly to the empty state.
+            try {
+              sessionStorage.removeItem(action.stash.key);
+            } catch {
+              // Storage wholly unavailable — nothing to clear; empty state anyway.
+            }
           }
         }
         navigate(action.path);

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import BpmnViewer from "../components/BpmnViewer";
 import { Badge } from "../components/ui";
@@ -28,6 +28,19 @@ export default function DefinitionPreview() {
   // Read once on mount: the stash is a one-shot handoff, and re-reading on every
   // render would fight a later navigation that clears it.
   const [xml] = useState<string | null>(readStashedXml);
+
+  // Enforce the one-shot contract: once we've captured the XML into component
+  // state, drop it from sessionStorage so it can't leak (a laid-out diagram is
+  // large) or resurface as a STALE preview if the user later revisits
+  // `/explorer?preview=1` without a fresh handoff. The captured `xml` still
+  // renders — clearing storage doesn't disturb the state we already hold.
+  useEffect(() => {
+    try {
+      window.sessionStorage.removeItem(DEFINITION_PREVIEW_STASH_KEY);
+    } catch {
+      // Storage unavailable — nothing to clear.
+    }
+  }, []);
 
   return (
     <div className="flex h-full flex-col">
