@@ -4,8 +4,28 @@
 // trusted* message means, so the console's node:test unit suite can cover the
 // routing table directly without a renderer.
 
+/// The sessionStorage key the host stashes a raw-XML definition preview under
+/// before navigating to `/explorer?preview=1`. The XML is carried out-of-band
+/// (in same-origin storage) rather than in the URL because a laid-out BPMN
+/// document is far larger than any URL length budget. The DefinitionPreview
+/// view reads it straight back.
+export const DEFINITION_PREVIEW_STASH_KEY = "nano.explorer.definitionPreview";
+
+/// A defensive cap on a previewed definition's XML size (chars). A laid-out
+/// delivery graph is a few KB; anything past ~4MB is not a real diagram and
+/// would risk blowing the sessionStorage quota, so we drop it.
+export const DEFINITION_PREVIEW_MAX_XML = 4_000_000;
+
 export type AppViewMessageAction =
-  { kind: "theme" } | { kind: "navigate"; path: string };
+  | { kind: "theme" }
+  | { kind: "navigate"; path: string }
+  /// Navigate AND first write `stash.value` to sessionStorage under
+  /// `stash.key`. Used to hand a raw BPMN document to the definition-preview
+  /// view without putting it in the URL. The value is data rendered read-only
+  /// by bpmn-js (which builds SVG from the parsed model and executes nothing),
+  /// carried across the same trust boundary as the `instance` deep-link — the
+  /// message is already origin/source-checked in AppView before we act on it.
+  | { kind: "navigate"; path: string; stash: { key: string; value: string } };
 
 /**
  * Interpret a trusted message posted by the embedded app. Returns the action
@@ -38,6 +58,28 @@ export function decideAppViewMessage(
         return {
           kind: "navigate",
           path: "/explorer?instance=" + encodeURIComponent(instance.trim()),
+        };
+      }
+    }
+    // A staged delivery-graph proposal (or any not-yet-deployed model) previews
+    // its generated DI here: the app hands the compiled BPMN XML, we stash it
+    // same-origin and route to the read-only definition preview. No instance,
+    // no deployed definition — the XML is rendered straight by bpmn-js.
+    if (msg.target === "definitionPreview") {
+      const params = msg.params;
+      const xml =
+        typeof params === "object" && params !== null
+          ? (params as { xml?: unknown }).xml
+          : undefined;
+      if (
+        typeof xml === "string" &&
+        xml.trim().startsWith("<") &&
+        xml.length <= DEFINITION_PREVIEW_MAX_XML
+      ) {
+        return {
+          kind: "navigate",
+          path: "/explorer?preview=1",
+          stash: { key: DEFINITION_PREVIEW_STASH_KEY, value: xml },
         };
       }
     }

@@ -1,0 +1,63 @@
+import { useState } from "react";
+import { Link } from "react-router-dom";
+import BpmnViewer from "../components/BpmnViewer";
+import { Badge } from "../components/ui";
+import { DEFINITION_PREVIEW_STASH_KEY } from "../lib/appViewMessage";
+
+/// Read-only preview of a BPMN document that is NOT deployed — no process
+/// definition, no instance. The XML is handed in out-of-band via same-origin
+/// sessionStorage (the definition-preview App-View bridge target stashes it,
+/// then routes here) because a laid-out diagram is far larger than a URL budget.
+///
+/// This is how a staged delivery-graph proposal previews its generated Diagram
+/// Interchange before dispatch: the compiler already emits full DI, so the
+/// operator sees the exact laid-out model that a dispatch would run, rendered by
+/// the SAME bpmn-js viewer the live process explorer uses — one DI surface, not
+/// two.
+function readStashedXml(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const xml = window.sessionStorage.getItem(DEFINITION_PREVIEW_STASH_KEY);
+    return xml && xml.trim() !== "" ? xml : null;
+  } catch {
+    return null;
+  }
+}
+
+export default function DefinitionPreview() {
+  // Read once on mount: the stash is a one-shot handoff, and re-reading on every
+  // render would fight a later navigation that clears it.
+  const [xml] = useState<string | null>(readStashedXml);
+
+  return (
+    <div className="flex h-full flex-col">
+      <header className="flex items-center justify-between border-b border-edge px-5 py-4">
+        <div>
+          <h1 className="flex items-center gap-2 text-xl font-semibold text-fg">
+            Definition preview
+            <Badge tone="info">not deployed</Badge>
+          </h1>
+          <p className="text-xs text-fg-faint">
+            A read-only view of a compiled BPMN model that has not been deployed
+            or dispatched — the generated diagram interchange exactly as a
+            dispatch would run it.
+          </p>
+        </div>
+        <Link to="/explorer" className="text-sm text-accent underline">
+          ← Process instances
+        </Link>
+      </header>
+      <div className="relative min-h-0 flex-1">
+        {xml ? (
+          <BpmnViewer xml={xml} />
+        ) : (
+          <div className="flex h-full items-center justify-center px-6 text-center text-sm text-fg-faint">
+            No definition to preview. Open this from a staged delivery-graph
+            proposal&rsquo;s <span className="mx-1 font-medium">Preview DI</span>{" "}
+            action.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

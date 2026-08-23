@@ -13,6 +13,7 @@ import {
   Route,
   Routes,
   useLocation,
+  useSearchParams,
 } from "react-router-dom";
 import Topology from "./views/Topology";
 import { useTheme } from "./theme/ThemeProvider";
@@ -65,6 +66,17 @@ const Workers = lazyImport(() => import("./views/Workers"));
 const Metrics = lazyImport(() => import("./views/Metrics"));
 const Traces = lazyImport(() => import("./views/Traces"));
 const Explorer = lazyImport(() => import("./views/Explorer"));
+const DefinitionPreview = lazyImport(() => import("./views/DefinitionPreview"));
+
+/// The `/explorer` route serves two views off one path: the normal process
+/// instance explorer, and — with `?preview=1` — a read-only preview of a
+/// not-yet-deployed BPMN definition (a staged delivery-graph proposal's DI).
+/// Branch on the query param here so the heavy instance-list hooks in Explorer
+/// never run in preview mode.
+function ExplorerRoute() {
+  const [params] = useSearchParams();
+  return params.has("preview") ? <DefinitionPreview /> : <Explorer />;
+}
 const Config = lazyImport(() => import("./views/Config"));
 const Credits = lazyImport(() => import("./views/Credits"));
 
@@ -859,7 +871,7 @@ export default function App() {
                   path="/modeler"
                   element={<Navigate to={HOME_ROUTE} replace />}
                 />
-                <Route path="/explorer" element={<Explorer />} />
+                <Route path="/explorer" element={<ExplorerRoute />} />
                 <Route path="/traces" element={<Traces />} />
                 <Route path="/workers" element={<Workers />} />
                 <Route
