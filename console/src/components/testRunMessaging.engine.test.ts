@@ -39,10 +39,12 @@ const require = createRequire(import.meta.url);
 // are a wasm-bindgen pair, so a `.wasm` from a different engine-wasm build fails
 // to instantiate against the session's glue ("function import requires a
 // callable"). bojtos-kit pins engine-wasm to a single (hoisted) copy that the
-// console shares, whose binary is the package-root `nanobpmn_engine_bg.wasm` —
-// not a `lean/`/`readmodel/` subpath of a newer, unrelated build.
+// console shares, and its session loads the default (`lean`) glue via
+// `import init from "@nanobpm/engine-wasm"`, so the matching binary is the
+// `lean/nanobpmn_engine_bg.wasm` subpath — not the `readmodel/` build, whose
+// glue is only pulled in lazily for read-model queries.
 const WASM_BYTES = readFileSync(
-  require.resolve("@nanobpm/engine-wasm/nanobpmn_engine_bg.wasm"),
+  require.resolve("@nanobpm/engine-wasm/lean/nanobpmn_engine_bg.wasm"),
 );
 
 // A model that parks on BOTH a message intermediate-catch and a signal catch at
