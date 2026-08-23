@@ -206,10 +206,10 @@ export function useTemplateUpdate(opts?: {
               void applyOne(reviewPlan.target, reviewPlan.takeTheirs)
             }
             onTakeUpstream={(paths) =>
-              void resolveConflicts(reviewPlan.target, [
-                ...reviewPlan.takeTheirs,
-                ...paths,
-              ])
+              void resolveConflicts(
+                reviewPlan.target,
+                Array.from(new Set([...reviewPlan.takeTheirs, ...paths])),
+              )
             }
             onClose={() => {
               // Ignore close while an apply is in flight: the pending request
