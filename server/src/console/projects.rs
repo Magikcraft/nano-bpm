@@ -4814,6 +4814,27 @@ fn prune_old_checkpoints(dir: &Path, keep: usize) {
     }
 }
 
+/// How the overlay should resolve genuine (unmergeable / no-base) conflicts.
+/// The default keeps every local file (the historical behaviour); a maker can
+/// opt specific files — or, with `all_theirs`, every conflict — into
+/// *take-upstream*, discarding the local change and writing the incoming pack
+/// file. A take-upstream file is reclassified as an `overwrite`, so once all
+/// conflicts are resolved the apply is clean and the scaffold version bumps.
+#[derive(Debug, Default, Clone)]
+pub struct ConflictResolution {
+    /// Project-relative POSIX paths to resolve take-upstream.
+    pub take_theirs: BTreeSet<String>,
+    /// Take upstream for *every* conflict (`resolveConflicts: theirs`).
+    pub all_theirs: bool,
+}
+
+impl ConflictResolution {
+    /// Whether the given project-relative path should be resolved take-upstream.
+    fn take_upstream(&self, rel_str: &str) -> bool {
+        self.all_theirs || self.take_theirs.contains(rel_str)
+    }
+}
+
 /// Overlay a newer version of a project's scaffolding pack onto it, using the
 /// recorded scaffold version as a 3-way merge base so a user's edits to
 /// upstream-unchanged files survive and only genuine conflicts surface. See the
@@ -4823,6 +4844,7 @@ pub fn update_from_template(
     name: &str,
     apply: bool,
     version: Option<&str>,
+    resolution: &ConflictResolution,
 ) -> Result<UpdatePlan, String> {
     let dir = project_dir(name).ok_or_else(|| "not found".to_string())?;
     if !dir.is_dir() {
@@ -4944,6 +4966,7 @@ pub fn update_from_template(
         &sf.pack,
         sf.version.clone(),
         want_version.clone(),
+        resolution,
     );
     let mut plan = match plan {
         Ok(p) => p,
@@ -5051,6 +5074,7 @@ fn overlay_plan(
     pack: &str,
     from_version: Option<String>,
     to_version: Option<String>,
+    resolution: &ConflictResolution,
 ) -> Result<UpdatePlan, String> {
     let mut plan = UpdatePlan {
         pack: pack.to_string(),
@@ -5193,11 +5217,18 @@ fn overlay_plan(
                 // Upstream unchanged since scaffold; user edited → keep local.
             }
             Some(base) => {
-                // Both sides changed — try a 3-way auto-merge, else conflict.
+                // Both sides changed — try a 3-way auto-merge, else conflict
+                // (unless the user asked to take upstream for this file).
                 if let Some(merged) = try_git_merge(&base, &cur_bytes, &new_bytes) {
                     plan.merged.push(rel_str.clone());
                     if apply {
                         std::fs::write(&dst_path, &merged)
+                            .map_err(|e| format!("write {rel_str}: {e}"))?;
+                    }
+                } else if resolution.take_upstream(&rel_str) {
+                    plan.overwrite.push(rel_str.clone());
+                    if apply {
+                        std::fs::write(&dst_path, &new_bytes)
                             .map_err(|e| format!("write {rel_str}: {e}"))?;
                     }
                 } else {
@@ -5206,8 +5237,17 @@ fn overlay_plan(
             }
             None => {
                 // No merge base (2-way): the file exists locally and differs —
-                // we can't prove the user didn't edit it, so never clobber.
-                plan.conflicts.push(rel_str.clone());
+                // we can't prove the user didn't edit it, so never clobber
+                // unless the user explicitly asked to take upstream for it.
+                if resolution.take_upstream(&rel_str) {
+                    plan.overwrite.push(rel_str.clone());
+                    if apply {
+                        std::fs::write(&dst_path, &new_bytes)
+                            .map_err(|e| format!("write {rel_str}: {e}"))?;
+                    }
+                } else {
+                    plan.conflicts.push(rel_str.clone());
+                }
             }
         }
     }
@@ -12962,6 +13002,7 @@ mod tests {
             "appx",
             Some("1.0.0".into()),
             Some("2.0.0".into()),
+            &ConflictResolution::default(),
         )
         .unwrap();
 
@@ -12993,7 +13034,17 @@ mod tests {
         // The pack tries to write through the symlinked `resources/` dir.
         let new = tree(&[("resources/secret.txt", "clobbered\n")]);
 
-        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            None,
+            true,
+            "p",
+            None,
+            None,
+            &ConflictResolution::default(),
+        )
+        .unwrap();
 
         // Fail closed: surfaced as a conflict, and the outside file is intact.
         assert_eq!(plan.conflicts, vec!["resources/secret.txt"]);
@@ -13016,7 +13067,17 @@ mod tests {
         let new = tree(&[("real.ts", "hi\n")]);
         std::os::unix::fs::symlink(outside.join("passwd"), new.join("leak")).unwrap();
 
-        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            None,
+            true,
+            "p",
+            None,
+            None,
+            &ConflictResolution::default(),
+        )
+        .unwrap();
 
         assert!(
             plan.conflicts.contains(&"leak".to_string()),
@@ -13042,7 +13103,17 @@ mod tests {
             ("db/data.sqlite", "PACKDB"), // pack ships a stub — must be skipped
         ]);
 
-        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            None,
+            true,
+            "p",
+            None,
+            None,
+            &ConflictResolution::default(),
+        )
+        .unwrap();
 
         assert!(
             plan.preserved.contains(&"db/data.sqlite".to_string()),
@@ -13066,7 +13137,17 @@ mod tests {
         let proj = tree(&[("main.ts", "old\n"), ("app.db", "LIVEDATA")]);
         let new = tree(&[("main.ts", "old\n")]); // no app.db shipped
 
-        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            None,
+            true,
+            "p",
+            None,
+            None,
+            &ConflictResolution::default(),
+        )
+        .unwrap();
 
         assert!(
             plan.preserved.contains(&"app.db".to_string()),
@@ -13087,7 +13168,17 @@ mod tests {
         // User edited the file; upstream (new) is identical to base.
         let proj = tree(&[("main.ts", "line1\nMINE\n")]);
         let new = tree(&[("main.ts", "line1\nline2\n")]);
-        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            Some(base.as_path()),
+            true,
+            "p",
+            None,
+            None,
+            &ConflictResolution::default(),
+        )
+        .unwrap();
         assert!(plan.overwrite.is_empty() && plan.conflicts.is_empty() && plan.merged.is_empty());
         // The user's edit survives verbatim.
         assert_eq!(read(&proj, "main.ts"), "line1\nMINE\n");
@@ -13100,7 +13191,17 @@ mod tests {
         // User changed the top; upstream changed the bottom → non-overlapping.
         let proj = tree(&[("f.txt", "AAA\nb\nc\nd\ne\n")]);
         let new = tree(&[("f.txt", "a\nb\nc\nd\nEEE\n")]);
-        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            Some(base.as_path()),
+            true,
+            "p",
+            None,
+            None,
+            &ConflictResolution::default(),
+        )
+        .unwrap();
         assert_eq!(plan.merged, vec!["f.txt"], "disjoint edits auto-merge");
         assert!(plan.conflicts.is_empty());
         let merged = read(&proj, "f.txt");
@@ -13114,11 +13215,130 @@ mod tests {
         // Both sides changed the same line → conflict.
         let proj = tree(&[("f.txt", "user version\n")]);
         let new = tree(&[("f.txt", "upstream version\n")]);
-        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            Some(base.as_path()),
+            true,
+            "p",
+            None,
+            None,
+            &ConflictResolution::default(),
+        )
+        .unwrap();
         assert_eq!(plan.conflicts, vec!["f.txt"]);
         assert!(plan.overwrite.is_empty() && plan.merged.is_empty());
         // The user's file is left untouched on a conflict.
         assert_eq!(read(&proj, "f.txt"), "user version\n");
+    }
+
+    #[test]
+    fn overlay_plan_take_theirs_resolves_a_three_way_conflict() {
+        let _g = lock();
+        let base = tree(&[("f.txt", "shared\n")]);
+        // Both sides changed the same line → would normally conflict.
+        let proj = tree(&[("f.txt", "user version\n")]);
+        let new = tree(&[("f.txt", "upstream version\n")]);
+        let resolution = ConflictResolution {
+            take_theirs: ["f.txt".to_string()].into_iter().collect(),
+            all_theirs: false,
+        };
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            Some(base.as_path()),
+            true,
+            "p",
+            None,
+            None,
+            &resolution,
+        )
+        .unwrap();
+        // The conflict is resolved take-upstream: written from the new pack,
+        // reported under `overwrite`, and excluded from `conflicts`.
+        assert!(
+            plan.conflicts.is_empty(),
+            "conflict resolved: {:?}",
+            plan.conflicts
+        );
+        assert_eq!(plan.overwrite, vec!["f.txt"]);
+        assert_eq!(read(&proj, "f.txt"), "upstream version\n");
+    }
+
+    #[test]
+    fn overlay_plan_resolve_all_theirs_resolves_a_two_way_conflict() {
+        let _g = lock();
+        // No merge base (2-way): a locally-differing file is normally a conflict.
+        let proj = tree(&[("f.txt", "user version\n")]);
+        let new = tree(&[("f.txt", "upstream version\n")]);
+        let resolution = ConflictResolution {
+            take_theirs: BTreeSet::new(),
+            all_theirs: true,
+        };
+        let plan = overlay_plan(&proj, &new, None, true, "p", None, None, &resolution).unwrap();
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.overwrite, vec!["f.txt"]);
+        assert_eq!(read(&proj, "f.txt"), "upstream version\n");
+    }
+
+    #[test]
+    fn overlay_plan_take_theirs_only_touches_listed_files() {
+        let _g = lock();
+        let base = tree(&[("a.txt", "shared\n"), ("b.txt", "shared\n")]);
+        let proj = tree(&[("a.txt", "mine a\n"), ("b.txt", "mine b\n")]);
+        let new = tree(&[("a.txt", "theirs a\n"), ("b.txt", "theirs b\n")]);
+        // Only resolve a.txt; b.txt stays a conflict (untouched).
+        let resolution = ConflictResolution {
+            take_theirs: ["a.txt".to_string()].into_iter().collect(),
+            all_theirs: false,
+        };
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            Some(base.as_path()),
+            true,
+            "p",
+            None,
+            None,
+            &resolution,
+        )
+        .unwrap();
+        assert_eq!(plan.overwrite, vec!["a.txt"]);
+        assert_eq!(plan.conflicts, vec!["b.txt"]);
+        assert_eq!(read(&proj, "a.txt"), "theirs a\n");
+        assert_eq!(read(&proj, "b.txt"), "mine b\n");
+    }
+
+    #[test]
+    fn overlay_plan_take_theirs_dry_run_reclassifies_without_writing() {
+        let _g = lock();
+        let base = tree(&[("f.txt", "shared\n")]);
+        let proj = tree(&[("f.txt", "user version\n")]);
+        let new = tree(&[("f.txt", "upstream version\n")]);
+        let resolution = ConflictResolution {
+            take_theirs: ["f.txt".to_string()].into_iter().collect(),
+            all_theirs: false,
+        };
+        // apply=false: the plan reclassifies the conflict as an overwrite, but
+        // nothing is written — so the UI can preview the resolved plan.
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            Some(base.as_path()),
+            false,
+            "p",
+            None,
+            None,
+            &resolution,
+        )
+        .unwrap();
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.overwrite, vec!["f.txt"]);
+        assert_eq!(
+            read(&proj, "f.txt"),
+            "user version\n",
+            "dry run must not write"
+        );
     }
 
     #[cfg(unix)]
@@ -13134,12 +13354,99 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("secret"), base.join("f.txt")).unwrap();
         let proj = tree(&[("f.txt", "user version\n")]);
         let new = tree(&[("f.txt", "upstream version\n")]);
-        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            Some(base.as_path()),
+            true,
+            "p",
+            None,
+            None,
+            &ConflictResolution::default(),
+        )
+        .unwrap();
         // With the base treated as unavailable, we fall back to conservative
         // 2-way: an existing, differing file is a conflict, never touched.
         assert_eq!(plan.conflicts, vec!["f.txt"]);
         assert!(plan.overwrite.is_empty() && plan.merged.is_empty());
         assert_eq!(read(&proj, "f.txt"), "user version\n");
+    }
+
+    /// Take-upstream conflict resolution must never be able to punch through the
+    /// destination symlink guard: even when a file is explicitly requested via
+    /// `take_theirs` *or* the blanket `all_theirs`, a write through a symlinked
+    /// path component must still fail closed — surfaced as a conflict, never
+    /// written, and the host file behind the symlink left intact. The symlink
+    /// guard runs *before* the take-upstream branch, so this holds on both the
+    /// 3-way (base present) and 2-way (no base) code paths; assert both, and in
+    /// both dry-run and apply, so a future refactor that reorders the checks or
+    /// adds a new resolution write path can't silently regress escape safety.
+    #[cfg(unix)]
+    #[test]
+    fn overlay_plan_take_upstream_cannot_override_symlink_guard() {
+        let _g = lock();
+        unsafe { std::env::set_var("NANO_APP_DB_URL", "file:./app.db") };
+        for take_theirs in [true, false] {
+            for all_theirs in [true, false] {
+                for base_present in [true, false] {
+                    for apply in [true, false] {
+                        // A symlink inside the project points at a host dir the
+                        // update must never write into.
+                        let outside = tree(&[("secret.txt", "DO NOT TOUCH\n")]);
+                        let proj = tree(&[("keep.ts", "x\n")]);
+                        std::os::unix::fs::symlink(&outside, proj.join("resources")).unwrap();
+                        // The pack ships a file whose destination path traverses
+                        // the symlinked `resources/` component.
+                        let new = tree(&[("resources/secret.txt", "clobbered\n")]);
+                        // A base that would make this a "both changed" 3-way
+                        // conflict, routing through the take-upstream branch.
+                        let base = tree(&[("resources/secret.txt", "shared\n")]);
+                        let resolution = ConflictResolution {
+                            take_theirs: if take_theirs {
+                                ["resources/secret.txt".to_string()].into_iter().collect()
+                            } else {
+                                BTreeSet::new()
+                            },
+                            all_theirs,
+                        };
+                        let plan = overlay_plan(
+                            &proj,
+                            &new,
+                            base_present.then_some(base.as_path()),
+                            apply,
+                            "p",
+                            None,
+                            None,
+                            &resolution,
+                        )
+                        .unwrap();
+                        let case = format!(
+                            "take_theirs={take_theirs} all_theirs={all_theirs} \
+                             base_present={base_present} apply={apply}"
+                        );
+                        // Fail closed regardless of the requested resolution.
+                        assert_eq!(
+                            plan.conflicts,
+                            vec!["resources/secret.txt"],
+                            "must stay a conflict ({case}): {plan:?}"
+                        );
+                        assert!(
+                            plan.overwrite.is_empty()
+                                && plan.create.is_empty()
+                                && plan.merged.is_empty(),
+                            "no write path taken ({case}): {plan:?}"
+                        );
+                        // The host file behind the symlink is never clobbered.
+                        assert_eq!(
+                            read(&outside, "secret.txt"),
+                            "DO NOT TOUCH\n",
+                            "outside file intact ({case})"
+                        );
+                    }
+                }
+            }
+        }
+        unsafe { std::env::remove_var("NANO_APP_DB_URL") };
     }
 
     #[test]
@@ -13153,7 +13460,17 @@ mod tests {
             ("same.txt", "x\n"),
             ("n.txt", "new\n"),
         ]);
-        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            None,
+            true,
+            "p",
+            None,
+            None,
+            &ConflictResolution::default(),
+        )
+        .unwrap();
         assert_eq!(plan.conflicts, vec!["f.txt"]);
         assert_eq!(plan.create, vec!["n.txt"]);
         assert_eq!(read(&proj, "f.txt"), "local\n");
@@ -13166,7 +13483,17 @@ mod tests {
         let base = tree(&[("a.txt", "1\n")]);
         let proj = tree(&[("a.txt", "1\n")]);
         let new = tree(&[("a.txt", "2\n"), ("sub/b.txt", "hi\n")]);
-        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            Some(base.as_path()),
+            true,
+            "p",
+            None,
+            None,
+            &ConflictResolution::default(),
+        )
+        .unwrap();
         assert_eq!(plan.overwrite, vec!["a.txt"]);
         assert_eq!(plan.create, vec!["sub/b.txt"]);
         assert_eq!(read(&proj, "a.txt"), "2\n");

@@ -751,6 +751,14 @@ export type UpdateFromTemplateRequest = {
      * Optional npm version/dist-tag of the pack to overlay. Defaults to the currently installed pack version (the offline `updateAvailable` target).
      */
     version?: string;
+    /**
+     * Project-relative paths of conflicted files to resolve *take-upstream*: discard the local changes and write the incoming pack file verbatim. Each listed file is written (on `apply`) and reported under `overwrite` instead of `conflicts`. Paths that aren't conflicts (or aren't shipped by the pack) are ignored. Combine with `apply: true` to resolve and write in a single call.
+     */
+    takeTheirs?: Array<string>;
+    /**
+     * Bulk conflict resolution. `theirs` resolves *every* conflict take-upstream (equivalent to listing all conflicted paths in `takeTheirs`), so a fully-resolved apply advances `scaffoldedFrom.version`. `mine` keeps every local file (the default behaviour). Applies on top of any explicit `takeTheirs`.
+     */
+    resolveConflicts?: 'theirs' | 'mine';
 };
 
 export type UpdatePlan = {

@@ -1200,10 +1200,31 @@ impl apis::projects::Projects for ServerImpl {
         let name = path_params.name.clone();
         let apply = body.as_ref().and_then(|b| b.apply).unwrap_or(false);
         let version = body.as_ref().and_then(|b| b.version.clone());
+        // Conflict resolution: specific take-upstream paths and/or a bulk
+        // "take theirs" for every conflict. `resolveConflicts: mine` is the
+        // default (keep local) and needs no explicit handling.
+        let resolution = super::projects::ConflictResolution {
+            take_theirs: body
+                .as_ref()
+                .and_then(|b| b.take_theirs.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            all_theirs: body
+                .as_ref()
+                .and_then(|b| b.resolve_conflicts.as_deref())
+                .map(|r| r.eq_ignore_ascii_case("theirs"))
+                .unwrap_or(false),
+        };
         // npm pack + filesystem work — keep it off the async runtime.
         let update_name = name.clone();
         let res = tokio::task::spawn_blocking(move || {
-            super::projects::update_from_template(&update_name, apply, version.as_deref())
+            super::projects::update_from_template(
+                &update_name,
+                apply,
+                version.as_deref(),
+                &resolution,
+            )
         })
         .await;
         match res {

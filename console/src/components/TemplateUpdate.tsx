@@ -41,6 +41,7 @@ export function useTemplateUpdate(opts?: {
   const [reviewPlan, setReviewPlan] = useState<{
     target: UpdateTarget;
     plan: UpdatePlan;
+    takeTheirs: string[];
   } | null>(null);
   const [confirm, setConfirm] = useState<{
     target: UpdateTarget;
@@ -54,11 +55,11 @@ export function useTemplateUpdate(opts?: {
   const clearError = useCallback(() => setError(null), []);
 
   const dryRun = useCallback(
-    async (target: UpdateTarget): Promise<UpdatePlan> =>
+    async (target: UpdateTarget, takeTheirs?: string[]): Promise<UpdatePlan> =>
       (
         await updateProjectFromTemplate({
           path: { name: target.name },
-          body: { apply: false },
+          body: { apply: false, takeTheirs },
           throwOnError: true,
         })
       ).data,
@@ -66,11 +67,11 @@ export function useTemplateUpdate(opts?: {
   );
 
   const apply = useCallback(
-    async (target: UpdateTarget): Promise<UpdatePlan> =>
+    async (target: UpdateTarget, takeTheirs?: string[]): Promise<UpdatePlan> =>
       (
         await updateProjectFromTemplate({
           path: { name: target.name },
-          body: { apply: true },
+          body: { apply: true, takeTheirs },
           throwOnError: true,
         })
       ).data,
@@ -94,7 +95,7 @@ export function useTemplateUpdate(opts?: {
         if (planIsClean(plan)) {
           setConfirm({ target, plan });
         } else {
-          setReviewPlan({ target, plan });
+          setReviewPlan({ target, plan, takeTheirs: [] });
         }
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -108,14 +109,15 @@ export function useTemplateUpdate(opts?: {
 
   /// Apply a single update (a snapshot is taken server-side first), show the
   /// applied result in the review modal, and let the caller refresh.
+  /// `takeTheirs` carries the conflicts the user chose to resolve take-upstream.
   const applyOne = useCallback(
-    async (target: UpdateTarget) => {
+    async (target: UpdateTarget, takeTheirs: string[] = []) => {
       setBusy(true);
       setError(null);
       try {
-        const plan = await apply(target);
+        const plan = await apply(target, takeTheirs);
         setConfirm(null);
-        setReviewPlan({ target, plan });
+        setReviewPlan({ target, plan, takeTheirs });
         await onApplied?.(target.name);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -124,6 +126,25 @@ export function useTemplateUpdate(opts?: {
       }
     },
     [apply, onApplied],
+  );
+
+  /// Resolve some/all conflicts take-upstream and re-run the dry run so the
+  /// review modal re-renders the resulting plan (the chosen files move from
+  /// "Conflicts" to "Updated"). Nothing is written yet — the user still applies.
+  const resolveConflicts = useCallback(
+    async (target: UpdateTarget, takeTheirs: string[]) => {
+      setBusy(true);
+      setError(null);
+      try {
+        const plan = await dryRun(target, takeTheirs);
+        setReviewPlan({ target, plan, takeTheirs });
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [dryRun],
   );
 
   /// Sequentially apply an update to each target, stopping at the first project
@@ -143,7 +164,7 @@ export function useTemplateUpdate(opts?: {
             results.push({ name: target.name, plan });
             await onApplied?.(target.name);
             if (plan.conflicts.length > 0) {
-              setReviewPlan({ target, plan });
+              setReviewPlan({ target, plan, takeTheirs: [] });
               break;
             }
           } catch (e) {
@@ -181,7 +202,15 @@ export function useTemplateUpdate(opts?: {
             target={reviewPlan.target}
             plan={reviewPlan.plan}
             busy={busy}
-            onApply={() => void applyOne(reviewPlan.target)}
+            onApply={() =>
+              void applyOne(reviewPlan.target, reviewPlan.takeTheirs)
+            }
+            onTakeUpstream={(paths) =>
+              void resolveConflicts(
+                reviewPlan.target,
+                Array.from(new Set([...reviewPlan.takeTheirs, ...paths])),
+              )
+            }
             onClose={() => {
               // Ignore close while an apply is in flight: the pending request
               // resolves into setReviewPlan(...) and would otherwise race the UI
@@ -192,7 +221,7 @@ export function useTemplateUpdate(opts?: {
         )}
       </>
     ),
-    [confirm, reviewPlan, busy, applyOne],
+    [confirm, reviewPlan, busy, applyOne, resolveConflicts],
   );
 
   return {
@@ -269,24 +298,30 @@ export function ConfirmUpdateModal({
 
 /// The review modal for "Update from template": shows the overlay plan grouped
 /// by outcome (new / updated / merged / conflicts / kept), and applies the safe
-/// subset on confirm. Conflicts are never written — they're surfaced so the user
-/// can resolve them by hand and re-run.
+/// subset on confirm. Conflicts can be resolved *take-upstream* (discard local,
+/// write the incoming pack file) individually or in bulk via `onTakeUpstream` —
+/// which re-runs the dry run so the resolved plan re-renders before applying.
 export function UpdatePlanModal({
   target,
   plan,
   busy,
   onApply,
+  onTakeUpstream,
   onClose,
 }: {
   target: UpdateTarget;
   plan: UpdatePlan;
   busy: boolean;
   onApply: () => void;
+  onTakeUpstream?: (paths: string[]) => void;
   onClose: () => void;
 }) {
   const title = targetTitle(target);
   const changes = planChangeCount(plan);
   const nothingToDo = planNothingToDo(plan);
+  // Conflicts can be resolved take-upstream only before applying and only when
+  // the flow wired a resolver (the batch/observe callers may not).
+  const canResolve = !plan.applied && !!onTakeUpstream;
   // Close on Escape for keyboard users, but not while an apply is in flight.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -334,12 +369,29 @@ export function UpdatePlanModal({
             )}
           </p>
           {plan.conflicts.length > 0 && (
-            <p className="rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
-              {plan.conflicts.length} file
-              {plan.conflicts.length === 1 ? "" : "s"} changed both upstream and
-              locally — these are <strong>not</strong> written. Resolve them by
-              hand, then re-run the update.
-            </p>
+            <div className="space-y-2 rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
+              <p>
+                {plan.conflicts.length} file
+                {plan.conflicts.length === 1 ? "" : "s"} changed both upstream
+                and locally. Keep them and they stay unwritten (and the version
+                stays pinned), or <strong>take upstream</strong> to discard your
+                local changes and match the pack.
+              </p>
+              {!plan.applied && canResolve && (
+                <Button
+                  variant="ghost"
+                  onClick={() => onTakeUpstream?.(plan.conflicts)}
+                  disabled={busy}
+                  className="!border-danger/50 !text-danger"
+                >
+                  {busy
+                    ? "Resolving…"
+                    : `Take upstream for all ${plan.conflicts.length} conflict${
+                        plan.conflicts.length === 1 ? "" : "s"
+                      }`}
+                </Button>
+              )}
+            </div>
           )}
           {plan.applied && plan.checkpoint && (
             <p className="rounded-md border border-edge bg-bg-subtle px-3 py-2 text-xs text-fg-faint">
@@ -363,9 +415,13 @@ export function UpdatePlanModal({
             items={plan.merged}
           />
           <PlanGroup
-            label="Conflicts (skipped)"
+            label={canResolve ? "Conflicts" : "Conflicts (skipped)"}
             tone="danger"
             items={plan.conflicts}
+            onTakeItem={
+              canResolve ? (path) => onTakeUpstream?.([path]) : undefined
+            }
+            actionBusy={busy}
           />
           <PlanGroup label="Preserved" tone="muted" items={plan.preserved} />
           <PlanGroup
@@ -429,15 +485,21 @@ export function UpdatePlanModal({
   );
 }
 
-/// One labelled bucket of the update plan; renders nothing when empty.
+/// One labelled bucket of the update plan; renders nothing when empty. When
+/// `onTakeItem` is supplied (the Conflicts bucket, pre-apply), each file gets a
+/// "Take upstream" action that resolves just that file take-upstream.
 function PlanGroup({
   label,
   items,
   tone,
+  onTakeItem,
+  actionBusy,
 }: {
   label: string;
   items: string[];
   tone: "ok" | "accent" | "danger" | "muted";
+  onTakeItem?: (path: string) => void;
+  actionBusy?: boolean;
 }) {
   if (items.length === 0) return null;
   const toneClass = {
@@ -455,8 +517,23 @@ function PlanGroup({
       </div>
       <ul className="space-y-0.5 font-mono text-xs text-fg-faint">
         {items.map((f) => (
-          <li key={f} className="truncate" title={f}>
-            {f}
+          <li
+            key={f}
+            className="flex items-center justify-between gap-2"
+            title={f}
+          >
+            <span className="truncate">{f}</span>
+            {onTakeItem && (
+              <button
+                type="button"
+                onClick={() => onTakeItem(f)}
+                disabled={actionBusy}
+                className="shrink-0 rounded px-1.5 py-0.5 font-sans text-[10px] font-medium text-danger hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-50"
+                title="Discard your local changes and take the upstream version"
+              >
+                Take upstream
+              </button>
+            )}
           </li>
         ))}
       </ul>

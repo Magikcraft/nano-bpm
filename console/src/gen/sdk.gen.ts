@@ -426,6 +426,8 @@ export const compileProject = <ThrowOnError extends boolean = false>(options: Op
  * Update a project from a newer version of its scaffolding pack
  *
  * Overlays a newer version of the project's `scaffoldedFrom` pack onto the project, preserving the sqlite datasource (app.db + WAL/SHM), generated SDK (`nano-generated/`) and local VCS/deps (`.git/`, `node_modules/`). Uses the recorded `scaffoldedFrom.version` as a 3-way merge base so a user's edits to upstream-unchanged files survive and only genuine conflicts are surfaced. Dry-run by default (`apply: false`) — returns the plan without writing. With `apply: true` it writes the non-conflicting subset and bumps `scaffoldedFrom.version` on a clean update.
+ *
+ * Conflicts can be resolved *take-upstream* (discard the local changes and write the incoming pack file) via `takeTheirs` (a list of specific project-relative paths) and/or `resolveConflicts: theirs` (take upstream for every conflict). A take-upstream file is written from the pack and reported under `overwrite`, not `conflicts` — so once all conflicts are resolved the apply is treated as clean and `scaffoldedFrom.version` bumps.
  */
 export const updateProjectFromTemplate = <ThrowOnError extends boolean = false>(options: Options<UpdateProjectFromTemplateData, ThrowOnError>): RequestResult<UpdateProjectFromTemplateResponses, UpdateProjectFromTemplateErrors, ThrowOnError> => (options.client ?? client).post<UpdateProjectFromTemplateResponses, UpdateProjectFromTemplateErrors, ThrowOnError>({
     url: '/projects/{name}/update-from-template',

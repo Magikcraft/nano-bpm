@@ -844,6 +844,15 @@ paths:
         conflicts are surfaced. Dry-run by default (`apply: false`) — returns the
         plan without writing. With `apply: true` it writes the non-conflicting
         subset and bumps `scaffoldedFrom.version` on a clean update.
+
+
+        Conflicts can be resolved *take-upstream* (discard the local changes and
+        write the incoming pack file) via `takeTheirs` (a list of specific
+        project-relative paths) and/or `resolveConflicts: theirs` (take upstream
+        for every conflict). A take-upstream file is written from the pack and
+        reported under `overwrite`, not `conflicts` — so once all conflicts are
+        resolved the apply is treated as clean and `scaffoldedFrom.version`
+        bumps.
       parameters: [ { $ref: '#/components/parameters/NamePath' } ]
       requestBody:
         required: false
@@ -2528,6 +2537,25 @@ components:
             Optional npm version/dist-tag of the pack to overlay. Defaults to the
             currently installed pack version (the offline `updateAvailable`
             target).
+        takeTheirs:
+          type: array
+          items: { type: string }
+          description: >-
+            Project-relative paths of conflicted files to resolve *take-upstream*:
+            discard the local changes and write the incoming pack file verbatim.
+            Each listed file is written (on `apply`) and reported under
+            `overwrite` instead of `conflicts`. Paths that aren't conflicts (or
+            aren't shipped by the pack) are ignored. Combine with `apply: true`
+            to resolve and write in a single call.
+        resolveConflicts:
+          type: string
+          enum: [theirs, mine]
+          description: >-
+            Bulk conflict resolution. `theirs` resolves *every* conflict
+            take-upstream (equivalent to listing all conflicted paths in
+            `takeTheirs`), so a fully-resolved apply advances
+            `scaffoldedFrom.version`. `mine` keeps every local file (the default
+            behaviour). Applies on top of any explicit `takeTheirs`.
     UpdatePlan:
       type: object
       required: [pack, applied, versionBumped, create, overwrite, merged, preserved, conflicts, orphans]
