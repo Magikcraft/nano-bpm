@@ -216,7 +216,23 @@ export default function AppView() {
       const action = decideAppViewMessage(ev.data);
       if (!action) return;
       if (action.kind === "theme") postTheme();
-      else navigate(action.path);
+      else {
+        if ("stash" in action && action.stash) {
+          try {
+            sessionStorage.setItem(action.stash.key, action.stash.value);
+          } catch {
+            // sessionStorage may be full/unavailable. Drop any prior stash so a
+            // failed write can't leave a STALE handoff behind for the preview
+            // view to render — it must degrade cleanly to the empty state.
+            try {
+              sessionStorage.removeItem(action.stash.key);
+            } catch {
+              // Storage wholly unavailable — nothing to clear; empty state anyway.
+            }
+          }
+        }
+        navigate(action.path);
+      }
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
