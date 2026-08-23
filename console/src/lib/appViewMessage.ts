@@ -11,10 +11,13 @@
 /// view reads it straight back.
 export const DEFINITION_PREVIEW_STASH_KEY = "nano.explorer.definitionPreview";
 
-/// A defensive cap on a previewed definition's XML size (chars). A laid-out
-/// delivery graph is a few KB; anything past ~4MB is not a real diagram and
-/// would risk blowing the sessionStorage quota, so we drop it.
-export const DEFINITION_PREVIEW_MAX_XML = 4_000_000;
+/// A defensive cap on a previewed definition's XML size, in characters (UTF-16
+/// code units — NOT bytes; a char can encode to up to 3-4 UTF-8 bytes). A
+/// laid-out delivery graph is a few KB; anything past this is not a real diagram
+/// and would risk overflowing the sessionStorage quota (typically ~5MB), so we
+/// drop it. The write is also wrapped in try/catch as a backstop, so an
+/// over-quota value degrades to the preview's empty state rather than throwing.
+export const DEFINITION_PREVIEW_MAX_XML = 2_000_000;
 
 export type AppViewMessageAction =
   | { kind: "theme" }

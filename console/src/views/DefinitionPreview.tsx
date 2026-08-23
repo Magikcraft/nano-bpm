@@ -2,7 +2,10 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import BpmnViewer from "../components/BpmnViewer";
 import { Badge } from "../components/ui";
-import { DEFINITION_PREVIEW_STASH_KEY } from "../lib/appViewMessage";
+import {
+  DEFINITION_PREVIEW_MAX_XML,
+  DEFINITION_PREVIEW_STASH_KEY,
+} from "../lib/appViewMessage";
 
 /// Read-only preview of a BPMN document that is NOT deployed — no process
 /// definition, no instance. The XML is handed in out-of-band via same-origin
@@ -18,7 +21,18 @@ function readStashedXml(): string | null {
   if (typeof window === "undefined") return null;
   try {
     const xml = window.sessionStorage.getItem(DEFINITION_PREVIEW_STASH_KEY);
-    return xml && xml.trim() !== "" ? xml : null;
+    // Re-validate here, mirroring the bridge guard: the stash is normally
+    // written by the (already validated) App-View bridge, but defending at the
+    // read too keeps preview behaviour predictable — an invalid/oversized value
+    // yields the empty state rather than a silently blank bpmn-js canvas.
+    if (
+      typeof xml === "string" &&
+      xml.trim().startsWith("<") &&
+      xml.length <= DEFINITION_PREVIEW_MAX_XML
+    ) {
+      return xml;
+    }
+    return null;
   } catch {
     return null;
   }
