@@ -432,6 +432,15 @@ fn parse_with_captures(
     // Throw events are pass-throughs for execution, but the reference-integrity
     // validator (#851) needs the link name to check throw↔catch pairing.
     let mut cur_throw: Option<usize> = None;
+    // Index of the end event currently being read, so a nested `zeebe:ioMapping`
+    // (an output mapping projecting a variable when the token reaches this end
+    // event, e.g. a per-branch outcome inside a sub-process) attaches to the end
+    // event itself rather than falling through to the innermost enclosing
+    // activity on the `io_stack` (its sub-process). Without this, several end
+    // events in one sub-process — each mapping the same target — all hoist onto
+    // the sub-process, and the last-parsed one clobbers the rest at sub-process
+    // completion (they never attach to the reached end event that should apply).
+    let mut cur_end: Option<usize> = None;
     // Index of the call activity currently being read, so a nested
     // `zeebe:calledElement processId="…"` child can record its callee.
     let mut cur_call: Option<usize> = None;
@@ -592,7 +601,20 @@ fn parse_with_captures(
                                 }
                             }
                             "endEvent" => {
-                                acc.add_node(attrs, NodeKind::End);
+                                let idx = acc.add_node(attrs, NodeKind::End);
+                                // An end event can carry a `zeebe:ioMapping`
+                                // (output) or execution listeners; push it so they
+                                // attach to the end event, not the enclosing
+                                // sub-process. A self-closing `<endEvent/>` has no
+                                // children and no end tag, so only a real open
+                                // element enters the io_stack (popped on
+                                // `</endEvent>` when `cur_end` is set).
+                                if !self_closing {
+                                    cur_end = idx;
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
+                                }
                             }
                             "exclusiveGateway" => {
                                 let idx = acc.add_node(attrs, NodeKind::Exclusive);
@@ -1031,6 +1053,16 @@ fn parse_with_captures(
                                 let idx = acc.add_node(attrs, NodeKind::IntermediateThrow);
                                 if !self_closing {
                                     cur_throw = idx;
+                                    // A throw event can carry a `zeebe:ioMapping`
+                                    // (e.g. a message throw). Push it onto the
+                                    // io_stack — same defect class as end events —
+                                    // so nested mappings attach to the throw event
+                                    // rather than the enclosing activity. `cur_throw`
+                                    // is Some iff the node had an id, matching the
+                                    // guarded pop on `</intermediateThrowEvent>`.
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
                                 }
                             }
                             // An abstract `task` (or `manualTask`) has no
@@ -1578,7 +1610,24 @@ fn parse_with_captures(
                     }
                     cur_intermediate = None;
                 }
-                "intermediateThrowEvent" => cur_throw = None,
+                "intermediateThrowEvent" => {
+                    // Balance the io_stack push done for a non-self-closing throw
+                    // event (id-less throw events are never pushed, so guard on
+                    // `cur_throw`).
+                    if cur_throw.is_some() {
+                        io_stack.pop();
+                    }
+                    cur_throw = None;
+                }
+                "endEvent" => {
+                    // Balance the io_stack push done for a non-self-closing end
+                    // event (id-less end events are never pushed, so guard on
+                    // `cur_end` — mirrors the id-less catch-event handling).
+                    if cur_end.is_some() {
+                        io_stack.pop();
+                    }
+                    cur_end = None;
+                }
                 "multiInstanceLoopCharacteristics" => cur_multi_instance = None,
                 "completionCondition" => {
                     if let Some(text) = completion_condition_text.take() {
@@ -5318,6 +5367,108 @@ mod tests {
         assert_eq!(io.outputs.len(), 1);
         assert_eq!(io.outputs[0].source, "=round + 1");
         assert_eq!(io.outputs[0].target, "round");
+    }
+
+    #[test]
+    fn end_event_io_mapping_attaches_to_the_end_event_not_the_enclosing_subprocess() {
+        // given — a sub-process with two end events, each carrying a
+        // `zeebe:output` mapping for the same target. Each mapping must attach to
+        // its OWN end event; none may hoist onto the enclosing sub-process.
+        // Previously end events were never pushed onto the io_stack, so every
+        // nested end-event mapping fell through to the innermost open activity
+        // (the sub-process). With several end events mapping the same target, the
+        // sub-process then collected them all and the last-parsed one clobbered
+        // the rest at completion — a "fixed" outcome routed as "escalate" in the
+        // nano-workforce merge-loop (#466).
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="sub" />
+              <bpmn:subProcess id="sub">
+                <bpmn:startEvent id="ss" />
+                <bpmn:sequenceFlow id="f1" sourceRef="ss" targetRef="endA" />
+                <bpmn:endEvent id="endA">
+                  <bpmn:extensionElements>
+                    <zeebe:ioMapping>
+                      <zeebe:output source="=&#34;A&#34;" target="outcome" />
+                    </zeebe:ioMapping>
+                  </bpmn:extensionElements>
+                </bpmn:endEvent>
+                <bpmn:endEvent id="endB">
+                  <bpmn:extensionElements>
+                    <zeebe:ioMapping>
+                      <zeebe:output source="=&#34;B&#34;" target="outcome" />
+                    </zeebe:ioMapping>
+                  </bpmn:extensionElements>
+                </bpmn:endEvent>
+              </bpmn:subProcess>
+              <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="done" />
+              <bpmn:endEvent id="done" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then — each end event owns exactly its own mapping, and the sub-process
+        // (and the mapping-free `done` end event) own none.
+        assert!(
+            def.element("sub").unwrap().io.outputs.is_empty(),
+            "end-event mappings must not hoist onto the enclosing sub-process"
+        );
+        let end_a = &def.element("endA").unwrap().io.outputs;
+        assert_eq!(end_a.len(), 1);
+        assert_eq!(end_a[0].source, "=\"A\"");
+        assert_eq!(end_a[0].target, "outcome");
+        let end_b = &def.element("endB").unwrap().io.outputs;
+        assert_eq!(end_b.len(), 1);
+        assert_eq!(end_b[0].source, "=\"B\"");
+        assert!(def.element("done").unwrap().io.outputs.is_empty());
+    }
+
+    #[test]
+    fn throw_event_io_mapping_attaches_to_the_throw_event_not_the_enclosing_subprocess() {
+        // Same defect class as end events: a `zeebe:ioMapping` on a message
+        // intermediate throw event nested in a sub-process must attach to the
+        // throw event, not hoist onto the enclosing sub-process.
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="sub" />
+              <bpmn:subProcess id="sub">
+                <bpmn:startEvent id="ss" />
+                <bpmn:sequenceFlow id="f1" sourceRef="ss" targetRef="thr" />
+                <bpmn:intermediateThrowEvent id="thr">
+                  <bpmn:extensionElements>
+                    <zeebe:taskDefinition type="notify" />
+                    <zeebe:ioMapping>
+                      <zeebe:output source="=&#34;sent&#34;" target="state" />
+                    </zeebe:ioMapping>
+                  </bpmn:extensionElements>
+                  <bpmn:messageEventDefinition id="m" />
+                </bpmn:intermediateThrowEvent>
+                <bpmn:sequenceFlow id="f2" sourceRef="thr" targetRef="e" />
+                <bpmn:endEvent id="e" />
+              </bpmn:subProcess>
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        assert!(
+            def.element("sub").unwrap().io.outputs.is_empty(),
+            "throw-event mapping must not hoist onto the enclosing sub-process"
+        );
+        let thr = &def.element("thr").unwrap().io.outputs;
+        assert_eq!(thr.len(), 1);
+        assert_eq!(thr[0].source, "=\"sent\"");
+        assert_eq!(thr[0].target, "state");
     }
 
     #[test]
