@@ -1,6 +1,6 @@
 {
   "name": "@nanobpm/engine-testkit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Engine-agnostic fluent assertion DSL (assertThat*) for the Nano BPMN engine read model. Zero-runtime-dependency matchers over a minimal structural read-model port (snapshot + user-task read channel) that @nanobpm/engine-wasm — and any adapter over it (urban-testkit, bojtos-kit) — satisfies. Lifted out of @nanobpm/urban-testkit so it is reusable beyond Urban apps.",
   "license": "Apache-2.0",
   "type": "module",
