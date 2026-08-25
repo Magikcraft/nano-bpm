@@ -3522,6 +3522,138 @@ fn subprocess_terminate_end_resolves_an_incident_in_its_scope() {
 }
 
 #[test]
+fn scope_teardown_does_not_resurrect_a_cancelled_incident_job() {
+    // Regression: forced scope teardown emits `JobCanceled` and then
+    // `IncidentResolved` for the *same* failed job in one batch. `IncidentResolved`
+    // must not return the just-cancelled job to `Created`, or the resolution
+    // resurrects a job whose element instance is being removed — leaving an
+    // activatable job pointing at a dead token. The job must stay `Canceled` and
+    // out of the activatable pool.
+    //
+    //  sub: sub_start -> split =< work(svc) -> work_end,
+    //                             trigger(svc) -> stop(terminate) >
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("work", "work-job")
+        .contained_in("work", "sub")
+        .end_event("work_end")
+        .contained_in("work_end", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "work")
+        .connect("work", "work_end")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+
+    // Fail the work job with no retries left to park an incident on its element.
+    let work_job = engine.activate_jobs("work-job", "W", 10, 60_000, 0)[0].key;
+    engine
+        .apply_command(Command::fail_job(work_job, 0, "boom"))
+        .unwrap();
+    assert_eq!(
+        engine.state().jobs.get(&work_job).unwrap().state,
+        state::JobState::Failed
+    );
+
+    // The sibling terminate fires when `trigger` completes: it cancels the failed
+    // job *and* resolves its incident in the same teardown batch.
+    complete_one(&mut engine, "trigger-job");
+
+    let job = engine.state().jobs.get(&work_job).unwrap();
+    assert_eq!(
+        job.state,
+        state::JobState::Canceled,
+        "the cancelled job must stay Canceled — incident resolution must not resurrect it"
+    );
+    assert!(
+        engine
+            .activate_jobs("work-job", "W2", 10, 60_000, 0)
+            .is_empty(),
+        "a resurrected job would reappear in the activatable pool against a dead token"
+    );
+}
+
+#[test]
+fn terminate_clears_open_parallel_join_bookkeeping() {
+    // A terminate that fires while a parallel join is half-open must drop the
+    // join's runtime bookkeeping (`join_counts`/`join_instances`) on the terminal
+    // instance — the same forced-teardown cleanup as MI/ad-hoc state. Otherwise a
+    // mid-join terminate strands this bookkeeping on the terminal instance shell
+    // until eviction, leaving its snapshot inconsistent.
+    //
+    //  start -> split =< a(svc) -> join, b(svc) -> join,
+    //                    trigger(svc) -> stop(terminate) >
+    //  join(parallel) -> done
+    let proc = ProcessBuilder::new("join-term")
+        .start_event("start")
+        .parallel_gateway("split")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .parallel_gateway("join")
+        .end_event("done")
+        .service_task("trigger", "trigger-job")
+        .terminate_end_event("stop")
+        .connect("start", "split")
+        .connect("split", "a")
+        .connect("split", "b")
+        .connect("split", "trigger")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "done")
+        .connect("trigger", "stop")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(proc)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("join-term"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Drive branch `a` into the join so it half-opens and waits for branch `b`.
+    complete_one(&mut engine, "ja");
+    let instance = engine.instance(key).unwrap();
+    assert_eq!(
+        instance.join_counts.get("join").copied(),
+        Some(1),
+        "the join is half-open before the terminate"
+    );
+    assert!(instance.join_instances.contains_key("join"));
+
+    // The sibling terminate fires when `trigger` completes, ending the instance.
+    complete_one(&mut engine, "trigger-job");
+    let instance = engine.instance(key).unwrap();
+    assert_eq!(
+        instance.state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    assert!(
+        instance.join_counts.is_empty() && instance.join_instances.is_empty(),
+        "the terminal instance must not retain open-join bookkeeping"
+    );
+}
+
+#[test]
 fn top_level_terminate_end_clears_a_multi_instance_body() {
     // A top-level terminate ends the whole instance; its `ProcessInstanceTerminated`
     // reducer must also drop the multi-instance runtime record, or a large in-flight
