@@ -176,6 +176,19 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
                 "external ad-hoc activity activation is a server/REST seam; the studio wasm engine \
                  drives ad-hoc tools through the agent-job path, not this direct command",
         },
+        // AgentInstance write commands (engine-native AgentInstance parity). In
+        // S1 these are record/intent stubs: the CREATE/UPDATE/COMPLETE processors
+        // and their TestEngine drivers land in S3, so there is no `#[wasm_bindgen]`
+        // method to surface them through yet. Classified `NotSurfaced` until then.
+        Command::CreateAgentInstance { .. } => Surface::NotSurfaced {
+            reason: "AgentInstance CREATE processor + TestEngine driver arrive in agent-instance-parity S3",
+        },
+        Command::UpdateAgentInstance { .. } => Surface::NotSurfaced {
+            reason: "AgentInstance UPDATE processor + TestEngine driver arrive in agent-instance-parity S3",
+        },
+        Command::CompleteAgentInstance { .. } => Surface::NotSurfaced {
+            reason: "AgentInstance COMPLETE processor + TestEngine driver arrive in agent-instance-parity S3",
+        },
     }
 }
 

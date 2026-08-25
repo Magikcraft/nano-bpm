@@ -988,6 +988,18 @@ pub enum Event {
         business_id: Option<String>,
         target_partition: u64,
     },
+
+    /// An engine-native AgentInstance was created (Camunda `AgentInstanceIntent.CREATED`,
+    /// stable/8.10). Emitted when an [`crate::model::ElementKind::AgentTask`]
+    /// element activates: the engine mints a dedicated `agent_instance_key`,
+    /// links it to the activating `element_instance_key`, and records the full
+    /// instance in status `INITIALIZING`. The applier inserts it into the owning
+    /// process instance's `agent_instances` map. Carries the whole record value
+    /// so state rebuilds by replay.
+    AgentInstanceCreated {
+        instance_key: Key,
+        agent_instance: crate::agent::AgentInstance,
+    },
 }
 
 impl Event {
@@ -1078,6 +1090,7 @@ impl Event {
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             Event::ProcessInstanceTerminating { instance_key } => Some(*instance_key),
             Event::ProcessInstanceMigrated { instance_key, .. } => Some(*instance_key),
+            Event::AgentInstanceCreated { instance_key, .. } => Some(*instance_key),
             Event::ProcessDeployed { .. }
             | Event::DecisionRequirementsDeployed { .. }
             | Event::DecisionDeployed { .. }
@@ -1374,6 +1387,11 @@ impl Event {
             | Event::UserTaskTransitionDeferred { user_task_key, .. }
             | Event::UserTaskCorrectionsApplied { user_task_key, .. }
             | Event::UserTaskTransitionResolved { user_task_key, .. } => m = m.max(*user_task_key),
+            Event::AgentInstanceCreated { agent_instance, .. } => {
+                m = m
+                    .max(agent_instance.agent_instance_key)
+                    .max(agent_instance.element_instance_key)
+            }
             _ => {}
         }
         m

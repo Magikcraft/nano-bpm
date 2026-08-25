@@ -66,6 +66,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::ConditionalBoundaryEvent { .. } => "conditionalBoundaryEvent",
         ElementKind::CompensationBoundaryEvent { .. } => "compensationBoundaryEvent",
         ElementKind::CompensationThrowEvent => "compensationThrowEvent",
+        ElementKind::AgentTask { .. } => "agentTask",
     }
 }
 
@@ -2443,6 +2444,20 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 }
             }
             out.push_str("    </bpmn:subProcess>\n");
+        }
+        ElementKind::AgentTask { agent_type, .. } => {
+            // An engine-native agent task round-trips as a serviceTask carrying a
+            // `zeebe:agentDefinition` marker. The runtime definition/limits are
+            // agent config supplied at CREATE (slice S3), not model structure, so
+            // only the structural `agentType` marker is emitted here.
+            out.push_str(&format!("    <bpmn:serviceTask id=\"{eid}\"{na}>\n"));
+            out.push_str("      <bpmn:extensionElements>\n");
+            out.push_str(&format!(
+                "        <zeebe:agentDefinition agentType=\"{}\"/>\n",
+                xml_escape(agent_type.as_str())
+            ));
+            out.push_str("      </bpmn:extensionElements>\n");
+            out.push_str("    </bpmn:serviceTask>\n");
         }
     }
 }

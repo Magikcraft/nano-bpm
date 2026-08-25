@@ -167,6 +167,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::ConditionalBoundaryEvent { .. } => "conditionalBoundaryEvent",
         ElementKind::CompensationBoundaryEvent { .. } => "compensationBoundaryEvent",
         ElementKind::CompensationThrowEvent => "compensationThrowEvent",
+        ElementKind::AgentTask { .. } => "agentTask",
     }
 }
 
@@ -207,6 +208,12 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
             if let Some(v) = result_variable {
                 attrs.push(format!("resultVariable {}", quote(v)));
             }
+        }
+        ElementKind::AgentTask { agent_type, .. } => {
+            // Only the structural `agentType` marker round-trips through the
+            // compact IR; the runtime definition/limits are agent config, not
+            // model structure, and are supplied at CREATE time (slice S3).
+            attrs.push(format!("agentType {}", quote(agent_type.as_str())));
         }
         ElementKind::UserTask(props) => {
             if let Some(v) = &props.assignee {
@@ -1199,6 +1206,16 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
             handler: attrs.require("handler", id)?,
         },
         "compensationThrowEvent" => ElementKind::CompensationThrowEvent,
+        "agentTask" => {
+            let raw: String = attrs.require("agentType", id)?;
+            let agent_type = nanobpmn_engine_core::AgentType::parse(&raw)
+                .ok_or_else(|| format!("element '{id}': unknown agentType '{raw}'"))?;
+            ElementKind::AgentTask {
+                agent_type,
+                definition: nanobpmn_engine_core::AgentDefinition::default(),
+                limits: None,
+            }
+        }
         other => return Err(format!("unknown element kind '{other}'")),
     };
     Ok(kind)
@@ -1233,7 +1250,8 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::ScriptTask { .. }
         | ElementKind::CallActivity { .. }
         | ElementKind::SignalIntermediateCatchEvent { .. }
-        | ElementKind::ConditionalIntermediateCatchEvent { .. } => None,
+        | ElementKind::ConditionalIntermediateCatchEvent { .. }
+        | ElementKind::AgentTask { .. } => None,
     }
 }
 
