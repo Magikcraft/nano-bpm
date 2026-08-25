@@ -7197,7 +7197,7 @@ impl ServerImpl {
         }
         match result {
             Some(instance) => Ok(Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(
-                process_instance_result(&instance, &self.store),
+                process_instance_result(&instance, &MemoRootResolver::new(&self.store)),
             )),
             None => Ok(
                 Resp::Status404_TheProcessInstanceWithTheGivenKeyWasNotFound(problem(
@@ -8017,10 +8017,12 @@ impl ServerImpl {
     ) -> (u16, Option<serde_json::Value>) {
         use crate::falcon::ReadKind;
         let body = match kind {
-            ReadKind::ProcessInstance => self
-                .store
-                .process_instance(key)
-                .map(|x| serde_json::to_value(process_instance_result(&x, &self.store))),
+            ReadKind::ProcessInstance => self.store.process_instance(key).map(|x| {
+                serde_json::to_value(process_instance_result(
+                    &x,
+                    &MemoRootResolver::new(&self.store),
+                ))
+            }),
             ReadKind::Incident => self
                 .store
                 .incident(key)
@@ -8035,10 +8037,12 @@ impl ServerImpl {
                 .store
                 .variable(key)
                 .map(|v| serde_json::to_value(variable_result(&v))),
-            ReadKind::ElementInstance => self
-                .store
-                .element_instance(key)
-                .map(|x| serde_json::to_value(element_instance_result(&x, &self.store))),
+            ReadKind::ElementInstance => self.store.element_instance(key).map(|x| {
+                serde_json::to_value(element_instance_result(
+                    &x,
+                    &MemoRootResolver::new(&self.store),
+                ))
+            }),
         };
         match body {
             Some(Ok(v)) => (200, Some(v)),
@@ -9680,6 +9684,10 @@ impl ServerImpl {
             });
         }
 
+        // One memoised root resolver for both the filter and projection passes,
+        // so a wait state's root chain is walked once even though the two passes
+        // each ask for it.
+        let roots = MemoRootResolver::new(&self.store);
         let mut matched: Vec<WaitState> = states
             .into_iter()
             .filter(|ws| match filter {
@@ -9693,8 +9701,7 @@ impl ServerImpl {
                         &ws.process_instance_key.to_string(),
                     ) && query::match_process_instance_key(
                         &f.root_process_instance_key,
-                        &self
-                            .store
+                        &roots
                             .root_process_instance_key(ws.process_instance_key)
                             .to_string(),
                     ) && query::match_element_id(&f.element_id, &ws.element_id)
@@ -9722,7 +9729,7 @@ impl ServerImpl {
                 models::ElementInstanceWaitStateResult::new(
                     ws.wait_state_type,
                     types::Nullable::Present(models::ProcessInstanceKey(
-                        self.store
+                        roots
                             .root_process_instance_key(ws.process_instance_key)
                             .to_string(),
                     )),
@@ -10569,11 +10576,13 @@ impl ServerImpl {
             matched.into_iter().map(|inst| (inst.key, inst)).collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
         // Build result models only for the returned page, never the whole
-        // (potentially very large) matched set.
+        // (potentially very large) matched set. One memoised root resolver spans
+        // the page so instances sharing a parent chain walk it once.
+        let roots = MemoRootResolver::new(&self.store);
         let items: Vec<models::ProcessInstanceResult> = page
             .items
             .into_iter()
-            .map(|inst| process_instance_result(inst, &self.store))
+            .map(|inst| process_instance_result(inst, &roots))
             .collect();
 
         Ok(Resp::Status200_TheProcessInstanceSearchResult(
@@ -11071,10 +11080,13 @@ impl ServerImpl {
             .map(|ei| (ei.element_instance_key, ei))
             .collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        // One memoised root resolver spans the page so every element of the same
+        // process instance resolves that instance's root once, not per element.
+        let roots = MemoRootResolver::new(&self.store);
         let items: Vec<models::ElementInstanceResult> = page
             .items
             .into_iter()
-            .map(|row| element_instance_result(row, &self.store))
+            .map(|row| element_instance_result(row, &roots))
             .collect();
 
         Ok(Resp::Status200_TheElementInstanceSearchResult(
@@ -11134,7 +11146,7 @@ impl ServerImpl {
         }
         match result {
             Some(row) => Ok(Resp::Status200_TheElementInstanceIsSuccessfullyReturned(
-                element_instance_result(&row, &self.store),
+                element_instance_result(&row, &MemoRootResolver::new(&self.store)),
             )),
             None => Ok(
                 Resp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(problem(
@@ -17353,6 +17365,24 @@ impl ServerImpl {
                     )
                     && query::match_date_time_ms(&filter.end_date, None)
                     && query::match_string_opt(&filter.business_id, inst.business_id.as_deref())
+                    // Call-activity hierarchy filters (C8 parity, issue #977):
+                    // the batch matcher must honour the same parent/child algebra
+                    // as `search_process_instances_impl`, so a batch scoped to a
+                    // parent's direct children (or to top-level instances via
+                    // `$exists:false`) selects the right instances instead of
+                    // silently ignoring the filter and matching everything.
+                    && query::match_process_instance_key_opt(
+                        &filter.parent_process_instance_key,
+                        inst.parent_process_instance_key
+                            .map(|k| k.to_string())
+                            .as_deref(),
+                    )
+                    && query::match_element_instance_key_opt(
+                        &filter.parent_element_instance_key,
+                        inst.parent_element_instance_key
+                            .map(|k| k.to_string())
+                            .as_deref(),
+                    )
             })
             .map(|inst| inst.key)
             .collect();
@@ -18169,16 +18199,51 @@ fn match_instance_variables(
     }
 }
 
+/// Per-request memoiser for [`readstore::ReadModel::root_process_instance_key`].
+///
+/// Root resolution walks the `parentProcessInstanceKey` chain with one read-model
+/// point lookup per hop. A single response can project up to a full page (10k)
+/// of rows, and every element instance of one process instance resolves the same
+/// chain — so projecting a page naively is O(rows × chain-depth) repeated
+/// lookups. Wrapping the read model in a resolver built once per request collapses
+/// that to one walk per *distinct* entry key: subsequent rows sharing a key hit
+/// the cache. It caches only the entry-key → root mapping the projection asks
+/// for; because a hierarchy is partition-co-located and the read model is
+/// immutable for the life of a request, the cache cannot go stale mid-response.
+struct MemoRootResolver<'a> {
+    model: &'a readstore::ReadModel,
+    cache: std::cell::RefCell<std::collections::HashMap<Key, Key>>,
+}
+
+impl<'a> MemoRootResolver<'a> {
+    fn new(model: &'a readstore::ReadModel) -> Self {
+        Self {
+            model,
+            cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn root_process_instance_key(&self, key: Key) -> Key {
+        if let Some(&root) = self.cache.borrow().get(&key) {
+            return root;
+        }
+        let root = self.model.root_process_instance_key(key);
+        self.cache.borrow_mut().insert(key, root);
+        root
+    }
+}
+
 /// Projects a [`ProcessInstanceRow`] into the generated `ProcessInstanceResult`.
 ///
 /// Surfaces the call-activity hierarchy (C8 parity): `parentProcessInstanceKey`
 /// / `parentElementInstanceKey` carry the engine-tracked linkage for a child
 /// spawned by a call activity (both null for a top-level instance), and
 /// `rootProcessInstanceKey` is resolved by walking the parent chain to the
-/// top-level ancestor (`store`) — a top-level instance reports its own key.
+/// top-level ancestor (`roots`, memoised per request) — a top-level instance
+/// reports its own key.
 fn process_instance_result(
     instance: &readstore::ProcessInstanceRow,
-    store: &readstore::ReadModel,
+    roots: &MemoRootResolver,
 ) -> models::ProcessInstanceResult {
     let process_definition_id = instance.process_definition_id.clone();
     let version = instance.version;
@@ -18199,7 +18264,7 @@ fn process_instance_result(
         None => types::Nullable::Null,
     };
     let root_process_instance_key = types::Nullable::Present(models::ProcessInstanceKey(
-        store.root_process_instance_key(instance.key).to_string(),
+        roots.root_process_instance_key(instance.key).to_string(),
     ));
 
     models::ProcessInstanceResult::new(
@@ -18450,12 +18515,12 @@ fn wait_state_element_type(wire: &str) -> models::WaitStateElementTypeEnum {
 /// `elementName` falls back to the element id when the deployed model carried no
 /// `name` attribute. `rootProcessInstanceKey` is resolved by walking the owning
 /// process instance's `parentProcessInstanceKey` chain to the top-level ancestor
-/// (`store`): elements of a top-level instance root to that instance, while
-/// elements of a call-activity child (issue #808) root to the true top-level
-/// process instance that started the tree (issue #977).
+/// (`roots`, memoised per request): elements of a top-level instance root to that
+/// instance, while elements of a call-activity child (issue #808) root to the
+/// true top-level process instance that started the tree (issue #977).
 fn element_instance_result(
     row: &readstore::ElementInstanceRow,
-    store: &readstore::ReadModel,
+    roots: &MemoRootResolver,
 ) -> models::ElementInstanceResult {
     let start_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.start_date_ms as i64)
@@ -18479,7 +18544,7 @@ fn element_instance_result(
     } else {
         row.tenant_id.clone()
     };
-    let root_process_instance_key = store.root_process_instance_key(row.instance_key);
+    let root_process_instance_key = roots.root_process_instance_key(row.instance_key);
 
     models::ElementInstanceResult::new(
         row.process_definition_id.clone(),
@@ -33529,6 +33594,116 @@ mod call_activity_hierarchy_read_model_tests {
         result.items
     }
 
+    /// Runs `search` filtered by `parentElementInstanceKey`, returning the keys —
+    /// the second hierarchy matcher (a bare element-instance key enumerates the
+    /// children spawned by that specific call-activity element instance).
+    async fn children_by_element_of(
+        server: &ServerImpl,
+        parent_ei: &models::ElementInstanceKey,
+    ) -> Vec<String> {
+        use apis::process_instance::SearchProcessInstancesResponse as Resp;
+        let filter = models::ProcessInstanceFilter {
+            parent_element_instance_key: Some(
+                models::ElementInstanceKeyFilterProperty::ElementInstanceKey(parent_ei.clone()),
+            ),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        let Resp::Status200_TheProcessInstanceSearchResult(result) = server
+            .search_process_instances_impl(&body)
+            .await
+            .expect("search returns")
+        else {
+            panic!("expected a 200 search result");
+        };
+        let mut keys: Vec<String> = result
+            .items
+            .into_iter()
+            .map(|i| i.process_instance_key.0)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Runs `search` for top-level instances only (`parentProcessInstanceKey`
+    /// `$exists: false`), returning the process-definition ids. A top-level
+    /// instance carries no parent linkage, so this must match it while excluding
+    /// every call-activity child.
+    async fn top_level_definition_ids(server: &ServerImpl) -> Vec<String> {
+        use apis::process_instance::SearchProcessInstancesResponse as Resp;
+        let filter = models::ProcessInstanceFilter {
+            parent_process_instance_key: Some(
+                models::ProcessInstanceKeyFilterProperty::AdvancedProcessInstanceKeyFilter(
+                    models::AdvancedProcessInstanceKeyFilter {
+                        dollar_exists: Some(false),
+                        ..models::AdvancedProcessInstanceKeyFilter::new()
+                    },
+                ),
+            ),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        });
+        let Resp::Status200_TheProcessInstanceSearchResult(result) = server
+            .search_process_instances_impl(&body)
+            .await
+            .expect("search returns")
+        else {
+            panic!("expected a 200 search result");
+        };
+        let mut ids: Vec<String> = result
+            .items
+            .into_iter()
+            .map(|i| i.process_definition_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Polls the wait-state search (optionally filtered by `rootProcessInstanceKey`)
+    /// until at least `want` items are projected, returning them.
+    async fn wait_states_until(
+        server: &ServerImpl,
+        root_filter: Option<Key>,
+        want: usize,
+    ) -> Vec<models::ElementInstanceWaitStateResult> {
+        use apis::element_instance::SearchElementInstanceWaitStatesResponse as Resp;
+        let filter = root_filter.map(|root| models::ElementInstanceWaitStateFilter {
+            root_process_instance_key: Some(
+                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                    models::ProcessInstanceKey(root.to_string()),
+                ),
+            ),
+            ..models::ElementInstanceWaitStateFilter::new()
+        });
+        for _ in 0..200 {
+            let resp = server
+                .search_element_instance_wait_states_impl(&Some(
+                    models::ElementInstanceWaitStateQuery {
+                        page: None,
+                        filter: filter.clone(),
+                    },
+                ))
+                .await
+                .expect("wait-state search returns");
+            let Resp::Status200_TheElementInstanceWaitStateSearchResult(result) = resp else {
+                panic!("expected a 200 wait-state result");
+            };
+            if result.items.len() >= want {
+                return result.items;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("wait-state search never projected {want} items");
+    }
+
     fn get_by_id<'a>(
         items: &'a [models::ProcessInstanceResult],
         process_id: &str,
@@ -33657,6 +33832,48 @@ mod call_activity_hierarchy_read_model_tests {
             vec![leaf.process_instance_key.0.clone()]
         );
 
+        // Second matcher parity: filtering by parentElementInstanceKey enumerates
+        // the children spawned by that specific call-activity element instance.
+        assert_eq!(
+            children_by_element_of(&server, &top_c1.element_instance_key).await,
+            vec![middle_key.to_string()],
+            "top's c1 element instance spawned exactly the middle child"
+        );
+        assert_eq!(
+            children_by_element_of(&server, &middle_m.element_instance_key).await,
+            vec![leaf.process_instance_key.0.clone()],
+            "middle's m element instance spawned exactly the leaf child"
+        );
+
+        // `$exists: false` on parentProcessInstanceKey selects only the top-level
+        // instance — the call-activity children carry a parent and are excluded.
+        assert_eq!(
+            top_level_definition_ids(&server).await,
+            vec!["ca-top".to_string()],
+            "only the top-level instance has no parent linkage"
+        );
+
+        // Wait-state projection + filter parity: the leaf parks on its `work` job,
+        // and that wait state must report the top-level root (not the leaf), on
+        // both the unfiltered projection and a search filtered by that root.
+        let all_waits = wait_states_until(&server, None, 1).await;
+        let leaf_wait = all_waits
+            .iter()
+            .find(|w| w.process_instance_key.0 == leaf.process_instance_key.0)
+            .expect("leaf's parked job is a projected wait state");
+        assert_eq!(
+            leaf_wait.root_process_instance_key,
+            types::Nullable::Present(models::ProcessInstanceKey(top_key_s.clone())),
+            "the leaf's wait state roots to the top-level instance"
+        );
+        let rooted_at_top = wait_states_until(&server, Some(top_key), 1).await;
+        assert!(
+            rooted_at_top
+                .iter()
+                .any(|w| w.process_instance_key.0 == leaf.process_instance_key.0),
+            "filtering wait states by the top-level root includes the leaf's job"
+        );
+
         // Element instances under the leaf child report the true root, not the
         // leaf's own instance key.
         let leaf_key: Key = leaf.process_instance_key.0.parse().unwrap();
@@ -33704,5 +33921,70 @@ mod call_activity_hierarchy_read_model_tests {
                 types::Nullable::Present(models::ProcessInstanceKey(solo_key_s.clone()))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_honours_the_parent_process_instance_filter() {
+        // The incident-resolution / cancellation batch matcher reuses
+        // `ProcessInstanceFilter` and promises the *same* filter algebra as
+        // search. A batch scoped to a parent's direct children must therefore
+        // select exactly those children — not silently ignore the parent filter
+        // and match every instance (issue #977 hierarchy parity).
+        let server = ServerImpl::default();
+        deploy(
+            &server,
+            vec![
+                parking_process("bm-child", "work"),
+                calling_process("bm-parent", "c1", "bm-child"),
+            ],
+        )
+        .await;
+        let (parent_key, _) = server
+            .create_for_stream(
+                Some("bm-parent".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create bm-parent");
+
+        // Both the parent and its spawned child must be projected before matching.
+        let items = search_until(&server, 2).await;
+        let child_key = get_by_id(&items, "bm-child").process_instance_key.0.clone();
+
+        // Scoped to the parent's children: exactly the child.
+        let child_filter = models::ProcessInstanceFilter {
+            parent_process_instance_key: Some(
+                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                    models::ProcessInstanceKey(parent_key.to_string()),
+                ),
+            ),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let matched = server.batch_matched_process_instances(&child_filter);
+        assert_eq!(
+            matched,
+            vec![child_key.parse::<u64>().unwrap()],
+            "the batch matcher selects exactly the parent's direct child"
+        );
+
+        // `$exists: false` selects only the top-level parent, never the child.
+        let top_filter = models::ProcessInstanceFilter {
+            parent_process_instance_key: Some(
+                models::ProcessInstanceKeyFilterProperty::AdvancedProcessInstanceKeyFilter(
+                    models::AdvancedProcessInstanceKeyFilter {
+                        dollar_exists: Some(false),
+                        ..models::AdvancedProcessInstanceKeyFilter::new()
+                    },
+                ),
+            ),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let top_matched = server.batch_matched_process_instances(&top_filter);
+        assert_eq!(
+            top_matched,
+            vec![parent_key],
+            "the batch matcher selects only the top-level parent for $exists:false"
+        );
     }
 }

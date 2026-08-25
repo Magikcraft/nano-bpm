@@ -213,42 +213,24 @@ impl ReadModel {
     }
 
     /// Resolves the `rootProcessInstanceKey` for `key` by walking the
-    /// `parentProcessInstanceKey` chain to the top-level ancestor (C8 parity).
+    /// `parentProcessInstanceKey` chain to the top-level ancestor (C8 parity,
+    /// issue #977).
     ///
     /// A top-level instance (no parent) roots to its own key. A call-activity
     /// child — however deeply nested — roots to the top-level process instance
-    /// that started the whole tree. Point lookups route per key, so the walk
-    /// crosses partitions transparently when a parent lives on another shard.
+    /// that started the whole tree. This node's point lookups route per key, so
+    /// the walk would cross partitions transparently were an ancestor on another
+    /// local shard; in practice a call-activity hierarchy is partition-co-located
+    /// (the engine mints a child on its parent's partition), so the whole chain
+    /// resolves within one shard.
     ///
-    /// Best-effort at the boundaries: if `key` itself is unknown to the read
-    /// model, or an ancestor row has been pruned/not-yet-projected, the walk
-    /// stops and returns the furthest ancestor key it could observe (the child
-    /// key, or that missing parent's key) rather than fabricating a root. A
-    /// depth cap guards against a corrupt parent cycle.
+    /// Delegates to the shared [`resolve_root_process_instance_key`] so the
+    /// gateway, the single-partition [`ReadStore`] and the `engine-wasm`
+    /// `TestEngine` all resolve roots with the identical algorithm (no drift);
+    /// best-effort boundaries and the cycle-guarding depth cap are documented
+    /// there.
     pub fn root_process_instance_key(&self, key: Key) -> Key {
-        const MAX_DEPTH: usize = 1024;
-        let mut root = key;
-        let mut current = self.process_instance(key);
-        let mut depth = 0usize;
-        while let Some(row) = current {
-            match row.parent_process_instance_key {
-                None => {
-                    root = row.key;
-                    break;
-                }
-                Some(parent_key) => {
-                    // The parent is a known ancestor even if its row is absent,
-                    // so provisionally treat it as the root before walking up.
-                    root = parent_key;
-                    depth += 1;
-                    if depth > MAX_DEPTH {
-                        break;
-                    }
-                    current = self.process_instance(parent_key);
-                }
-            }
-        }
-        root
+        resolve_root_process_instance_key(key, |k| self.process_instance(k))
     }
 
     pub fn incident(&self, key: Key) -> Option<IncidentRow> {

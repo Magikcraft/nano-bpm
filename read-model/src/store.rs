@@ -945,6 +945,52 @@ pub struct ProcessInstanceRow {
     pub parent_element_instance_key: Option<Key>,
 }
 
+/// Resolves the `rootProcessInstanceKey` for `key` (C8 parity, issue #977) by
+/// walking the `parentProcessInstanceKey` chain — supplied by `lookup` — to the
+/// top-level ancestor. A top-level instance (no parent) roots to its own key; a
+/// call-activity child (issue #808), however deeply nested, roots to the
+/// top-level instance that started the whole tree.
+///
+/// The walk is parameterised by `lookup` so it is the **single** root-resolution
+/// algorithm shared by every read surface: the server's sharded
+/// `ReadModel` routes each hop across partitions, the single-partition
+/// [`ReadStore`] (and the `engine-wasm` `TestEngine`) looks up in place — same
+/// chain, one implementation, no drift.
+///
+/// Best-effort at the boundaries: if `key` itself is unknown, or an ancestor row
+/// has been pruned/not-yet-projected, the walk stops and returns the furthest
+/// ancestor key it could observe (the child key, or that missing parent's key)
+/// rather than fabricating a root. A depth cap guards against a corrupt parent
+/// cycle (e.g. a lasso `A → B → A`), terminating with the last key observed.
+pub fn resolve_root_process_instance_key(
+    key: Key,
+    mut lookup: impl FnMut(Key) -> Option<ProcessInstanceRow>,
+) -> Key {
+    const MAX_DEPTH: usize = 1024;
+    let mut root = key;
+    let mut current = lookup(key);
+    let mut depth = 0usize;
+    while let Some(row) = current {
+        match row.parent_process_instance_key {
+            None => {
+                root = row.key;
+                break;
+            }
+            Some(parent_key) => {
+                // The parent is a known ancestor even if its row is absent, so
+                // provisionally treat it as the root before walking up.
+                root = parent_key;
+                depth += 1;
+                if depth > MAX_DEPTH {
+                    break;
+                }
+                current = lookup(parent_key);
+            }
+        }
+    }
+    root
+}
+
 pub struct JobRow {
     pub key: Key,
     pub instance_key: Key,
@@ -2163,6 +2209,19 @@ impl ReadStore {
         )
         .optional()
         .expect("query process_instance")
+    }
+
+    /// Resolves `key`'s `rootProcessInstanceKey` (issue #977) by walking the
+    /// `parentProcessInstanceKey` chain via this store's own point lookups. A
+    /// call-activity hierarchy is partition-co-located — the engine mints a child
+    /// on its parent's partition (`compose_key(self.partition_id, …)` in
+    /// `engine-core`), so the whole parent → child → grandchild chain lives in a
+    /// single store — hence a single-store walk resolves the true top-level root
+    /// without any cross-partition routing. Delegates to the shared
+    /// [`resolve_root_process_instance_key`] so this shares the gateway's exact
+    /// algorithm.
+    pub fn root_process_instance_key(&self, key: Key) -> Key {
+        resolve_root_process_instance_key(key, |k| self.process_instance(k))
     }
 
     pub fn jobs(&self) -> Vec<JobRow> {
@@ -5559,6 +5618,92 @@ mod definition_xml_tests {
             parent_process_instance_key: None,
             parent_element_instance_key: None,
         }
+    }
+
+    /// A create event carrying the call-activity parent linkage (issue #977):
+    /// the calling instance's key and the spawning call-activity element instance
+    /// key, so a hierarchy can be seeded event-first.
+    fn created_event_with_parent(
+        instance_key: super::Key,
+        parent_pi: super::Key,
+        parent_ei: super::Key,
+    ) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: Some(parent_pi),
+            parent_element_instance_key: Some(parent_ei),
+        }
+    }
+
+    /// `ReadStore::root_process_instance_key` walks the `parentProcessInstanceKey`
+    /// chain to the top-level ancestor within a single (partition-co-located)
+    /// store: a top-level instance self-roots and every call-activity descendant
+    /// — however deeply nested — roots to the top-level instance, never its own
+    /// key. This is the walk the `engine-wasm` `TestEngine` read model relies on.
+    #[test]
+    fn root_process_instance_key_walks_a_co_located_hierarchy_to_the_top() {
+        let store = ReadStore::open(None).unwrap();
+        // top (no parent) <- child (via EI 111) <- grandchild (via EI 222).
+        store
+            .export(&[
+                &created_event(10),
+                &created_event_with_parent(20, 10, 111),
+                &created_event_with_parent(30, 20, 222),
+            ])
+            .unwrap();
+
+        assert_eq!(store.root_process_instance_key(10), 10, "top self-roots");
+        assert_eq!(
+            store.root_process_instance_key(20),
+            10,
+            "direct child roots to the top"
+        );
+        assert_eq!(
+            store.root_process_instance_key(30),
+            10,
+            "nested descendant roots to the top, not its own or its parent's key"
+        );
+    }
+
+    /// Best-effort boundaries plus the cycle guard: an unknown key self-roots
+    /// (nothing to walk); a known child whose parent row is absent roots to that
+    /// furthest observable ancestor key; and a corrupt `A → B → A` parent cycle
+    /// terminates via the depth cap instead of looping forever (issue #977, the
+    /// lasso guard).
+    #[test]
+    fn root_process_instance_key_is_best_effort_and_cycle_safe() {
+        let store = ReadStore::open(None).unwrap();
+        // `child` (2000) names a parent (7777) that was never projected/pruned.
+        store
+            .export(&[&created_event_with_parent(2000, 7777, 111)])
+            .unwrap();
+        // A lasso cycle: A(40) -> B(41) -> A(40) -> …
+        store
+            .export(&[
+                &created_event_with_parent(40, 41, 333),
+                &created_event_with_parent(41, 40, 444),
+            ])
+            .unwrap();
+
+        // Unknown key: nothing to walk, roots to itself.
+        assert_eq!(store.root_process_instance_key(9999), 9999);
+        // Known child, absent parent: the furthest known ancestor is the parent
+        // key, so that is the reported root (not the child).
+        assert_eq!(store.root_process_instance_key(2000), 7777);
+        // The cycle terminates (depth cap) with one of the ring's keys rather
+        // than hanging; the guarantee under test is termination, not a value.
+        let cycle_root = store.root_process_instance_key(40);
+        assert!(
+            cycle_root == 40 || cycle_root == 41,
+            "a parent cycle terminates at a ring member, got {cycle_root}"
+        );
     }
 
     #[test]
