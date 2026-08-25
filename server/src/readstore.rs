@@ -227,7 +227,7 @@ impl ReadModel {
     /// Delegates to the shared [`resolve_root_process_instance_key`] so the
     /// gateway, the single-partition [`ReadStore`] and the `engine-wasm`
     /// `TestEngine` all resolve roots with the identical algorithm (no drift);
-    /// best-effort boundaries and the cycle-guarding depth cap are documented
+    /// best-effort boundaries and the cycle-guarding visited set are documented
     /// there.
     pub fn root_process_instance_key(&self, key: Key) -> Key {
         resolve_root_process_instance_key(key, |k| self.process_instance(k))

@@ -7197,7 +7197,7 @@ impl ServerImpl {
         }
         match result {
             Some(instance) => Ok(Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(
-                process_instance_result(&instance, &MemoRootResolver::new(&self.store)),
+                process_instance_result(&instance, &readstore::RootResolver::new(|k| self.store.process_instance(k))),
             )),
             None => Ok(
                 Resp::Status404_TheProcessInstanceWithTheGivenKeyWasNotFound(problem(
@@ -8020,7 +8020,7 @@ impl ServerImpl {
             ReadKind::ProcessInstance => self.store.process_instance(key).map(|x| {
                 serde_json::to_value(process_instance_result(
                     &x,
-                    &MemoRootResolver::new(&self.store),
+                    &readstore::RootResolver::new(|k| self.store.process_instance(k)),
                 ))
             }),
             ReadKind::Incident => self
@@ -8040,7 +8040,7 @@ impl ServerImpl {
             ReadKind::ElementInstance => self.store.element_instance(key).map(|x| {
                 serde_json::to_value(element_instance_result(
                     &x,
-                    &MemoRootResolver::new(&self.store),
+                    &readstore::RootResolver::new(|k| self.store.process_instance(k)),
                 ))
             }),
         };
@@ -9687,7 +9687,7 @@ impl ServerImpl {
         // One memoised root resolver for both the filter and projection passes,
         // so a wait state's root chain is walked once even though the two passes
         // each ask for it.
-        let roots = MemoRootResolver::new(&self.store);
+        let roots = readstore::RootResolver::new(|k| self.store.process_instance(k));
         let mut matched: Vec<WaitState> = states
             .into_iter()
             .filter(|ws| match filter {
@@ -10578,7 +10578,7 @@ impl ServerImpl {
         // Build result models only for the returned page, never the whole
         // (potentially very large) matched set. One memoised root resolver spans
         // the page so instances sharing a parent chain walk it once.
-        let roots = MemoRootResolver::new(&self.store);
+        let roots = readstore::RootResolver::new(|k| self.store.process_instance(k));
         let items: Vec<models::ProcessInstanceResult> = page
             .items
             .into_iter()
@@ -11082,7 +11082,7 @@ impl ServerImpl {
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
         // One memoised root resolver spans the page so every element of the same
         // process instance resolves that instance's root once, not per element.
-        let roots = MemoRootResolver::new(&self.store);
+        let roots = readstore::RootResolver::new(|k| self.store.process_instance(k));
         let items: Vec<models::ElementInstanceResult> = page
             .items
             .into_iter()
@@ -11146,7 +11146,7 @@ impl ServerImpl {
         }
         match result {
             Some(row) => Ok(Resp::Status200_TheElementInstanceIsSuccessfullyReturned(
-                element_instance_result(&row, &MemoRootResolver::new(&self.store)),
+                element_instance_result(&row, &readstore::RootResolver::new(|k| self.store.process_instance(k))),
             )),
             None => Ok(
                 Resp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(problem(
@@ -17337,13 +17337,37 @@ impl ServerImpl {
     /// `ProcessInstanceFilter`, using the exact same filter algebra as
     /// `search_process_instances_impl`. These become the items of a batch
     /// operation minted by a process-instance batch creator.
-    fn batch_matched_process_instances(&self, filter: &models::ProcessInstanceFilter) -> Vec<u64> {
+    ///
+    /// `honour_hierarchy_filters` gates the call-activity `parentProcessInstanceKey`
+    /// / `parentElementInstanceKey` predicates (C8 parity, issue #977). Batch
+    /// operations differ by contract on whether those filters apply:
+    /// incident-resolution (and the `search` surface) honour them, but
+    /// **cancellation** ignores/overrides `parentProcessInstanceKey` — only ACTIVE
+    /// root instances can be cancelled (`spec/process-instances.yaml:371-375`), so
+    /// a child-scoped cancellation request must not silently enqueue the child key.
+    fn batch_matched_process_instances(
+        &self,
+        filter: &models::ProcessInstanceFilter,
+        honour_hierarchy_filters: bool,
+    ) -> Vec<u64> {
         let mut keys: Vec<u64> = self
             .store
             .process_instances()
             .into_iter()
             .filter(|inst| {
                 let state_str = process_instance_state_enum(inst.state).to_string();
+                let hierarchy_matches = !honour_hierarchy_filters
+                    || (query::match_process_instance_key_opt(
+                        &filter.parent_process_instance_key,
+                        inst.parent_process_instance_key
+                            .map(|k| k.to_string())
+                            .as_deref(),
+                    ) && query::match_element_instance_key_opt(
+                        &filter.parent_element_instance_key,
+                        inst.parent_element_instance_key
+                            .map(|k| k.to_string())
+                            .as_deref(),
+                    ));
                 query::match_process_instance_key(
                     &filter.process_instance_key,
                     &inst.key.to_string(),
@@ -17365,24 +17389,9 @@ impl ServerImpl {
                     )
                     && query::match_date_time_ms(&filter.end_date, None)
                     && query::match_string_opt(&filter.business_id, inst.business_id.as_deref())
-                    // Call-activity hierarchy filters (C8 parity, issue #977):
-                    // the batch matcher must honour the same parent/child algebra
-                    // as `search_process_instances_impl`, so a batch scoped to a
-                    // parent's direct children (or to top-level instances via
-                    // `$exists:false`) selects the right instances instead of
-                    // silently ignoring the filter and matching everything.
-                    && query::match_process_instance_key_opt(
-                        &filter.parent_process_instance_key,
-                        inst.parent_process_instance_key
-                            .map(|k| k.to_string())
-                            .as_deref(),
-                    )
-                    && query::match_element_instance_key_opt(
-                        &filter.parent_element_instance_key,
-                        inst.parent_element_instance_key
-                            .map(|k| k.to_string())
-                            .as_deref(),
-                    )
+                    // Call-activity hierarchy filters (C8 parity, issue #977),
+                    // gated per the per-operation contract above.
+                    && hierarchy_matches
             })
             .map(|inst| inst.key)
             .collect();
@@ -17398,7 +17407,10 @@ impl ServerImpl {
     ) -> Result<apis::process_instance::CancelProcessInstancesBatchOperationResponse, ()> {
         use apis::process_instance::CancelProcessInstancesBatchOperationResponse as Resp;
         let op_type = models::BatchOperationTypeEnum::CancelProcessInstance;
-        let items = self.batch_matched_process_instances(&body.filter);
+        // Cancellation ignores/overrides `parentProcessInstanceKey` — only ACTIVE
+        // root instances can be cancelled (spec §371-375), so the call-activity
+        // hierarchy filters must not scope this batch to a parent's children.
+        let items = self.batch_matched_process_instances(&body.filter, false);
         let key = self.batch_operations.create(op_type, items);
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
@@ -17422,7 +17434,9 @@ impl ServerImpl {
             ));
         };
         let op_type = models::BatchOperationTypeEnum::ResolveIncident;
-        let items = self.batch_matched_process_instances(&req.filter);
+        // Incident resolution honours the call-activity hierarchy filters (only
+        // `state` is overridden by contract, spec §416-418).
+        let items = self.batch_matched_process_instances(&req.filter, true);
         let key = self.batch_operations.create(op_type, items);
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
@@ -18199,40 +18213,6 @@ fn match_instance_variables(
     }
 }
 
-/// Per-request memoiser for [`readstore::ReadModel::root_process_instance_key`].
-///
-/// Root resolution walks the `parentProcessInstanceKey` chain with one read-model
-/// point lookup per hop. A single response can project up to a full page (10k)
-/// of rows, and every element instance of one process instance resolves the same
-/// chain — so projecting a page naively is O(rows × chain-depth) repeated
-/// lookups. Wrapping the read model in a resolver built once per request collapses
-/// that to one walk per *distinct* entry key: subsequent rows sharing a key hit
-/// the cache. It caches only the entry-key → root mapping the projection asks
-/// for; because a hierarchy is partition-co-located and the read model is
-/// immutable for the life of a request, the cache cannot go stale mid-response.
-struct MemoRootResolver<'a> {
-    model: &'a readstore::ReadModel,
-    cache: std::cell::RefCell<std::collections::HashMap<Key, Key>>,
-}
-
-impl<'a> MemoRootResolver<'a> {
-    fn new(model: &'a readstore::ReadModel) -> Self {
-        Self {
-            model,
-            cache: std::cell::RefCell::new(std::collections::HashMap::new()),
-        }
-    }
-
-    fn root_process_instance_key(&self, key: Key) -> Key {
-        if let Some(&root) = self.cache.borrow().get(&key) {
-            return root;
-        }
-        let root = self.model.root_process_instance_key(key);
-        self.cache.borrow_mut().insert(key, root);
-        root
-    }
-}
-
 /// Projects a [`ProcessInstanceRow`] into the generated `ProcessInstanceResult`.
 ///
 /// Surfaces the call-activity hierarchy (C8 parity): `parentProcessInstanceKey`
@@ -18243,7 +18223,7 @@ impl<'a> MemoRootResolver<'a> {
 /// reports its own key.
 fn process_instance_result(
     instance: &readstore::ProcessInstanceRow,
-    roots: &MemoRootResolver,
+    roots: &readstore::RootResolver,
 ) -> models::ProcessInstanceResult {
     let process_definition_id = instance.process_definition_id.clone();
     let version = instance.version;
@@ -18520,7 +18500,7 @@ fn wait_state_element_type(wire: &str) -> models::WaitStateElementTypeEnum {
 /// true top-level process instance that started the tree (issue #977).
 fn element_instance_result(
     row: &readstore::ElementInstanceRow,
-    roots: &MemoRootResolver,
+    roots: &readstore::RootResolver,
 ) -> models::ElementInstanceResult {
     let start_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.start_date_ms as i64)
@@ -32991,7 +32971,7 @@ mod batch_operation_tests {
         let mut projected = false;
         for _ in 0..200 {
             if server
-                .batch_matched_process_instances(&models::ProcessInstanceFilter::new())
+                .batch_matched_process_instances(&models::ProcessInstanceFilter::new(), true)
                 .contains(&instance_key)
             {
                 projected = true;
@@ -33925,11 +33905,12 @@ mod call_activity_hierarchy_read_model_tests {
 
     #[tokio::test]
     async fn batch_matcher_honours_the_parent_process_instance_filter() {
-        // The incident-resolution / cancellation batch matcher reuses
-        // `ProcessInstanceFilter` and promises the *same* filter algebra as
+        // The incident-resolution batch matcher (and the `search` surface) reuse
+        // `ProcessInstanceFilter` and promise the *same* filter algebra as
         // search. A batch scoped to a parent's direct children must therefore
         // select exactly those children — not silently ignore the parent filter
-        // and match every instance (issue #977 hierarchy parity).
+        // and match every instance (issue #977 hierarchy parity). Cancellation is
+        // the exception, covered separately below.
         let server = ServerImpl::default();
         deploy(
             &server,
@@ -33961,7 +33942,7 @@ mod call_activity_hierarchy_read_model_tests {
             ),
             ..models::ProcessInstanceFilter::new()
         };
-        let matched = server.batch_matched_process_instances(&child_filter);
+        let matched = server.batch_matched_process_instances(&child_filter, true);
         assert_eq!(
             matched,
             vec![child_key.parse::<u64>().unwrap()],
@@ -33980,11 +33961,28 @@ mod call_activity_hierarchy_read_model_tests {
             ),
             ..models::ProcessInstanceFilter::new()
         };
-        let top_matched = server.batch_matched_process_instances(&top_filter);
+        let top_matched = server.batch_matched_process_instances(&top_filter, true);
         assert_eq!(
             top_matched,
             vec![parent_key],
             "the batch matcher selects only the top-level parent for $exists:false"
+        );
+
+        // Cancellation ignores `parentProcessInstanceKey` by contract (only ACTIVE
+        // root instances are cancellable): with the hierarchy filters disabled the
+        // same child-scoped filter must NOT scope to the child — it matches every
+        // instance instead, so the child request does not silently enqueue only
+        // the child. (issue #977 review: cancellation must not inherit the new
+        // hierarchy predicates.)
+        let cancel_matched = server.batch_matched_process_instances(&child_filter, false);
+        assert_eq!(
+            cancel_matched,
+            {
+                let mut all = vec![parent_key, child_key.parse::<u64>().unwrap()];
+                all.sort_unstable();
+                all
+            },
+            "cancellation ignores the parent filter and matches all instances"
         );
     }
 }

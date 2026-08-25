@@ -960,35 +960,111 @@ pub struct ProcessInstanceRow {
 /// Best-effort at the boundaries: if `key` itself is unknown, or an ancestor row
 /// has been pruned/not-yet-projected, the walk stops and returns the furthest
 /// ancestor key it could observe (the child key, or that missing parent's key)
-/// rather than fabricating a root. A depth cap guards against a corrupt parent
-/// cycle (e.g. a lasso `A → B → A`), terminating with the last key observed.
+/// rather than fabricating a root. A `visited` set guards against a corrupt
+/// parent cycle (e.g. a lasso `A → B → A`), terminating at the first ring member
+/// re-encountered instead of looping.
+///
+/// This is a one-shot convenience over [`resolve_root_with_cache`]: it resolves a
+/// single key with a throwaway cache. Callers projecting many rows in one
+/// response should use a [`RootResolver`] instead so the walked chain is memoised
+/// across rows.
 pub fn resolve_root_process_instance_key(
     key: Key,
     mut lookup: impl FnMut(Key) -> Option<ProcessInstanceRow>,
 ) -> Key {
-    const MAX_DEPTH: usize = 1024;
-    let mut root = key;
-    let mut current = lookup(key);
-    let mut depth = 0usize;
-    while let Some(row) = current {
-        match row.parent_process_instance_key {
-            None => {
-                root = row.key;
-                break;
-            }
-            Some(parent_key) => {
-                // The parent is a known ancestor even if its row is absent, so
-                // provisionally treat it as the root before walking up.
-                root = parent_key;
-                depth += 1;
-                if depth > MAX_DEPTH {
-                    break;
+    let mut cache = std::collections::HashMap::new();
+    resolve_root_with_cache(key, &mut lookup, &mut cache)
+}
+
+/// The canonical root walk, memoising **every** key it visits (not just `key`).
+///
+/// All keys on one parent chain share the same top-level ancestor, so a single
+/// walk that touches `N` ancestors seeds `N` cache entries — a later sibling or
+/// descendant row in the same response reuses the shared prefix (or the whole
+/// chain) instead of re-walking it. This collapses projecting a page from
+/// `O(rows × chain-depth)` point lookups to `O(distinct keys)`.
+///
+/// Termination and boundary semantics match [`resolve_root_process_instance_key`]:
+/// a definitive top-level root (parent `None`) and a best-effort furthest-observed
+/// ancestor (a pruned/absent parent row) are cached for the whole path, because
+/// every key on the path resolves to that same value. A detected cycle terminates
+/// at the re-encountered ring member and is **not** cached, since a corrupt ring
+/// has no well-defined root to memoise.
+fn resolve_root_with_cache(
+    key: Key,
+    lookup: &mut dyn FnMut(Key) -> Option<ProcessInstanceRow>,
+    cache: &mut std::collections::HashMap<Key, Key>,
+) -> Key {
+    if let Some(&root) = cache.get(&key) {
+        return root;
+    }
+    // Keys walked so far (from `key` upward), all sharing the eventual root.
+    let mut path: Vec<Key> = Vec::new();
+    let mut visited: std::collections::HashSet<Key> = std::collections::HashSet::new();
+    let mut current = key;
+    let root = loop {
+        // A previously-resolved ancestor short-circuits the rest of the walk.
+        if let Some(&cached) = cache.get(&current) {
+            break cached;
+        }
+        if !visited.insert(current) {
+            // Cycle: terminate at the re-encountered ring member without
+            // poisoning the cache with an ambiguous root.
+            return current;
+        }
+        match lookup(current) {
+            // `current`'s row is absent: an unknown entry key self-roots, and a
+            // named-but-pruned ancestor is the furthest observable root. Either
+            // way `current` is the root for the whole path.
+            None => break current,
+            Some(row) => match row.parent_process_instance_key {
+                // Definitive top-level ancestor (`row.key == current`).
+                None => break row.key,
+                Some(parent) => {
+                    path.push(current);
+                    current = parent;
                 }
-                current = lookup(parent_key);
-            }
+            },
+        }
+    };
+    // Seed the whole walked path plus its terminal so common ancestors are reused.
+    for k in path {
+        cache.insert(k, root);
+    }
+    cache.insert(current, root);
+    root
+}
+
+/// A per-response memoiser over [`resolve_root_with_cache`]. Built once around a
+/// `lookup` closure (a `ReadStore` / sharded `ReadModel` point lookup) and shared
+/// across every row projected in one search/get response, so a call-activity
+/// hierarchy's parent chain is walked once and every descendant row reuses it —
+/// see [`resolve_root_with_cache`] for the caching guarantee.
+///
+/// Interior mutability lets it be shared behind `&self` through a projection map,
+/// exactly like the read model it wraps; the cache cannot go stale because the
+/// read model is immutable for the life of a response.
+pub struct RootResolver<'a> {
+    lookup: std::cell::RefCell<Box<dyn FnMut(Key) -> Option<ProcessInstanceRow> + 'a>>,
+    cache: std::cell::RefCell<std::collections::HashMap<Key, Key>>,
+}
+
+impl<'a> RootResolver<'a> {
+    /// Wraps `lookup` (a `parentProcessInstanceKey`-carrying row point lookup)
+    /// in a fresh, empty memoiser.
+    pub fn new(lookup: impl FnMut(Key) -> Option<ProcessInstanceRow> + 'a) -> Self {
+        Self {
+            lookup: std::cell::RefCell::new(Box::new(lookup)),
+            cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
-    root
+
+    /// The `rootProcessInstanceKey` for `key`, memoising the whole walked chain.
+    pub fn root_process_instance_key(&self, key: Key) -> Key {
+        let mut lookup = self.lookup.borrow_mut();
+        let mut cache = self.cache.borrow_mut();
+        resolve_root_with_cache(key, &mut **lookup, &mut cache)
+    }
 }
 
 pub struct JobRow {
@@ -5186,7 +5262,7 @@ mod writability_tests {
 mod definition_xml_tests {
     use nanobpmn_engine_core::{Event, ProcessBuilder, ProcessDefinition};
 
-    use super::ReadStore;
+    use super::{ReadStore, RootResolver};
 
     fn deployed_event(key: u64, xml: &str) -> Event {
         deployed_event_versioned("p", key, 1, xml)
@@ -5675,8 +5751,8 @@ mod definition_xml_tests {
     /// Best-effort boundaries plus the cycle guard: an unknown key self-roots
     /// (nothing to walk); a known child whose parent row is absent roots to that
     /// furthest observable ancestor key; and a corrupt `A → B → A` parent cycle
-    /// terminates via the depth cap instead of looping forever (issue #977, the
-    /// lasso guard).
+    /// terminates at the re-encountered ring member instead of looping forever
+    /// (issue #977, the lasso guard).
     #[test]
     fn root_process_instance_key_is_best_effort_and_cycle_safe() {
         let store = ReadStore::open(None).unwrap();
@@ -5697,12 +5773,55 @@ mod definition_xml_tests {
         // Known child, absent parent: the furthest known ancestor is the parent
         // key, so that is the reported root (not the child).
         assert_eq!(store.root_process_instance_key(2000), 7777);
-        // The cycle terminates (depth cap) with one of the ring's keys rather
-        // than hanging; the guarantee under test is termination, not a value.
+        // The cycle terminates at a ring member rather than hanging; the
+        // guarantee under test is termination, not a value.
         let cycle_root = store.root_process_instance_key(40);
         assert!(
             cycle_root == 40 || cycle_root == 41,
             "a parent cycle terminates at a ring member, got {cycle_root}"
+        );
+    }
+
+    /// A [`RootResolver`] walks each parent chain **once** and memoises every key
+    /// it touches, so projecting a page of co-located descendants is
+    /// `O(distinct keys)` point lookups, not `O(rows × chain-depth)` (issue #977
+    /// review: the naive per-row walk repeated shared-ancestor lookups).
+    #[test]
+    fn root_resolver_memoises_the_whole_walked_chain() {
+        let store = ReadStore::open(None).unwrap();
+        // top(10) <- child(20) <- grandchild(30) <- great-grandchild(40).
+        store
+            .export(&[
+                &created_event(10),
+                &created_event_with_parent(20, 10, 111),
+                &created_event_with_parent(30, 20, 222),
+                &created_event_with_parent(40, 30, 333),
+            ])
+            .unwrap();
+
+        let lookups = std::cell::Cell::new(0usize);
+        let resolver = RootResolver::new(|k| {
+            lookups.set(lookups.get() + 1);
+            store.process_instance(k)
+        });
+
+        // Resolving the deepest descendant seeds every ancestor on the chain.
+        assert_eq!(resolver.root_process_instance_key(40), 10);
+        let after_deep = lookups.get();
+        assert_eq!(
+            after_deep, 4,
+            "one walk looks up each of the four chain keys exactly once"
+        );
+
+        // Every other chain member now resolves from cache — no further lookups.
+        assert_eq!(resolver.root_process_instance_key(30), 10);
+        assert_eq!(resolver.root_process_instance_key(20), 10);
+        assert_eq!(resolver.root_process_instance_key(10), 10);
+        assert_eq!(resolver.root_process_instance_key(40), 10);
+        assert_eq!(
+            lookups.get(),
+            after_deep,
+            "cached ancestors trigger no re-walk"
         );
     }
 

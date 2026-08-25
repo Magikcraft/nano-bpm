@@ -27,7 +27,7 @@ use nanobpmn_engine_core::{
 /// everything it touches is `#[cfg(feature = "read-model")]`.
 #[cfg(feature = "read-model")]
 use nanobpmn_read_model::{
-    FormRow, ProcessInstanceRow, ReadStore, ResourceRow, UserTaskRow, VariableRow,
+    FormRow, ProcessInstanceRow, ReadStore, ResourceRow, RootResolver, UserTaskRow, VariableRow,
     VARIABLE_VALUE_PREVIEW_LEN,
 };
 use serde::Serialize;
@@ -960,11 +960,14 @@ impl TestEngine {
     #[wasm_bindgen(js_name = searchProcessInstances)]
     pub fn search_process_instances(&self, filter_json: &str) -> Result<String, JsValue> {
         validate_search_filter_body(filter_json)?;
+        // One resolver spans the whole search so instances sharing a parent chain
+        // walk it once (issue #977 review: avoid O(rows × chain-depth) root walks).
+        let roots = RootResolver::new(|k| self.read_model.process_instance(k));
         let items: Vec<serde_json::Value> = self
             .read_model
             .process_instances()
             .iter()
-            .map(|row| process_instance_result(row, &self.read_model))
+            .map(|row| process_instance_result(row, &roots))
             .collect();
         to_json(&search_result(items))
     }
@@ -1218,11 +1221,12 @@ fn resource_result(row: &ResourceRow) -> serde_json::Value {
 /// the gateway projects it: `parentProcessInstanceKey` / `parentElementInstanceKey`
 /// carry the engine-tracked linkage for a child spawned by a call activity (both
 /// null for a top-level instance), and `rootProcessInstanceKey` is resolved by
-/// walking the parent chain through `store` to the top-level ancestor — a
-/// top-level instance reports its own key. Fields the engine does not retain
-/// (definition name, version tag) stay null.
+/// walking the parent chain via `roots` (a per-search [`RootResolver`] memoising
+/// the whole walked chain, so a page of co-located descendants walks each parent
+/// once) to the top-level ancestor — a top-level instance reports its own key.
+/// Fields the engine does not retain (definition name, version tag) stay null.
 #[cfg(feature = "read-model")]
-fn process_instance_result(row: &ProcessInstanceRow, store: &ReadStore) -> serde_json::Value {
+fn process_instance_result(row: &ProcessInstanceRow, roots: &RootResolver) -> serde_json::Value {
     let state = match row.state {
         ProcessInstanceState::Active => "ACTIVE",
         ProcessInstanceState::Completed => "COMPLETED",
@@ -1250,7 +1254,7 @@ fn process_instance_result(row: &ProcessInstanceRow, store: &ReadStore) -> serde
         "processDefinitionKey": row.process_definition_key,
         "parentProcessInstanceKey": parent_process_instance_key,
         "parentElementInstanceKey": parent_element_instance_key,
-        "rootProcessInstanceKey": store.root_process_instance_key(row.key).to_string(),
+        "rootProcessInstanceKey": roots.root_process_instance_key(row.key).to_string(),
         "tags": row.tags,
         "businessId": row.business_id,
     })
