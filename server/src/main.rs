@@ -7196,9 +7196,13 @@ impl ServerImpl {
             });
         }
         match result {
-            Some(instance) => Ok(Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(
-                process_instance_result(&instance),
-            )),
+            Some(instance) => {
+                let root = self
+                    .root_process_instance_key(instance.key, instance.parent_process_instance_key);
+                Ok(Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(
+                    process_instance_result(&instance, root),
+                ))
+            }
             None => Ok(
                 Resp::Status404_TheProcessInstanceWithTheGivenKeyWasNotFound(problem(
                     "Process instance not found",
@@ -8006,6 +8010,28 @@ impl ServerImpl {
             .map_err(|e| (502, format!("peer node {node} unreachable: {e}")))
     }
 
+    /// Resolves the root process instance key for `key` by walking the engine's
+    /// `parentProcessInstanceKey` chain in the local read model up to the
+    /// top-level ancestor (a top-level instance is its own root). See
+    /// [`resolve_root_process_instance_key`]; #977.
+    fn root_process_instance_key(&self, key: Key, parent: Option<Key>) -> Key {
+        resolve_root_process_instance_key(key, parent, |k| {
+            self.store
+                .process_instance(k)
+                .and_then(|r| r.parent_process_instance_key)
+        })
+    }
+
+    /// Root process instance key for an element instance's owning process
+    /// instance. When that owning instance is not (yet) projected the element's
+    /// own process instance key is its best-known root.
+    fn root_for_element_instance(&self, instance_key: Key) -> Key {
+        match self.store.process_instance(instance_key) {
+            Some(row) => self.root_process_instance_key(row.key, row.parent_process_instance_key),
+            None => instance_key,
+        }
+    }
+
     /// Peer-side of query forwarding: answers a GET-by-key read for a key this
     /// node owns from its local read model. Returns `(200, entity-json)` or
     /// `(404, None)` (or `(500, None)` on a serialization error). The gateway
@@ -8017,10 +8043,10 @@ impl ServerImpl {
     ) -> (u16, Option<serde_json::Value>) {
         use crate::falcon::ReadKind;
         let body = match kind {
-            ReadKind::ProcessInstance => self
-                .store
-                .process_instance(key)
-                .map(|x| serde_json::to_value(process_instance_result(&x))),
+            ReadKind::ProcessInstance => self.store.process_instance(key).map(|x| {
+                let root = self.root_process_instance_key(x.key, x.parent_process_instance_key);
+                serde_json::to_value(process_instance_result(&x, root))
+            }),
             ReadKind::Incident => self
                 .store
                 .incident(key)
@@ -8035,10 +8061,10 @@ impl ServerImpl {
                 .store
                 .variable(key)
                 .map(|v| serde_json::to_value(variable_result(&v))),
-            ReadKind::ElementInstance => self
-                .store
-                .element_instance(key)
-                .map(|x| serde_json::to_value(element_instance_result(&x))),
+            ReadKind::ElementInstance => self.store.element_instance(key).map(|x| {
+                let root = self.root_for_element_instance(x.instance_key);
+                serde_json::to_value(element_instance_result(&x, root))
+            }),
         };
         match body {
             Some(Ok(v)) => (200, Some(v)),
@@ -10515,6 +10541,20 @@ impl ServerImpl {
                         // still matches.
                         && query::match_date_time_ms(&f.end_date, None)
                         && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
+                        && query::match_process_instance_key(
+                            &f.parent_process_instance_key,
+                            &inst
+                                .parent_process_instance_key
+                                .map(|k| k.to_string())
+                                .unwrap_or_default(),
+                        )
+                        && query::match_element_instance_key(
+                            &f.parent_element_instance_key,
+                            &inst
+                                .parent_element_instance_key
+                                .map(|k| k.to_string())
+                                .unwrap_or_default(),
+                        )
                         && match_instance_variables(
                             &f.variables,
                             variables_index.get(&inst.key),
@@ -10536,6 +10576,12 @@ impl ServerImpl {
                     query::SortVal::Num(inst.process_definition_key.parse().unwrap_or(0))
                 }
                 "state" => query::SortVal::Str(process_instance_state_enum(inst.state).to_string()),
+                "parentProcessInstanceKey" => {
+                    query::SortVal::Num(inst.parent_process_instance_key.unwrap_or(0) as i64)
+                }
+                "parentElementInstanceKey" => {
+                    query::SortVal::Num(inst.parent_element_instance_key.unwrap_or(0) as i64)
+                }
                 _ => query::SortVal::Num(inst.key as i64),
             },
             |inst| inst.key,
@@ -10545,11 +10591,25 @@ impl ServerImpl {
             matched.into_iter().map(|inst| (inst.key, inst)).collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
         // Build result models only for the returned page, never the whole
-        // (potentially very large) matched set.
+        // (potentially very large) matched set. The parent map is over every
+        // projected instance so `rootProcessInstanceKey` can be resolved by
+        // walking the call-activity parent chain (#977) without a store hit per
+        // ancestor.
+        let parent_of: std::collections::HashMap<Key, Option<Key>> = instances
+            .iter()
+            .map(|r| (r.key, r.parent_process_instance_key))
+            .collect();
         let items: Vec<models::ProcessInstanceResult> = page
             .items
             .into_iter()
-            .map(process_instance_result)
+            .map(|inst| {
+                let root = resolve_root_process_instance_key(
+                    inst.key,
+                    inst.parent_process_instance_key,
+                    |k| parent_of.get(&k).copied().flatten(),
+                );
+                process_instance_result(inst, root)
+            })
             .collect();
 
         Ok(Resp::Status200_TheProcessInstanceSearchResult(
@@ -11047,10 +11107,27 @@ impl ServerImpl {
             .map(|ei| (ei.element_instance_key, ei))
             .collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        // Resolve each element's `rootProcessInstanceKey` by walking its owning
+        // process instance's call-activity parent chain (#977); the parent map
+        // spans every projected instance so the walk needs no per-ancestor store
+        // hit.
+        let parent_of: std::collections::HashMap<Key, Option<Key>> = self
+            .store
+            .process_instances()
+            .iter()
+            .map(|r| (r.key, r.parent_process_instance_key))
+            .collect();
         let items: Vec<models::ElementInstanceResult> = page
             .items
             .into_iter()
-            .map(element_instance_result)
+            .map(|ei| {
+                let root = resolve_root_process_instance_key(
+                    ei.instance_key,
+                    parent_of.get(&ei.instance_key).copied().flatten(),
+                    |k| parent_of.get(&k).copied().flatten(),
+                );
+                element_instance_result(ei, root)
+            })
             .collect();
 
         Ok(Resp::Status200_TheElementInstanceSearchResult(
@@ -11109,9 +11186,12 @@ impl ServerImpl {
             });
         }
         match result {
-            Some(row) => Ok(Resp::Status200_TheElementInstanceIsSuccessfullyReturned(
-                element_instance_result(&row),
-            )),
+            Some(row) => {
+                let root = self.root_for_element_instance(row.instance_key);
+                Ok(Resp::Status200_TheElementInstanceIsSuccessfullyReturned(
+                    element_instance_result(&row, root),
+                ))
+            }
             None => Ok(
                 Resp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(problem(
                     "Element instance not found",
@@ -18145,9 +18225,45 @@ fn match_instance_variables(
     }
 }
 
+/// Walks the `parentProcessInstanceKey` chain from a process instance up to its
+/// top-level ancestor and returns the **root** process instance key. A top-level
+/// instance (no parent) is its own root; a call-activity child reports the true
+/// top-level ancestor (correct for arbitrarily nested parent→child→grandchild
+/// chains). `parent_of` yields the parent process instance key of a given
+/// instance, or `None` when it is top-level or unknown to the read model. The
+/// walk is depth-bounded so malformed data (a cycle) can never spin.
+fn resolve_root_process_instance_key(
+    key: Key,
+    parent: Option<Key>,
+    parent_of: impl Fn(Key) -> Option<Key>,
+) -> Key {
+    let mut root = key;
+    let mut next = parent;
+    // A hierarchy this deep is already pathological; the bound only exists to
+    // make a cycle in corrupt data terminate, not as a real nesting limit.
+    for _ in 0..1024 {
+        match next {
+            Some(p) if p != root => {
+                root = p;
+                next = parent_of(p);
+            }
+            _ => break,
+        }
+    }
+    root
+}
+
 /// Projects a [`ProcessInstanceRow`] into the generated `ProcessInstanceResult`.
+///
+/// `root_process_instance_key` is the top-level ancestor of this instance,
+/// resolved by the caller via [`resolve_root_process_instance_key`] (a top-level
+/// instance passes its own key). The engine-tracked `parentProcessInstanceKey` /
+/// `parentElementInstanceKey` are threaded through from the row so a
+/// call-activity child surfaces its parent linkage (Zeebe/C8 parity, #977);
+/// both are null for a top-level instance.
 fn process_instance_result(
     instance: &readstore::ProcessInstanceRow,
+    root_process_instance_key: Key,
 ) -> models::ProcessInstanceResult {
     let process_definition_id = instance.process_definition_id.clone();
     let version = instance.version;
@@ -18158,6 +18274,15 @@ fn process_instance_result(
     let start_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(instance.start_date_ms as i64)
             .unwrap_or_else(epoch);
+
+    let parent_process_instance_key = match instance.parent_process_instance_key {
+        Some(k) => types::Nullable::Present(models::ProcessInstanceKey(k.to_string())),
+        None => types::Nullable::Null,
+    };
+    let parent_element_instance_key = match instance.parent_element_instance_key {
+        Some(k) => types::Nullable::Present(models::ElementInstanceKey(k.to_string())),
+        None => types::Nullable::Null,
+    };
 
     models::ProcessInstanceResult::new(
         process_definition_id,
@@ -18171,9 +18296,11 @@ fn process_instance_result(
         "<default>".to_string(),
         models::ProcessInstanceKey(instance.key.to_string()),
         models::ProcessDefinitionKey(process_definition_key),
-        types::Nullable::Null,
-        types::Nullable::Null,
-        types::Nullable::Null,
+        parent_process_instance_key,
+        parent_element_instance_key,
+        types::Nullable::Present(models::ProcessInstanceKey(
+            root_process_instance_key.to_string(),
+        )),
         instance.tags.clone().into_iter().map(models::Tag).collect(),
         instance
             .business_id
@@ -18405,12 +18532,17 @@ fn wait_state_element_type(wire: &str) -> models::WaitStateElementTypeEnum {
 
 /// Projects an [`ElementInstanceRow`] into the generated `ElementInstanceResult`.
 /// `elementName` falls back to the element id when the deployed model carried no
-/// `name` attribute. `rootProcessInstanceKey` is reported as this element's own
-/// `processInstanceKey`. Call activities now execute natively as distinct child
-/// process instances (issue #808), so a child's elements are still projected
-/// self-rooted here; walking `parentProcessInstanceKey` up to the true top-level
-/// ancestor for nested call activities is a tracked follow-up.
-fn element_instance_result(row: &readstore::ElementInstanceRow) -> models::ElementInstanceResult {
+/// `name` attribute. `root_process_instance_key` is the top-level ancestor of the
+/// element's owning process instance, resolved by the caller via
+/// [`resolve_root_process_instance_key`]: a top-level instance's elements report
+/// that instance's own key, while a call-activity child's elements (issue #808
+/// executes call activities as native child instances) report the true top-level
+/// root — walking the `parentProcessInstanceKey` chain, the #977 follow-up that
+/// replaced the earlier self-root shortcut.
+fn element_instance_result(
+    row: &readstore::ElementInstanceRow,
+    root_process_instance_key: Key,
+) -> models::ElementInstanceResult {
     let start_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.start_date_ms as i64)
             .unwrap_or_else(epoch);
@@ -18446,7 +18578,9 @@ fn element_instance_result(row: &readstore::ElementInstanceRow) -> models::Eleme
         tenant_id,
         models::ElementInstanceKey(row.element_instance_key.to_string()),
         models::ProcessInstanceKey(row.instance_key.to_string()),
-        types::Nullable::Present(models::ProcessInstanceKey(row.instance_key.to_string())),
+        types::Nullable::Present(models::ProcessInstanceKey(
+            root_process_instance_key.to_string(),
+        )),
         models::ProcessDefinitionKey(row.process_definition_key.clone()),
         incident_key,
     )
@@ -33342,6 +33476,323 @@ mod search_process_instances_variable_filter_tests {
         assert_eq!(
             keys(&matched),
             vec!["1".to_string(), "2".to_string(), "3".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod call_activity_parent_root_tests {
+    //! Read-model parity for call-activity hierarchies (issue #977). The engine
+    //! executes `callActivity` as native child process instances and tracks the
+    //! parent linkage internally; these drive the actual REST projections so a
+    //! child surfaces non-null `parentProcessInstanceKey` /
+    //! `parentElementInstanceKey` / `rootProcessInstanceKey`, a nested chain roots
+    //! every descendant at the top-level ancestor, a search filtered by
+    //! `parentProcessInstanceKey` enumerates exactly the direct children, and a
+    //! single-track (non-call-activity) instance is unaffected (self-root, null
+    //! parents).
+    use nanobpmn_engine_core::Event;
+
+    use super::*;
+
+    /// A `ProcessInstanceCreated` for `instance_key`, optionally spawned by a
+    /// parent instance's call-activity element instance.
+    fn created(instance_key: u64, parent: Option<(u64, u64)>) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: parent.map(|(pi, _)| pi),
+            parent_element_instance_key: parent.map(|(_, ei)| ei),
+        }
+    }
+
+    /// Seeds a `root(1) → child(2) via EI 1001 → grandchild(3) via EI 2001`
+    /// call-activity chain plus an unrelated single-track instance `9`.
+    fn seed_hierarchy(server: &ServerImpl) {
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[
+                &created(1, None),
+                &created(2, Some((1, 1001))),
+                &created(3, Some((2, 2001))),
+                &created(9, None),
+            ])
+            .unwrap();
+    }
+
+    async fn search(
+        server: &ServerImpl,
+        filter: Option<models::ProcessInstanceFilter>,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter,
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    fn item<'a>(
+        result: &'a models::ProcessInstanceSearchQueryResult,
+        key: &str,
+    ) -> &'a models::ProcessInstanceResult {
+        result
+            .items
+            .iter()
+            .find(|i| i.process_instance_key.0 == key)
+            .unwrap_or_else(|| panic!("instance {key} present in search result"))
+    }
+
+    fn present(v: &types::Nullable<models::ProcessInstanceKey>) -> Option<String> {
+        match v {
+            types::Nullable::Present(k) => Some(k.0.clone()),
+            types::Nullable::Null => None,
+        }
+    }
+
+    fn present_ei(v: &types::Nullable<models::ElementInstanceKey>) -> Option<String> {
+        match v {
+            types::Nullable::Present(k) => Some(k.0.clone()),
+            types::Nullable::Null => None,
+        }
+    }
+
+    async fn get(server: &ServerImpl, key: &str) -> models::ProcessInstanceResult {
+        let path = models::GetProcessInstancePathParams {
+            process_instance_key: key.to_string(),
+        };
+        match server.get_process_instance_impl(&path).await {
+            Ok(apis::process_instance::GetProcessInstanceResponse::Status200_TheProcessInstanceIsSuccessfullyReturned(r)) => r,
+            other => panic!("expected a 200 get result, got {other:?}"),
+        }
+    }
+
+    /// A child instance surfaces the engine-tracked parent PI/EI keys and roots
+    /// at the top-level ancestor — the primary #977 acceptance.
+    #[tokio::test]
+    async fn child_surfaces_parent_and_root_keys() {
+        let server = ServerImpl::default();
+        seed_hierarchy(&server);
+
+        let all = search(&server, None).await;
+        let child = item(&all, "2");
+        assert_eq!(
+            present(&child.parent_process_instance_key),
+            Some("1".into())
+        );
+        assert_eq!(
+            present_ei(&child.parent_element_instance_key),
+            Some("1001".into())
+        );
+        assert_eq!(present(&child.root_process_instance_key), Some("1".into()));
+    }
+
+    /// A nested parent→child→grandchild chain roots *every* descendant at the
+    /// top-level instance, not at each level's own key.
+    #[tokio::test]
+    async fn nested_chain_roots_at_top_level() {
+        let server = ServerImpl::default();
+        seed_hierarchy(&server);
+        let all = search(&server, None).await;
+
+        let grandchild = item(&all, "3");
+        assert_eq!(
+            present(&grandchild.parent_process_instance_key),
+            Some("2".into())
+        );
+        assert_eq!(
+            present_ei(&grandchild.parent_element_instance_key),
+            Some("2001".into())
+        );
+        // The root is the top-level ancestor (1), not the immediate parent (2).
+        assert_eq!(
+            present(&grandchild.root_process_instance_key),
+            Some("1".into())
+        );
+    }
+
+    /// A top-level instance reports null parents and self-roots.
+    #[tokio::test]
+    async fn top_level_self_roots_with_null_parents() {
+        let server = ServerImpl::default();
+        seed_hierarchy(&server);
+        let all = search(&server, None).await;
+
+        let root = item(&all, "1");
+        assert_eq!(present(&root.parent_process_instance_key), None);
+        assert_eq!(present_ei(&root.parent_element_instance_key), None);
+        assert_eq!(present(&root.root_process_instance_key), Some("1".into()));
+    }
+
+    /// A search filtered by `parentProcessInstanceKey` enumerates exactly the
+    /// direct children of that parent (not transitive descendants).
+    #[tokio::test]
+    async fn filter_by_parent_returns_direct_children() {
+        let server = ServerImpl::default();
+        seed_hierarchy(&server);
+
+        let filter = models::ProcessInstanceFilter {
+            parent_process_instance_key: Some(
+                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                    models::ProcessInstanceKey("1".to_string()),
+                ),
+            ),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let result = search(&server, Some(filter)).await;
+        let mut keys: Vec<String> = result
+            .items
+            .iter()
+            .map(|i| i.process_instance_key.0.clone())
+            .collect();
+        keys.sort();
+        // Only 2 is a direct child of 1; grandchild 3's parent is 2.
+        assert_eq!(keys, vec!["2".to_string()]);
+    }
+
+    /// A filter by `parentElementInstanceKey` isolates the child spawned by that
+    /// specific call-activity element instance.
+    #[tokio::test]
+    async fn filter_by_parent_element_isolates_child() {
+        let server = ServerImpl::default();
+        seed_hierarchy(&server);
+
+        let filter = models::ProcessInstanceFilter {
+            parent_element_instance_key: Some(
+                models::ElementInstanceKeyFilterProperty::ElementInstanceKey(
+                    models::ElementInstanceKey("2001".to_string()),
+                ),
+            ),
+            ..models::ProcessInstanceFilter::new()
+        };
+        let result = search(&server, Some(filter)).await;
+        let keys: Vec<String> = result
+            .items
+            .iter()
+            .map(|i| i.process_instance_key.0.clone())
+            .collect();
+        assert_eq!(keys, vec!["3".to_string()]);
+    }
+
+    /// `GET /v2/process-instances/{childKey}` returns the same parent/root keys
+    /// as the search projection.
+    #[tokio::test]
+    async fn get_by_key_matches_search_projection() {
+        let server = ServerImpl::default();
+        seed_hierarchy(&server);
+
+        let child = get(&server, "2").await;
+        assert_eq!(
+            present(&child.parent_process_instance_key),
+            Some("1".into())
+        );
+        assert_eq!(
+            present_ei(&child.parent_element_instance_key),
+            Some("1001".into())
+        );
+        assert_eq!(present(&child.root_process_instance_key), Some("1".into()));
+
+        let grandchild = get(&server, "3").await;
+        assert_eq!(
+            present(&grandchild.root_process_instance_key),
+            Some("1".into())
+        );
+
+        let top = get(&server, "1").await;
+        assert_eq!(present(&top.parent_process_instance_key), None);
+        assert_eq!(present(&top.root_process_instance_key), Some("1".into()));
+    }
+
+    /// No regression for a single-track instance: it self-roots with null
+    /// parents on both search and get.
+    #[tokio::test]
+    async fn single_track_instance_is_unaffected() {
+        let server = ServerImpl::default();
+        seed_hierarchy(&server);
+
+        let all = search(&server, None).await;
+        let solo = item(&all, "9");
+        assert_eq!(present(&solo.parent_process_instance_key), None);
+        assert_eq!(present_ei(&solo.parent_element_instance_key), None);
+        assert_eq!(present(&solo.root_process_instance_key), Some("9".into()));
+
+        let got = get(&server, "9").await;
+        assert_eq!(present(&got.parent_process_instance_key), None);
+        assert_eq!(present(&got.root_process_instance_key), Some("9".into()));
+    }
+
+    /// An element instance under a call-activity child reports the *true*
+    /// top-level `rootProcessInstanceKey`, replacing the old self-root shortcut.
+    #[tokio::test]
+    async fn element_instance_under_child_reports_true_root() {
+        let server = ServerImpl::default();
+        seed_hierarchy(&server);
+        // Activate an element under the grandchild instance (3), whose top-level
+        // ancestor is 1.
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[&Event::ElementActivated {
+                instance_key: 3,
+                element_instance_key: 3005,
+                element_id: "task".to_string(),
+                scope: 0,
+            }])
+            .unwrap();
+
+        let path = models::GetElementInstancePathParams {
+            element_instance_key: "3005".to_string(),
+        };
+        let row = match server.get_element_instance_impl(&path).await {
+            Ok(apis::element_instance::GetElementInstanceResponse::Status200_TheElementInstanceIsSuccessfullyReturned(r)) => r,
+            other => panic!("expected a 200 element-instance get, got {other:?}"),
+        };
+        assert_eq!(row.process_instance_key.0, "3");
+        // rootProcessInstanceKey walks 3 → 2 → 1, not self-rooted at 3.
+        match row.root_process_instance_key {
+            types::Nullable::Present(k) => assert_eq!(k.0, "1"),
+            types::Nullable::Null => panic!("rootProcessInstanceKey must be present"),
+        }
+    }
+
+    /// The root-walk resolver: self-root, nested chain, missing-ancestor
+    /// fallback, and a cycle terminate correctly.
+    #[test]
+    fn resolve_root_walks_and_is_cycle_safe() {
+        // Top-level: own key is the root.
+        assert_eq!(resolve_root_process_instance_key(1, None, |_| None), 1);
+
+        // Chain 3 → 2 → 1.
+        let parent_of = |k: Key| match k {
+            3 => Some(2),
+            2 => Some(1),
+            _ => None,
+        };
+        assert_eq!(resolve_root_process_instance_key(3, Some(2), parent_of), 1);
+        assert_eq!(resolve_root_process_instance_key(2, Some(1), parent_of), 1);
+
+        // Unknown ancestor: the furthest known key is the best-effort root.
+        let orphan = |_k: Key| None;
+        assert_eq!(resolve_root_process_instance_key(5, Some(4), orphan), 4);
+
+        // A 2-cycle (A↔B) must terminate rather than spin.
+        let cycle = |k: Key| match k {
+            10 => Some(11),
+            11 => Some(10),
+            _ => None,
+        };
+        let root = resolve_root_process_instance_key(10, Some(11), cycle);
+        assert!(
+            root == 10 || root == 11,
+            "cycle terminates at a chain member"
         );
     }
 }
