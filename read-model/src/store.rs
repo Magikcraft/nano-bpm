@@ -36,7 +36,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -46,7 +46,7 @@ const SCHEMA_VERSION: i64 = 3;
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -8497225416382442826;
+const SCHEMA_FINGERPRINT: i64 = -2825677536285512153;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -128,7 +128,15 @@ CREATE TABLE jobs (
     process_definition_key TEXT NOT NULL,
     job_kind               INTEGER NOT NULL DEFAULT 0,
     listener_event_type    INTEGER NOT NULL DEFAULT 0,
-    created_at_ms          INTEGER NOT NULL DEFAULT 0
+    created_at_ms          INTEGER NOT NULL DEFAULT 0,
+    -- Declared read-set (`fetchVariables`) recorded on the durable
+    -- `JobActivated` event: the variable names the worker asked for on the most
+    -- recent activation that declared a non-empty set. Preserved across a later
+    -- fetch-all re-activation (not overwritten by a declaration-free activation).
+    -- Engine-native read provenance for reification (issue #986). A JSON array;
+    -- '[]' means no durable activation has declared a set (fetch-all / undeclared
+    -- reads) or the job has not been activated with a declared set.
+    read_set               TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE incidents (
     key                    INTEGER PRIMARY KEY,
@@ -1149,6 +1157,15 @@ pub struct JobRow {
     /// [`crate::Event::JobCreated`]. `0` for jobs created before the engine
     /// recorded the field. Feeds the `/v2/jobs/statistics/*` `created` counters.
     pub created_at_ms: u64,
+    /// The declared read-set (`fetchVariables`) recorded on the most recent
+    /// durable [`crate::Event::JobActivated`] for this job that declared a
+    /// non-empty set — the variable names the worker was handed. Preserved across
+    /// a later fetch-all re-activation (a declaration-free activation does not
+    /// overwrite it). Engine-native read provenance for reification (issue #986).
+    /// Empty when no durable activation has declared a set (fetch-all / undeclared
+    /// reads), or when the job's activation was never durably recorded (e.g.
+    /// leader-local activation, which does not export `JobActivated`).
+    pub read_set: Vec<String>,
 }
 
 pub struct UserTaskRow {
@@ -2368,7 +2385,7 @@ impl ReadStore {
             .prepare(
                 "SELECT key, instance_key, element_instance_key, element_id, job_type, state, \
                  retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 job_kind, listener_event_type, created_at_ms \
+                 job_kind, listener_event_type, created_at_ms, read_set \
                  FROM jobs",
             )
             .expect("prepare jobs");
@@ -2884,6 +2901,9 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         // `u64` and skew `/v2/jobs/statistics/*`. Mirrors `map_message_subscription`
         // — one canonical convention for every `created_at_ms` mapper.
         created_at_ms: r.get::<_, i64>(13)?.max(0) as u64,
+        // Stored as a JSON array (mirrors `candidate_groups`); a malformed value
+        // degrades to an empty read-set rather than failing the whole row map.
+        read_set: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(14)?).unwrap_or_default(),
     })
 }
 
@@ -4148,17 +4168,39 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             job_key,
             worker,
             deadline,
+            fetch_variables,
             ..
         } => {
-            tx.cexecute(
-                "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4 WHERE key = ?1",
-                params![
-                    *job_key as i64,
-                    job_state_code(JobState::Activated),
-                    worker,
-                    *deadline as i64,
-                ],
-            )?;
+            // Record the declared read-set alongside the activation. Serialized as
+            // a JSON array (mirrors `candidate_groups`); empty stays '[]'. Only
+            // overwritten when this activation declared a set, so a subsequent
+            // fetch-all re-activation of the same job does not erase the last
+            // declared provenance.
+            if fetch_variables.is_empty() {
+                tx.cexecute(
+                    "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4 WHERE key = ?1",
+                    params![
+                        *job_key as i64,
+                        job_state_code(JobState::Activated),
+                        worker,
+                        *deadline as i64,
+                    ],
+                )?;
+            } else {
+                let read_set =
+                    serde_json::to_string(fetch_variables).unwrap_or_else(|_| "[]".into());
+                tx.cexecute(
+                    "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, read_set = ?5 \
+                     WHERE key = ?1",
+                    params![
+                        *job_key as i64,
+                        job_state_code(JobState::Activated),
+                        worker,
+                        *deadline as i64,
+                        read_set,
+                    ],
+                )?;
+            }
         }
 
         Event::JobLockExpired { job_key, .. } => {
@@ -7261,6 +7303,7 @@ mod element_instance_tests {
                     worker: "w1".to_string(),
                     deadline: 60_000,
                     activated_at: Some(1),
+                    fetch_variables: Vec::new(),
                 },
                 &Event::JobFailed {
                     job_key: 8001,
@@ -7285,6 +7328,7 @@ mod element_instance_tests {
                     worker: "w2".to_string(),
                     deadline: 60_000,
                     activated_at: Some(1),
+                    fetch_variables: Vec::new(),
                 },
                 &Event::JobErrorThrown {
                     job_key: 8002,
@@ -7309,6 +7353,7 @@ mod element_instance_tests {
                     worker: "w3".to_string(),
                     deadline: 60_000,
                     activated_at: Some(1),
+                    fetch_variables: Vec::new(),
                 },
                 &Event::JobFailed {
                     job_key: 8003,
@@ -7396,6 +7441,89 @@ mod element_instance_tests {
         let errored = &jobs[&9002];
         assert_eq!(errored.state, JobState::Errored);
         assert_eq!(errored.worker.as_deref(), Some("host-b-senior"));
+    }
+
+    #[test]
+    fn projects_the_declared_read_set_from_job_activated_onto_the_row() {
+        // #986 — a `JobActivated` that carries a declared read-set (`fetchVariables`)
+        // must surface it on the read-model job row (engine-native read provenance
+        // for reification). A declaration-free activation leaves the read-set empty
+        // ("undeclared / fetch-all"), and re-activating with an empty set does not
+        // erase a previously declared set.
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                // Declared: worker asked for [a, c].
+                &Event::JobCreated {
+                    job_key: 7001,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobActivated {
+                    job_key: 7001,
+                    instance_key: INST,
+                    worker: "w1".to_string(),
+                    deadline: 60_000,
+                    activated_at: Some(1),
+                    fetch_variables: vec!["a".to_string(), "c".to_string()],
+                },
+                // Declaration-free: no fetchVariables ⇒ read-set stays empty.
+                &Event::JobCreated {
+                    job_key: 7002,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobActivated {
+                    job_key: 7002,
+                    instance_key: INST,
+                    worker: "w2".to_string(),
+                    deadline: 60_000,
+                    activated_at: Some(1),
+                    fetch_variables: Vec::new(),
+                },
+            ])
+            .unwrap();
+
+        let jobs: HashMap<Key, super::JobRow> =
+            store.jobs().into_iter().map(|j| (j.key, j)).collect();
+
+        assert_eq!(jobs[&7001].read_set, vec!["a".to_string(), "c".to_string()]);
+        assert!(
+            jobs[&7002].read_set.is_empty(),
+            "declaration-free activation leaves an empty (undeclared) read-set"
+        );
+
+        // A later declaration-free re-activation (e.g. lock re-lease) must not
+        // erase the previously declared provenance.
+        store
+            .export(&[&Event::JobActivated {
+                job_key: 7001,
+                instance_key: INST,
+                worker: "w1".to_string(),
+                deadline: 120_000,
+                activated_at: Some(2),
+                fetch_variables: Vec::new(),
+            }])
+            .unwrap();
+        let jobs: HashMap<Key, super::JobRow> =
+            store.jobs().into_iter().map(|j| (j.key, j)).collect();
+        assert_eq!(
+            jobs[&7001].read_set,
+            vec!["a".to_string(), "c".to_string()],
+            "a declaration-free re-activation preserves the last declared read-set"
+        );
     }
 
     #[test]

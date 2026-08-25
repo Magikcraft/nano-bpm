@@ -1525,6 +1525,178 @@ fn activation_empty_fetch_variable_returns_all_variables() {
     server.shutdown();
 }
 
+/// Boots a single-node server with **replicated activation** (`NANOBPMN_RAFT=1` +
+/// `NANOBPMN_REPLICATE_ACTIVATION=quorum`), the only mode under which
+/// `JobActivated` is journaled and exported to the read model. Leader-local
+/// activation (the default) locks jobs ephemerally on the leader's engine actor
+/// and never journals the event, so the durable read-set (#986) is only
+/// observable here. A single voter elects itself deterministically.
+fn boot_replicated_activation(journal: &Path) -> ServerProcess {
+    ServerProcess::boot_with_env(
+        journal,
+        &[
+            ("NANOBPMN_RAFT", "1"),
+            ("NANOBPMN_REPLICATE_ACTIVATION", "quorum"),
+        ],
+    )
+}
+
+/// Creates a demo instance seeded with `{a, b, c}`, retrying the create until the
+/// freshly booted Raft group has elected a leader (writes 503 with
+/// `RESOURCE_EXHAUSTED` until one is reachable). The companion of
+/// [`create_demo_instance_with_vars`] for the replicated-activation harness.
+fn create_demo_instance_with_vars_replicated(server: &ServerProcess) -> String {
+    // Raft leader election on a cold single-voter group can take several seconds
+    // in a debug build; poll well past that before giving up.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let instance_key = loop {
+        let (status, body) = server.request(
+            "POST",
+            &path("/process-instances"),
+            Some(r#"{"processDefinitionId":"demo"}"#),
+        );
+        if status == 200 {
+            let json: serde_json::Value =
+                serde_json::from_str(&body).expect("create response is JSON");
+            break json["processInstanceKey"]
+                .as_str()
+                .expect("processInstanceKey present")
+                .to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "create never reached a leader: {status} {body}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let (status, body) = server.request(
+        "PUT",
+        &path(&format!("/element-instances/{instance_key}/variables")),
+        Some(r#"{"variables":{"a":1,"b":2,"c":3}}"#),
+    );
+    assert_eq!(status, 204, "setting variables failed: {body}");
+    instance_key
+}
+
+/// Activates one `demo-work` job, retrying until the (freshly elected) Raft
+/// leader accepts the activation and returns a job. `fetch` is the optional
+/// `fetchVariable` projection list. Returns the activated job's key.
+fn activate_demo_job_key(server: &ServerProcess, fetch: Option<&[&str]>) -> String {
+    let fetch_field = match fetch {
+        Some(names) => {
+            let list = names
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(r#","fetchVariable":[{list}]"#)
+        }
+        None => String::new(),
+    };
+    let body = format!(
+        r#"{{"type":"demo-work","maxJobsToActivate":1,"timeout":60000,"requestTimeout":-1{fetch_field}}}"#
+    );
+    // Under Raft the leader may still be settling; poll until a job is leased.
+    let (status, resp) = server.request_until(
+        "POST",
+        &path("/jobs/activation"),
+        Some(&body),
+        |status, body| {
+            status == 200
+                && serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|j| j["jobs"].as_array().map(|a| !a.is_empty()))
+                    .unwrap_or(false)
+        },
+    );
+    assert_eq!(status, 200, "activation failed: {resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).expect("activation response is JSON");
+    let jobs = json["jobs"].as_array().expect("jobs array");
+    assert_eq!(jobs.len(), 1, "exactly one job should activate: {resp}");
+    jobs[0]["jobKey"]
+        .as_str()
+        .expect("jobKey present")
+        .to_string()
+}
+
+/// Reads the `fetchedVariables` field the read model surfaces for `job_key` via
+/// `/jobs/search`, polling until the activation has been projected (the read
+/// model is eventually consistent). `None` means the field was absent or null.
+fn searched_job_fetched_variables(server: &ServerProcess, job_key: &str) -> Option<Vec<String>> {
+    let (_status, body) =
+        server.request_until("POST", &path("/jobs/search"), Some("{}"), |_, b| {
+            serde_json::from_str::<serde_json::Value>(b)
+                .ok()
+                .and_then(|j| j["items"].as_array().cloned())
+                .map(|items| items.iter().any(|i| i["jobKey"].as_str() == Some(job_key)))
+                .unwrap_or(false)
+        });
+    let json: serde_json::Value = serde_json::from_str(&body).expect("search response is JSON");
+    let item = json["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .find(|i| i["jobKey"].as_str() == Some(job_key))
+        .unwrap_or_else(|| panic!("job {job_key} not found in search: {body}"));
+    match &item["fetchedVariables"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::Array(a) => Some(
+            a.iter()
+                .map(|v| {
+                    v.as_str()
+                        .expect("fetchedVariables entry is a string")
+                        .to_string()
+                })
+                .collect(),
+        ),
+        other => panic!("fetchedVariables is neither null nor array: {other}"),
+    }
+}
+
+/// #986: the declared read-set (`fetchVariables`) is recorded on the durable
+/// `JobActivated` event and projected onto the read model — the acceptance
+/// criterion that the *log / read model* (not just the served HTTP response)
+/// reflects the fetched set. Asserted end-to-end over the real REST surface under
+/// replicated activation, the mode that journals the activation event.
+#[test]
+fn activation_read_set_is_durable_in_the_read_model() {
+    let scratch = ScratchDir::new();
+    let server = boot_replicated_activation(&scratch.journal_path());
+    create_demo_instance_with_vars_replicated(&server);
+
+    // Declared fetchVariable = [a, c] → the read model records exactly that set.
+    let job_key = activate_demo_job_key(&server, Some(&["a", "c"]));
+    let fetched = searched_job_fetched_variables(&server, &job_key);
+    assert_eq!(
+        fetched,
+        Some(vec!["a".to_string(), "c".to_string()]),
+        "the declared read-set must be durable on the searched job"
+    );
+
+    server.shutdown();
+}
+
+/// #986 no-regression complement: a declaration-free activation (no
+/// `fetchVariable`) records **no** read-set — the read model surfaces
+/// `fetchedVariables: null`, so a fetch-all activation reads as
+/// undeclared/unknown rather than "reads everything", keeping the reification DAG
+/// honest.
+#[test]
+fn declaration_free_activation_records_no_read_set_in_the_read_model() {
+    let scratch = ScratchDir::new();
+    let server = boot_replicated_activation(&scratch.journal_path());
+    create_demo_instance_with_vars_replicated(&server);
+
+    let job_key = activate_demo_job_key(&server, None);
+    let fetched = searched_job_fetched_variables(&server, &job_key);
+    assert_eq!(
+        fetched, None,
+        "a fetch-all activation must not record a declared read-set"
+    );
+
+    server.shutdown();
+}
+
 #[test]
 fn create_instance_variables_flow_through_to_activated_jobs() {
     let scratch = ScratchDir::new();

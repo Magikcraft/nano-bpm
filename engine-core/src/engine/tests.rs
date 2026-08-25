@@ -18332,3 +18332,103 @@ fn subprocess_end_event_output_propagates_reached_branch_not_last_defined() {
         );
     }
 }
+
+/// #986 — a declared `fetchVariables` read-set supplied to `activate_jobs_with_fetch`
+/// is stamped onto the durable `JobActivated` event (engine-native read
+/// provenance for reification), while a fetch-all activation records none.
+#[test]
+fn activation_stamps_the_declared_read_set_on_job_activated() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+
+    // Declared activation: worker asks for [amount, currency].
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let events = engine
+        .apply_command_at(
+            Command::activate_jobs_with_fetch(
+                "payment",
+                "w",
+                1,
+                60_000,
+                0,
+                vec!["amount".to_string(), "currency".to_string()],
+            ),
+            0,
+        )
+        .unwrap();
+    let declared = events
+        .iter()
+        .find_map(|e| match e {
+            Event::JobActivated {
+                fetch_variables, ..
+            } => Some(fetch_variables.clone()),
+            _ => None,
+        })
+        .expect("a JobActivated was emitted");
+    assert_eq!(
+        declared,
+        vec!["amount".to_string(), "currency".to_string()],
+        "the declared read-set is stamped onto the activation event"
+    );
+
+    // Fetch-all activation: a second instance, activated without a declared set,
+    // records an empty (undeclared) read-set.
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let events = engine
+        .apply_command_at(Command::activate_jobs("payment", "w", 1, 60_000, 0), 0)
+        .unwrap();
+    let undeclared = events
+        .iter()
+        .find_map(|e| match e {
+            Event::JobActivated {
+                fetch_variables, ..
+            } => Some(fetch_variables.clone()),
+            _ => None,
+        })
+        .expect("a JobActivated was emitted");
+    assert!(
+        undeclared.is_empty(),
+        "a fetch-all activation records no declared read-set"
+    );
+}
+
+/// #986 — the new `fetch_variables` field must NOT change the journal byte shape
+/// of a declaration-free activation: `skip_serializing_if` omits it entirely when
+/// empty, so historical/undeclared `JobActivated` records serialize identically.
+#[cfg(feature = "serde")]
+#[test]
+fn declaration_free_job_activated_is_byte_identical() {
+    let undeclared = Event::JobActivated {
+        job_key: 7,
+        instance_key: 3,
+        worker: "w".to_string(),
+        deadline: 60_000,
+        activated_at: Some(1),
+        fetch_variables: Vec::new(),
+    };
+    let json = serde_json::to_string(&undeclared).unwrap();
+    assert!(
+        !json.contains("fetch_variables"),
+        "an empty read-set must be omitted from the serialized event: {json}"
+    );
+
+    // A declared read-set IS serialized, and round-trips.
+    let declared = Event::JobActivated {
+        job_key: 7,
+        instance_key: 3,
+        worker: "w".to_string(),
+        deadline: 60_000,
+        activated_at: Some(1),
+        fetch_variables: vec!["a".to_string(), "c".to_string()],
+    };
+    let json = serde_json::to_string(&declared).unwrap();
+    assert!(json.contains("fetch_variables"));
+    let back: Event = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, declared);
+}

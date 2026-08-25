@@ -726,13 +726,13 @@ pub fn replay_instance_with_mocks(
                 apply_and_fold(
                     &mut engine,
                     &mut produced,
-                    Command::ActivateJobs {
-                        job_type: job_type.clone(),
-                        worker: "replay".to_string(),
-                        max_jobs: 100_000,
-                        timeout: u64::MAX / 4,
-                        now: clock,
-                    },
+                    Command::activate_jobs(
+                        job_type.clone(),
+                        "replay".to_string(),
+                        100_000,
+                        u64::MAX / 4,
+                        clock,
+                    ),
                     clock,
                 );
             }

@@ -5519,6 +5519,11 @@ export type JobSearchResult = {
      *
      */
     priority: number;
+    /**
+     * nano extension (not part of the Camunda 8 API). The declared read-set — the `fetchVariables` names the worker asked for on the most recent durable activation of this job that declared a non-empty set — recorded on the `JobActivated` event as engine-native read provenance for post-hoc reification / data-dependency analysis. It is not cleared by a subsequent fetch-all re-activation. `null`/absent when no durable activation has declared a set (fetch-all / undeclared reads) or the activation was not durably recorded (e.g. leader-local activation, which does not export `JobActivated`).
+     *
+     */
+    fetchedVariables?: Array<string> | null;
 };
 
 /**

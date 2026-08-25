@@ -15305,7 +15305,7 @@ impl ServerImpl {
                 let p = led[(start + off) % ln];
                 if self.replicate_activation_for(p) {
                     futures.push(
-                        self.activate_on_raft(p, job_type, worker, want, timeout)
+                        self.activate_on_raft(p, job_type, worker, want, timeout, fetch_variable)
                             .boxed(),
                     );
                 } else {
@@ -15319,8 +15319,15 @@ impl ServerImpl {
                         continue;
                     };
                     futures.push(
-                        self.activate_on_local(handle, job_type, worker, want, timeout)
-                            .boxed(),
+                        self.activate_on_local(
+                            handle,
+                            job_type,
+                            worker,
+                            want,
+                            timeout,
+                            fetch_variable,
+                        )
+                        .boxed(),
                     );
                 }
             }
@@ -15335,8 +15342,15 @@ impl ServerImpl {
                 .collect();
         }
         let activated: Vec<ActivatedJobWithIdentity> = if n == 1 {
-            self.activate_on(&handles[0], job_type, worker, max_jobs, timeout)
-                .await
+            self.activate_on(
+                &handles[0],
+                job_type,
+                worker,
+                max_jobs,
+                timeout,
+                fetch_variable,
+            )
+            .await
         } else {
             // Fan out across partitions CONCURRENTLY so every partition's engine
             // thread runs its activation pass in parallel, instead of one
@@ -15363,7 +15377,14 @@ impl ServerImpl {
                     continue;
                 }
                 let handle = &handles[(start + off) % n];
-                futures.push(self.activate_on(handle, job_type, worker, want, timeout));
+                futures.push(self.activate_on(
+                    handle,
+                    job_type,
+                    worker,
+                    want,
+                    timeout,
+                    fetch_variable,
+                ));
             }
             futures_util::future::join_all(futures)
                 .await
@@ -15390,9 +15411,17 @@ impl ServerImpl {
         worker: &str,
         want: usize,
         timeout: u64,
+        fetch_variable: Option<&[String]>,
     ) -> Vec<ActivatedJobWithIdentity> {
         let job_type = job_type.to_string();
         let worker = worker.to_string();
+        // Declared read-set (`fetchVariables`) threaded into the activation so the
+        // engine stamps it onto `JobActivated` (#986). Leader-local activation
+        // discards the event (never journaled), so this is durable only where the
+        // event is exported, but is threaded uniformly for a consistent surface.
+        let fetch_variables: Vec<String> = fetch_variable
+            .map(|names| names.to_vec())
+            .unwrap_or_default();
         #[cfg(feature = "console")]
         let worker_for_trace = worker.clone();
         let activated: Vec<ActivatedJobWithIdentity> = handle
@@ -15402,7 +15431,14 @@ impl ServerImpl {
                 let timer = cmd_profile::start();
                 let now = now_millis();
                 let out: Vec<ActivatedJobWithIdentity> = engine
-                    .activate_jobs(&job_type, &worker, want, timeout, now)
+                    .activate_jobs_with_fetch(
+                        &job_type,
+                        &worker,
+                        want,
+                        timeout,
+                        now,
+                        fetch_variables,
+                    )
                     .into_iter()
                     .map(|job| {
                         let (process_id, version, process_definition_key) = engine
@@ -15444,8 +15480,9 @@ impl ServerImpl {
         worker: &str,
         want: usize,
         timeout: u64,
+        fetch_variable: Option<&[String]>,
     ) -> Vec<ActivatedJobWithIdentity> {
-        self.activate_on(&handle, job_type, worker, want, timeout)
+        self.activate_on(&handle, job_type, worker, want, timeout, fetch_variable)
             .await
     }
 
@@ -15462,6 +15499,7 @@ impl ServerImpl {
         worker: &str,
         want: usize,
         timeout: u64,
+        fetch_variable: Option<&[String]>,
     ) -> Vec<ActivatedJobWithIdentity> {
         let Some(part) = self.raft.get(p) else {
             return Vec::new();
@@ -15473,13 +15511,22 @@ impl ServerImpl {
         // A single logical instant drives both the command (job-lock deadlines)
         // and the journal apply, so leader and followers mint identical state.
         let now = now_millis();
-        let response = match part
-            .propose_result(
-                Command::activate_jobs(job_type, worker, want, timeout, now),
+        // Replicated activation journals `JobActivated`, so the declared read-set
+        // (`fetchVariables`) rides the command into the durable event as
+        // engine-native read provenance for reification (#986). Empty ⇒ fetch-all
+        // (undeclared), keeping the command/event byte-identical.
+        let command = match fetch_variable {
+            Some(names) if !names.is_empty() => Command::activate_jobs_with_fetch(
+                job_type,
+                worker,
+                want,
+                timeout,
                 now,
-            )
-            .await
-        {
+                names.to_vec(),
+            ),
+            _ => Command::activate_jobs(job_type, worker, want, timeout, now),
+        };
+        let response = match part.propose_result(command, now).await {
             Ok(r) if r.error.is_none() => r,
             _ => return Vec::new(),
         };
@@ -18671,7 +18718,7 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
 
     let (job_kind_enum, job_listener_event_type_enum) = job_kind_enums(&job.kind);
 
-    models::JobSearchResult::new(
+    let mut result = models::JobSearchResult::new(
         std::collections::HashMap::new(),
         deadline,
         types::Nullable::Null,
@@ -18697,7 +18744,14 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
         types::Nullable::Null,
         types::Nullable::Null,
         0,
-    )
+    );
+    // nano extension (#986): surface the declared read-set recorded on the durable
+    // `JobActivated`. Omitted (`Null`) when the activation declared none, so a
+    // fetch-all / undeclared activation reads as `null` rather than "[]".
+    if !job.read_set.is_empty() {
+        result.fetched_variables = Some(types::Nullable::Present(job.read_set.clone()));
+    }
+    result
 }
 
 /// Maps an engine [`nanobpmn_engine_core::UserTaskState`] to the REST user-task

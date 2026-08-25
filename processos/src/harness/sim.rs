@@ -143,13 +143,13 @@ pub fn run_instance(
                 apply_and_fold(
                     &mut engine,
                     &mut output,
-                    Command::ActivateJobs {
-                        job_type: job_type.clone(),
-                        worker: "sim".to_string(),
-                        max_jobs: 100_000,
-                        timeout: u64::MAX / 4,
-                        now: clock,
-                    },
+                    Command::activate_jobs(
+                        job_type.clone(),
+                        "sim".to_string(),
+                        100_000,
+                        u64::MAX / 4,
+                        clock,
+                    ),
                     clock,
                 );
             }
