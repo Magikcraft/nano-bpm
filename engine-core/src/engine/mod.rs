@@ -159,6 +159,20 @@ pub struct Engine {
     /// window between a retirement and its create, so it drains continuously. NOT
     /// part of the snapshot; pure host-side bookkeeping, never affects determinism.
     retired_tombstones: HashSet<Key>,
+    /// Sub-process scopes torn down (by a scoped terminate end or an interrupting
+    /// boundary) during the command currently draining. A scoped teardown removes
+    /// every descendant token but deliberately leaves the enclosing sub-process
+    /// token active until the post-drain [`complete_drained_subprocesses`](Self::complete_drained_subprocesses)
+    /// sweep completes it — so a sibling branch's `Step::Activate` still queued in
+    /// the *same* drain would otherwise pass [`step_targets_dead_scope`](Self::step_targets_dead_scope)'s
+    /// "scope still active" check and recreate a token inside the dead scope,
+    /// which then keeps the parent from ever draining (a wedge). Recording the
+    /// scope here lets the guard reject those queued activations. NOT journaled:
+    /// the guard runs only during live command processing (recovery replays the
+    /// emitted events, never re-runs the guard), and the whole window lives inside
+    /// one command's drain — so it is cleared at the top of every
+    /// [`plan_command_at`](Self::plan_command_at) and never affects determinism.
+    torn_down_scopes: HashSet<Key>,
     /// Host-injected **cluster variables** (see [`crate::cluster_vars`]): a shared,
     /// mutable snapshot of global + per-tenant configuration values that FEEL
     /// expressions resolve at runtime. External configuration, not journaled
@@ -369,6 +383,7 @@ impl Engine {
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
             retired_tombstones: HashSet::new(),
+            torn_down_scopes: HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
         }
     }
@@ -488,6 +503,7 @@ impl Engine {
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
             retired_tombstones: HashSet::new(),
+            torn_down_scopes: HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
         }
     }
@@ -1103,6 +1119,11 @@ impl Engine {
         now: u64,
     ) -> Result<(Vec<Event>, VecDeque<Step>), EngineError> {
         self.now = now;
+        // Clear the per-command scratch of sub-process scopes torn down mid-drain
+        // (see [`torn_down_scopes`]): each command drains independently, so a
+        // scope invalidated by a previous command's terminate must not leak into
+        // this one's dead-scope guard.
+        self.torn_down_scopes.clear();
         let mut log: Vec<Event> = Vec::new();
         let mut queue: VecDeque<Step> = VecDeque::new();
 
@@ -4100,19 +4121,47 @@ impl Engine {
                 container_key,
                 ..
             } => (*instance_key, None, None, Some(*container_key)),
-            // Retry steps re-drive an activation that *creates* the body/container
-            // (or child) runtime record, so the owner may not exist yet — only the
-            // instance-terminal check applies. Likewise a cross-instance
-            // `CompleteCallActivity` targets the still-live parent, and its handler
-            // already tolerates a vanished call-activity token.
-            Step::RetryMiChildActivation { instance_key, .. }
-            | Step::RetryMiBodyActivation { instance_key, .. }
-            | Step::CompleteCallActivity { instance_key, .. } => (*instance_key, None, None, None),
-            // Task-keyed: resolve the owning instance through the user task.
+            // A multi-instance **child** retry re-drives the *already-activated*
+            // child (its activation events are not re-emitted, #946), so both its
+            // child token and its owning body must still exist: a scoped terminate
+            // that tore the loop down between queueing and draining this retry must
+            // drop it, exactly like the non-retry MI steps above. Thread the child
+            // (element-instance) and body (owner) keys so the shared checks below
+            // apply — reusing the same "did teardown remove it?" logic.
+            Step::RetryMiChildActivation {
+                instance_key,
+                body_key,
+                child_key,
+                ..
+            } => (*instance_key, None, Some(*child_key), Some(*body_key)),
+            // A multi-instance **body** retry re-drives the *already-activated*
+            // body token (its activation/scope events are not re-emitted), so the
+            // body element instance must still be active. Its `multi_instances`
+            // record may legitimately not exist yet — the retry re-runs the very
+            // fan-out that creates it — so only the element-instance check applies,
+            // not the owner check.
+            Step::RetryMiBodyActivation {
+                instance_key,
+                body_key,
+                ..
+            } => (*instance_key, None, Some(*body_key), None),
+            // A cross-instance `CompleteCallActivity` targets the still-live
+            // parent, and its handler already tolerates a vanished call-activity
+            // token — only the instance-terminal check applies.
+            Step::CompleteCallActivity { instance_key, .. } => (*instance_key, None, None, None),
+            // Task-keyed: resolve the owning instance through the user task, and
+            // reject the step unless the task is still `Created`. `UserTaskCanceled`
+            // deliberately *retains* the record (state → `Canceled`, `pending`
+            // cleared), so a bare existence check would let an `AdvanceTaskListener`
+            // queued before a terminate teardown mint another listener job against
+            // an already-cancelled (or completed) task.
             Step::AdvanceTaskListener { user_task_key, .. } => {
                 match self.state.user_tasks.get(user_task_key) {
-                    Some(t) => (t.instance_key, None, None, None),
-                    None => return true, // the task is gone
+                    Some(t) if t.state == crate::state::UserTaskState::Created => {
+                        (t.instance_key, None, None, None)
+                    }
+                    // Gone, or no longer `Created` (canceled/completed): drop it.
+                    _ => return true,
                 }
             }
         };
@@ -4123,12 +4172,18 @@ impl Engine {
             return true;
         }
         // A non-root activation scope that no longer exists: not an active
-        // element instance, nor a multi-instance body, nor an ad-hoc container.
+        // element instance, nor a multi-instance body, nor an ad-hoc container —
+        // or one whose teardown was *decided* this drain but whose sub-process
+        // token is still active pending the post-drain completion sweep (a scoped
+        // terminate / interrupting boundary leaves it live until then, so a still-
+        // queued sibling activation must be rejected here rather than recreate a
+        // token inside the dead scope and wedge the drain).
         if let Some(scope) = scope {
             if scope != 0
-                && !instance.active.contains_key(&scope)
-                && !instance.multi_instances.contains_key(&scope)
-                && !instance.adhoc_instances.contains_key(&scope)
+                && (self.torn_down_scopes.contains(&scope)
+                    || (!instance.active.contains_key(&scope)
+                        && !instance.multi_instances.contains_key(&scope)
+                        && !instance.adhoc_instances.contains_key(&scope)))
             {
                 return true;
             }
@@ -8053,6 +8108,13 @@ impl Engine {
         // the post-drain `complete_drained_subprocesses` sweep via its ordinary
         // completion path, which also continues the parent on the sub-process's
         // outgoing flow — one source of truth for sub-process completion.
+        //
+        // Record the scope as torn down for this drain so a sibling branch's
+        // `Step::Activate` still queued behind this terminate cannot recreate a
+        // token inside the dead scope (which would keep the sub-process from ever
+        // draining) — the sub-process token stays active until the sweep, so the
+        // dead-scope guard needs this marker, not just the `active` map.
+        self.torn_down_scopes.insert(scope);
         (self.scope_teardown_events(instance_key, scope), Vec::new())
     }
     /// completed (ADR 0037). If another listener remains in the chain, its job is

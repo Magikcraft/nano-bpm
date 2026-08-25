@@ -2807,6 +2807,28 @@ pub fn apply(state: &mut State, event: &Event) {
             }
         }
 
+        // A sub-process scope was torn down: drop the compensation state scoped to
+        // it (or a nested scope). Mirrors the whole-instance
+        // `ProcessInstanceTerminated` sweep, but bounded to the terminated
+        // sub-process — `scopes` is the terminated scope plus its descendants, so
+        // any completed-activity subscription or pending handler wait belonging to
+        // one of them is removed, leaving the still-live parent's compensation
+        // state intact.
+        Event::ScopedCompensationCleared {
+            instance_key,
+            scopes,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                let scope_set: std::collections::HashSet<Key> = scopes.iter().copied().collect();
+                instance
+                    .compensable
+                    .retain(|c| !scope_set.contains(&c.scope));
+                instance
+                    .compensation_waits
+                    .retain(|_, w| !scope_set.contains(&w.scope));
+            }
+        }
+
         // A multi-instance body activated: record its runtime state so subsequent
         // child spawns/completions and the body's completion are reconstructable.
         Event::MultiInstanceActivated {

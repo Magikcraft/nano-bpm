@@ -180,6 +180,10 @@ impl Engine {
         instance_key: Key,
         scope_eik: Key,
     ) {
+        // Mark the scope torn down for this drain so a sibling activation still
+        // queued behind the interrupting boundary cannot recreate a token inside
+        // it (mirrors the scoped terminate-end path; see [`torn_down_scopes`]).
+        self.torn_down_scopes.insert(scope_eik);
         for event in self.scope_teardown_events(instance_key, scope_eik) {
             self.emit(log, event);
         }
@@ -288,6 +292,39 @@ impl Engine {
                 element_instance_key: eik,
                 element_id,
             });
+        }
+        // Scoped compensation cleanup. A completed compensable activity and an
+        // in-flight compensation throw both record the `scope` (element instance
+        // of the enclosing sub-process, or `0` for the root) they belong to. The
+        // whole-instance `ProcessInstanceTerminated` reducer clears both maps, but
+        // a *sub-process* terminate only removes the tokens above — leaving the
+        // completed-activity subscriptions and pending handler waits scoped to the
+        // torn-down sub-process (or a nested scope) attached to the still-live
+        // parent until whole-instance eviction. That strands stale compensation
+        // state on long-running parents and could run a handler for an activity in
+        // a scope that no longer exists. Drop exactly the entries scoped to the
+        // terminated scope and its descendants, carrying the scope set on the
+        // event so replay reproduces the removal without recomputing the (by then
+        // torn-down) scope tree.
+        if let Some(instance) = self.state.instances.get(&instance_key) {
+            let mut scopes: Vec<Key> = self.scope_descendants(instance_key, scope_eik);
+            scopes.push(scope_eik);
+            let scope_set: std::collections::HashSet<Key> = scopes.iter().copied().collect();
+            let clears_any = instance
+                .compensable
+                .iter()
+                .any(|c| scope_set.contains(&c.scope))
+                || instance
+                    .compensation_waits
+                    .values()
+                    .any(|w| scope_set.contains(&w.scope));
+            if clears_any {
+                scopes.sort_unstable();
+                events.push(Event::ScopedCompensationCleared {
+                    instance_key,
+                    scopes,
+                });
+            }
         }
         events
     }
