@@ -237,6 +237,7 @@ export default function InstanceDetail({
                 "State",
                 "Retries",
                 "Worker",
+                "Job key",
                 "Activated",
                 "Timeout",
               ]}
@@ -248,6 +249,7 @@ export default function InstanceDetail({
                   <Td>{j.state}</Td>
                   <Td>{j.retries}</Td>
                   <Td className="text-fg-faint">{j.worker ?? "—"}</Td>
+                  <Td className="font-mono text-fg-faint">{j.key}</Td>
                   <Td className="text-fg-faint">
                     {j.activated_at_ms != null
                       ? fmtClock(j.activated_at_ms)

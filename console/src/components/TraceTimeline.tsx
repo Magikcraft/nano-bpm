@@ -3,26 +3,12 @@ import type { ReactNode } from "react";
 import type { InstanceTrace, TraceElement } from "../gen";
 import { SectionLabel } from "./ui";
 import { IncidentReason } from "./IncidentReason";
+import { fmtClock, fmtDuration } from "./traceTime.ts";
 
-/** Format a duration given in milliseconds. */
-export function fmtDuration(ms: number | null): string {
-  if (ms == null) return "—";
-  if (ms < 1000) return `${ms} ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(2)} s`;
-  const m = Math.floor(ms / 60_000);
-  const s = ((ms % 60_000) / 1000).toFixed(0);
-  return `${m}m ${s}s`;
-}
-
-/** Format an absolute wall-clock timestamp (ms since the Unix epoch). */
-export function fmtClock(ms: number): string {
-  return new Date(ms).toLocaleTimeString(undefined, {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
+// Re-exported so existing importers of `../components/TraceTimeline` keep
+// working; the implementations live in the JSX-free `traceTime.ts` so they are
+// unit-testable under `node --test`.
+export { fmtClock, fmtDuration } from "./traceTime.ts";
 
 /// How the timeline turns the trace's numeric timestamps into labels. Production
 /// traces are wall-clock milliseconds (the default); the in-browser simulation
