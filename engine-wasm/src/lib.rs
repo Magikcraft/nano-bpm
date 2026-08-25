@@ -1254,7 +1254,7 @@ fn process_instance_result(row: &ProcessInstanceRow, roots: &RootResolver) -> se
         "processDefinitionKey": row.process_definition_key,
         "parentProcessInstanceKey": parent_process_instance_key,
         "parentElementInstanceKey": parent_element_instance_key,
-        "rootProcessInstanceKey": roots.root_process_instance_key(row.key).to_string(),
+        "rootProcessInstanceKey": roots.root_of_row(row).to_string(),
         "tags": row.tags,
         "businessId": row.business_id,
     })

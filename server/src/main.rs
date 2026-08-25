@@ -17345,6 +17345,16 @@ impl ServerImpl {
     /// **cancellation** ignores/overrides `parentProcessInstanceKey` — only ACTIVE
     /// root instances can be cancelled (`spec/process-instances.yaml:371-375`), so
     /// a child-scoped cancellation request must not silently enqueue the child key.
+    ///
+    /// The caller's `filter.state` is **always ignored and overridden to ACTIVE**:
+    /// every process-instance batch operation that consumes this matcher is
+    /// ACTIVE-only by contract — cancellation (only ACTIVE root instances are
+    /// cancellable, `spec/process-instances.yaml:371-375`) and incident-resolution
+    /// (only ACTIVE instances can have unresolved incidents,
+    /// `spec/process-instances.yaml:416-418`) both state "any given filters for
+    /// state … are ignored and overridden". Enforcing ACTIVE here (rather than
+    /// threading a per-call `state` policy) keeps the override in one place so a
+    /// caller cannot forget it and enqueue a COMPLETED/TERMINATED instance.
     fn batch_matched_process_instances(
         &self,
         filter: &models::ProcessInstanceFilter,
@@ -17355,7 +17365,9 @@ impl ServerImpl {
             .process_instances()
             .into_iter()
             .filter(|inst| {
-                let state_str = process_instance_state_enum(inst.state).to_string();
+                // Batch operations are ACTIVE-only by contract; `filter.state` is
+                // ignored and overridden to ACTIVE (see the doc comment above).
+                let state_matches = matches!(inst.state, ProcessInstanceState::Active);
                 let hierarchy_matches = !honour_hierarchy_filters
                     || (query::match_process_instance_key_opt(
                         &filter.parent_process_instance_key,
@@ -17379,7 +17391,7 @@ impl ServerImpl {
                         &filter.process_definition_version,
                         Some(i64::from(inst.version)),
                     )
-                    && query::match_process_instance_state(&filter.state, &state_str)
+                    && state_matches
                     && filter
                         .has_incident
                         .is_none_or(|want| want == inst.has_incident)
@@ -17434,8 +17446,8 @@ impl ServerImpl {
             ));
         };
         let op_type = models::BatchOperationTypeEnum::ResolveIncident;
-        // Incident resolution honours the call-activity hierarchy filters (only
-        // `state` is overridden by contract, spec §416-418).
+        // Incident resolution honours the call-activity hierarchy filters; `state`
+        // is ignored/overridden to ACTIVE by the matcher (spec §416-418).
         let items = self.batch_matched_process_instances(&req.filter, true);
         let key = self.batch_operations.create(op_type, items);
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
@@ -18244,7 +18256,7 @@ fn process_instance_result(
         None => types::Nullable::Null,
     };
     let root_process_instance_key = types::Nullable::Present(models::ProcessInstanceKey(
-        roots.root_process_instance_key(instance.key).to_string(),
+        roots.root_of_row(instance).to_string(),
     ));
 
     models::ProcessInstanceResult::new(
@@ -33797,6 +33809,10 @@ mod call_activity_hierarchy_read_model_tests {
             leaf.parent_process_instance_key
         );
         assert_eq!(
+            got.parent_element_instance_key,
+            leaf.parent_element_instance_key
+        );
+        assert_eq!(
             got.root_process_instance_key,
             leaf.root_process_instance_key
         );
@@ -33984,5 +34000,49 @@ mod call_activity_hierarchy_read_model_tests {
             },
             "cancellation ignores the parent filter and matches all instances"
         );
+    }
+
+    #[tokio::test]
+    async fn batch_matcher_overrides_the_state_filter_to_active() {
+        // Every process-instance batch operation is ACTIVE-only by contract:
+        // cancellation (only ACTIVE root instances are cancellable,
+        // spec §371-375) and incident-resolution (only ACTIVE instances can have
+        // unresolved incidents, spec §416-418) both promise that "any given
+        // filters for state … are ignored and overridden". A caller-supplied
+        // `state` that is NOT active must therefore neither exclude the ACTIVE
+        // instances (state is ignored) nor be honoured — the matcher enforces
+        // ACTIVE regardless. Guards the class for cancellation AND
+        // incident-resolution (both honour-hierarchy modes).
+        let server = ServerImpl::default();
+        deploy(&server, vec![parking_process("bm-state", "work")]).await;
+        let (instance_key, _) = server
+            .create_for_stream(
+                Some("bm-state".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create bm-state");
+        search_until(&server, 1).await;
+
+        // A non-ACTIVE state filter must not suppress the ACTIVE instance: the
+        // matcher overrides `state` to ACTIVE and still selects it. (Before the
+        // fix, `state: COMPLETED` was honoured and this returned empty.)
+        let completed_filter = models::ProcessInstanceFilter {
+            state: Some(models::ProcessInstanceStateFilterProperty::ProcessInstanceStateEnum(
+                models::ProcessInstanceStateEnum::Completed,
+            )),
+            ..models::ProcessInstanceFilter::new()
+        };
+        for honour_hierarchy in [true, false] {
+            let matched =
+                server.batch_matched_process_instances(&completed_filter, honour_hierarchy);
+            assert_eq!(
+                matched,
+                vec![instance_key],
+                "batch matcher overrides state to ACTIVE and selects the active \
+                 instance despite a COMPLETED filter (honour_hierarchy={honour_hierarchy})"
+            );
+        }
     }
 }
