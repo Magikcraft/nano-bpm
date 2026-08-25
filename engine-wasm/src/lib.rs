@@ -27,7 +27,7 @@ use nanobpmn_engine_core::{
 /// everything it touches is `#[cfg(feature = "read-model")]`.
 #[cfg(feature = "read-model")]
 use nanobpmn_read_model::{
-    FormRow, ProcessInstanceRow, ReadStore, ResourceRow, UserTaskRow, VariableRow,
+    FormRow, ProcessInstanceRow, ReadStore, ResourceRow, RootResolver, UserTaskRow, VariableRow,
     VARIABLE_VALUE_PREVIEW_LEN,
 };
 use serde::Serialize;
@@ -960,11 +960,14 @@ impl TestEngine {
     #[wasm_bindgen(js_name = searchProcessInstances)]
     pub fn search_process_instances(&self, filter_json: &str) -> Result<String, JsValue> {
         validate_search_filter_body(filter_json)?;
+        // One resolver spans the whole search so instances sharing a parent chain
+        // walk it once (issue #977 review: avoid O(rows × chain-depth) root walks).
+        let roots = RootResolver::new(|k| self.read_model.process_instance(k));
         let items: Vec<serde_json::Value> = self
             .read_model
             .process_instances()
             .iter()
-            .map(process_instance_result)
+            .map(|row| process_instance_result(row, &roots))
             .collect();
         to_json(&search_result(items))
     }
@@ -1214,14 +1217,28 @@ fn resource_result(row: &ResourceRow) -> serde_json::Value {
 }
 
 /// Serialise a [`ProcessInstanceRow`] as the gateway's `ProcessInstanceResult`
-/// JSON shape. Fields the engine does not retain (name, version tag, parent/root
-/// keys) are null, exactly as the gateway projects them.
+/// JSON shape. The call-activity hierarchy (issue #977) is surfaced exactly as
+/// the gateway projects it: `parentProcessInstanceKey` / `parentElementInstanceKey`
+/// carry the engine-tracked linkage for a child spawned by a call activity (both
+/// null for a top-level instance), and `rootProcessInstanceKey` is resolved by
+/// walking the parent chain via `roots` (a per-search [`RootResolver`] memoising
+/// the whole walked chain, so a page of co-located descendants walks each parent
+/// once) to the top-level ancestor — a top-level instance reports its own key.
+/// Fields the engine does not retain (definition name, version tag) stay null.
 #[cfg(feature = "read-model")]
-fn process_instance_result(row: &ProcessInstanceRow) -> serde_json::Value {
+fn process_instance_result(row: &ProcessInstanceRow, roots: &RootResolver) -> serde_json::Value {
     let state = match row.state {
         ProcessInstanceState::Active => "ACTIVE",
         ProcessInstanceState::Completed => "COMPLETED",
         ProcessInstanceState::Terminated | ProcessInstanceState::Terminating => "TERMINATED",
+    };
+    let parent_process_instance_key = match row.parent_process_instance_key {
+        Some(k) => serde_json::Value::String(k.to_string()),
+        None => serde_json::Value::Null,
+    };
+    let parent_element_instance_key = match row.parent_element_instance_key {
+        Some(k) => serde_json::Value::String(k.to_string()),
+        None => serde_json::Value::Null,
     };
     serde_json::json!({
         "processDefinitionId": row.process_definition_id,
@@ -1235,9 +1252,9 @@ fn process_instance_result(row: &ProcessInstanceRow) -> serde_json::Value {
         "tenantId": "<default>",
         "processInstanceKey": row.key.to_string(),
         "processDefinitionKey": row.process_definition_key,
-        "parentProcessInstanceKey": serde_json::Value::Null,
-        "parentElementInstanceKey": serde_json::Value::Null,
-        "rootProcessInstanceKey": serde_json::Value::Null,
+        "parentProcessInstanceKey": parent_process_instance_key,
+        "parentElementInstanceKey": parent_element_instance_key,
+        "rootProcessInstanceKey": roots.root_of_row(row).to_string(),
         "tags": row.tags,
         "businessId": row.business_id,
     })
@@ -3345,6 +3362,95 @@ mod read_channel_tests {
                 "filter body {body:?} should be rejected"
             );
         }
+    }
+
+    const CA_CHILD_XML: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="ca-child">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="work">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="child-work" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="work" />
+          <bpmn:sequenceFlow id="b" sourceRef="work" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    const CA_PARENT_XML: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="ca-parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:callActivity id="c1">
+            <bpmn:extensionElements>
+              <zeebe:calledElement processId="ca-child" />
+            </bpmn:extensionElements>
+          </bpmn:callActivity>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="c1" />
+          <bpmn:sequenceFlow id="b" sourceRef="c1" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    #[test]
+    fn search_process_instances_surfaces_call_activity_parent_and_root_keys() {
+        // Issue #977 (Zeebe/C8 parity): the `engine-wasm` read model — the surface
+        // nano-ide#473 / the console consume via `@nanobpm/engine-wasm` — must
+        // surface the native call-activity hierarchy, not hard-code the linkage to
+        // null. A `ca-parent` → `ca-child` run parks the child on a service-task
+        // job so both instances stay ACTIVE and are projected.
+        let mut eng = TestEngine::new();
+        eng.deploy(CA_CHILD_XML).unwrap();
+        eng.deploy(CA_PARENT_XML).unwrap();
+        let snap = parse(&eng.create_instance("ca-parent", "{}", None).unwrap());
+        let parent_key = snap["instances"]
+            .as_array()
+            .and_then(|xs| xs.iter().find(|i| i["processId"] == "ca-parent"))
+            .map(|i| i["key"].as_str().unwrap().to_string())
+            .expect("parent instance created");
+
+        let result = parse(&eng.search_process_instances("").unwrap());
+        let items = result["items"].as_array().expect("items array");
+        let by_id = |id: &str| -> J {
+            items
+                .iter()
+                .find(|i| i["processDefinitionId"] == id)
+                .unwrap_or_else(|| panic!("no {id} instance projected: {result}"))
+                .clone()
+        };
+
+        // Top-level parent: no parent linkage, self-rooted (no-regression guard).
+        let parent = by_id("ca-parent");
+        assert_eq!(parent["processInstanceKey"], serde_json::json!(parent_key));
+        assert_eq!(parent["parentProcessInstanceKey"], J::Null);
+        assert_eq!(parent["parentElementInstanceKey"], J::Null);
+        assert_eq!(
+            parent["rootProcessInstanceKey"],
+            serde_json::json!(parent_key),
+            "a top-level instance roots to its own key, not null"
+        );
+
+        // Call-activity child: parent linkage populated, roots to the parent.
+        let child = by_id("ca-child");
+        assert_eq!(
+            child["parentProcessInstanceKey"],
+            serde_json::json!(parent_key),
+            "the child reports its calling instance, not null"
+        );
+        assert_ne!(
+            child["parentElementInstanceKey"],
+            J::Null,
+            "the child reports the spawning call-activity element instance"
+        );
+        assert_eq!(
+            child["rootProcessInstanceKey"],
+            serde_json::json!(parent_key),
+            "the child roots to the top-level parent"
+        );
     }
 
     #[test]

@@ -945,6 +945,190 @@ pub struct ProcessInstanceRow {
     pub parent_element_instance_key: Option<Key>,
 }
 
+/// Resolves the `rootProcessInstanceKey` for `key` (C8 parity, issue #977) by
+/// walking the `parentProcessInstanceKey` chain — supplied by `lookup` — to the
+/// top-level ancestor. A top-level instance (no parent) roots to its own key; a
+/// call-activity child (issue #808), however deeply nested, roots to the
+/// top-level instance that started the whole tree.
+///
+/// The walk is parameterised by `lookup` so it is the **single** root-resolution
+/// algorithm shared by every read surface: the server's sharded
+/// `ReadModel` routes each hop across partitions, the single-partition
+/// [`ReadStore`] (and the `engine-wasm` `TestEngine`) looks up in place — same
+/// chain, one implementation, no drift.
+///
+/// Best-effort at the boundaries: if `key` itself is unknown, or an ancestor row
+/// has been pruned/not-yet-projected, the walk stops and returns the furthest
+/// ancestor key it could observe (the child key, or that missing parent's key)
+/// rather than fabricating a root. A `visited` set guards against a corrupt
+/// parent cycle (e.g. a lasso `A → B → A`), terminating at the first ring member
+/// re-encountered instead of looping.
+///
+/// This is a one-shot convenience over [`resolve_root_with_cache`]: it resolves a
+/// single key with a throwaway cache. Callers projecting many rows in one
+/// response should use a [`RootResolver`] instead so the walked chain is memoised
+/// across rows.
+pub fn resolve_root_process_instance_key(
+    key: Key,
+    mut lookup: impl FnMut(Key) -> Option<ProcessInstanceRow>,
+) -> Key {
+    let mut cache = std::collections::HashMap::new();
+    resolve_root_with_cache(key, &mut lookup, &mut cache)
+}
+
+/// The canonical root walk, memoising **every** key it visits (not just `key`).
+///
+/// All keys on one parent chain share the same top-level ancestor, so a single
+/// walk that touches `N` ancestors seeds `N` cache entries — a later sibling or
+/// descendant row in the same response reuses the shared prefix (or the whole
+/// chain) instead of re-walking it. This collapses projecting a page from
+/// `O(rows × chain-depth)` point lookups to `O(distinct keys)`.
+///
+/// Termination and boundary semantics match [`resolve_root_process_instance_key`]:
+/// a definitive top-level root (parent `None`) and a best-effort furthest-observed
+/// ancestor (a pruned/absent parent row) are cached for the whole path, because
+/// every key on the path resolves to that same value. A detected cycle terminates
+/// at the re-encountered ring member and is **not** cached, since a corrupt ring
+/// has no well-defined root to memoise.
+fn resolve_root_with_cache(
+    key: Key,
+    lookup: &mut dyn FnMut(Key) -> Option<ProcessInstanceRow>,
+    cache: &mut std::collections::HashMap<Key, Key>,
+) -> Key {
+    if let Some(&root) = cache.get(&key) {
+        return root;
+    }
+    walk_root_to_top(
+        key,
+        Vec::new(),
+        std::collections::HashSet::new(),
+        lookup,
+        cache,
+    )
+}
+
+/// Like [`resolve_root_with_cache`], but for an entry row the caller **already
+/// holds** (every projection row comes straight out of `process_instances()`),
+/// so the walk skips the redundant point lookup of the entry's *own* key and
+/// reads its `parent_process_instance_key` link directly. A top-level entry
+/// (parent `None`) self-roots with **no** lookup at all — collapsing an
+/// otherwise `O(page_size)` burst of point queries for a page of top-level rows.
+///
+/// Semantically identical to `resolve_root_with_cache(entry.key, …)`: the same
+/// `visited`/`cache`/cycle-termination behaviour (the entry key is seeded into
+/// `visited` and `path` exactly as the first loop step would), differing only by
+/// not re-reading a row already in hand. Both entry points share the single
+/// [`walk_root_to_top`] core, so there is no second root-walk to drift.
+fn resolve_root_from_row_with_cache(
+    entry: &ProcessInstanceRow,
+    lookup: &mut dyn FnMut(Key) -> Option<ProcessInstanceRow>,
+    cache: &mut std::collections::HashMap<Key, Key>,
+) -> Key {
+    if let Some(&root) = cache.get(&entry.key) {
+        return root;
+    }
+    match entry.parent_process_instance_key {
+        // Definitive top-level ancestor: self-roots, no lookup needed.
+        None => {
+            cache.insert(entry.key, entry.key);
+            entry.key
+        }
+        Some(parent) => {
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(entry.key);
+            walk_root_to_top(parent, vec![entry.key], visited, lookup, cache)
+        }
+    }
+}
+
+/// The shared root-walk core: from `current` (with any already-walked `path` and
+/// `visited` prefix), climb the `parentProcessInstanceKey` chain to the
+/// top-level ancestor, memoising **every** key visited (see
+/// [`resolve_root_with_cache`] for the caching/termination guarantees).
+fn walk_root_to_top(
+    mut current: Key,
+    mut path: Vec<Key>,
+    mut visited: std::collections::HashSet<Key>,
+    lookup: &mut dyn FnMut(Key) -> Option<ProcessInstanceRow>,
+    cache: &mut std::collections::HashMap<Key, Key>,
+) -> Key {
+    let root = loop {
+        // A previously-resolved ancestor short-circuits the rest of the walk.
+        if let Some(&cached) = cache.get(&current) {
+            break cached;
+        }
+        if !visited.insert(current) {
+            // Cycle: terminate at the re-encountered ring member without
+            // poisoning the cache with an ambiguous root.
+            return current;
+        }
+        match lookup(current) {
+            // `current`'s row is absent: an unknown entry key self-roots, and a
+            // named-but-pruned ancestor is the furthest observable root. Either
+            // way `current` is the root for the whole path.
+            None => break current,
+            Some(row) => match row.parent_process_instance_key {
+                // Definitive top-level ancestor (`row.key == current`).
+                None => break row.key,
+                Some(parent) => {
+                    path.push(current);
+                    current = parent;
+                }
+            },
+        }
+    };
+    // Seed the whole walked path plus its terminal so common ancestors are reused.
+    for k in path {
+        cache.insert(k, root);
+    }
+    cache.insert(current, root);
+    root
+}
+
+/// A per-response memoiser over [`resolve_root_with_cache`]. Built once around a
+/// `lookup` closure (a `ReadStore` / sharded `ReadModel` point lookup) and shared
+/// across every row projected in one search/get response, so a call-activity
+/// hierarchy's parent chain is walked once and every descendant row reuses it —
+/// see [`resolve_root_with_cache`] for the caching guarantee.
+///
+/// Interior mutability lets it be shared behind `&self` through a projection map,
+/// exactly like the read model it wraps; the cache cannot go stale because the
+/// read model is immutable for the life of a response.
+pub struct RootResolver<'a> {
+    lookup: std::cell::RefCell<Box<dyn FnMut(Key) -> Option<ProcessInstanceRow> + 'a>>,
+    cache: std::cell::RefCell<std::collections::HashMap<Key, Key>>,
+}
+
+impl<'a> RootResolver<'a> {
+    /// Wraps `lookup` (a `parentProcessInstanceKey`-carrying row point lookup)
+    /// in a fresh, empty memoiser.
+    pub fn new(lookup: impl FnMut(Key) -> Option<ProcessInstanceRow> + 'a) -> Self {
+        Self {
+            lookup: std::cell::RefCell::new(Box::new(lookup)),
+            cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The `rootProcessInstanceKey` for `key`, memoising the whole walked chain.
+    pub fn root_process_instance_key(&self, key: Key) -> Key {
+        let mut lookup = self.lookup.borrow_mut();
+        let mut cache = self.cache.borrow_mut();
+        resolve_root_with_cache(key, &mut **lookup, &mut cache)
+    }
+
+    /// The `rootProcessInstanceKey` for an **already-loaded** row, skipping the
+    /// redundant point lookup of the row's own key (a top-level row self-roots
+    /// with no lookup at all). Prefer this over [`Self::root_process_instance_key`]
+    /// whenever the projection already holds the [`ProcessInstanceRow`] — it is
+    /// semantically identical but avoids one point query per projected row. See
+    /// [`resolve_root_from_row_with_cache`].
+    pub fn root_of_row(&self, row: &ProcessInstanceRow) -> Key {
+        let mut lookup = self.lookup.borrow_mut();
+        let mut cache = self.cache.borrow_mut();
+        resolve_root_from_row_with_cache(row, &mut **lookup, &mut cache)
+    }
+}
+
 pub struct JobRow {
     pub key: Key,
     pub instance_key: Key,
@@ -2163,6 +2347,19 @@ impl ReadStore {
         )
         .optional()
         .expect("query process_instance")
+    }
+
+    /// Resolves `key`'s `rootProcessInstanceKey` (issue #977) by walking the
+    /// `parentProcessInstanceKey` chain via this store's own point lookups. A
+    /// call-activity hierarchy is partition-co-located — the engine mints a child
+    /// on its parent's partition (`compose_key(self.partition_id, …)` in
+    /// `engine-core`), so the whole parent → child → grandchild chain lives in a
+    /// single store — hence a single-store walk resolves the true top-level root
+    /// without any cross-partition routing. Delegates to the shared
+    /// [`resolve_root_process_instance_key`] so this shares the gateway's exact
+    /// algorithm.
+    pub fn root_process_instance_key(&self, key: Key) -> Key {
+        resolve_root_process_instance_key(key, |k| self.process_instance(k))
     }
 
     pub fn jobs(&self) -> Vec<JobRow> {
@@ -5127,7 +5324,7 @@ mod writability_tests {
 mod definition_xml_tests {
     use nanobpmn_engine_core::{Event, ProcessBuilder, ProcessDefinition};
 
-    use super::ReadStore;
+    use super::{ReadStore, RootResolver};
 
     fn deployed_event(key: u64, xml: &str) -> Event {
         deployed_event_versioned("p", key, 1, xml)
@@ -5559,6 +5756,196 @@ mod definition_xml_tests {
             parent_process_instance_key: None,
             parent_element_instance_key: None,
         }
+    }
+
+    /// A create event carrying the call-activity parent linkage (issue #977):
+    /// the calling instance's key and the spawning call-activity element instance
+    /// key, so a hierarchy can be seeded event-first.
+    fn created_event_with_parent(
+        instance_key: super::Key,
+        parent_pi: super::Key,
+        parent_ei: super::Key,
+    ) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: Some(parent_pi),
+            parent_element_instance_key: Some(parent_ei),
+        }
+    }
+
+    /// `ReadStore::root_process_instance_key` walks the `parentProcessInstanceKey`
+    /// chain to the top-level ancestor within a single (partition-co-located)
+    /// store: a top-level instance self-roots and every call-activity descendant
+    /// — however deeply nested — roots to the top-level instance, never its own
+    /// key. This is the walk the `engine-wasm` `TestEngine` read model relies on.
+    #[test]
+    fn root_process_instance_key_walks_a_co_located_hierarchy_to_the_top() {
+        let store = ReadStore::open(None).unwrap();
+        // top (no parent) <- child (via EI 111) <- grandchild (via EI 222).
+        store
+            .export(&[
+                &created_event(10),
+                &created_event_with_parent(20, 10, 111),
+                &created_event_with_parent(30, 20, 222),
+            ])
+            .unwrap();
+
+        assert_eq!(store.root_process_instance_key(10), 10, "top self-roots");
+        assert_eq!(
+            store.root_process_instance_key(20),
+            10,
+            "direct child roots to the top"
+        );
+        assert_eq!(
+            store.root_process_instance_key(30),
+            10,
+            "nested descendant roots to the top, not its own or its parent's key"
+        );
+    }
+
+    /// Best-effort boundaries plus the cycle guard: an unknown key self-roots
+    /// (nothing to walk); a known child whose parent row is absent roots to that
+    /// furthest observable ancestor key; and a corrupt `A → B → A` parent cycle
+    /// terminates at the re-encountered ring member instead of looping forever
+    /// (issue #977, the lasso guard).
+    #[test]
+    fn root_process_instance_key_is_best_effort_and_cycle_safe() {
+        let store = ReadStore::open(None).unwrap();
+        // `child` (2000) names a parent (7777) that was never projected/pruned.
+        store
+            .export(&[&created_event_with_parent(2000, 7777, 111)])
+            .unwrap();
+        // A lasso cycle: A(40) -> B(41) -> A(40) -> …
+        store
+            .export(&[
+                &created_event_with_parent(40, 41, 333),
+                &created_event_with_parent(41, 40, 444),
+            ])
+            .unwrap();
+
+        // Unknown key: nothing to walk, roots to itself.
+        assert_eq!(store.root_process_instance_key(9999), 9999);
+        // Known child, absent parent: the furthest known ancestor is the parent
+        // key, so that is the reported root (not the child).
+        assert_eq!(store.root_process_instance_key(2000), 7777);
+        // The cycle terminates at a ring member rather than hanging; the
+        // guarantee under test is termination, not a value.
+        let cycle_root = store.root_process_instance_key(40);
+        assert!(
+            cycle_root == 40 || cycle_root == 41,
+            "a parent cycle terminates at a ring member, got {cycle_root}"
+        );
+    }
+
+    /// A [`RootResolver`] walks each parent chain **once** and memoises every key
+    /// it touches, so projecting a page of co-located descendants is
+    /// `O(distinct keys)` point lookups, not `O(rows × chain-depth)` (issue #977
+    /// review: the naive per-row walk repeated shared-ancestor lookups).
+    #[test]
+    fn root_resolver_memoises_the_whole_walked_chain() {
+        let store = ReadStore::open(None).unwrap();
+        // top(10) <- child(20) <- grandchild(30) <- great-grandchild(40).
+        store
+            .export(&[
+                &created_event(10),
+                &created_event_with_parent(20, 10, 111),
+                &created_event_with_parent(30, 20, 222),
+                &created_event_with_parent(40, 30, 333),
+            ])
+            .unwrap();
+
+        let lookups = std::cell::Cell::new(0usize);
+        let resolver = RootResolver::new(|k| {
+            lookups.set(lookups.get() + 1);
+            store.process_instance(k)
+        });
+
+        // Resolving the deepest descendant seeds every ancestor on the chain.
+        assert_eq!(resolver.root_process_instance_key(40), 10);
+        let after_deep = lookups.get();
+        assert_eq!(
+            after_deep, 4,
+            "one walk looks up each of the four chain keys exactly once"
+        );
+
+        // Every other chain member now resolves from cache — no further lookups.
+        assert_eq!(resolver.root_process_instance_key(30), 10);
+        assert_eq!(resolver.root_process_instance_key(20), 10);
+        assert_eq!(resolver.root_process_instance_key(10), 10);
+        assert_eq!(resolver.root_process_instance_key(40), 10);
+        assert_eq!(
+            lookups.get(),
+            after_deep,
+            "cached ancestors trigger no re-walk"
+        );
+    }
+
+    /// `root_of_row` resolves an already-loaded row identically to
+    /// `root_process_instance_key(row.key)` but skips the redundant lookup of the
+    /// row's own key — a top-level row self-roots with **zero** lookups, and a
+    /// child row does one fewer lookup than the by-key walk. Guards the
+    /// read-amplification fix (issue #977 review) and the parity of the two entry
+    /// points (a top-level row, a co-located child chain, and a corrupt cycle).
+    #[test]
+    fn root_of_row_matches_the_by_key_walk_without_the_self_lookup() {
+        let store = ReadStore::open(None).unwrap();
+        // top(10) <- child(20) <- grandchild(30); plus a lasso A(40)->B(41)->A.
+        store
+            .export(&[
+                &created_event(10),
+                &created_event_with_parent(20, 10, 111),
+                &created_event_with_parent(30, 20, 222),
+                &created_event_with_parent(40, 41, 333),
+                &created_event_with_parent(41, 40, 444),
+            ])
+            .unwrap();
+
+        // Top-level row self-roots with NO lookup at all.
+        let lookups = std::cell::Cell::new(0usize);
+        let resolver = RootResolver::new(|k| {
+            lookups.set(lookups.get() + 1);
+            store.process_instance(k)
+        });
+        let top = store.process_instance(10).unwrap();
+        assert_eq!(resolver.root_of_row(&top), 10);
+        assert_eq!(lookups.get(), 0, "a top-level row needs no point lookup");
+
+        // A child row: one fewer lookup than the by-key walk (its own key is not
+        // re-read), same resolved root.
+        let by_key = RootResolver::new(|k| store.process_instance(k));
+        let child = store.process_instance(30).unwrap();
+        let lookups2 = std::cell::Cell::new(0usize);
+        let from_row = RootResolver::new(|k| {
+            lookups2.set(lookups2.get() + 1);
+            store.process_instance(k)
+        });
+        assert_eq!(
+            from_row.root_of_row(&child),
+            by_key.root_process_instance_key(30)
+        );
+        assert_eq!(from_row.root_of_row(&child), 10);
+        assert_eq!(
+            lookups2.get(),
+            2,
+            "walking from key 30's parent looks up only 20 and 10, not 30 itself"
+        );
+
+        // Cycle parity: `root_of_row` terminates at the same ring member as the
+        // by-key walk (best-effort, termination is the guarantee).
+        let cyc = RootResolver::new(|k| store.process_instance(k));
+        let row_a = store.process_instance(40).unwrap();
+        assert_eq!(
+            cyc.root_of_row(&row_a),
+            by_key.root_process_instance_key(40),
+            "a corrupt cycle terminates identically for both entry points"
+        );
     }
 
     #[test]
