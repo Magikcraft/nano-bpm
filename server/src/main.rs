@@ -9699,11 +9699,21 @@ impl ServerImpl {
                     ) && query::match_process_instance_key(
                         &f.process_instance_key,
                         &ws.process_instance_key.to_string(),
-                    ) && query::match_process_instance_key(
-                        &f.root_process_instance_key,
-                        &roots
-                            .root_process_instance_key(ws.process_instance_key)
-                            .to_string(),
+                    ) && (
+                        // Only resolve the (potentially multi-hop, per-row) root
+                        // chain when a `rootProcessInstanceKey` filter is actually
+                        // present — a `None` filter matches every row regardless,
+                        // so resolving here would force a parent-chain lookup for
+                        // every wait state before pagination for nothing (#977
+                        // review). The paged projection below still resolves roots
+                        // for the rows it returns.
+                        f.root_process_instance_key.is_none()
+                            || query::match_process_instance_key(
+                                &f.root_process_instance_key,
+                                &roots
+                                    .root_process_instance_key(ws.process_instance_key)
+                                    .to_string(),
+                            )
                     ) && query::match_element_id(&f.element_id, &ws.element_id)
                         && query::match_wait_state_element_type(&f.element_type, &ws.element_type)
                         && query::match_wait_state_type(
@@ -17328,6 +17338,25 @@ impl ServerImpl {
     }
 }
 
+/// How a process-instance batch matcher treats the call-activity hierarchy
+/// (issue #977). Batch operations differ by contract, so the policy is passed
+/// explicitly rather than inferred:
+///
+/// * [`HonourFilters`](BatchHierarchyPolicy::HonourFilters) — evaluate the
+///   caller's `parentProcessInstanceKey` / `parentElementInstanceKey` predicates
+///   verbatim (incident-resolution and the `search` surface).
+/// * [`RootOnly`](BatchHierarchyPolicy::RootOnly) — ignore the caller's parent
+///   filters **and** target only root instances
+///   (`parent_process_instance_key.is_none()`). Cancellation: only ACTIVE root
+///   instances are cancellable (`spec/process-instances.yaml:371-375`), so a
+///   child-scoped request must neither scope to the child nor enqueue active
+///   call-activity children.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BatchHierarchyPolicy {
+    HonourFilters,
+    RootOnly,
+}
+
 /// v2 REST batch-operations surface (epic #903, sub-issue #905).
 ///
 /// Kept in its own `impl` block so this slice never touches the shared
@@ -17338,13 +17367,17 @@ impl ServerImpl {
     /// `search_process_instances_impl`. These become the items of a batch
     /// operation minted by a process-instance batch creator.
     ///
-    /// `honour_hierarchy_filters` gates the call-activity `parentProcessInstanceKey`
-    /// / `parentElementInstanceKey` predicates (C8 parity, issue #977). Batch
-    /// operations differ by contract on whether those filters apply:
-    /// incident-resolution (and the `search` surface) honour them, but
-    /// **cancellation** ignores/overrides `parentProcessInstanceKey` — only ACTIVE
-    /// root instances can be cancelled (`spec/process-instances.yaml:371-375`), so
-    /// a child-scoped cancellation request must not silently enqueue the child key.
+    /// `honour_hierarchy` ([`BatchHierarchyPolicy`]) gates the call-activity
+    /// `parentProcessInstanceKey` / `parentElementInstanceKey` predicates (C8
+    /// parity, issue #977). Batch operations differ by contract on how those
+    /// filters apply: incident-resolution (and the `search` surface) honour them
+    /// ([`HonourFilters`](BatchHierarchyPolicy::HonourFilters)), but
+    /// **cancellation** ignores/overrides them and targets only ACTIVE **root**
+    /// instances ([`RootOnly`](BatchHierarchyPolicy::RootOnly)) — only ACTIVE root
+    /// instances can be cancelled (`spec/process-instances.yaml:371-375`), so a
+    /// child-scoped cancellation request must not silently enqueue the child key,
+    /// **and** an unfiltered cancellation must not enqueue active call-activity
+    /// children either.
     ///
     /// The caller's `filter.state` is **always ignored and overridden to ACTIVE**:
     /// every process-instance batch operation that consumes this matcher is
@@ -17358,7 +17391,7 @@ impl ServerImpl {
     fn batch_matched_process_instances(
         &self,
         filter: &models::ProcessInstanceFilter,
-        honour_hierarchy_filters: bool,
+        honour_hierarchy: BatchHierarchyPolicy,
     ) -> Vec<u64> {
         let mut keys: Vec<u64> = self
             .store
@@ -17368,18 +17401,28 @@ impl ServerImpl {
                 // Batch operations are ACTIVE-only by contract; `filter.state` is
                 // ignored and overridden to ACTIVE (see the doc comment above).
                 let state_matches = matches!(inst.state, ProcessInstanceState::Active);
-                let hierarchy_matches = !honour_hierarchy_filters
-                    || (query::match_process_instance_key_opt(
-                        &filter.parent_process_instance_key,
-                        inst.parent_process_instance_key
-                            .map(|k| k.to_string())
-                            .as_deref(),
-                    ) && query::match_element_instance_key_opt(
-                        &filter.parent_element_instance_key,
-                        inst.parent_element_instance_key
-                            .map(|k| k.to_string())
-                            .as_deref(),
-                    ));
+                let hierarchy_matches = match honour_hierarchy {
+                    // Incident-resolution / search: honour the supplied
+                    // call-activity hierarchy predicates verbatim.
+                    BatchHierarchyPolicy::HonourFilters => {
+                        query::match_process_instance_key_opt(
+                            &filter.parent_process_instance_key,
+                            inst.parent_process_instance_key
+                                .map(|k| k.to_string())
+                                .as_deref(),
+                        ) && query::match_element_instance_key_opt(
+                            &filter.parent_element_instance_key,
+                            inst.parent_element_instance_key
+                                .map(|k| k.to_string())
+                                .as_deref(),
+                        )
+                    }
+                    // Cancellation: ignore the supplied parent filters and target
+                    // only root instances (spec §371-375) — never active children.
+                    BatchHierarchyPolicy::RootOnly => {
+                        inst.parent_process_instance_key.is_none()
+                    }
+                };
                 query::match_process_instance_key(
                     &filter.process_instance_key,
                     &inst.key.to_string(),
@@ -17419,10 +17462,11 @@ impl ServerImpl {
     ) -> Result<apis::process_instance::CancelProcessInstancesBatchOperationResponse, ()> {
         use apis::process_instance::CancelProcessInstancesBatchOperationResponse as Resp;
         let op_type = models::BatchOperationTypeEnum::CancelProcessInstance;
-        // Cancellation ignores/overrides `parentProcessInstanceKey` — only ACTIVE
-        // root instances can be cancelled (spec §371-375), so the call-activity
-        // hierarchy filters must not scope this batch to a parent's children.
-        let items = self.batch_matched_process_instances(&body.filter, false);
+        // Cancellation ignores/overrides the supplied parent filters and targets
+        // only ACTIVE **root** instances (spec §371-375): the call-activity
+        // hierarchy filters must not scope this batch to a parent's children, and
+        // an unfiltered request must not enqueue active call-activity children.
+        let items = self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::RootOnly);
         let key = self.batch_operations.create(op_type, items);
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
@@ -17448,7 +17492,7 @@ impl ServerImpl {
         let op_type = models::BatchOperationTypeEnum::ResolveIncident;
         // Incident resolution honours the call-activity hierarchy filters; `state`
         // is ignored/overridden to ACTIVE by the matcher (spec §416-418).
-        let items = self.batch_matched_process_instances(&req.filter, true);
+        let items = self.batch_matched_process_instances(&req.filter, BatchHierarchyPolicy::HonourFilters);
         let key = self.batch_operations.create(op_type, items);
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
@@ -32983,7 +33027,7 @@ mod batch_operation_tests {
         let mut projected = false;
         for _ in 0..200 {
             if server
-                .batch_matched_process_instances(&models::ProcessInstanceFilter::new(), true)
+                .batch_matched_process_instances(&models::ProcessInstanceFilter::new(), BatchHierarchyPolicy::HonourFilters)
                 .contains(&instance_key)
             {
                 projected = true;
@@ -33958,7 +34002,7 @@ mod call_activity_hierarchy_read_model_tests {
             ),
             ..models::ProcessInstanceFilter::new()
         };
-        let matched = server.batch_matched_process_instances(&child_filter, true);
+        let matched = server.batch_matched_process_instances(&child_filter, BatchHierarchyPolicy::HonourFilters);
         assert_eq!(
             matched,
             vec![child_key.parse::<u64>().unwrap()],
@@ -33977,28 +34021,25 @@ mod call_activity_hierarchy_read_model_tests {
             ),
             ..models::ProcessInstanceFilter::new()
         };
-        let top_matched = server.batch_matched_process_instances(&top_filter, true);
+        let top_matched = server.batch_matched_process_instances(&top_filter, BatchHierarchyPolicy::HonourFilters);
         assert_eq!(
             top_matched,
             vec![parent_key],
             "the batch matcher selects only the top-level parent for $exists:false"
         );
 
-        // Cancellation ignores `parentProcessInstanceKey` by contract (only ACTIVE
-        // root instances are cancellable): with the hierarchy filters disabled the
-        // same child-scoped filter must NOT scope to the child — it matches every
-        // instance instead, so the child request does not silently enqueue only
-        // the child. (issue #977 review: cancellation must not inherit the new
-        // hierarchy predicates.)
-        let cancel_matched = server.batch_matched_process_instances(&child_filter, false);
+        // Cancellation ignores the supplied `parentProcessInstanceKey` by contract
+        // **and** targets only ACTIVE root instances (spec §371-375): the same
+        // child-scoped filter must NOT scope to the child, and — crucially — must
+        // NOT enqueue the active child either. Only the top-level (root) parent is
+        // a legal cancellation target. (issue #977 review: cancellation must not
+        // inherit the new hierarchy predicates nor cancel active call-activity
+        // children.)
+        let cancel_matched = server.batch_matched_process_instances(&child_filter, BatchHierarchyPolicy::RootOnly);
         assert_eq!(
             cancel_matched,
-            {
-                let mut all = vec![parent_key, child_key.parse::<u64>().unwrap()];
-                all.sort_unstable();
-                all
-            },
-            "cancellation ignores the parent filter and matches all instances"
+            vec![parent_key],
+            "cancellation ignores the parent filter and targets only the root instance"
         );
     }
 
@@ -34034,14 +34075,14 @@ mod call_activity_hierarchy_read_model_tests {
             )),
             ..models::ProcessInstanceFilter::new()
         };
-        for honour_hierarchy in [true, false] {
+        for honour_hierarchy in [BatchHierarchyPolicy::HonourFilters, BatchHierarchyPolicy::RootOnly] {
             let matched =
                 server.batch_matched_process_instances(&completed_filter, honour_hierarchy);
             assert_eq!(
                 matched,
                 vec![instance_key],
                 "batch matcher overrides state to ACTIVE and selects the active \
-                 instance despite a COMPLETED filter (honour_hierarchy={honour_hierarchy})"
+                 instance despite a COMPLETED filter (honour_hierarchy={honour_hierarchy:?})"
             );
         }
     }
