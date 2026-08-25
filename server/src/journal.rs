@@ -2048,6 +2048,23 @@ impl Journal {
         timeout: u64,
         now: u64,
     ) -> Vec<ActivatedJob> {
+        self.activate_jobs_with_fetch(job_type, worker, max_jobs, timeout, now, Vec::new())
+    }
+
+    /// Like [`Journal::activate_jobs`] but records the declared read-set
+    /// (`fetchVariables`) on each resulting [`Event::JobActivated`], so the
+    /// activation's read provenance is journaled durably. An empty
+    /// `fetch_variables` is exactly [`Journal::activate_jobs`] and keeps the
+    /// activation event byte-identical.
+    pub fn activate_jobs_with_fetch(
+        &mut self,
+        job_type: impl Into<String>,
+        worker: impl Into<String>,
+        max_jobs: usize,
+        timeout: u64,
+        now: u64,
+        fetch_variables: Vec<String>,
+    ) -> Vec<ActivatedJob> {
         let job_type = job_type.into();
         // Rehydrate up to `max_jobs` cold instances holding an activatable job of
         // this type, so a worker poll can reach a parked-then-cold backlog. Only
@@ -2063,9 +2080,14 @@ impl Journal {
                 self.rehydrate_cold(key);
             }
         }
-        let mut activated = self
-            .engine
-            .activate_jobs(&job_type, worker, max_jobs, timeout, now);
+        let mut activated = self.engine.activate_jobs_with_fetch(
+            &job_type,
+            worker,
+            max_jobs,
+            timeout,
+            now,
+            fetch_variables,
+        );
         // Rehydrate any spilled variables the activated jobs need. In lean mode
         // the authoritative store is read **non-destructively** (`get`) — the row
         // must survive for the next recovery; the spilled flag is cleared so the

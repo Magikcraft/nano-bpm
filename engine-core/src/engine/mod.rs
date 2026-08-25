@@ -1709,6 +1709,7 @@ impl Engine {
                 max_jobs,
                 timeout,
                 now,
+                fetch_variables,
             } => {
                 let deadline = now.saturating_add(timeout);
                 // Deterministic selection: walk the per-type activatable index in
@@ -1744,6 +1745,11 @@ impl Engine {
                             worker: worker.clone(),
                             deadline,
                             activated_at: Some(now),
+                            // Stamp the declared read-set onto every activation in
+                            // this batch. Cloned per job so each `JobActivated`
+                            // independently carries its provenance; empty for a
+                            // fetch-all activation (byte-identical, no field).
+                            fetch_variables: fetch_variables.clone(),
                         },
                     );
                 }
