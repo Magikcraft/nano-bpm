@@ -10541,19 +10541,17 @@ impl ServerImpl {
                         // still matches.
                         && query::match_date_time_ms(&f.end_date, None)
                         && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
-                        && query::match_process_instance_key(
+                        && query::match_process_instance_key_opt(
                             &f.parent_process_instance_key,
-                            &inst
-                                .parent_process_instance_key
+                            inst.parent_process_instance_key
                                 .map(|k| k.to_string())
-                                .unwrap_or_default(),
+                                .as_deref(),
                         )
-                        && query::match_element_instance_key(
+                        && query::match_element_instance_key_opt(
                             &f.parent_element_instance_key,
-                            &inst
-                                .parent_element_instance_key
+                            inst.parent_element_instance_key
                                 .map(|k| k.to_string())
-                                .unwrap_or_default(),
+                                .as_deref(),
                         )
                         && match_instance_variables(
                             &f.variables,
@@ -18239,16 +18237,16 @@ fn resolve_root_process_instance_key(
 ) -> Key {
     let mut root = key;
     let mut next = parent;
-    // A hierarchy this deep is already pathological; the bound only exists to
-    // make a cycle in corrupt data terminate, not as a real nesting limit.
-    for _ in 0..1024 {
-        match next {
-            Some(p) if p != root => {
-                root = p;
-                next = parent_of(p);
-            }
-            _ => break,
+    // Track every key on the walked chain so a cycle in corrupt data (a
+    // self-loop, or a lasso like 3→2→3) terminates the instant a key repeats,
+    // rather than spinning to an arbitrary depth bound.
+    let mut seen = std::collections::HashSet::from([root]);
+    while let Some(p) = next {
+        if !seen.insert(p) {
+            break;
         }
+        root = p;
+        next = parent_of(p);
     }
     root
 }

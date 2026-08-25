@@ -439,11 +439,25 @@ pub fn match_process_instance_key(
     filter: &Option<models::ProcessInstanceKeyFilterProperty>,
     value: &str,
 ) -> bool {
+    match_process_instance_key_opt(filter, Some(value))
+}
+
+/// Matches a `ProcessInstanceKeyFilterProperty` against a possibly-absent key.
+/// Passing `None` (no key on the record — e.g. the `parentProcessInstanceKey` of
+/// a top-level instance) lets advanced `$exists: false` filters match, and makes
+/// any value-based operator (including a bare key) fail — unlike coercing absence
+/// to an empty string, which spuriously satisfies `$exists: true`.
+pub fn match_process_instance_key_opt(
+    filter: &Option<models::ProcessInstanceKeyFilterProperty>,
+    value: Option<&str>,
+) -> bool {
     match filter {
         None => true,
-        Some(models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(k)) => k.0 == value,
+        Some(models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(k)) => {
+            value == Some(k.0.as_str())
+        }
         Some(models::ProcessInstanceKeyFilterProperty::AdvancedProcessInstanceKeyFilter(a)) => {
-            ops!(a, |k: &models::ProcessInstanceKey| k.0.clone()).matches(Some(value))
+            ops!(a, |k: &models::ProcessInstanceKey| k.0.clone()).matches(value)
         }
     }
 }
@@ -467,11 +481,25 @@ pub fn match_element_instance_key(
     filter: &Option<models::ElementInstanceKeyFilterProperty>,
     value: &str,
 ) -> bool {
+    match_element_instance_key_opt(filter, Some(value))
+}
+
+/// Matches an `ElementInstanceKeyFilterProperty` against a possibly-absent key.
+/// Passing `None` (no key on the record — e.g. the `parentElementInstanceKey` of
+/// a top-level instance) lets advanced `$exists: false` filters match, and makes
+/// any value-based operator (including a bare key) fail — unlike coercing absence
+/// to an empty string, which spuriously satisfies `$exists: true`.
+pub fn match_element_instance_key_opt(
+    filter: &Option<models::ElementInstanceKeyFilterProperty>,
+    value: Option<&str>,
+) -> bool {
     match filter {
         None => true,
-        Some(models::ElementInstanceKeyFilterProperty::ElementInstanceKey(k)) => k.0 == value,
+        Some(models::ElementInstanceKeyFilterProperty::ElementInstanceKey(k)) => {
+            value == Some(k.0.as_str())
+        }
         Some(models::ElementInstanceKeyFilterProperty::AdvancedElementInstanceKeyFilter(a)) => {
-            ops!(a, |k: &models::ElementInstanceKey| k.0.clone()).matches(Some(value))
+            ops!(a, |k: &models::ElementInstanceKey| k.0.clone()).matches(value)
         }
     }
 }
@@ -1263,5 +1291,66 @@ mod tests {
         assert!(!match_job_key_opt(&bare, None));
         // No filter matches anything, present or absent.
         assert!(match_job_key_opt(&None, None));
+    }
+
+    /// The parent-key matchers (#977) must honour `$exists` against an absent
+    /// parent (a top-level instance) rather than coercing it to an empty string:
+    /// `$exists:false` matches a null parent, `$exists:true` does not, and a bare
+    /// key never matches absence.
+    #[test]
+    fn match_parent_process_instance_key_opt_respects_absence() {
+        let exists_false = Some(
+            models::ProcessInstanceKeyFilterProperty::AdvancedProcessInstanceKeyFilter(
+                models::AdvancedProcessInstanceKeyFilter {
+                    dollar_exists: Some(false),
+                    ..models::AdvancedProcessInstanceKeyFilter::new()
+                },
+            ),
+        );
+        assert!(match_process_instance_key_opt(&exists_false, None));
+        assert!(!match_process_instance_key_opt(&exists_false, Some("7")));
+
+        let exists_true = Some(
+            models::ProcessInstanceKeyFilterProperty::AdvancedProcessInstanceKeyFilter(
+                models::AdvancedProcessInstanceKeyFilter {
+                    dollar_exists: Some(true),
+                    ..models::AdvancedProcessInstanceKeyFilter::new()
+                },
+            ),
+        );
+        assert!(match_process_instance_key_opt(&exists_true, Some("7")));
+        assert!(!match_process_instance_key_opt(&exists_true, None));
+
+        let bare = Some(
+            models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                models::ProcessInstanceKey("7".to_string()),
+            ),
+        );
+        assert!(match_process_instance_key_opt(&bare, Some("7")));
+        assert!(!match_process_instance_key_opt(&bare, None));
+        assert!(match_process_instance_key_opt(&None, None));
+    }
+
+    #[test]
+    fn match_parent_element_instance_key_opt_respects_absence() {
+        let exists_false = Some(
+            models::ElementInstanceKeyFilterProperty::AdvancedElementInstanceKeyFilter(
+                models::AdvancedElementInstanceKeyFilter {
+                    dollar_exists: Some(false),
+                    ..models::AdvancedElementInstanceKeyFilter::new()
+                },
+            ),
+        );
+        assert!(match_element_instance_key_opt(&exists_false, None));
+        assert!(!match_element_instance_key_opt(&exists_false, Some("7")));
+
+        let bare = Some(
+            models::ElementInstanceKeyFilterProperty::ElementInstanceKey(
+                models::ElementInstanceKey("7".to_string()),
+            ),
+        );
+        assert!(match_element_instance_key_opt(&bare, Some("7")));
+        assert!(!match_element_instance_key_opt(&bare, None));
+        assert!(match_element_instance_key_opt(&None, None));
     }
 }
