@@ -212,6 +212,45 @@ impl ReadModel {
         self.shard_for(key)?.process_instance(key)
     }
 
+    /// Resolves the `rootProcessInstanceKey` for `key` by walking the
+    /// `parentProcessInstanceKey` chain to the top-level ancestor (C8 parity).
+    ///
+    /// A top-level instance (no parent) roots to its own key. A call-activity
+    /// child — however deeply nested — roots to the top-level process instance
+    /// that started the whole tree. Point lookups route per key, so the walk
+    /// crosses partitions transparently when a parent lives on another shard.
+    ///
+    /// Best-effort at the boundaries: if `key` itself is unknown to the read
+    /// model, or an ancestor row has been pruned/not-yet-projected, the walk
+    /// stops and returns the furthest ancestor key it could observe (the child
+    /// key, or that missing parent's key) rather than fabricating a root. A
+    /// depth cap guards against a corrupt parent cycle.
+    pub fn root_process_instance_key(&self, key: Key) -> Key {
+        const MAX_DEPTH: usize = 1024;
+        let mut root = key;
+        let mut current = self.process_instance(key);
+        let mut depth = 0usize;
+        while let Some(row) = current {
+            match row.parent_process_instance_key {
+                None => {
+                    root = row.key;
+                    break;
+                }
+                Some(parent_key) => {
+                    // The parent is a known ancestor even if its row is absent,
+                    // so provisionally treat it as the root before walking up.
+                    root = parent_key;
+                    depth += 1;
+                    if depth > MAX_DEPTH {
+                        break;
+                    }
+                    current = self.process_instance(parent_key);
+                }
+            }
+        }
+        root
+    }
+
     pub fn incident(&self, key: Key) -> Option<IncidentRow> {
         self.shard_for(key)?.incident(key)
     }
@@ -696,5 +735,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A `ProcessInstanceCreated` carrying a parent linkage, so a call-activity
+    /// hierarchy can be seeded event-first.
+    fn created_with_parent(instance_key: Key, parent_pi: Key, parent_ei: Key) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: Some(parent_pi),
+            parent_element_instance_key: Some(parent_ei),
+        }
+    }
+
+    /// `root_process_instance_key` walks the `parentProcessInstanceKey` chain to
+    /// the top-level ancestor (C8 parity, issue #977): a top-level instance roots
+    /// to its own key, and a call-activity child — however deeply nested — roots
+    /// to the top-level instance. The walk crosses partitions, so seed parent,
+    /// child and grandchild onto three different shards and route point lookups
+    /// through the merged model.
+    #[test]
+    fn root_process_instance_key_walks_the_parent_chain_across_partitions() {
+        use nanobpmn_engine_core::compose_key;
+
+        let root = compose_key(0, 10); // top-level, no parent
+        let child = compose_key(1, 20); // parent = root, via call-activity EI 111
+        let grandchild = compose_key(2, 30); // parent = child, via call-activity EI 222
+
+        let s0 = shard();
+        let s1 = shard();
+        let s2 = shard();
+        s0.export(&[&created(root)]).unwrap();
+        s1.export(&[&created_with_parent(child, root, 111)])
+            .unwrap();
+        s2.export(&[&created_with_parent(grandchild, child, 222)])
+            .unwrap();
+        let model = ReadModel::from_shards(vec![(0, s0), (1, s1), (2, s2)]);
+
+        // Top-level self-roots; every descendant roots to the top-level ancestor.
+        assert_eq!(model.root_process_instance_key(root), root);
+        assert_eq!(model.root_process_instance_key(child), root);
+        assert_eq!(model.root_process_instance_key(grandchild), root);
+    }
+
+    /// Best-effort boundaries: an unknown starting key self-roots (no row to
+    /// walk), and if an ancestor row is missing the walk stops at the furthest
+    /// ancestor key it could observe rather than fabricating a different root.
+    #[test]
+    fn root_process_instance_key_is_best_effort_at_missing_boundaries() {
+        let s0 = shard();
+        // `child` names a parent (7777) whose row was never projected/pruned.
+        let child = 2000u64;
+        s0.export(&[&created_with_parent(child, 7777, 111)])
+            .unwrap();
+        let model = ReadModel::from_shards(vec![(0, s0)]);
+
+        // Unknown key: nothing to walk, roots to itself.
+        assert_eq!(model.root_process_instance_key(9999), 9999);
+        // Known child with an absent parent: the furthest known ancestor is the
+        // parent key itself, so that is the reported root (not the child).
+        assert_eq!(model.root_process_instance_key(child), 7777);
     }
 }
