@@ -231,6 +231,37 @@ impl Engine {
             events.extend(self.cancel_all_signal_subscriptions_on(eik));
             events.extend(self.cancel_all_conditional_subscriptions_on(eik));
             events.extend(self.cancel_created_user_tasks_on(eik));
+            // Resolve any incident parked on this element instance. Unlike the
+            // whole-instance `ProcessInstanceTerminated` reducer (which closes
+            // every open incident on the instance), scope teardown only removes
+            // the token via `ElementCompleted`, which touches no incident state —
+            // so without this the instance keeps a stale `hasIncident` for a
+            // descendant whose element is gone, and a later `IncidentResolved`
+            // could enqueue a re-drive against the vanished token.
+            events.extend(self.resolve_incidents_on(instance_key, eik));
+            // Drop the runtime record of a multi-instance body / ad-hoc container
+            // being torn down. `ElementCompleted` clears the body/container token
+            // but not the `multi_instances` / `adhoc_instances` map (those are
+            // cleared only by `MultiInstanceCompleted` / `AdHocCompleted`), so
+            // without this the terminated scope retains a stale active-child set
+            // and output state — and the dead-scope guard would treat that stale
+            // map as a live scope, letting a still-queued `ActivateMiChild` /
+            // `ActivateAdHocTool` mint a child into the dead body/container.
+            if let Some(instance) = self.state.instances.get(&instance_key) {
+                if instance.multi_instances.contains_key(&eik) {
+                    events.push(Event::MultiInstanceCompleted {
+                        instance_key,
+                        body_key: eik,
+                    });
+                }
+                if instance.adhoc_instances.contains_key(&eik) {
+                    events.push(Event::AdHocCompleted {
+                        instance_key,
+                        container_key: eik,
+                        cancelled: true,
+                    });
+                }
+            }
             // Reset a parallel join accumulating on this element instance so its
             // `join_counts`/`join_instances` bookkeeping (untouched by
             // `ElementCompleted`) cannot fire against a dead token if the scope
@@ -283,6 +314,44 @@ impl Engine {
             .map(|t| Event::UserTaskCanceled {
                 user_task_key: t.key,
                 instance_key: t.instance_key,
+            })
+            .collect()
+    }
+
+    /// The `IncidentResolved` events for every **active** incident parked on
+    /// `element_instance_key`, sorted by key. Mirrors — per element instance —
+    /// the incident-closing the whole-instance `ProcessInstanceTerminated`
+    /// reducer does for a top-level terminate: when scope teardown removes a
+    /// descendant token, any incident sitting on it must be resolved too, or the
+    /// instance keeps a stale `hasIncident` for a vanished element (and a later
+    /// external resolve could re-drive the dead token). `resolved_at` is the
+    /// command clock (`now`); a job-incident's parked job key rides along so the
+    /// reducer returns it to the activatable pool (harmless — its element instance
+    /// is being completed in the same batch and its job cancelled alongside).
+    pub(crate) fn resolve_incidents_on(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+    ) -> Vec<Event> {
+        let mut incidents: Vec<&state::Incident> = self
+            .state
+            .incidents
+            .values()
+            .filter(|i| {
+                i.instance_key == instance_key
+                    && i.element_instance_key == element_instance_key
+                    && i.state == state::IncidentState::Active
+            })
+            .collect();
+        incidents.sort_by_key(|i| i.key);
+        incidents
+            .into_iter()
+            .map(|i| Event::IncidentResolved {
+                incident_key: i.key,
+                instance_key,
+                job_key: i.job_key,
+                resolved_at: self.now,
+                operation_reference: None,
             })
             .collect()
     }

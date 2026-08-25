@@ -4032,20 +4032,25 @@ impl Engine {
     }
 
     /// Whether a queued step would (re)create work on an instance that has
-    /// already `Terminated`, or under a sub-process scope / element instance that
-    /// teardown has already removed — in which case `process_step` drops it (see
-    /// the terminal-scope guard there). Only the token/job-creating and
-    /// element-scoped steps are guarded; cross-instance completion steps (e.g.
-    /// `CompleteCallActivity`, which targets a still-live parent), body/container
-    /// and task-keyed steps are left alone.
+    /// already `Terminated`, or under a sub-process scope / element instance /
+    /// multi-instance body / ad-hoc container that teardown has already removed —
+    /// in which case `process_step` drops it (see the terminal-scope guard
+    /// there). **Every** step variant that names an instance is subject to the
+    /// instance-terminal check (a `Terminated` instance can hold no more live
+    /// work of any kind); element-scoped, body/container-scoped and listener/
+    /// retry steps additionally verify their target still exists. The lone
+    /// exception is a cross-instance `CompleteCallActivity`, which targets a
+    /// still-live *parent* and whose own handler already tolerates a
+    /// vanished call-activity token — so only its parent-terminal check applies.
     fn step_targets_dead_scope(&self, step: &Step) -> bool {
-        // (instance_key, activation target scope, element-instance target)
-        let (instance_key, scope, eik) = match step {
+        // (instance_key, activation target scope, element-instance target,
+        //  multi-instance body / ad-hoc container owner)
+        let (instance_key, scope, eik, owner) = match step {
             Step::Activate {
                 instance_key,
                 scope,
                 ..
-            } => (*instance_key, Some(*scope), None),
+            } => (*instance_key, Some(*scope), None, None),
             Step::Complete {
                 instance_key,
                 element_instance_key,
@@ -4065,8 +4070,51 @@ impl Engine {
                 instance_key,
                 element_instance_key,
                 ..
-            } => (*instance_key, None, Some(*element_instance_key)),
-            _ => return false,
+            }
+            | Step::AdvanceListener {
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Step::RetryCallActivitySpawn {
+                instance_key,
+                element_instance_key,
+                ..
+            } => (*instance_key, None, Some(*element_instance_key), None),
+            Step::ActivateMiChild {
+                instance_key,
+                body_key,
+                ..
+            }
+            | Step::CompleteMiBody {
+                instance_key,
+                body_key,
+            } => (*instance_key, None, None, Some(*body_key)),
+            Step::ActivateAdHocTool {
+                instance_key,
+                container_key,
+                ..
+            }
+            | Step::CompleteAdHoc {
+                instance_key,
+                container_key,
+                ..
+            } => (*instance_key, None, None, Some(*container_key)),
+            // Retry steps re-drive an activation that *creates* the body/container
+            // (or child) runtime record, so the owner may not exist yet — only the
+            // instance-terminal check applies. Likewise a cross-instance
+            // `CompleteCallActivity` targets the still-live parent, and its handler
+            // already tolerates a vanished call-activity token.
+            Step::RetryMiChildActivation { instance_key, .. }
+            | Step::RetryMiBodyActivation { instance_key, .. }
+            | Step::CompleteCallActivity { instance_key, .. } => (*instance_key, None, None, None),
+            // Task-keyed: resolve the owning instance through the user task.
+            Step::AdvanceTaskListener { user_task_key, .. } => {
+                match self.state.user_tasks.get(user_task_key) {
+                    Some(t) => (t.instance_key, None, None, None),
+                    None => return true, // the task is gone
+                }
+            }
         };
         let Some(instance) = self.state.instances.get(&instance_key) else {
             return true; // the whole instance is gone
@@ -4088,6 +4136,16 @@ impl Engine {
         // A completion/re-drive target whose element instance teardown removed.
         if let Some(eik) = eik {
             if !instance.active.contains_key(&eik) {
+                return true;
+            }
+        }
+        // A multi-instance body / ad-hoc container owner teardown removed: its
+        // runtime record is gone, so a queued child activation or body/container
+        // completion would mint work into a dead loop.
+        if let Some(owner) = owner {
+            if !instance.multi_instances.contains_key(&owner)
+                && !instance.adhoc_instances.contains_key(&owner)
+            {
                 return true;
             }
         }

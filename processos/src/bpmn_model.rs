@@ -1996,10 +1996,32 @@ fn emit_element(
             out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}/>\n"));
         }
         ElementKind::EndEvent => {
-            out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}/>\n"));
+            // Round-trip any `zeebe:ioMapping` the model carries (the parser
+            // pushes an end event onto the io_stack, so mappings attach to it):
+            // a self-closing tag would silently drop them, changing the model on
+            // re-parse. Terse self-closing form only when there is nothing to nest.
+            if el.io.inputs.is_empty() && el.io.outputs.is_empty() {
+                out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}/>\n"));
+            } else {
+                out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}>\n"));
+                out.push_str("      <bpmn:extensionElements>\n");
+                emit_io_mapping(el, out);
+                out.push_str("      </bpmn:extensionElements>\n");
+                out.push_str("    </bpmn:endEvent>\n");
+            }
         }
         ElementKind::TerminateEndEvent => {
             out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}>\n"));
+            // Preserve any `zeebe:ioMapping` on the terminate end (same io_stack
+            // attachment as a plain end event) so the model round-trips; without
+            // it, re-parsing the emitted BPMN would drop the mapping. Nano — like
+            // Zeebe — does not *apply* io mappings on a terminate end at runtime,
+            // but the serializer must not silently mutate the authored model.
+            if !el.io.inputs.is_empty() || !el.io.outputs.is_empty() {
+                out.push_str("      <bpmn:extensionElements>\n");
+                emit_io_mapping(el, out);
+                out.push_str("      </bpmn:extensionElements>\n");
+            }
             out.push_str("      <bpmn:terminateEventDefinition />\n");
             out.push_str("    </bpmn:endEvent>\n");
         }
@@ -4219,6 +4241,50 @@ mod tests {
         assert_eq!(work.io.inputs.len(), 1, "input mapping preserved");
         assert_eq!(work.io.outputs.len(), 1, "output mapping preserved");
         assert!(work.multi_instance.is_some(), "multi-instance preserved");
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_a_terminate_end_event_with_io() {
+        // A terminate end is an `<endEvent>` with a `<terminateEventDefinition>`;
+        // the parser pushes it onto the io_stack, so a `zeebe:ioMapping` attaches
+        // to it. The serializer must nest that mapping inside the open endEvent —
+        // a bare `<endEvent><terminateEventDefinition/></endEvent>` would silently
+        // drop it, changing the model on re-parse. (Nano, like Zeebe, does not
+        // *apply* io on a terminate end at runtime, but must not mutate the model.)
+        use nanobpmn_engine_core::Mapping;
+        let mut def = nanobpmn_engine_core::ProcessBuilder::new("Halting")
+            .start_event("Start")
+            .terminate_end_event("Stop")
+            .connect("Start", "Stop")
+            .build()
+            .unwrap();
+        {
+            let stop = def.elements.get_mut("Stop").unwrap();
+            stop.io.outputs.push(Mapping {
+                source: "= reason".to_string(),
+                target: "haltReason".to_string(),
+            });
+        }
+
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<zeebe:ioMapping>"),
+            "terminate end with io must emit ioMapping:\n{xml}"
+        );
+        assert!(
+            xml.contains("terminateEventDefinition"),
+            "terminate definition must survive:\n{xml}"
+        );
+
+        let reparsed = parse_bpmn(&xml).expect("serialized terminate end re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+        let stop = &reparsed[0].elements["Stop"];
+        assert_eq!(stop.kind, ElementKind::TerminateEndEvent);
+        assert_eq!(
+            stop.io.outputs.len(),
+            1,
+            "terminate-end output mapping preserved on round-trip"
+        );
     }
 
     #[test]

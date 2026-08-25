@@ -3385,6 +3385,254 @@ fn subprocess_terminate_end_cancels_a_signal_subscription_in_its_scope() {
     assert_eq!(open_subs(&engine), 0);
 }
 
+#[test]
+fn subprocess_terminate_end_clears_a_multi_instance_body_in_its_scope() {
+    // A terminate end must drop the runtime record of a multi-instance body torn
+    // down with its scope. `ElementCompleted` removes the body token but leaves
+    // `multi_instances` populated (cleared only by `MultiInstanceCompleted`), so
+    // without explicit teardown the terminated scope keeps a stale active-child
+    // set — and the dead-scope guard would read it as a live loop.
+    //
+    //  sub: sub_start -> split =< each(MI svc "handle") -> each_end,
+    //                             trigger(svc) -> stop(terminate) >
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .contained_in("each", "sub")
+        .end_event("each_end")
+        .contained_in("each_end", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "each")
+        .connect("each", "each_end")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    // The multi-instance body registered a runtime record on activation.
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+
+    // The sibling terminate fires when `trigger` completes.
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::MultiInstanceCompleted { .. })),
+        "scope teardown must emit MultiInstanceCompleted for the torn-down body"
+    );
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record must be gone after terminate"
+    );
+}
+
+#[test]
+fn subprocess_terminate_end_resolves_an_incident_in_its_scope() {
+    // A terminate end must resolve an incident parked on a descendant of the
+    // torn-down scope. `ElementCompleted` touches no incident state, so without
+    // this the instance keeps a stale `hasIncident` for a vanished element and a
+    // later external resolve could re-drive the dead token.
+    //
+    //  sub: sub_start -> split =< work(svc) -> work_end,
+    //                             trigger(svc) -> stop(terminate) >
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("work", "work-job")
+        .contained_in("work", "sub")
+        .end_event("work_end")
+        .contained_in("work_end", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "work")
+        .connect("work", "work_end")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Fail the work job with no retries left to park an incident in the scope.
+    let work_job = engine.activate_jobs("work-job", "W", 10, 60_000, 0)[0].key;
+    engine
+        .apply_command(Command::fail_job(work_job, 0, "boom"))
+        .unwrap();
+    assert_eq!(engine.instance(key).unwrap().incidents.len(), 1);
+
+    // The sibling terminate fires when `trigger` completes.
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::IncidentResolved { .. })),
+        "scope teardown must resolve the descendant incident"
+    );
+    assert!(
+        engine.instance(key).unwrap().incidents.is_empty(),
+        "the instance must carry no active incident after terminate"
+    );
+}
+
+#[test]
+fn top_level_terminate_end_clears_a_multi_instance_body() {
+    // A top-level terminate ends the whole instance; its `ProcessInstanceTerminated`
+    // reducer must also drop the multi-instance runtime record, or a large in-flight
+    // loop keeps its item/output payload on the terminal instance until eviction.
+    //
+    //  start -> split =< each(MI svc "handle") -> each_end,
+    //                    trigger(svc) -> stop(terminate) >
+    let proc = ProcessBuilder::new("mi-term")
+        .start_event("start")
+        .parallel_gateway("split")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .end_event("each_end")
+        .service_task("trigger", "trigger-job")
+        .terminate_end_event("stop")
+        .connect("start", "split")
+        .connect("split", "each")
+        .connect("each", "each_end")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(proc)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-term",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "terminal teardown must clear the multi-instance runtime record"
+    );
+}
+
+#[test]
+fn top_level_terminate_end_clears_an_adhoc_container() {
+    // The ad-hoc analogue of the multi-instance case: a top-level terminate must
+    // drop the ad-hoc container runtime record on the terminal transition.
+    //
+    //  s -> split =< agent(adhoc, resting) , trigger(svc) -> stop(terminate) >
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:parallelGateway id="split" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:serviceTask id="trigger">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="trigger-job" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="agent_end" />
+          <bpmn:endEvent id="stop"><bpmn:terminateEventDefinition /></bpmn:endEvent>
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="split" />
+          <bpmn:sequenceFlow id="f2" sourceRef="split" targetRef="agent" />
+          <bpmn:sequenceFlow id="f3" sourceRef="split" targetRef="trigger" />
+          <bpmn:sequenceFlow id="f4" sourceRef="agent" targetRef="agent_end" />
+          <bpmn:sequenceFlow id="f5" sourceRef="trigger" targetRef="stop" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let proc = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(proc)).unwrap();
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    // The ad-hoc container registered a runtime record on activation and rests
+    // waiting for its `agent-worker` job.
+    assert_eq!(engine.instance(key).unwrap().adhoc_instances.len(), 1);
+
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+    assert!(
+        engine.instance(key).unwrap().adhoc_instances.is_empty(),
+        "terminal teardown must clear the ad-hoc container runtime record"
+    );
+}
+
 fn approval_process() -> ProcessDefinition {
     // s -> g(xor): decision==yes -> approved ; else default -> rejected
     ProcessBuilder::new("approval")

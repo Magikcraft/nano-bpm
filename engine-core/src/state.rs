@@ -2445,6 +2445,15 @@ pub fn apply(state: &mut State, event: &Event) {
                 instance.active.clear();
                 instance.scopes.clear();
                 instance.incidents.clear();
+                // Drop the multi-instance / ad-hoc runtime records too: a forced
+                // teardown removes the body/container token but these maps are
+                // otherwise cleared only by `MultiInstanceCompleted` /
+                // `AdHocCompleted`, so terminating an instance mid-loop would
+                // retain the whole item/output/active-set payload on a terminal
+                // instance until eviction (and leave a stale "live scope" for the
+                // dead-scope guard to read). Immediate terminal cleanup (ADR 0012).
+                instance.multi_instances.clear();
+                instance.adhoc_instances.clear();
                 // Drop the variable payload on the terminal transition — see
                 // `ProcessInstanceCompleted` above (ADR 0012).
                 if !instance.variables.is_empty() {
