@@ -130,9 +130,11 @@ CREATE TABLE jobs (
     listener_event_type    INTEGER NOT NULL DEFAULT 0,
     created_at_ms          INTEGER NOT NULL DEFAULT 0,
     -- Declared read-set (`fetchVariables`) recorded on the durable
-    -- `JobActivated` event: the variable names the worker asked for on the last
-    -- activation. Engine-native read provenance for reification (issue #986). A
-    -- JSON array; '[]' means the activation declared none (fetch-all / undeclared
+    -- `JobActivated` event: the variable names the worker asked for on the most
+    -- recent activation that declared a non-empty set. Preserved across a later
+    -- fetch-all re-activation (not overwritten by a declaration-free activation).
+    -- Engine-native read provenance for reification (issue #986). A JSON array;
+    -- '[]' means no durable activation has declared a set (fetch-all / undeclared
     -- reads) or the job has not been activated with a declared set.
     read_set               TEXT NOT NULL DEFAULT '[]'
 );
@@ -1155,10 +1157,12 @@ pub struct JobRow {
     /// [`crate::Event::JobCreated`]. `0` for jobs created before the engine
     /// recorded the field. Feeds the `/v2/jobs/statistics/*` `created` counters.
     pub created_at_ms: u64,
-    /// The declared read-set (`fetchVariables`) recorded on the last durable
-    /// [`crate::Event::JobActivated`] for this job — the variable names the
-    /// worker was handed. Engine-native read provenance for reification (issue
-    /// #986). Empty when the activation declared none (fetch-all / undeclared
+    /// The declared read-set (`fetchVariables`) recorded on the most recent
+    /// durable [`crate::Event::JobActivated`] for this job that declared a
+    /// non-empty set — the variable names the worker was handed. Preserved across
+    /// a later fetch-all re-activation (a declaration-free activation does not
+    /// overwrite it). Engine-native read provenance for reification (issue #986).
+    /// Empty when no durable activation has declared a set (fetch-all / undeclared
     /// reads), or when the job's activation was never durably recorded (e.g.
     /// leader-local activation, which does not export `JobActivated`).
     pub read_set: Vec<String>,
