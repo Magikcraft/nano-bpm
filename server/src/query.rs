@@ -439,11 +439,24 @@ pub fn match_process_instance_key(
     filter: &Option<models::ProcessInstanceKeyFilterProperty>,
     value: &str,
 ) -> bool {
+    match_process_instance_key_opt(filter, Some(value))
+}
+
+/// Matches a `ProcessInstanceKeyFilterProperty` against a possibly-absent key.
+/// Passing `None` (no key on the record, e.g. a top-level instance's
+/// `parentProcessInstanceKey`) lets `$exists: false` match while a bare key or
+/// any value operator fails — the honest semantics for an absent linkage.
+pub fn match_process_instance_key_opt(
+    filter: &Option<models::ProcessInstanceKeyFilterProperty>,
+    value: Option<&str>,
+) -> bool {
     match filter {
         None => true,
-        Some(models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(k)) => k.0 == value,
+        Some(models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(k)) => {
+            value == Some(k.0.as_str())
+        }
         Some(models::ProcessInstanceKeyFilterProperty::AdvancedProcessInstanceKeyFilter(a)) => {
-            ops!(a, |k: &models::ProcessInstanceKey| k.0.clone()).matches(Some(value))
+            ops!(a, |k: &models::ProcessInstanceKey| k.0.clone()).matches(value)
         }
     }
 }
@@ -467,11 +480,23 @@ pub fn match_element_instance_key(
     filter: &Option<models::ElementInstanceKeyFilterProperty>,
     value: &str,
 ) -> bool {
+    match_element_instance_key_opt(filter, Some(value))
+}
+
+/// Matches an `ElementInstanceKeyFilterProperty` against a possibly-absent key.
+/// Passing `None` (e.g. a top-level instance's `parentElementInstanceKey`) lets
+/// `$exists: false` match while a bare key or value operator fails.
+pub fn match_element_instance_key_opt(
+    filter: &Option<models::ElementInstanceKeyFilterProperty>,
+    value: Option<&str>,
+) -> bool {
     match filter {
         None => true,
-        Some(models::ElementInstanceKeyFilterProperty::ElementInstanceKey(k)) => k.0 == value,
+        Some(models::ElementInstanceKeyFilterProperty::ElementInstanceKey(k)) => {
+            value == Some(k.0.as_str())
+        }
         Some(models::ElementInstanceKeyFilterProperty::AdvancedElementInstanceKeyFilter(a)) => {
-            ops!(a, |k: &models::ElementInstanceKey| k.0.clone()).matches(Some(value))
+            ops!(a, |k: &models::ElementInstanceKey| k.0.clone()).matches(value)
         }
     }
 }
