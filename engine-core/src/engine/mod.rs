@@ -4948,12 +4948,12 @@ impl Engine {
                 definition,
                 limits,
             }) => {
-                let agent_instance_key = self.mint_key();
-                let (bpmn_process_id, process_definition_key, process_definition_version) = self
-                    .state
-                    .instances
-                    .get(&instance_key)
-                    .map(|inst| {
+                // Only mint an AgentInstance when the owning ProcessInstance is
+                // present: defaulting a missing/corrupt instance would silently
+                // record an agent with an empty bpmn_process_id and a zero
+                // process_definition_key. Resolve-or-skip instead.
+                if let Some((bpmn_process_id, process_definition_key, process_definition_version)) =
+                    self.state.instances.get(&instance_key).map(|inst| {
                         let version = self
                             .state
                             .process_versions
@@ -4966,37 +4966,39 @@ impl Engine {
                             version,
                         )
                     })
-                    .unwrap_or_default();
-                let root_process_instance_key = self.root_process_instance_key(instance_key);
-                let agent_instance = crate::agent::AgentInstance {
-                    agent_instance_key,
-                    agent_definition_key: 0,
-                    element_instance_key,
-                    element_instance_keys: vec![element_instance_key],
-                    element_id: element_id.clone(),
-                    process_instance_key: instance_key,
-                    root_process_instance_key,
-                    bpmn_process_id,
-                    process_definition_key,
-                    process_definition_version,
-                    process_definition_version_tag: None,
-                    tenant_id: crate::DEFAULT_TENANT.to_string(),
-                    agent_type,
-                    status: crate::agent::AgentInstanceStatus::Initializing,
-                    definition,
-                    limits: limits.unwrap_or_default(),
-                    metrics: crate::agent::AgentInstanceMetrics::default(),
-                    tools: Vec::new(),
-                    job_key: 0,
-                    job_lease: 0,
-                    created_at: self.now,
-                    last_updated_at: self.now,
-                    completed_at: 0,
-                };
-                events.push(Event::AgentInstanceCreated {
-                    instance_key,
-                    agent_instance,
-                });
+                {
+                    let agent_instance_key = self.mint_key();
+                    let root_process_instance_key = self.root_process_instance_key(instance_key);
+                    let agent_instance = crate::agent::AgentInstance {
+                        agent_instance_key,
+                        agent_definition_key: 0,
+                        element_instance_key,
+                        element_instance_keys: vec![element_instance_key],
+                        element_id: element_id.clone(),
+                        process_instance_key: instance_key,
+                        root_process_instance_key,
+                        bpmn_process_id,
+                        process_definition_key,
+                        process_definition_version,
+                        process_definition_version_tag: None,
+                        tenant_id: crate::DEFAULT_TENANT.to_string(),
+                        agent_type,
+                        status: crate::agent::AgentInstanceStatus::Initializing,
+                        definition,
+                        limits: limits.unwrap_or_default(),
+                        metrics: crate::agent::AgentInstanceMetrics::default(),
+                        tools: Vec::new(),
+                        job_key: 0,
+                        job_lease: 0,
+                        created_at: self.now,
+                        last_updated_at: self.now,
+                        completed_at: 0,
+                    };
+                    events.push(Event::AgentInstanceCreated {
+                        instance_key,
+                        agent_instance,
+                    });
+                }
                 events.extend(self.arm_boundary_events(
                     instance_key,
                     element_instance_key,

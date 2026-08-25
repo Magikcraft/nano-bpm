@@ -982,9 +982,18 @@ fn parse_with_captures(
                                         Some(t) => acc.nodes[idx].agent_type = Some(t),
                                     }
                                 } else {
+                                    // Attribute the error to the nearest enclosing
+                                    // flow node so it is diagnosable, rather than an
+                                    // empty id (there is no owning task here).
+                                    let element_id = flow_node_stack
+                                        .iter()
+                                        .rev()
+                                        .find_map(|e| *e)
+                                        .map(|idx| acc.nodes[idx].id.clone())
+                                        .unwrap_or_default();
                                     return Err(ParseError::InvalidAgentDefinition {
                                         process_id: acc.id.clone(),
-                                        element_id: String::new(),
+                                        element_id,
                                         reason: "zeebe:agentDefinition is only valid on a serviceTask or adHocSubProcess".to_string(),
                                     });
                                 }
@@ -6422,6 +6431,34 @@ mod feel_timer_tests {
         assert!(
             matches!(err, ParseError::InvalidAgentDefinition { .. }),
             "expected InvalidAgentDefinition, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn misplaced_agent_definition_names_the_enclosing_flow_node() {
+        // A `zeebe:agentDefinition` on neither a serviceTask nor an adHocSubProcess
+        // (here a userTask) is rejected. The error must attribute the fault to the
+        // nearest enclosing flow node so it is diagnosable, not an empty id.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="bad-agent4" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:agentDefinition agentType="aiAgentTask" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidAgentDefinition { ref element_id, .. } if element_id == "review"),
+            "expected InvalidAgentDefinition attributed to 'review', got {err:?}"
         );
     }
 }

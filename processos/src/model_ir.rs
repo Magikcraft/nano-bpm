@@ -1210,6 +1210,19 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
             let raw: String = attrs.require("agentType", id)?;
             let agent_type = nanobpmn_engine_core::AgentType::parse(&raw)
                 .ok_or_else(|| format!("element '{id}': unknown agentType '{raw}'"))?;
+            // An `agentTask` round-trips as a `bpmn:serviceTask` carrying a
+            // `zeebe:agentDefinition` marker. The engine parser only accepts
+            // `aiAgentSubProcess` on an adHocSubProcess, so that variant would
+            // emit non-round-trippable (rejected) BPMN — refuse it here.
+            if matches!(
+                agent_type,
+                nanobpmn_engine_core::AgentType::AiAgentSubProcess
+            ) {
+                return Err(format!(
+                    "element '{id}': agentType 'aiAgentSubProcess' is not valid for an agentTask \
+                     (which round-trips as a serviceTask); use 'aiAgentTask' or 'external'"
+                ));
+            }
             ElementKind::AgentTask {
                 agent_type,
                 definition: nanobpmn_engine_core::AgentDefinition::default(),
@@ -1379,6 +1392,46 @@ mod tests {
             "\n{ir}"
         );
         assert!(ir.contains("Gate -> Alpha default\n"), "\n{ir}");
+    }
+
+    #[test]
+    fn agent_task_ir_rejects_ai_agent_sub_process_agent_type() {
+        use nanobpmn_engine_core::{AgentDefinition, AgentType};
+
+        // A valid, round-trippable agentTask model (agentType aiAgentTask).
+        let def = ProcessBuilder::new("p")
+            .start_event("s")
+            .agent_task(
+                "a",
+                AgentType::AiAgentTask,
+                AgentDefinition::default(),
+                None,
+            )
+            .end_event("e")
+            .connect("s", "a")
+            .connect("a", "e")
+            .build()
+            .unwrap();
+        let ir = definition_to_ir(&def, &HashMap::new());
+        // Baseline: the aiAgentTask form parses back.
+        ir_to_definition(&ir).expect("aiAgentTask agentTask must round-trip");
+
+        // An `agentTask` round-trips as a `bpmn:serviceTask`; the engine parser
+        // only accepts `aiAgentSubProcess` on an adHocSubProcess, so an IR
+        // `agentTask` carrying it would emit non-round-trippable BPMN. Refuse it
+        // at parse time rather than generate invalid output.
+        let bad = ir.replace("aiAgentTask", "aiAgentSubProcess");
+        assert_ne!(bad, ir, "the swap must actually change the IR");
+        let err =
+            ir_to_definition(&bad).expect_err("aiAgentSubProcess must be rejected on agentTask");
+        assert!(
+            err.contains("aiAgentSubProcess"),
+            "error should name the offending agentType, got: {err}"
+        );
+
+        // The other round-trippable agentType (external) still builds.
+        ir_to_definition(&ir.replace("aiAgentTask", "external"))
+            .expect("agentType 'external' must build");
     }
 
     #[test]

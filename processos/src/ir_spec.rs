@@ -476,7 +476,7 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
             key: "agentType",
             required: true,
             ty: AttrType::Str,
-            doc: "The `zeebe:agentDefinition agentType` (aiAgentTask, aiAgentSubProcess or external).",
+            doc: "The `zeebe:agentDefinition agentType`. An `agentTask` round-trips as a serviceTask, so only `aiAgentTask` or `external` are valid here (`aiAgentSubProcess` is an adHocSubProcess form).",
         }],
     },
 ];

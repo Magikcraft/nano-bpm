@@ -190,7 +190,7 @@ attr-line-compensationThrowEvent  ::= attr-parent | attr-retries | attr-timer | 
 elem-agentTask  ::= indent "agentTask" sp id (sp string)? (sp attrs-agentTask)? nl
 attrs-agentTask   ::= "{" nl (indent2 attr-line-agentTask nl)+ indent "}"
 attr-line-agentTask  ::= attr-agentTask-agentType | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
-attr-agentTask-agentType  ::= "agentType" sp attr-str   # The `zeebe:agentDefinition agentType` (aiAgentTask, aiAgentSubProcess or external).
+attr-agentTask-agentType  ::= "agentType" sp attr-str   # The `zeebe:agentDefinition agentType`. An `agentTask` round-trips as a serviceTask, so only `aiAgentTask` or `external` are valid here (`aiAgentSubProcess` is an adHocSubProcess form).
 
 # --- Attribute value primitives ---
 attr-str      ::= string
