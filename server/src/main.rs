@@ -7197,7 +7197,10 @@ impl ServerImpl {
         }
         match result {
             Some(instance) => Ok(Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(
-                process_instance_result(&instance, &readstore::RootResolver::new(|k| self.store.process_instance(k))),
+                process_instance_result(
+                    &instance,
+                    &readstore::RootResolver::new(|k| self.store.process_instance(k)),
+                ),
             )),
             None => Ok(
                 Resp::Status404_TheProcessInstanceWithTheGivenKeyWasNotFound(problem(
@@ -11156,7 +11159,10 @@ impl ServerImpl {
         }
         match result {
             Some(row) => Ok(Resp::Status200_TheElementInstanceIsSuccessfullyReturned(
-                element_instance_result(&row, &readstore::RootResolver::new(|k| self.store.process_instance(k))),
+                element_instance_result(
+                    &row,
+                    &readstore::RootResolver::new(|k| self.store.process_instance(k)),
+                ),
             )),
             None => Ok(
                 Resp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(problem(
@@ -17419,9 +17425,7 @@ impl ServerImpl {
                     }
                     // Cancellation: ignore the supplied parent filters and target
                     // only root instances (spec §371-375) — never active children.
-                    BatchHierarchyPolicy::RootOnly => {
-                        inst.parent_process_instance_key.is_none()
-                    }
+                    BatchHierarchyPolicy::RootOnly => inst.parent_process_instance_key.is_none(),
                 };
                 query::match_process_instance_key(
                     &filter.process_instance_key,
@@ -17466,7 +17470,8 @@ impl ServerImpl {
         // only ACTIVE **root** instances (spec §371-375): the call-activity
         // hierarchy filters must not scope this batch to a parent's children, and
         // an unfiltered request must not enqueue active call-activity children.
-        let items = self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::RootOnly);
+        let items =
+            self.batch_matched_process_instances(&body.filter, BatchHierarchyPolicy::RootOnly);
         let key = self.batch_operations.create(op_type, items);
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
@@ -17492,7 +17497,8 @@ impl ServerImpl {
         let op_type = models::BatchOperationTypeEnum::ResolveIncident;
         // Incident resolution honours the call-activity hierarchy filters; `state`
         // is ignored/overridden to ACTIVE by the matcher (spec §416-418).
-        let items = self.batch_matched_process_instances(&req.filter, BatchHierarchyPolicy::HonourFilters);
+        let items =
+            self.batch_matched_process_instances(&req.filter, BatchHierarchyPolicy::HonourFilters);
         let key = self.batch_operations.create(op_type, items);
         Ok(Resp::Status200_TheBatchOperationRequestWasCreated(
             models::BatchOperationCreatedResult::new(key.to_string(), op_type),
@@ -33027,7 +33033,10 @@ mod batch_operation_tests {
         let mut projected = false;
         for _ in 0..200 {
             if server
-                .batch_matched_process_instances(&models::ProcessInstanceFilter::new(), BatchHierarchyPolicy::HonourFilters)
+                .batch_matched_process_instances(
+                    &models::ProcessInstanceFilter::new(),
+                    BatchHierarchyPolicy::HonourFilters,
+                )
                 .contains(&instance_key)
             {
                 projected = true;
@@ -34002,7 +34011,8 @@ mod call_activity_hierarchy_read_model_tests {
             ),
             ..models::ProcessInstanceFilter::new()
         };
-        let matched = server.batch_matched_process_instances(&child_filter, BatchHierarchyPolicy::HonourFilters);
+        let matched = server
+            .batch_matched_process_instances(&child_filter, BatchHierarchyPolicy::HonourFilters);
         assert_eq!(
             matched,
             vec![child_key.parse::<u64>().unwrap()],
@@ -34021,7 +34031,8 @@ mod call_activity_hierarchy_read_model_tests {
             ),
             ..models::ProcessInstanceFilter::new()
         };
-        let top_matched = server.batch_matched_process_instances(&top_filter, BatchHierarchyPolicy::HonourFilters);
+        let top_matched = server
+            .batch_matched_process_instances(&top_filter, BatchHierarchyPolicy::HonourFilters);
         assert_eq!(
             top_matched,
             vec![parent_key],
@@ -34035,7 +34046,8 @@ mod call_activity_hierarchy_read_model_tests {
         // a legal cancellation target. (issue #977 review: cancellation must not
         // inherit the new hierarchy predicates nor cancel active call-activity
         // children.)
-        let cancel_matched = server.batch_matched_process_instances(&child_filter, BatchHierarchyPolicy::RootOnly);
+        let cancel_matched =
+            server.batch_matched_process_instances(&child_filter, BatchHierarchyPolicy::RootOnly);
         assert_eq!(
             cancel_matched,
             vec![parent_key],
@@ -34070,12 +34082,17 @@ mod call_activity_hierarchy_read_model_tests {
         // matcher overrides `state` to ACTIVE and still selects it. (Before the
         // fix, `state: COMPLETED` was honoured and this returned empty.)
         let completed_filter = models::ProcessInstanceFilter {
-            state: Some(models::ProcessInstanceStateFilterProperty::ProcessInstanceStateEnum(
-                models::ProcessInstanceStateEnum::Completed,
-            )),
+            state: Some(
+                models::ProcessInstanceStateFilterProperty::ProcessInstanceStateEnum(
+                    models::ProcessInstanceStateEnum::Completed,
+                ),
+            ),
             ..models::ProcessInstanceFilter::new()
         };
-        for honour_hierarchy in [BatchHierarchyPolicy::HonourFilters, BatchHierarchyPolicy::RootOnly] {
+        for honour_hierarchy in [
+            BatchHierarchyPolicy::HonourFilters,
+            BatchHierarchyPolicy::RootOnly,
+        ] {
             let matched =
                 server.batch_matched_process_instances(&completed_filter, honour_hierarchy);
             assert_eq!(

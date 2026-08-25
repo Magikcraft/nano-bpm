@@ -5926,7 +5926,10 @@ mod definition_xml_tests {
             lookups2.set(lookups2.get() + 1);
             store.process_instance(k)
         });
-        assert_eq!(from_row.root_of_row(&child), by_key.root_process_instance_key(30));
+        assert_eq!(
+            from_row.root_of_row(&child),
+            by_key.root_process_instance_key(30)
+        );
         assert_eq!(from_row.root_of_row(&child), 10);
         assert_eq!(
             lookups2.get(),
