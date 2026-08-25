@@ -362,9 +362,12 @@ impl Engine {
     /// descendant token, any incident sitting on it must be resolved too, or the
     /// instance keeps a stale `hasIncident` for a vanished element (and a later
     /// external resolve could re-drive the dead token). `resolved_at` is the
-    /// command clock (`now`); a job-incident's parked job key rides along so the
-    /// reducer returns it to the activatable pool (harmless — its element instance
-    /// is being completed in the same batch and its job cancelled alongside).
+    /// command clock (`now`); a job-incident's parked job key rides along, but
+    /// the `IncidentResolved` reducer only returns it to the activatable pool
+    /// when the job is still `Failed`. During this teardown the same batch emits
+    /// `JobCanceled` first, so the job is already terminal by the time its
+    /// incident is resolved and the reducer's `Failed`-only guard intentionally
+    /// leaves it cancelled rather than resurrecting it.
     pub(crate) fn resolve_incidents_on(
         &self,
         instance_key: Key,
