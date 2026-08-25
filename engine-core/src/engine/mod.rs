@@ -159,6 +159,20 @@ pub struct Engine {
     /// window between a retirement and its create, so it drains continuously. NOT
     /// part of the snapshot; pure host-side bookkeeping, never affects determinism.
     retired_tombstones: HashSet<Key>,
+    /// Sub-process scopes torn down (by a scoped terminate end or an interrupting
+    /// boundary) during the command currently draining. A scoped teardown removes
+    /// every descendant token but deliberately leaves the enclosing sub-process
+    /// token active until the post-drain [`complete_drained_subprocesses`](Self::complete_drained_subprocesses)
+    /// sweep completes it — so a sibling branch's `Step::Activate` still queued in
+    /// the *same* drain would otherwise pass [`step_targets_dead_scope`](Self::step_targets_dead_scope)'s
+    /// "scope still active" check and recreate a token inside the dead scope,
+    /// which then keeps the parent from ever draining (a wedge). Recording the
+    /// scope here lets the guard reject those queued activations. NOT journaled:
+    /// the guard runs only during live command processing (recovery replays the
+    /// emitted events, never re-runs the guard), and the whole window lives inside
+    /// one command's drain — so it is cleared at the top of every
+    /// [`plan_command_at`](Self::plan_command_at) and never affects determinism.
+    torn_down_scopes: HashSet<Key>,
     /// Host-injected **cluster variables** (see [`crate::cluster_vars`]): a shared,
     /// mutable snapshot of global + per-tenant configuration values that FEEL
     /// expressions resolve at runtime. External configuration, not journaled
@@ -369,6 +383,7 @@ impl Engine {
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
             retired_tombstones: HashSet::new(),
+            torn_down_scopes: HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
         }
     }
@@ -488,6 +503,7 @@ impl Engine {
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
             retired_tombstones: HashSet::new(),
+            torn_down_scopes: HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
         }
     }
@@ -1103,6 +1119,11 @@ impl Engine {
         now: u64,
     ) -> Result<(Vec<Event>, VecDeque<Step>), EngineError> {
         self.now = now;
+        // Clear the per-command scratch of sub-process scopes torn down mid-drain
+        // (see [`torn_down_scopes`]): each command drains independently, so a
+        // scope invalidated by a previous command's terminate must not leak into
+        // this one's dead-scope guard.
+        self.torn_down_scopes.clear();
         let mut log: Vec<Event> = Vec::new();
         let mut queue: VecDeque<Step> = VecDeque::new();
 
@@ -4031,9 +4052,179 @@ impl Engine {
         followups
     }
 
+    /// Whether a queued step would (re)create work on an instance that has
+    /// already `Terminated`, or under a sub-process scope / element instance /
+    /// multi-instance body / ad-hoc container that teardown has already removed —
+    /// in which case `process_step` drops it (see the terminal-scope guard
+    /// there). **Every** step variant that names an instance is subject to the
+    /// instance-terminal check (a `Terminated` instance can hold no more live
+    /// work of any kind); element-scoped, body/container-scoped and listener/
+    /// retry steps additionally verify their target still exists. The lone
+    /// exception is a cross-instance `CompleteCallActivity`, which targets a
+    /// still-live *parent* and whose own handler already tolerates a
+    /// vanished call-activity token — so only its parent-terminal check applies.
+    fn step_targets_dead_scope(&self, step: &Step) -> bool {
+        // (instance_key, activation target scope, element-instance target,
+        //  multi-instance body / ad-hoc container owner)
+        let (instance_key, scope, eik, owner) = match step {
+            Step::Activate {
+                instance_key,
+                scope,
+                ..
+            } => (*instance_key, Some(*scope), None, None),
+            Step::Complete {
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Step::CreateJob {
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Step::ReopenCatch {
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Step::RetryActivation {
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Step::AdvanceListener {
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Step::RetryCallActivitySpawn {
+                instance_key,
+                element_instance_key,
+                ..
+            } => (*instance_key, None, Some(*element_instance_key), None),
+            Step::ActivateMiChild {
+                instance_key,
+                body_key,
+                ..
+            }
+            | Step::CompleteMiBody {
+                instance_key,
+                body_key,
+            } => (*instance_key, None, None, Some(*body_key)),
+            Step::ActivateAdHocTool {
+                instance_key,
+                container_key,
+                ..
+            }
+            | Step::CompleteAdHoc {
+                instance_key,
+                container_key,
+                ..
+            } => (*instance_key, None, None, Some(*container_key)),
+            // A multi-instance **child** retry re-drives the *already-activated*
+            // child (its activation events are not re-emitted, #946), so both its
+            // child token and its owning body must still exist: a scoped terminate
+            // that tore the loop down between queueing and draining this retry must
+            // drop it, exactly like the non-retry MI steps above. Thread the child
+            // (element-instance) and body (owner) keys so the shared checks below
+            // apply — reusing the same "did teardown remove it?" logic.
+            Step::RetryMiChildActivation {
+                instance_key,
+                body_key,
+                child_key,
+                ..
+            } => (*instance_key, None, Some(*child_key), Some(*body_key)),
+            // A multi-instance **body** retry re-drives the *already-activated*
+            // body token (its activation/scope events are not re-emitted), so the
+            // body element instance must still be active. Its `multi_instances`
+            // record may legitimately not exist yet — the retry re-runs the very
+            // fan-out that creates it — so only the element-instance check applies,
+            // not the owner check.
+            Step::RetryMiBodyActivation {
+                instance_key,
+                body_key,
+                ..
+            } => (*instance_key, None, Some(*body_key), None),
+            // A cross-instance `CompleteCallActivity` targets the still-live
+            // parent, and its handler already tolerates a vanished call-activity
+            // token — only the instance-terminal check applies.
+            Step::CompleteCallActivity { instance_key, .. } => (*instance_key, None, None, None),
+            // Task-keyed: resolve the owning instance through the user task, and
+            // reject the step unless the task is still `Created`. `UserTaskCanceled`
+            // deliberately *retains* the record (state → `Canceled`, `pending`
+            // cleared), so a bare existence check would let an `AdvanceTaskListener`
+            // queued before a terminate teardown mint another listener job against
+            // an already-cancelled (or completed) task.
+            Step::AdvanceTaskListener { user_task_key, .. } => {
+                match self.state.user_tasks.get(user_task_key) {
+                    Some(t) if t.state == crate::state::UserTaskState::Created => {
+                        (t.instance_key, None, None, None)
+                    }
+                    // Gone, or no longer `Created` (canceled/completed): drop it.
+                    _ => return true,
+                }
+            }
+        };
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return true; // the whole instance is gone
+        };
+        if instance.state == ProcessInstanceState::Terminated {
+            return true;
+        }
+        // A non-root activation scope that no longer exists: not an active
+        // element instance, nor a multi-instance body, nor an ad-hoc container —
+        // or one whose teardown was *decided* this drain but whose sub-process
+        // token is still active pending the post-drain completion sweep (a scoped
+        // terminate / interrupting boundary leaves it live until then, so a still-
+        // queued sibling activation must be rejected here rather than recreate a
+        // token inside the dead scope and wedge the drain).
+        if let Some(scope) = scope {
+            if scope != 0
+                && (self.torn_down_scopes.contains(&scope)
+                    || (!instance.active.contains_key(&scope)
+                        && !instance.multi_instances.contains_key(&scope)
+                        && !instance.adhoc_instances.contains_key(&scope)))
+            {
+                return true;
+            }
+        }
+        // A completion/re-drive target whose element instance teardown removed.
+        if let Some(eik) = eik {
+            if !instance.active.contains_key(&eik) {
+                return true;
+            }
+        }
+        // A multi-instance body / ad-hoc container owner teardown removed: its
+        // runtime record is gone, so a queued child activation or body/container
+        // completion would mint work into a dead loop.
+        if let Some(owner) = owner {
+            if !instance.multi_instances.contains_key(&owner)
+                && !instance.adhoc_instances.contains_key(&owner)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The processor: decides the events and follow-up work for one lifecycle
     /// step. Reads state, mints keys, but never mutates [`State`].
     fn process_step(&mut self, step: Step) -> (Vec<Event>, Vec<Step>) {
+        // Terminal-scope guard (the single dispatch choke point). A queued step
+        // can sit behind the very teardown that invalidates it: a top-level
+        // terminate end marks its instance `Terminated`, and a sub-process-scoped
+        // terminate (or an interrupting boundary) removes the scope its inner
+        // tokens live in. `activate` / `complete` / `create_job_for` carry no
+        // terminal check of their own, so without this a sibling step still in
+        // the queue could recreate an element, job or token on a dead instance —
+        // or under a removed sub-process scope — after teardown (and a resolved
+        // incident inside a torn-down scope could re-drive a vanished token). Drop
+        // such a step here. `Terminating` (a deferred cancel still draining its
+        // own listeners) is deliberately NOT guarded — it must run its remaining
+        // steps to finish.
+        if self.step_targets_dead_scope(&step) {
+            return (Vec::new(), Vec::new());
+        }
         match step {
             Step::Activate {
                 instance_key,
@@ -7110,6 +7301,24 @@ impl Engine {
             return self.complete_exclusive_gateway(instance_key, element_instance_key, element_id);
         }
 
+        // A terminate end event (`<endEvent>` with `<terminateEventDefinition>`):
+        // it does not merely consume its own token — it kills every other active
+        // token in its enclosing scope and completes that scope (Zeebe/Camunda
+        // terminate semantics). Handled wholly here, off the normal end-event
+        // completion path, because it drives a scope-wide teardown rather than
+        // taking (non-existent) outgoing flows.
+        if matches!(
+            self.element_kind(instance_key, &element_id),
+            Some(ElementKind::TerminateEndEvent)
+        ) {
+            return self.complete_terminate_end(
+                instance_key,
+                element_instance_key,
+                element_id,
+                scope,
+            );
+        }
+
         // Inline-FEEL script task: evaluate its `zeebe:script` expression now.
         // The instance variables already include any input mappings applied when
         // the task activated. On success the result is staged under
@@ -7834,7 +8043,80 @@ impl Engine {
         (events, followups)
     }
 
-    /// Advances an element's execution-listener chain after one listener job
+    /// Completes a terminate end event (`ElementKind::TerminateEndEvent`): it
+    /// kills every other still-active token in its enclosing scope and then
+    /// completes that scope (Zeebe/Camunda terminate semantics). `scope` is the
+    /// terminate-end's enclosing scope — `0` for the top-level process, otherwise
+    /// the enclosing sub-process element-instance key.
+    ///
+    /// * Top-level (`scope == 0`): the terminate-end completes, every other token
+    ///   in the instance is discarded (its jobs/timers/subscriptions/user tasks
+    ///   cancelled, its call-activity children terminated) and the whole instance
+    ///   ends via `ProcessInstanceTerminated`. If this instance is itself a called
+    ///   process (spawned by a call activity), its termination ends **only** this
+    ///   instance — the parent's call activity completes normally and the parent
+    ///   continues on its outgoing flow (Zeebe/BPMN: a terminate end never
+    ///   propagates out of the process it fires in).
+    /// * Sub-process-scoped (`scope != 0`): only the tokens inside that
+    ///   sub-process scope die (this terminate-end among them); the now-childless
+    ///   sub-process is then completed by the ordinary post-drain
+    ///   [`complete_drained_subprocesses`](Self::complete_drained_subprocesses)
+    ///   sweep — through its real completion path (plain / multi-instance child /
+    ///   ad-hoc tool, with its output mappings, end-listener chain and boundary
+    ///   disarm) — which also continues the parent on the sub-process's outgoing
+    ///   flow. Deferring to that single completion path (rather than hand-building
+    ///   it here) keeps one source of truth and avoids mis-handling an MI/ad-hoc
+    ///   sub-process body.
+    ///
+    /// Returns events without emitting them so it composes inside the decide-only
+    /// `process_step` result, reusing the same teardown primitives as the
+    /// error-boundary / cancel paths ([`scope_teardown_events`],
+    /// [`discard_instance_events`]).
+    fn complete_terminate_end(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        if scope == 0 {
+            // Top-level terminate end: complete the terminate-end itself, then
+            // discard every remaining token and terminate the whole instance.
+            // Capture the parent-release step (if this is a called process) now,
+            // while the child's variables and the parent's call-activity token
+            // are still live — the events below are decided, not yet applied.
+            let release_parent = self.call_activity_completion_step(instance_key);
+            let mut events = vec![
+                Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                },
+                Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                },
+            ];
+            events.extend(self.discard_instance_events(instance_key));
+            return (events, release_parent.into_iter().collect());
+        }
+
+        // Sub-process-scoped terminate end: tear down every token inside the
+        // enclosing sub-process scope (this terminate-end included, as a
+        // descendant of `scope`). The now-childless sub-process is completed by
+        // the post-drain `complete_drained_subprocesses` sweep via its ordinary
+        // completion path, which also continues the parent on the sub-process's
+        // outgoing flow — one source of truth for sub-process completion.
+        //
+        // Record the scope as torn down for this drain so a sibling branch's
+        // `Step::Activate` still queued behind this terminate cannot recreate a
+        // token inside the dead scope (which would keep the sub-process from ever
+        // draining) — the sub-process token stays active until the sweep, so the
+        // dead-scope guard needs this marker, not just the `active` map.
+        self.torn_down_scopes.insert(scope);
+        (self.scope_teardown_events(instance_key, scope), Vec::new())
+    }
     /// completed (ADR 0037). If another listener remains in the chain, its job is
     /// created; otherwise the chain has drained and the deferred lifecycle
     /// transition runs — a `Start` chain enacts the element's activation
@@ -9037,6 +9319,20 @@ impl Engine {
     /// call-activity child — unlike [`Command::CancelInstance`] it never defers on
     /// user-task `canceling` listeners (a cascade cancel is not interruptible).
     fn discard_and_terminate_instance(&mut self, log: &mut Vec<Event>, instance_key: Key) {
+        for event in self.discard_instance_events(instance_key) {
+            self.emit(log, event);
+        }
+    }
+
+    /// The events that discard and terminate a whole process instance: the
+    /// cancellations of every in-play job, armed timer, open message/signal/
+    /// conditional subscription and created user task on the instance, followed
+    /// by `ProcessInstanceTerminated` (whose reducer clears the remaining active
+    /// tokens and scopes). Returns the events (does not emit) so it composes both
+    /// inside an emit-driven command tail ([`discard_and_terminate_instance`])
+    /// and inside a decide-only `process_step` result (a top-level terminate end
+    /// event's completion).
+    fn discard_instance_events(&self, instance_key: Key) -> Vec<Event> {
         let mut cancels: Vec<Event> = Vec::new();
 
         let mut jobs: Vec<&state::Job> = self
@@ -9137,10 +9433,8 @@ impl Engine {
             instance_key,
         }));
 
-        for event in cancels {
-            self.emit(log, event);
-        }
-        self.emit(log, Event::ProcessInstanceTerminated { instance_key });
+        cancels.push(Event::ProcessInstanceTerminated { instance_key });
+        cancels
     }
     fn emit(&mut self, log: &mut Vec<Event>, event: Event) {
         if self.track_dirty_vars {

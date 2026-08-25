@@ -2973,6 +2973,1066 @@ fn should_run_parallel_split_and_join() {
     );
 }
 
+#[test]
+fn terminate_end_kills_sibling_branch_and_terminates_the_instance() {
+    // s -> split =< work (service task), trigger (service task) -> stop (terminate end) >
+    //
+    // A parallel split forks two branches: `work` parks on a job while
+    // `trigger` reaches a terminate end. Completing `trigger` must kill the
+    // still-active `work` token (cancelling its job) and terminate the whole
+    // top-level instance — not degrade to a plain end that leaves `work` running.
+    let def = ProcessBuilder::new("term")
+        .start_event("s")
+        .parallel_gateway("split")
+        .service_task("work", "work-job")
+        .service_task("trigger", "trigger-job")
+        .terminate_end_event("stop")
+        .connect("s", "split")
+        .connect("split", "work")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Both branches forked; both tasks are parked on jobs.
+    assert_eq!(engine.pending_jobs().len(), 2);
+    assert!(!engine.is_completed(instance_key));
+    let work_job = engine.activate_jobs("work-job", "w", 1, 60_000, 0)[0].key;
+
+    // Completing the trigger job drives its token into the terminate end.
+    let events = complete_one(&mut engine, "trigger-job");
+
+    // The terminate end kills the sibling `work` token (its job cancelled) and
+    // terminates the whole instance.
+    assert!(events.contains(&Event::JobCanceled {
+        job_key: work_job,
+        instance_key,
+    }));
+    assert!(events.contains(&Event::ProcessInstanceTerminated { instance_key }));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
+    assert_eq!(
+        engine.instance(instance_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    // The cancelled sibling job can no longer be completed.
+    let err = engine
+        .apply_command(Command::complete_job(work_job))
+        .unwrap_err();
+    assert_eq!(err, EngineError::JobNotActive { job_key: work_job });
+}
+
+#[test]
+fn subprocess_terminate_end_confines_to_the_subprocess_scope() {
+    // A terminate end inside an embedded sub-process kills only that
+    // sub-process's tokens and lets the parent instance continue on the
+    // sub-process's outgoing flow — it does NOT terminate the whole instance.
+    //
+    //  start -> sub -> after (service task) -> done
+    //  sub: sub_start -> split =< inner_work (svc), inner_trigger (svc) -> inner_stop (terminate end) >
+    let def = ProcessBuilder::new("sub-term")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("inner_work", "inner-work-job")
+        .contained_in("inner_work", "sub")
+        .service_task("inner_trigger", "inner-trigger-job")
+        .contained_in("inner_trigger", "sub")
+        .terminate_end_event("inner_stop")
+        .contained_in("inner_stop", "sub")
+        .service_task("after", "after-job")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "inner_work")
+        .connect("split", "inner_trigger")
+        .connect("inner_trigger", "inner_stop")
+        .connect("sub", "after")
+        .connect("after", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("sub-term"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Inside the sub-process both inner branches are parked on jobs.
+    assert_eq!(engine.pending_jobs().len(), 2);
+    let inner_work_job = engine.activate_jobs("inner-work-job", "w", 1, 60_000, 0)[0].key;
+
+    // Completing the inner trigger drives its token into the terminate end.
+    let events = complete_one(&mut engine, "inner-trigger-job");
+
+    // The inner sibling token is killed (its job cancelled)...
+    assert!(events.contains(&Event::JobCanceled {
+        job_key: inner_work_job,
+        instance_key,
+    }));
+    // ...and the sub-process completes and continues on its outgoing flow —
+    // the parent instance is NOT terminated.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "sub" && to == "after"
+    )));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+    assert!(!engine.is_completed(instance_key));
+    assert_eq!(
+        engine.instance(instance_key).unwrap().state,
+        crate::state::ProcessInstanceState::Active
+    );
+
+    // The parent proceeds normally: completing the `after` task ends the
+    // instance by ordinary completion, not termination.
+    let final_events = complete_one(&mut engine, "after-job");
+    assert!(final_events.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn subprocess_terminate_end_terminates_a_call_activity_child_in_its_scope() {
+    // A terminate end inside a sub-process must also reap a call-activity CHILD
+    // process instance spawned from that scope — the child is a separate instance
+    // `scope_descendants` cannot see, so without explicit termination it (and its
+    // jobs) would keep running with no parent token.
+    //
+    //  orch: start -> sub -> after(svc) -> done
+    //  sub:  sub_start -> split =< c1(call "leaf"), trigger(svc) -> inner_stop(terminate) >
+    let leaf = ProcessBuilder::new("leaf")
+        .start_event("ls")
+        .service_task("leaf_work", "leaf-job")
+        .end_event("le")
+        .connect("ls", "leaf_work")
+        .connect("leaf_work", "le")
+        .build()
+        .unwrap();
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .call_activity("c1", "leaf")
+        .contained_in("c1", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("inner_stop")
+        .contained_in("inner_stop", "sub")
+        .service_task("after", "after-job")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "c1")
+        .connect("split", "trigger")
+        .connect("trigger", "inner_stop")
+        .connect("sub", "after")
+        .connect("after", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(leaf)).unwrap();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The call activity spawned a distinct child parked on its own job; the
+    // trigger branch parks on its own job.
+    let child_key = engine
+        .pending_jobs()
+        .iter()
+        .find(|j| j.job_type == "leaf-job")
+        .expect("leaf child parked on its job")
+        .instance_key;
+    assert_ne!(child_key, instance_key);
+    assert!(engine
+        .pending_jobs()
+        .iter()
+        .any(|j| j.job_type == "trigger-job"));
+
+    // Completing the trigger drives its token into the sub-process terminate end.
+    let events = complete_one(&mut engine, "trigger-job");
+
+    // The call-activity child in the terminated scope is terminated too, and its
+    // job cancelled with it.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceTerminated { instance_key: ik } if *ik == child_key
+    )));
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    assert!(!engine
+        .pending_jobs()
+        .iter()
+        .any(|j| j.job_type == "leaf-job"));
+
+    // The parent continues past the sub-process; the parent instance itself is
+    // NOT terminated.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "sub" && to == "after"
+    )));
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceTerminated { instance_key: ik } if *ik == instance_key
+    )));
+    assert_eq!(
+        engine.instance(instance_key).unwrap().state,
+        crate::state::ProcessInstanceState::Active
+    );
+}
+
+#[test]
+fn top_level_terminate_end_in_a_called_process_completes_the_parent_call_activity() {
+    // A terminate end in a CALLED process ends only that child instance (Zeebe/
+    // BPMN: terminate never propagates out of its own process). The parent's call
+    // activity then completes normally and the parent continues on its outgoing
+    // flow — the parent must not be left parked forever, nor terminated.
+    //
+    //  phase (called): ps -> psplit =< work(svc), trg(svc) -> stop(terminate) >
+    //  orch:           start -> c1(call "phase") -> end
+    let phase = ProcessBuilder::new("phase")
+        .start_event("ps")
+        .parallel_gateway("psplit")
+        .service_task("work", "work-job")
+        .service_task("trg", "trg-job")
+        .terminate_end_event("stop")
+        .connect("ps", "psplit")
+        .connect("psplit", "work")
+        .connect("psplit", "trg")
+        .connect("trg", "stop")
+        .build()
+        .unwrap();
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "phase")
+        .end_event("end")
+        .connect("start", "c1")
+        .connect("c1", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(phase)).unwrap();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let child_key = engine
+        .pending_jobs()
+        .first()
+        .expect("child parked on its jobs")
+        .instance_key;
+    assert_ne!(child_key, parent_key);
+    assert_eq!(engine.pending_jobs().len(), 2);
+
+    // Completing the child's trg job drives its token into the top-level
+    // terminate end of the called process.
+    let events = complete_one(&mut engine, "trg-job");
+
+    // The child terminates (its sibling work token cancelled)...
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceTerminated { instance_key: ik } if *ik == child_key
+    )));
+    // ...but the terminate does NOT propagate to the parent: the call activity
+    // completes and the parent runs to ordinary completion.
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceTerminated { instance_key: ik } if *ik == parent_key
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "c1" && to == "end"
+    )));
+    assert!(engine.is_completed(parent_key));
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+}
+
+#[test]
+fn subprocess_terminate_end_cancels_a_resting_user_task_in_its_scope() {
+    // A terminate end must cancel a resting user task in the torn-down scope —
+    // `ElementCompleted` alone leaves it queryable as `Created` and completable.
+    //
+    //  sub: sub_start -> split =< ut(user task), trigger(svc) -> stop(terminate) >
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .user_task("ut")
+        .contained_in("ut", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "ut")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let ut_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("user task created");
+    assert_eq!(
+        engine.state().user_tasks[&ut_key].state,
+        crate::state::UserTaskState::Created
+    );
+
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::UserTaskCanceled { user_task_key, .. } if *user_task_key == ut_key
+    )));
+    assert_eq!(
+        engine.state().user_tasks[&ut_key].state,
+        crate::state::UserTaskState::Canceled
+    );
+}
+
+#[test]
+fn subprocess_terminate_end_cancels_a_signal_subscription_in_its_scope() {
+    // A terminate end must cancel an open SIGNAL subscription in the torn-down
+    // scope — before, scope teardown cancelled only message subscriptions, so a
+    // later broadcast could fire a token in a dead scope.
+    //
+    //  sub: sub_start -> split =< await(signal catch) -> await_end,
+    //                             trigger(svc) -> stop(terminate) >
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .signal_intermediate_catch_event("await", "all-clear")
+        .contained_in("await", "sub")
+        .end_event("await_end")
+        .contained_in("await_end", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "await")
+        .connect("await", "await_end")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    // `signal_subscriptions()` retains cancelled records, so count only OPEN ones.
+    let open_subs = |e: &Engine| {
+        e.signal_subscriptions()
+            .iter()
+            .filter(|s| s.state == crate::state::MessageSubscriptionState::Open)
+            .count()
+    };
+    assert_eq!(open_subs(&engine), 1);
+
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::SignalSubscriptionCanceled { .. })));
+    assert_eq!(open_subs(&engine), 0);
+}
+
+#[test]
+fn subprocess_terminate_end_clears_a_multi_instance_body_in_its_scope() {
+    // A terminate end must drop the runtime record of a multi-instance body torn
+    // down with its scope. `ElementCompleted` removes the body token but leaves
+    // `multi_instances` populated (cleared only by `MultiInstanceCompleted`), so
+    // without explicit teardown the terminated scope keeps a stale active-child
+    // set — and the dead-scope guard would read it as a live loop.
+    //
+    //  sub: sub_start -> split =< each(MI svc "handle") -> each_end,
+    //                             trigger(svc) -> stop(terminate) >
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .contained_in("each", "sub")
+        .end_event("each_end")
+        .contained_in("each_end", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "each")
+        .connect("each", "each_end")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    // The multi-instance body registered a runtime record on activation.
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+
+    // The sibling terminate fires when `trigger` completes.
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::MultiInstanceCompleted { .. })),
+        "scope teardown must emit MultiInstanceCompleted for the torn-down body"
+    );
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record must be gone after terminate"
+    );
+}
+
+/// Defect-class guard (dead-scope guard, `Step::Activate` branch): a scoped
+/// terminate tears down every descendant token but deliberately leaves the
+/// enclosing sub-process token active until the post-drain completion sweep. A
+/// sibling branch's `Step::Activate` still queued in the same drain must NOT be
+/// allowed to recreate a token inside that already-terminated scope (it would
+/// keep the sub-process from ever draining — a wedge). The sub-process key is
+/// still in `active`, so the guard needs the per-drain `torn_down_scopes` marker,
+/// not just the `active`/MI/ad-hoc maps.
+#[test]
+fn dead_scope_guard_rejects_activation_into_a_torn_down_subprocess_scope() {
+    // start -> sub -> after, with an inner task so `sub` is a live active scope.
+    let def = ProcessBuilder::new("sub-live")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .service_task("inner", "inner-job")
+        .contained_in("inner", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .service_task("after", "after-job")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("sub", "after")
+        .connect("after", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("sub-live"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // `sub` is active (its inner task is parked on a job): find its element
+    // instance key — the scope the inner tokens run in.
+    let sub_eik = *engine
+        .instance(key)
+        .unwrap()
+        .active
+        .iter()
+        .find(|(_, element_id)| *element_id == "sub")
+        .map(|(eik, _)| eik)
+        .expect("sub scope is active");
+
+    let sibling_activation = Step::Activate {
+        instance_key: key,
+        element_id: "inner".to_string(),
+        scope: sub_eik,
+    };
+
+    // While the scope is live the guard admits the activation.
+    assert!(
+        !engine.step_targets_dead_scope(&sibling_activation),
+        "a live sub-process scope must admit a queued activation"
+    );
+
+    // Once the scope is marked torn down for this drain, the guard rejects the
+    // still-queued sibling activation even though the sub-process token is still
+    // in `active` (left for the drain sweep to complete).
+    engine.torn_down_scopes.insert(sub_eik);
+    assert!(
+        engine.step_targets_dead_scope(&sibling_activation),
+        "a queued activation into a torn-down scope must be dropped, not recreate a token that wedges the drain"
+    );
+
+    // A root-scoped activation (scope 0) is never gated by this marker.
+    assert!(!engine.step_targets_dead_scope(&Step::Activate {
+        instance_key: key,
+        element_id: "after".to_string(),
+        scope: 0,
+    }));
+}
+
+/// Defect-class guard (dead-scope guard, multi-instance retry branches): a
+/// resolved MI input-mapping incident re-drives the *already-activated* child /
+/// body via `RetryMiChildActivation` / `RetryMiBodyActivation`, reusing existing
+/// keys. If a scoped terminate tore the loop's body (and children) down first,
+/// those queued retries must be dropped — dispatching them would re-drive work in
+/// a dead scope. A bare instance-terminal check is insufficient because the
+/// instance itself stays active.
+#[test]
+fn dead_scope_guard_rejects_mi_retries_after_the_body_is_torn_down() {
+    //  sub: sub_start -> split =< each(MI svc "handle"), trigger(svc) -> stop(terminate) >
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .contained_in("each", "sub")
+        .end_event("each_end")
+        .contained_in("each_end", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .service_task("after", "after-job")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "each")
+        .connect("each", "each_end")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .connect("sub", "after")
+        .connect("after", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The MI body is active with its children parked on jobs. Capture the body
+    // and one child element-instance key.
+    let body_key = *engine
+        .instance(key)
+        .unwrap()
+        .multi_instances
+        .keys()
+        .next()
+        .expect("MI body registered");
+    let child_key = *engine
+        .instance(key)
+        .unwrap()
+        .scopes
+        .iter()
+        .find(|(_, parent)| **parent == body_key)
+        .map(|(child, _)| child)
+        .expect("MI child active under the body");
+
+    let child_retry = Step::RetryMiChildActivation {
+        instance_key: key,
+        element_id: "each".to_string(),
+        body_key,
+        child_key,
+        index: 0,
+    };
+    let body_retry = Step::RetryMiBodyActivation {
+        instance_key: key,
+        element_id: "each".to_string(),
+        body_key,
+        scope: body_key,
+    };
+
+    // While the loop is live the guard admits both retries.
+    assert!(!engine.step_targets_dead_scope(&child_retry));
+    assert!(!engine.step_targets_dead_scope(&body_retry));
+
+    // The sibling terminate tears the whole sub-process (and its MI body) down.
+    complete_one(&mut engine, "trigger-job");
+    assert!(engine.instance(key).unwrap().multi_instances.is_empty());
+    assert_eq!(
+        engine.instance(key).unwrap().state,
+        crate::state::ProcessInstanceState::Active,
+        "the parent instance continues past the scoped terminate"
+    );
+
+    // Now the queued retries target a dead body: the guard must drop both, even
+    // though the instance is still active.
+    assert!(
+        engine.step_targets_dead_scope(&child_retry),
+        "a child retry whose body was torn down must be dropped"
+    );
+    assert!(
+        engine.step_targets_dead_scope(&body_retry),
+        "a body retry whose body token was torn down must be dropped"
+    );
+}
+
+/// Defect-class guard (dead-scope guard, `AdvanceTaskListener` branch):
+/// `UserTaskCanceled` intentionally *retains* the task record (state → `Canceled`,
+/// `pending` cleared). A bare existence check would let an `AdvanceTaskListener`
+/// queued before a terminate teardown mint another listener job against the dead
+/// task, so the guard must require the task to still be `Created`.
+#[test]
+fn dead_scope_guard_rejects_task_listener_advance_for_a_canceled_task() {
+    //  sub: sub_start -> split =< ut(user task), trigger(svc) -> stop(terminate) >
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .user_task("ut")
+        .contained_in("ut", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .service_task("after", "after-job")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "ut")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .connect("sub", "after")
+        .connect("after", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let ut_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("user task created");
+
+    let advance = Step::AdvanceTaskListener {
+        user_task_key: ut_key,
+        event_type: crate::model::TaskListenerEventType::Completing,
+        index: 0,
+    };
+
+    // While the task is `Created` the guard admits the listener advance.
+    assert!(!engine.step_targets_dead_scope(&advance));
+
+    // The sibling terminate cancels the resting task (record retained, Canceled).
+    complete_one(&mut engine, "trigger-job");
+    assert_eq!(
+        engine.state().user_tasks[&ut_key].state,
+        crate::state::UserTaskState::Canceled
+    );
+    assert_eq!(
+        engine.instance(key).unwrap().state,
+        crate::state::ProcessInstanceState::Active
+    );
+
+    // A listener advance queued before the cancel must now be dropped rather than
+    // mint another listener job against the cancelled task.
+    assert!(
+        engine.step_targets_dead_scope(&advance),
+        "an AdvanceTaskListener for a cancelled task must be dropped"
+    );
+}
+
+#[test]
+fn subprocess_terminate_end_resolves_an_incident_in_its_scope() {
+    // A terminate end must resolve an incident parked on a descendant of the
+    // torn-down scope. `ElementCompleted` touches no incident state, so without
+    // this the instance keeps a stale `hasIncident` for a vanished element and a
+    // later external resolve could re-drive the dead token.
+    //
+    //  sub: sub_start -> split =< work(svc) -> work_end,
+    //                             trigger(svc) -> stop(terminate) >
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("work", "work-job")
+        .contained_in("work", "sub")
+        .end_event("work_end")
+        .contained_in("work_end", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "work")
+        .connect("work", "work_end")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Fail the work job with no retries left to park an incident in the scope.
+    let work_job = engine.activate_jobs("work-job", "W", 10, 60_000, 0)[0].key;
+    engine
+        .apply_command(Command::fail_job(work_job, 0, "boom"))
+        .unwrap();
+    assert_eq!(engine.instance(key).unwrap().incidents.len(), 1);
+
+    // The sibling terminate fires when `trigger` completes.
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::IncidentResolved { .. })),
+        "scope teardown must resolve the descendant incident"
+    );
+    assert!(
+        engine.instance(key).unwrap().incidents.is_empty(),
+        "the instance must carry no active incident after terminate"
+    );
+}
+
+#[test]
+fn scope_teardown_does_not_resurrect_a_cancelled_incident_job() {
+    // Regression: forced scope teardown emits `JobCanceled` and then
+    // `IncidentResolved` for the *same* failed job in one batch. `IncidentResolved`
+    // must not return the just-cancelled job to `Created`, or the resolution
+    // resurrects a job whose element instance is being removed — leaving an
+    // activatable job pointing at a dead token. The job must stay `Canceled` and
+    // out of the activatable pool.
+    //
+    //  sub: sub_start -> split =< work(svc) -> work_end,
+    //                             trigger(svc) -> stop(terminate) >
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("work", "work-job")
+        .contained_in("work", "sub")
+        .end_event("work_end")
+        .contained_in("work_end", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "work")
+        .connect("work", "work_end")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+
+    // Fail the work job with no retries left to park an incident on its element.
+    let work_job = engine.activate_jobs("work-job", "W", 10, 60_000, 0)[0].key;
+    engine
+        .apply_command(Command::fail_job(work_job, 0, "boom"))
+        .unwrap();
+    assert_eq!(
+        engine.state().jobs.get(&work_job).unwrap().state,
+        state::JobState::Failed
+    );
+
+    // The sibling terminate fires when `trigger` completes: it cancels the failed
+    // job *and* resolves its incident in the same teardown batch.
+    complete_one(&mut engine, "trigger-job");
+
+    let job = engine.state().jobs.get(&work_job).unwrap();
+    assert_eq!(
+        job.state,
+        state::JobState::Canceled,
+        "the cancelled job must stay Canceled — incident resolution must not resurrect it"
+    );
+    assert!(
+        engine
+            .activate_jobs("work-job", "W2", 10, 60_000, 0)
+            .is_empty(),
+        "a resurrected job would reappear in the activatable pool against a dead token"
+    );
+}
+
+#[test]
+fn terminate_clears_open_parallel_join_bookkeeping() {
+    // A terminate that fires while a parallel join is half-open must drop the
+    // join's runtime bookkeeping (`join_counts`/`join_instances`) on the terminal
+    // instance — the same forced-teardown cleanup as MI/ad-hoc state. Otherwise a
+    // mid-join terminate strands this bookkeeping on the terminal instance shell
+    // until eviction, leaving its snapshot inconsistent.
+    //
+    //  start -> split =< a(svc) -> join, b(svc) -> join,
+    //                    trigger(svc) -> stop(terminate) >
+    //  join(parallel) -> done
+    let proc = ProcessBuilder::new("join-term")
+        .start_event("start")
+        .parallel_gateway("split")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .parallel_gateway("join")
+        .end_event("done")
+        .service_task("trigger", "trigger-job")
+        .terminate_end_event("stop")
+        .connect("start", "split")
+        .connect("split", "a")
+        .connect("split", "b")
+        .connect("split", "trigger")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "done")
+        .connect("trigger", "stop")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(proc)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("join-term"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Drive branch `a` into the join so it half-opens and waits for branch `b`.
+    complete_one(&mut engine, "ja");
+    let instance = engine.instance(key).unwrap();
+    assert_eq!(
+        instance.join_counts.get("join").copied(),
+        Some(1),
+        "the join is half-open before the terminate"
+    );
+    assert!(instance.join_instances.contains_key("join"));
+
+    // The sibling terminate fires when `trigger` completes, ending the instance.
+    complete_one(&mut engine, "trigger-job");
+    let instance = engine.instance(key).unwrap();
+    assert_eq!(
+        instance.state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    assert!(
+        instance.join_counts.is_empty() && instance.join_instances.is_empty(),
+        "the terminal instance must not retain open-join bookkeeping"
+    );
+}
+
+#[test]
+fn top_level_terminate_end_clears_a_multi_instance_body() {
+    // A top-level terminate ends the whole instance; its `ProcessInstanceTerminated`
+    // reducer must also drop the multi-instance runtime record, or a large in-flight
+    // loop keeps its item/output payload on the terminal instance until eviction.
+    //
+    //  start -> split =< each(MI svc "handle") -> each_end,
+    //                    trigger(svc) -> stop(terminate) >
+    let proc = ProcessBuilder::new("mi-term")
+        .start_event("start")
+        .parallel_gateway("split")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .end_event("each_end")
+        .service_task("trigger", "trigger-job")
+        .terminate_end_event("stop")
+        .connect("start", "split")
+        .connect("split", "each")
+        .connect("each", "each_end")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(proc)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-term",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "terminal teardown must clear the multi-instance runtime record"
+    );
+}
+
+#[test]
+fn top_level_terminate_end_clears_an_adhoc_container() {
+    // The ad-hoc analogue of the multi-instance case: a top-level terminate must
+    // drop the ad-hoc container runtime record on the terminal transition.
+    //
+    //  s -> split =< agent(adhoc, resting) , trigger(svc) -> stop(terminate) >
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:parallelGateway id="split" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:serviceTask id="trigger">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="trigger-job" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="agent_end" />
+          <bpmn:endEvent id="stop"><bpmn:terminateEventDefinition /></bpmn:endEvent>
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="split" />
+          <bpmn:sequenceFlow id="f2" sourceRef="split" targetRef="agent" />
+          <bpmn:sequenceFlow id="f3" sourceRef="split" targetRef="trigger" />
+          <bpmn:sequenceFlow id="f4" sourceRef="agent" targetRef="agent_end" />
+          <bpmn:sequenceFlow id="f5" sourceRef="trigger" targetRef="stop" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let proc = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(proc)).unwrap();
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    // The ad-hoc container registered a runtime record on activation and rests
+    // waiting for its `agent-worker` job.
+    assert_eq!(engine.instance(key).unwrap().adhoc_instances.len(), 1);
+
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+    assert!(
+        engine.instance(key).unwrap().adhoc_instances.is_empty(),
+        "terminal teardown must clear the ad-hoc container runtime record"
+    );
+}
+
 fn approval_process() -> ProcessDefinition {
     // s -> g(xor): decision==yes -> approved ; else default -> rejected
     ProcessBuilder::new("approval")
@@ -4490,6 +5550,98 @@ fn should_pass_through_a_compensation_throw_event_with_nothing_to_compensate() {
     assert!(!created
         .iter()
         .any(|e| matches!(e, Event::CompensationTriggered { .. })));
+}
+
+/// Defect class: a *sub-process*-scoped terminate must also drop the compensation
+/// state scoped to the torn-down scope. A completed compensable activity records
+/// a `compensable` subscription tagged with the scope it ran in; the whole-
+/// instance `ProcessInstanceTerminated` sweep clears both compensation maps, but
+/// a scoped terminate only removes the tokens — leaving the subscription attached
+/// to the still-live parent until whole-instance eviction (stale state, and a
+/// handler that could run for an activity in a scope that no longer exists).
+#[test]
+fn subprocess_terminate_clears_scoped_compensation_state() {
+    //  main: start -> sub -> after(svc) -> done
+    //  sub:  sub_start -> split =< book(svc, comp-boundary "book-comp" -> "cancel")
+    //                                     -> hold(svc),
+    //                             trigger(svc) -> inner_stop(terminate) >
+    let def = ProcessBuilder::new("comp-term")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("book", "book-job")
+        .contained_in("book", "sub")
+        .compensation_boundary_event("book-comp", "book", "cancel")
+        .contained_in("book-comp", "sub")
+        .service_task("cancel", "cancel-job")
+        .contained_in("cancel", "sub")
+        .service_task("hold", "hold-job")
+        .contained_in("hold", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("inner_stop")
+        .contained_in("inner_stop", "sub")
+        .service_task("after", "after-job")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "book")
+        .connect("book", "hold")
+        .connect("split", "trigger")
+        .connect("trigger", "inner_stop")
+        .connect("sub", "after")
+        .connect("after", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-term"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Complete `book`: it becomes compensable (scoped to the sub-process) and its
+    // token advances to `hold`, so the sub-process is still live.
+    let events = complete_one(&mut engine, "book-job");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::CompensationSubscriptionCreated { element_id, handler, .. }
+            if element_id == "book" && handler == "cancel"
+    )));
+    assert_eq!(
+        engine.instance(instance_key).unwrap().compensable.len(),
+        1,
+        "the completed compensable activity is recorded"
+    );
+
+    // The sibling `trigger` drives its token into the terminate end, tearing down
+    // the sub-process scope — which must also clear the scoped compensation state.
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ScopedCompensationCleared { .. })),
+        "scope teardown must emit ScopedCompensationCleared"
+    );
+    assert!(
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .compensable
+            .is_empty(),
+        "the compensation subscription scoped to the terminated sub-process must be dropped"
+    );
+    // The parent continues past the scoped terminate and finishes normally.
+    assert_eq!(
+        engine.instance(instance_key).unwrap().state,
+        crate::state::ProcessInstanceState::Active
+    );
+    let final_events = complete_one(&mut engine, "after-job");
+    assert!(final_events.contains(&Event::ProcessInstanceCompleted { instance_key }));
 }
 
 /// start -> sub[ sub_start -> inner(work) -> sub_end ] --normal--> done

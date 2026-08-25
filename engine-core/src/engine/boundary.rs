@@ -180,42 +180,220 @@ impl Engine {
         instance_key: Key,
         scope_eik: Key,
     ) {
+        // Mark the scope torn down for this drain so a sibling activation still
+        // queued behind the interrupting boundary cannot recreate a token inside
+        // it (mirrors the scoped terminate-end path; see [`torn_down_scopes`]).
+        self.torn_down_scopes.insert(scope_eik);
+        for event in self.scope_teardown_events(instance_key, scope_eik) {
+            self.emit(log, event);
+        }
+    }
+
+    /// The events that tear down a sub-process scope: for each element instance
+    /// transitively inside `scope_eik`, the cancellations of **every** runtime
+    /// resource it owns — its in-play job, armed timers, open message/signal/
+    /// conditional subscriptions, any resting (`Created`) user task, any
+    /// parallel-join bookkeeping it accumulates, and any call-activity child
+    /// process instance it parks — followed by its `ElementCompleting` and
+    /// `ElementCompleted`. The sub-process element instance itself is left for
+    /// the caller to complete. Returns the events (does not emit) so it composes
+    /// both inside an emit-driven command tail ([`terminate_subprocess_scope`])
+    /// and inside a decide-only `process_step` result (a terminate end event's
+    /// completion).
+    ///
+    /// Every descendant-owned resource must be swept here: `ElementCompleted`
+    /// removes the token but does **not** cancel a user task, cancel a signal/
+    /// conditional subscription, or reset a parallel join, so anything left
+    /// behind can later re-drive (or be completed against) a token whose element
+    /// is gone. A parked call-activity child is a *separate* process instance —
+    /// not visited by [`scope_descendants`] — so it is terminated explicitly here
+    /// (its own grandchildren are then reaped by the post-drain
+    /// [`cascade_cancel_children`](crate::engine::Engine::cascade_cancel_children)
+    /// sweep, which sees the `ProcessInstanceTerminated` this emits).
+    pub(crate) fn scope_teardown_events(&self, instance_key: Key, scope_eik: Key) -> Vec<Event> {
+        let mut events = Vec::new();
         for eik in self.scope_descendants(instance_key, scope_eik) {
             let element_id = self
                 .element_id_of_instance(instance_key, eik)
                 .unwrap_or_default();
+            // Terminate any call-activity child process instance parked on this
+            // element instance before the parent token is removed — the child is
+            // a separate instance `scope_descendants` cannot see, so completing
+            // the call-activity token without this would leave the child (and its
+            // jobs/timers) running with no parent.
+            if let Some(child) = self.call_activity_child_of(eik) {
+                events.extend(self.discard_instance_events(child));
+            }
             if let Some(job_key) = self.active_job_on(eik) {
-                self.emit(
-                    log,
-                    Event::JobCanceled {
-                        job_key,
+                events.push(Event::JobCanceled {
+                    job_key,
+                    instance_key,
+                });
+            }
+            events.extend(self.cancel_all_timers_on(eik));
+            events.extend(self.cancel_all_subscriptions_on(eik));
+            events.extend(self.cancel_all_signal_subscriptions_on(eik));
+            events.extend(self.cancel_all_conditional_subscriptions_on(eik));
+            events.extend(self.cancel_created_user_tasks_on(eik));
+            // Resolve any incident parked on this element instance. Unlike the
+            // whole-instance `ProcessInstanceTerminated` reducer (which closes
+            // every open incident on the instance), scope teardown only removes
+            // the token via `ElementCompleted`, which touches no incident state —
+            // so without this the instance keeps a stale `hasIncident` for a
+            // descendant whose element is gone, and a later `IncidentResolved`
+            // could enqueue a re-drive against the vanished token.
+            events.extend(self.resolve_incidents_on(instance_key, eik));
+            // Drop the runtime record of a multi-instance body / ad-hoc container
+            // being torn down. `ElementCompleted` clears the body/container token
+            // but not the `multi_instances` / `adhoc_instances` map (those are
+            // cleared only by `MultiInstanceCompleted` / `AdHocCompleted`), so
+            // without this the terminated scope retains a stale active-child set
+            // and output state — and the dead-scope guard would treat that stale
+            // map as a live scope, letting a still-queued `ActivateMiChild` /
+            // `ActivateAdHocTool` mint a child into the dead body/container.
+            if let Some(instance) = self.state.instances.get(&instance_key) {
+                if instance.multi_instances.contains_key(&eik) {
+                    events.push(Event::MultiInstanceCompleted {
                         instance_key,
-                    },
-                );
+                        body_key: eik,
+                    });
+                }
+                if instance.adhoc_instances.contains_key(&eik) {
+                    events.push(Event::AdHocCompleted {
+                        instance_key,
+                        container_key: eik,
+                        cancelled: true,
+                    });
+                }
             }
-            for event in self.cancel_all_timers_on(eik) {
-                self.emit(log, event);
-            }
-            for event in self.cancel_all_subscriptions_on(eik) {
-                self.emit(log, event);
-            }
-            self.emit(
-                log,
-                Event::ElementCompleting {
+            // Reset a parallel join accumulating on this element instance so its
+            // `join_counts`/`join_instances` bookkeeping (untouched by
+            // `ElementCompleted`) cannot fire against a dead token if the scope
+            // is ever re-entered.
+            if self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.join_instances.get(&element_id))
+                == Some(&eik)
+            {
+                events.push(Event::ParallelJoinReset {
                     instance_key,
-                    element_instance_key: eik,
                     element_id: element_id.clone(),
-                },
-            );
-            self.emit(
-                log,
-                Event::ElementCompleted {
-                    instance_key,
-                    element_instance_key: eik,
-                    element_id,
-                },
-            );
+                });
+            }
+            events.push(Event::ElementCompleting {
+                instance_key,
+                element_instance_key: eik,
+                element_id: element_id.clone(),
+            });
+            events.push(Event::ElementCompleted {
+                instance_key,
+                element_instance_key: eik,
+                element_id,
+            });
         }
+        // Scoped compensation cleanup. A completed compensable activity and an
+        // in-flight compensation throw both record the `scope` (element instance
+        // of the enclosing sub-process, or `0` for the root) they belong to. The
+        // whole-instance `ProcessInstanceTerminated` reducer clears both maps, but
+        // a *sub-process* terminate only removes the tokens above — leaving the
+        // completed-activity subscriptions and pending handler waits scoped to the
+        // torn-down sub-process (or a nested scope) attached to the still-live
+        // parent until whole-instance eviction. That strands stale compensation
+        // state on long-running parents and could run a handler for an activity in
+        // a scope that no longer exists. Drop exactly the entries scoped to the
+        // terminated scope and its descendants, carrying the scope set on the
+        // event so replay reproduces the removal without recomputing the (by then
+        // torn-down) scope tree.
+        if let Some(instance) = self.state.instances.get(&instance_key) {
+            let mut scopes: Vec<Key> = self.scope_descendants(instance_key, scope_eik);
+            scopes.push(scope_eik);
+            let scope_set: std::collections::HashSet<Key> = scopes.iter().copied().collect();
+            let clears_any = instance
+                .compensable
+                .iter()
+                .any(|c| scope_set.contains(&c.scope))
+                || instance
+                    .compensation_waits
+                    .values()
+                    .any(|w| scope_set.contains(&w.scope));
+            if clears_any {
+                scopes.sort_unstable();
+                events.push(Event::ScopedCompensationCleared {
+                    instance_key,
+                    scopes,
+                });
+            }
+        }
+        events
+    }
+
+    /// The `UserTaskCanceled` events for every resting (`Created`) user task on
+    /// `element_instance_key`, sorted by key. `ElementCompleted` alone leaves a
+    /// user task queryable as `Created` (and completable), so scope teardown must
+    /// cancel it explicitly — mirroring the whole-instance
+    /// [`discard_instance_events`](crate::engine::Engine::discard_instance_events)
+    /// sweep, per element instance.
+    pub(crate) fn cancel_created_user_tasks_on(&self, element_instance_key: Key) -> Vec<Event> {
+        let mut tasks: Vec<&state::UserTask> = self
+            .state
+            .user_tasks
+            .values()
+            .filter(|t| {
+                t.element_instance_key == element_instance_key
+                    && t.state == state::UserTaskState::Created
+            })
+            .collect();
+        tasks.sort_by_key(|t| t.key);
+        tasks
+            .into_iter()
+            .map(|t| Event::UserTaskCanceled {
+                user_task_key: t.key,
+                instance_key: t.instance_key,
+            })
+            .collect()
+    }
+
+    /// The `IncidentResolved` events for every **active** incident parked on
+    /// `element_instance_key`, sorted by key. Mirrors — per element instance —
+    /// the incident-closing the whole-instance `ProcessInstanceTerminated`
+    /// reducer does for a top-level terminate: when scope teardown removes a
+    /// descendant token, any incident sitting on it must be resolved too, or the
+    /// instance keeps a stale `hasIncident` for a vanished element (and a later
+    /// external resolve could re-drive the dead token). `resolved_at` is the
+    /// command clock (`now`); a job-incident's parked job key rides along, but
+    /// the `IncidentResolved` reducer only returns it to the activatable pool
+    /// when the job is still `Failed`. During this teardown the same batch emits
+    /// `JobCanceled` first, so the job is already terminal by the time its
+    /// incident is resolved and the reducer's `Failed`-only guard intentionally
+    /// leaves it cancelled rather than resurrecting it.
+    pub(crate) fn resolve_incidents_on(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+    ) -> Vec<Event> {
+        let mut incidents: Vec<&state::Incident> = self
+            .state
+            .incidents
+            .values()
+            .filter(|i| {
+                i.instance_key == instance_key
+                    && i.element_instance_key == element_instance_key
+                    && i.state == state::IncidentState::Active
+            })
+            .collect();
+        incidents.sort_by_key(|i| i.key);
+        incidents
+            .into_iter()
+            .map(|i| Event::IncidentResolved {
+                incident_key: i.key,
+                instance_key,
+                job_key: i.job_key,
+                resolved_at: self.now,
+                operation_reference: None,
+            })
+            .collect()
     }
 
     /// Cancels every armed (`Created`) timer resting on `element_instance_key`,

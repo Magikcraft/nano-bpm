@@ -812,6 +812,15 @@ pub enum Event {
         throw_element_instance_key: Key,
         handler_element_id: ElementId,
     },
+    /// A sub-process scope was torn down (by a scoped terminate end or an
+    /// interrupting boundary), so the compensation state scoped to it must be
+    /// dropped. `scopes` is the terminated scope element instance plus every
+    /// descendant scope; the reducer removes each `compensable` subscription and
+    /// `compensation_waits` entry whose `scope` is in this set. Carries the scope
+    /// set explicitly (rather than recomputing it) because the descendant tokens
+    /// are torn down in the same batch, so the scope tree no longer exists by
+    /// replay. Emitted only when the scope actually holds compensation state.
+    ScopedCompensationCleared { instance_key: Key, scopes: Vec<Key> },
     /// A multi-instance body activated: its `input_collection` was evaluated to
     /// `items` and one child of `element_id` will run per item (all at once when
     /// `sequential` is `false`, one after another when `true`). Carries the
@@ -1061,6 +1070,7 @@ impl Event {
             | Event::CompensationSubscriptionCreated { instance_key, .. }
             | Event::CompensationTriggered { instance_key, .. }
             | Event::CompensationHandlerCompleted { instance_key, .. }
+            | Event::ScopedCompensationCleared { instance_key, .. }
             | Event::MultiInstanceActivated { instance_key, .. }
             | Event::MultiInstanceChildActivated { instance_key, .. }
             | Event::MultiInstanceChildCompleted { instance_key, .. }
@@ -1374,6 +1384,11 @@ impl Event {
             | Event::UserTaskTransitionDeferred { user_task_key, .. }
             | Event::UserTaskCorrectionsApplied { user_task_key, .. }
             | Event::UserTaskTransitionResolved { user_task_key, .. } => m = m.max(*user_task_key),
+            Event::ScopedCompensationCleared { scopes, .. } => {
+                if let Some(max_scope) = scopes.iter().copied().max() {
+                    m = m.max(max_scope);
+                }
+            }
             _ => {}
         }
         m

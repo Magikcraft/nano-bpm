@@ -441,6 +441,17 @@ pub enum ElementKind {
     /// A none end event. Pass-through; consuming the last token completes the
     /// process instance.
     EndEvent,
+    /// A terminate end event (`<endEvent>` with a `<terminateEventDefinition>`).
+    ///
+    /// Unlike a none end event, reaching it does not merely consume its own
+    /// token: it **kills every other still-active token in its enclosing scope**
+    /// (parallel-split sibling branches, pending timers, open jobs and
+    /// subscriptions) and then completes that scope — the Zeebe/Camunda
+    /// terminate semantics. A terminate end in the top-level process terminates
+    /// the whole instance (`ProcessInstanceTerminated`); a terminate end inside
+    /// an embedded sub-process terminates only that sub-process scope and lets
+    /// the parent instance continue on the sub-process's outgoing flow.
+    TerminateEndEvent,
     /// A service task. On activation it creates a job of `job_type` and the token
     /// rests until the job is completed. `priority` is the *raw* (un-evaluated)
     /// job-priority expression declared via `zeebe:priorityDefinition` (a literal
@@ -787,6 +798,7 @@ impl ElementKind {
             | ElementKind::CallActivity { .. } => true,
             ElementKind::StartEvent
             | ElementKind::EndEvent
+            | ElementKind::TerminateEndEvent
             | ElementKind::MessageStartEvent { .. }
             | ElementKind::TimerStartEvent { .. }
             | ElementKind::IntermediateThrowEvent
@@ -819,6 +831,7 @@ impl ElementKind {
             | ElementKind::MessageStartEvent { .. }
             | ElementKind::TimerStartEvent { .. } => "START_EVENT",
             ElementKind::EndEvent => "END_EVENT",
+            ElementKind::TerminateEndEvent => "END_EVENT",
             ElementKind::IntermediateThrowEvent => "INTERMEDIATE_THROW_EVENT",
             ElementKind::CompensationThrowEvent => "INTERMEDIATE_THROW_EVENT",
             ElementKind::Task => "TASK",
@@ -1560,6 +1573,14 @@ impl ProcessBuilder {
     /// Adds a none end event.
     pub fn end_event(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::EndEvent)
+    }
+
+    /// Adds a terminate end event (`<endEvent>` with a
+    /// `<terminateEventDefinition>`; see [`ElementKind::TerminateEndEvent`]).
+    /// Reaching it kills every other active token in its enclosing scope and
+    /// then completes that scope.
+    pub fn terminate_end_event(self, id: impl Into<String>) -> Self {
+        self.add(id, ElementKind::TerminateEndEvent)
     }
 
     /// Adds a none intermediate throw event (a pass-through; see

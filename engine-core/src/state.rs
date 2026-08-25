@@ -2268,16 +2268,32 @@ pub fn apply(state: &mut State, event: &Event) {
                 instance.incidents.retain(|k| k != incident_key);
             }
             // A recoverable job-incident: return the parked job to the
-            // activatable pool so a worker can pick it up again.
+            // activatable pool so a worker can pick it up again — but *only* if
+            // it is still `Failed` (parked). A job already driven to a terminal
+            // state (`Canceled`/`Completed`/`Errored`) by a concurrent forced
+            // teardown must not be resurrected by resolving its retained
+            // incident: scope teardown emits `JobCanceled` and then
+            // `IncidentResolved` for the same job in one batch, so an
+            // unconditional reset would return the just-cancelled job to
+            // `Created` and let a worker activate it against an element instance
+            // that is being removed. The normal `ResolveIncident` command only
+            // reaches here with a `Failed` job (retries validated first), so
+            // this guard is transparent to it.
             if let Some(job_key) = job_key {
-                if let Some(job) = state.jobs.get_mut(job_key) {
-                    job.state = JobState::Created;
-                    job.worker = None;
-                    job.deadline = None;
-                    job.activated_at = None;
-                    job.activation_timeout = None;
+                let is_failed = matches!(
+                    state.jobs.get(job_key).map(|j| j.state),
+                    Some(JobState::Failed)
+                );
+                if is_failed {
+                    if let Some(job) = state.jobs.get_mut(job_key) {
+                        job.state = JobState::Created;
+                        job.worker = None;
+                        job.deadline = None;
+                        job.activated_at = None;
+                        job.activation_timeout = None;
+                    }
+                    resync_job_index(state, *job_key);
                 }
-                resync_job_index(state, *job_key);
             }
         }
 
@@ -2445,6 +2461,28 @@ pub fn apply(state: &mut State, event: &Event) {
                 instance.active.clear();
                 instance.scopes.clear();
                 instance.incidents.clear();
+                // Drop the multi-instance / ad-hoc runtime records too: a forced
+                // teardown removes the body/container token but these maps are
+                // otherwise cleared only by `MultiInstanceCompleted` /
+                // `AdHocCompleted`, so terminating an instance mid-loop would
+                // retain the whole item/output/active-set payload on a terminal
+                // instance until eviction (and leave a stale "live scope" for the
+                // dead-scope guard to read). Immediate terminal cleanup (ADR 0012).
+                instance.multi_instances.clear();
+                instance.adhoc_instances.clear();
+                // Same forced-teardown rationale for the remaining runtime
+                // bookkeeping a mid-flight terminate can leave behind: an open
+                // parallel join (`join_counts`/`join_instances`) or a pending
+                // compensation (`compensable`/`compensation_waits`) is drained
+                // naturally only on normal completion. Terminating mid-join or
+                // mid-compensation would otherwise strand this bookkeeping —
+                // potentially a large compensation list — on the terminal
+                // instance shell until eviction, leaving its terminal snapshot
+                // inconsistent with the MI/ad-hoc/variable state cleared above.
+                instance.join_counts.clear();
+                instance.join_instances.clear();
+                instance.compensable.clear();
+                instance.compensation_waits.clear();
                 // Drop the variable payload on the terminal transition — see
                 // `ProcessInstanceCompleted` above (ADR 0012).
                 if !instance.variables.is_empty() {
@@ -2766,6 +2804,28 @@ pub fn apply(state: &mut State, event: &Event) {
                         .compensation_waits
                         .remove(throw_element_instance_key);
                 }
+            }
+        }
+
+        // A sub-process scope was torn down: drop the compensation state scoped to
+        // it (or a nested scope). Mirrors the whole-instance
+        // `ProcessInstanceTerminated` sweep, but bounded to the terminated
+        // sub-process — `scopes` is the terminated scope plus its descendants, so
+        // any completed-activity subscription or pending handler wait belonging to
+        // one of them is removed, leaving the still-live parent's compensation
+        // state intact.
+        Event::ScopedCompensationCleared {
+            instance_key,
+            scopes,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                let scope_set: std::collections::HashSet<Key> = scopes.iter().copied().collect();
+                instance
+                    .compensable
+                    .retain(|c| !scope_set.contains(&c.scope));
+                instance
+                    .compensation_waits
+                    .retain(|_, w| !scope_set.contains(&w.scope));
             }
         }
 

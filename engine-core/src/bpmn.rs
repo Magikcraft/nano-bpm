@@ -14,7 +14,9 @@
 //! ## Supported subset
 //!
 //! * `process` (one or more per file) with its `id`.
-//! * Flow nodes: `startEvent`, `endEvent`, `task`/`manualTask` (abstract
+//! * Flow nodes: `startEvent`, `endEvent` (plain none end, or — with a nested
+//!   `terminateEventDefinition` — a terminate end that kills the remaining
+//!   tokens in its enclosing scope), `task`/`manualTask` (abstract
 //!   pass-through), `serviceTask`, `userTask`, `exclusiveGateway`,
 //!   `parallelGateway`, `eventBasedGateway`.
 //! * `subProcess` (embedded): its nested flow nodes/flows are scoped to it, and
@@ -290,16 +292,9 @@ fn is_ignorable_tag(tag: &str) -> bool {
             | "escalationEventDefinition"
             | "linkEventDefinition"
             | "conditionalEventDefinition"
-            // `terminateEventDefinition` is a *documented* "parsed-not-executed"
-            // element (see `docs/camunda-compatibility.md`): its owning
-            // `<endEvent>` IS modelled, and — matching Zeebe deploy parity, which
-            // accepts terminate end events — Nano accepts it too, degrading to a
-            // plain end event (the "kill remaining tokens in scope" semantics are
-            // a known, documented limitation, not a silent accept-and-mis-execute
-            // of an *unknown* construct). So it must NOT be recorded as an
-            // unsupported element; rejecting it would break deploy parity for the
-            // many real-world models that use terminate ends.
-            | "terminateEventDefinition"
+            // `terminateEventDefinition` is handled by an explicit parse arm (it
+            // marks its owning `<endEvent>` as a terminate end event); it never
+            // reaches the fallback, so it is not listed here.
             // Nested value/config children of already-modelled constructs.
             | "condition"
             | "conditionExpression"
@@ -852,6 +847,20 @@ fn parse_with_captures(
                                             acc.nodes[idx].id.clone(),
                                         ));
                                     }
+                                }
+                            }
+                            // `terminateEventDefinition` on an `endEvent` makes it
+                            // a *terminate* end event: reaching it kills every
+                            // other active token in the enclosing scope and
+                            // completes that scope (Zeebe/Camunda terminate
+                            // semantics). Recorded on the owning end-event node so
+                            // the build step maps it to
+                            // `ElementKind::TerminateEndEvent`. It is only
+                            // meaningful on an `endEvent`; anywhere else it is
+                            // ignored (deploy-parity leniency).
+                            "terminateEventDefinition" => {
+                                if let Some(idx) = cur_end {
+                                    acc.nodes[idx].is_terminate = true;
                                 }
                             }
                             // `<association sourceRef=… targetRef=…>` — wires a
@@ -1879,6 +1888,10 @@ struct NodeAcc {
     /// `compensateEventDefinition`, making it a
     /// [`CompensationThrowEvent`](crate::model::ElementKind::CompensationThrowEvent).
     is_compensation_throw: bool,
+    /// True when this `endEvent` carries a `terminateEventDefinition`, making it
+    /// a [`TerminateEndEvent`](crate::model::ElementKind::TerminateEndEvent)
+    /// rather than a plain none end event.
+    is_terminate: bool,
     /// True when this activity is marked `isForCompensation="true"` — i.e. it is
     /// a compensation *handler*, reachable only via a compensation boundary's
     /// `<association>`, never by ordinary token flow. Used to resolve (and
@@ -2077,6 +2090,7 @@ impl ProcessAcc {
             linked_resources: Vec::new(),
             start_form_id: None,
             is_compensation_throw: false,
+            is_terminate: false,
             is_for_compensation: attr(attrs, "isForCompensation") == Some("true"),
         });
         let idx = self.nodes.len() - 1;
@@ -2723,6 +2737,8 @@ impl ProcessAcc {
                 NodeKind::End => {
                     if node.is_compensation_throw {
                         builder.compensation_throw_event(node.id)
+                    } else if node.is_terminate {
+                        builder.terminate_end_event(node.id)
                     } else {
                         builder.end_event(node.id)
                     }
@@ -4924,6 +4940,40 @@ mod tests {
         let targets: std::collections::BTreeSet<&str> =
             gw.outgoing.iter().map(|f| f.to.as_str()).collect();
         assert_eq!(targets, ["onReply", "onTimer"].into_iter().collect());
+    }
+
+    #[test]
+    fn should_parse_terminate_end_event() {
+        // given: a plain end event and an end event carrying a
+        // `terminateEventDefinition` (a terminate end).
+        let xml = r#"
+          <definitions>
+            <process id="term">
+              <startEvent id="s" />
+              <parallelGateway id="split" />
+              <endEvent id="plain" />
+              <endEvent id="stop">
+                <terminateEventDefinition />
+              </endEvent>
+              <sequenceFlow id="f0" sourceRef="s" targetRef="split" />
+              <sequenceFlow id="f1" sourceRef="split" targetRef="plain" />
+              <sequenceFlow id="f2" sourceRef="split" targetRef="stop" />
+            </process>
+          </definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the terminate end parses to the terminate kind; the plain end
+        // stays a none end event.
+        assert_eq!(
+            def.element("stop").unwrap().kind,
+            crate::model::ElementKind::TerminateEndEvent
+        );
+        assert_eq!(
+            def.element("plain").unwrap().kind,
+            crate::model::ElementKind::EndEvent
+        );
     }
 
     #[test]
