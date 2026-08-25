@@ -833,10 +833,7 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
         }
 
         // A non-end flow node with no outgoing flow silently drops its token.
-        let is_event_end = matches!(
-            kind,
-            ElementKind::EndEvent | ElementKind::TerminateEndEvent
-        );
+        let is_event_end = matches!(kind, ElementKind::EndEvent | ElementKind::TerminateEndEvent);
         if !is_event_end && el.outgoing.is_empty() && !is_boundary(kind) {
             // Sub-process inner ends and the like aside, a task/gateway with no exit is a
             // dead end.

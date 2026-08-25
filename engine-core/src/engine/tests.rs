@@ -3031,7 +3031,7 @@ fn terminate_end_kills_sibling_branch_and_terminates_the_instance() {
 }
 
 #[test]
-fn subprocess_terminate_end_contains_to_the_subprocess_scope() {
+fn subprocess_terminate_end_confines_to_the_subprocess_scope() {
     // A terminate end inside an embedded sub-process kills only that
     // sub-process's tokens and lets the parent instance continue on the
     // sub-process's outgoing flow — it does NOT terminate the whole instance.
@@ -3102,6 +3102,287 @@ fn subprocess_terminate_end_contains_to_the_subprocess_scope() {
     let final_events = complete_one(&mut engine, "after-job");
     assert!(final_events.contains(&Event::ProcessInstanceCompleted { instance_key }));
     assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn subprocess_terminate_end_terminates_a_call_activity_child_in_its_scope() {
+    // A terminate end inside a sub-process must also reap a call-activity CHILD
+    // process instance spawned from that scope — the child is a separate instance
+    // `scope_descendants` cannot see, so without explicit termination it (and its
+    // jobs) would keep running with no parent token.
+    //
+    //  orch: start -> sub -> after(svc) -> done
+    //  sub:  sub_start -> split =< c1(call "leaf"), trigger(svc) -> inner_stop(terminate) >
+    let leaf = ProcessBuilder::new("leaf")
+        .start_event("ls")
+        .service_task("leaf_work", "leaf-job")
+        .end_event("le")
+        .connect("ls", "leaf_work")
+        .connect("leaf_work", "le")
+        .build()
+        .unwrap();
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .call_activity("c1", "leaf")
+        .contained_in("c1", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("inner_stop")
+        .contained_in("inner_stop", "sub")
+        .service_task("after", "after-job")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "c1")
+        .connect("split", "trigger")
+        .connect("trigger", "inner_stop")
+        .connect("sub", "after")
+        .connect("after", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(leaf)).unwrap();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The call activity spawned a distinct child parked on its own job; the
+    // trigger branch parks on its own job.
+    let child_key = engine
+        .pending_jobs()
+        .iter()
+        .find(|j| j.job_type == "leaf-job")
+        .expect("leaf child parked on its job")
+        .instance_key;
+    assert_ne!(child_key, instance_key);
+    assert!(engine
+        .pending_jobs()
+        .iter()
+        .any(|j| j.job_type == "trigger-job"));
+
+    // Completing the trigger drives its token into the sub-process terminate end.
+    let events = complete_one(&mut engine, "trigger-job");
+
+    // The call-activity child in the terminated scope is terminated too, and its
+    // job cancelled with it.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceTerminated { instance_key: ik } if *ik == child_key
+    )));
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    assert!(!engine
+        .pending_jobs()
+        .iter()
+        .any(|j| j.job_type == "leaf-job"));
+
+    // The parent continues past the sub-process; the parent instance itself is
+    // NOT terminated.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "sub" && to == "after"
+    )));
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceTerminated { instance_key: ik } if *ik == instance_key
+    )));
+    assert_eq!(
+        engine.instance(instance_key).unwrap().state,
+        crate::state::ProcessInstanceState::Active
+    );
+}
+
+#[test]
+fn top_level_terminate_end_in_a_called_process_completes_the_parent_call_activity() {
+    // A terminate end in a CALLED process ends only that child instance (Zeebe/
+    // BPMN: terminate never propagates out of its own process). The parent's call
+    // activity then completes normally and the parent continues on its outgoing
+    // flow — the parent must not be left parked forever, nor terminated.
+    //
+    //  phase (called): ps -> psplit =< work(svc), trg(svc) -> stop(terminate) >
+    //  orch:           start -> c1(call "phase") -> end
+    let phase = ProcessBuilder::new("phase")
+        .start_event("ps")
+        .parallel_gateway("psplit")
+        .service_task("work", "work-job")
+        .service_task("trg", "trg-job")
+        .terminate_end_event("stop")
+        .connect("ps", "psplit")
+        .connect("psplit", "work")
+        .connect("psplit", "trg")
+        .connect("trg", "stop")
+        .build()
+        .unwrap();
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity("c1", "phase")
+        .end_event("end")
+        .connect("start", "c1")
+        .connect("c1", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(phase)).unwrap();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let child_key = engine
+        .pending_jobs()
+        .first()
+        .expect("child parked on its jobs")
+        .instance_key;
+    assert_ne!(child_key, parent_key);
+    assert_eq!(engine.pending_jobs().len(), 2);
+
+    // Completing the child's trg job drives its token into the top-level
+    // terminate end of the called process.
+    let events = complete_one(&mut engine, "trg-job");
+
+    // The child terminates (its sibling work token cancelled)...
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceTerminated { instance_key: ik } if *ik == child_key
+    )));
+    // ...but the terminate does NOT propagate to the parent: the call activity
+    // completes and the parent runs to ordinary completion.
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceTerminated { instance_key: ik } if *ik == parent_key
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "c1" && to == "end"
+    )));
+    assert!(engine.is_completed(parent_key));
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+}
+
+#[test]
+fn subprocess_terminate_end_cancels_a_resting_user_task_in_its_scope() {
+    // A terminate end must cancel a resting user task in the torn-down scope —
+    // `ElementCompleted` alone leaves it queryable as `Created` and completable.
+    //
+    //  sub: sub_start -> split =< ut(user task), trigger(svc) -> stop(terminate) >
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .user_task("ut")
+        .contained_in("ut", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "ut")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let ut_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("user task created");
+    assert_eq!(
+        engine.state().user_tasks[&ut_key].state,
+        crate::state::UserTaskState::Created
+    );
+
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::UserTaskCanceled { user_task_key, .. } if *user_task_key == ut_key
+    )));
+    assert_eq!(
+        engine.state().user_tasks[&ut_key].state,
+        crate::state::UserTaskState::Canceled
+    );
+}
+
+#[test]
+fn subprocess_terminate_end_cancels_a_signal_subscription_in_its_scope() {
+    // A terminate end must cancel an open SIGNAL subscription in the torn-down
+    // scope — before, scope teardown cancelled only message subscriptions, so a
+    // later broadcast could fire a token in a dead scope.
+    //
+    //  sub: sub_start -> split =< await(signal catch) -> await_end,
+    //                             trigger(svc) -> stop(terminate) >
+    let orch = ProcessBuilder::new("orch")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .signal_intermediate_catch_event("await", "all-clear")
+        .contained_in("await", "sub")
+        .end_event("await_end")
+        .contained_in("await_end", "sub")
+        .service_task("trigger", "trigger-job")
+        .contained_in("trigger", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "await")
+        .connect("await", "await_end")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(orch)).unwrap();
+    engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    // `signal_subscriptions()` retains cancelled records, so count only OPEN ones.
+    let open_subs = |e: &Engine| {
+        e.signal_subscriptions()
+            .iter()
+            .filter(|s| s.state == crate::state::MessageSubscriptionState::Open)
+            .count()
+    };
+    assert_eq!(open_subs(&engine), 1);
+
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::SignalSubscriptionCanceled { .. })));
+    assert_eq!(open_subs(&engine), 0);
 }
 
 fn approval_process() -> ProcessDefinition {

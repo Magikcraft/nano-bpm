@@ -186,23 +186,40 @@ impl Engine {
     }
 
     /// The events that tear down a sub-process scope: for each element instance
-    /// transitively inside `scope_eik`, the cancellations of its in-play job,
-    /// armed timers and open subscriptions, followed by its `ElementCompleting`
-    /// and `ElementCompleted`. The sub-process element instance itself is left
-    /// for the caller to complete. Returns the events (does not emit) so it
-    /// composes both inside an emit-driven command tail
-    /// ([`terminate_subprocess_scope`]) and inside a decide-only `process_step`
-    /// result (a terminate end event's completion).
-    pub(crate) fn scope_teardown_events(
-        &self,
-        instance_key: Key,
-        scope_eik: Key,
-    ) -> Vec<Event> {
+    /// transitively inside `scope_eik`, the cancellations of **every** runtime
+    /// resource it owns — its in-play job, armed timers, open message/signal/
+    /// conditional subscriptions, any resting (`Created`) user task, any
+    /// parallel-join bookkeeping it accumulates, and any call-activity child
+    /// process instance it parks — followed by its `ElementCompleting` and
+    /// `ElementCompleted`. The sub-process element instance itself is left for
+    /// the caller to complete. Returns the events (does not emit) so it composes
+    /// both inside an emit-driven command tail ([`terminate_subprocess_scope`])
+    /// and inside a decide-only `process_step` result (a terminate end event's
+    /// completion).
+    ///
+    /// Every descendant-owned resource must be swept here: `ElementCompleted`
+    /// removes the token but does **not** cancel a user task, cancel a signal/
+    /// conditional subscription, or reset a parallel join, so anything left
+    /// behind can later re-drive (or be completed against) a token whose element
+    /// is gone. A parked call-activity child is a *separate* process instance —
+    /// not visited by [`scope_descendants`] — so it is terminated explicitly here
+    /// (its own grandchildren are then reaped by the post-drain
+    /// [`cascade_cancel_children`](crate::engine::Engine::cascade_cancel_children)
+    /// sweep, which sees the `ProcessInstanceTerminated` this emits).
+    pub(crate) fn scope_teardown_events(&self, instance_key: Key, scope_eik: Key) -> Vec<Event> {
         let mut events = Vec::new();
         for eik in self.scope_descendants(instance_key, scope_eik) {
             let element_id = self
                 .element_id_of_instance(instance_key, eik)
                 .unwrap_or_default();
+            // Terminate any call-activity child process instance parked on this
+            // element instance before the parent token is removed — the child is
+            // a separate instance `scope_descendants` cannot see, so completing
+            // the call-activity token without this would leave the child (and its
+            // jobs/timers) running with no parent.
+            if let Some(child) = self.call_activity_child_of(eik) {
+                events.extend(self.discard_instance_events(child));
+            }
             if let Some(job_key) = self.active_job_on(eik) {
                 events.push(Event::JobCanceled {
                     job_key,
@@ -211,6 +228,25 @@ impl Engine {
             }
             events.extend(self.cancel_all_timers_on(eik));
             events.extend(self.cancel_all_subscriptions_on(eik));
+            events.extend(self.cancel_all_signal_subscriptions_on(eik));
+            events.extend(self.cancel_all_conditional_subscriptions_on(eik));
+            events.extend(self.cancel_created_user_tasks_on(eik));
+            // Reset a parallel join accumulating on this element instance so its
+            // `join_counts`/`join_instances` bookkeeping (untouched by
+            // `ElementCompleted`) cannot fire against a dead token if the scope
+            // is ever re-entered.
+            if self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.join_instances.get(&element_id))
+                == Some(&eik)
+            {
+                events.push(Event::ParallelJoinReset {
+                    instance_key,
+                    element_id: element_id.clone(),
+                });
+            }
             events.push(Event::ElementCompleting {
                 instance_key,
                 element_instance_key: eik,
@@ -223,6 +259,32 @@ impl Engine {
             });
         }
         events
+    }
+
+    /// The `UserTaskCanceled` events for every resting (`Created`) user task on
+    /// `element_instance_key`, sorted by key. `ElementCompleted` alone leaves a
+    /// user task queryable as `Created` (and completable), so scope teardown must
+    /// cancel it explicitly — mirroring the whole-instance
+    /// [`discard_instance_events`](crate::engine::Engine::discard_instance_events)
+    /// sweep, per element instance.
+    pub(crate) fn cancel_created_user_tasks_on(&self, element_instance_key: Key) -> Vec<Event> {
+        let mut tasks: Vec<&state::UserTask> = self
+            .state
+            .user_tasks
+            .values()
+            .filter(|t| {
+                t.element_instance_key == element_instance_key
+                    && t.state == state::UserTaskState::Created
+            })
+            .collect();
+        tasks.sort_by_key(|t| t.key);
+        tasks
+            .into_iter()
+            .map(|t| Event::UserTaskCanceled {
+                user_task_key: t.key,
+                instance_key: t.instance_key,
+            })
+            .collect()
     }
 
     /// Cancels every armed (`Created`) timer resting on `element_instance_key`,
