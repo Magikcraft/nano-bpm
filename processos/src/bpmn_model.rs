@@ -40,6 +40,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
     match kind {
         ElementKind::StartEvent => "startEvent",
         ElementKind::EndEvent => "endEvent",
+        ElementKind::TerminateEndEvent => "terminateEndEvent",
         ElementKind::ServiceTask { .. } => "serviceTask",
         ElementKind::BusinessRuleTask { .. } => "businessRuleTask",
         ElementKind::UserTask(_) => "userTask",
@@ -609,7 +610,7 @@ pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
     let is_end_id = |id: &str| {
         matches!(
             def.element(id).map(|e| &e.kind),
-            Some(ElementKind::EndEvent)
+            Some(ElementKind::EndEvent) | Some(ElementKind::TerminateEndEvent)
         )
     };
     let tasks: HashSet<String> = def
@@ -796,7 +797,12 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
     // No explicit end event.
     let end_events = ids
         .iter()
-        .filter(|id| matches!(def.elements[**id].kind, ElementKind::EndEvent))
+        .filter(|id| {
+            matches!(
+                def.elements[**id].kind,
+                ElementKind::EndEvent | ElementKind::TerminateEndEvent
+            )
+        })
         .count();
     if end_events == 0 {
         findings.push(finding(
@@ -827,7 +833,10 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
         }
 
         // A non-end flow node with no outgoing flow silently drops its token.
-        let is_event_end = matches!(kind, ElementKind::EndEvent);
+        let is_event_end = matches!(
+            kind,
+            ElementKind::EndEvent | ElementKind::TerminateEndEvent
+        );
         if !is_event_end && el.outgoing.is_empty() && !is_boundary(kind) {
             // Sub-process inner ends and the like aside, a task/gateway with no exit is a
             // dead end.
@@ -1991,6 +2000,11 @@ fn emit_element(
         }
         ElementKind::EndEvent => {
             out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}/>\n"));
+        }
+        ElementKind::TerminateEndEvent => {
+            out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}>\n"));
+            out.push_str("      <bpmn:terminateEventDefinition />\n");
+            out.push_str("    </bpmn:endEvent>\n");
         }
         ElementKind::IntermediateThrowEvent => {
             out.push_str(&format!(

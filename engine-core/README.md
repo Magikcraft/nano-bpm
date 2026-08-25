@@ -210,6 +210,14 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   nothing to compensate the throw is a pass-through. This covers the
   single-activity path (one completed task → its handler); whole-scope and nested
   compensation are follow-ups.
+- **Terminate end events** (`<endEvent>` with a `<terminateEventDefinition>`)
+  don't merely consume their own token: reaching one **kills every other active
+  token in its enclosing scope** — parallel-split sibling branches, pending
+  timers, open jobs and subscriptions — and then completes that scope. A
+  terminate end in the top-level process ends the whole instance
+  (`ProcessInstanceTerminated`); a terminate end inside an embedded sub-process
+  ends only that sub-process scope, and the parent instance continues on the
+  sub-process's outgoing flow.
 - **Message start events** create a new process instance when a matching message
   arrives. Deploying a process whose start event carries a
   `messageEventDefinition` opens a **process-level** `MessageStartSubscription`
@@ -297,7 +305,9 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > token scope whose inner flow runs to its own end before the sub-process routes
 > on, with **error, timer and message boundary events** attached to the
 > sub-process — an interrupting one terminates the whole inner scope and routes to
-> its handler). Instances carry JSON-like variables (`null`, booleans, numbers,
+> its handler), and **terminate end events** (an `endEvent` with a
+> `terminateEventDefinition` that kills the remaining tokens in its enclosing
+> scope, then completes that scope). Instances carry JSON-like variables (`null`, booleans, numbers,
 > strings, lists and contexts) evaluated by an in-house FEEL engine ([`feel`])
 > for gateway conditions, job types and message correlation. Processes can be
 > built programmatically with [`ProcessBuilder`] or parsed from BPMN 2.0 XML for

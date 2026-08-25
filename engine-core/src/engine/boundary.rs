@@ -180,42 +180,49 @@ impl Engine {
         instance_key: Key,
         scope_eik: Key,
     ) {
+        for event in self.scope_teardown_events(instance_key, scope_eik) {
+            self.emit(log, event);
+        }
+    }
+
+    /// The events that tear down a sub-process scope: for each element instance
+    /// transitively inside `scope_eik`, the cancellations of its in-play job,
+    /// armed timers and open subscriptions, followed by its `ElementCompleting`
+    /// and `ElementCompleted`. The sub-process element instance itself is left
+    /// for the caller to complete. Returns the events (does not emit) so it
+    /// composes both inside an emit-driven command tail
+    /// ([`terminate_subprocess_scope`]) and inside a decide-only `process_step`
+    /// result (a terminate end event's completion).
+    pub(crate) fn scope_teardown_events(
+        &self,
+        instance_key: Key,
+        scope_eik: Key,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
         for eik in self.scope_descendants(instance_key, scope_eik) {
             let element_id = self
                 .element_id_of_instance(instance_key, eik)
                 .unwrap_or_default();
             if let Some(job_key) = self.active_job_on(eik) {
-                self.emit(
-                    log,
-                    Event::JobCanceled {
-                        job_key,
-                        instance_key,
-                    },
-                );
-            }
-            for event in self.cancel_all_timers_on(eik) {
-                self.emit(log, event);
-            }
-            for event in self.cancel_all_subscriptions_on(eik) {
-                self.emit(log, event);
-            }
-            self.emit(
-                log,
-                Event::ElementCompleting {
+                events.push(Event::JobCanceled {
+                    job_key,
                     instance_key,
-                    element_instance_key: eik,
-                    element_id: element_id.clone(),
-                },
-            );
-            self.emit(
-                log,
-                Event::ElementCompleted {
-                    instance_key,
-                    element_instance_key: eik,
-                    element_id,
-                },
-            );
+                });
+            }
+            events.extend(self.cancel_all_timers_on(eik));
+            events.extend(self.cancel_all_subscriptions_on(eik));
+            events.push(Event::ElementCompleting {
+                instance_key,
+                element_instance_key: eik,
+                element_id: element_id.clone(),
+            });
+            events.push(Event::ElementCompleted {
+                instance_key,
+                element_instance_key: eik,
+                element_id,
+            });
         }
+        events
     }
 
     /// Cancels every armed (`Created`) timer resting on `element_instance_key`,

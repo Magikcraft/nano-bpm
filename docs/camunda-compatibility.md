@@ -73,7 +73,7 @@ what Nano *recognizes*; everything not listed there is dropped on parse.
 | `boundaryEvent` — message | **executed** (interrupting + non-interrupting) | `engine/boundary.rs:521` |
 | `boundaryEvent` — signal | **executed** (interrupting + non-interrupting) | `engine/boundary.rs:588` |
 | `boundaryEvent` — conditional | **executed** (interrupting + non-interrupting) | `engine/boundary.rs:616` |
-| `terminateEndEvent` | **parsed-not-executed** | The `endEvent` is parsed, but there is no `terminateEventDefinition` arm in `bpmn.rs`, so the terminate semantics (kill all remaining tokens in the scope) are **not** applied — it behaves as a plain end event. |
+| `terminateEndEvent` | **executed** | An `endEvent` carrying a `terminateEventDefinition` kills every other active token in its enclosing scope (parallel-split siblings, pending timers, open jobs/subscriptions) and completes that scope. A top-level terminate end terminates the whole instance; a sub-process-scoped one ends only that sub-process scope and the parent continues on the sub-process's outgoing flow. `bpmn.rs` (`terminateEventDefinition` arm); `model.rs` (`ElementKind::TerminateEndEvent`); `engine/mod.rs` (`complete_terminate_end`). |
 | `escalation` events | **unsupported** | No parser arm / dispatch. |
 | `compensation` events | **unsupported** | No parser arm / dispatch. |
 

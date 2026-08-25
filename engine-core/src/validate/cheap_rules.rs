@@ -68,7 +68,11 @@ pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
 fn end_events_have_no_outgoing(input: &ValidationInput<'_>) -> Result<(), ParseError> {
     let def = input.def;
     for element in def.elements.values() {
-        if matches!(element.kind, ElementKind::EndEvent) && !element.outgoing.is_empty() {
+        if matches!(
+            element.kind,
+            ElementKind::EndEvent | ElementKind::TerminateEndEvent
+        ) && !element.outgoing.is_empty()
+        {
             return Err(ParseError::InvalidEndEvent {
                 process_id: def.id.clone(),
                 element_id: element.id.clone(),

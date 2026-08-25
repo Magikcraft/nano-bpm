@@ -2973,6 +2973,137 @@ fn should_run_parallel_split_and_join() {
     );
 }
 
+#[test]
+fn terminate_end_kills_sibling_branch_and_terminates_the_instance() {
+    // s -> split =< work (service task), trigger (service task) -> stop (terminate end) >
+    //
+    // A parallel split forks two branches: `work` parks on a job while
+    // `trigger` reaches a terminate end. Completing `trigger` must kill the
+    // still-active `work` token (cancelling its job) and terminate the whole
+    // top-level instance — not degrade to a plain end that leaves `work` running.
+    let def = ProcessBuilder::new("term")
+        .start_event("s")
+        .parallel_gateway("split")
+        .service_task("work", "work-job")
+        .service_task("trigger", "trigger-job")
+        .terminate_end_event("stop")
+        .connect("s", "split")
+        .connect("split", "work")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Both branches forked; both tasks are parked on jobs.
+    assert_eq!(engine.pending_jobs().len(), 2);
+    assert!(!engine.is_completed(instance_key));
+    let work_job = engine.activate_jobs("work-job", "w", 1, 60_000, 0)[0].key;
+
+    // Completing the trigger job drives its token into the terminate end.
+    let events = complete_one(&mut engine, "trigger-job");
+
+    // The terminate end kills the sibling `work` token (its job cancelled) and
+    // terminates the whole instance.
+    assert!(events.contains(&Event::JobCanceled {
+        job_key: work_job,
+        instance_key,
+    }));
+    assert!(events.contains(&Event::ProcessInstanceTerminated { instance_key }));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
+    assert_eq!(
+        engine.instance(instance_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    // The cancelled sibling job can no longer be completed.
+    let err = engine
+        .apply_command(Command::complete_job(work_job))
+        .unwrap_err();
+    assert_eq!(err, EngineError::JobNotActive { job_key: work_job });
+}
+
+#[test]
+fn subprocess_terminate_end_contains_to_the_subprocess_scope() {
+    // A terminate end inside an embedded sub-process kills only that
+    // sub-process's tokens and lets the parent instance continue on the
+    // sub-process's outgoing flow — it does NOT terminate the whole instance.
+    //
+    //  start -> sub -> after (service task) -> done
+    //  sub: sub_start -> split =< inner_work (svc), inner_trigger (svc) -> inner_stop (terminate end) >
+    let def = ProcessBuilder::new("sub-term")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("inner_work", "inner-work-job")
+        .contained_in("inner_work", "sub")
+        .service_task("inner_trigger", "inner-trigger-job")
+        .contained_in("inner_trigger", "sub")
+        .terminate_end_event("inner_stop")
+        .contained_in("inner_stop", "sub")
+        .service_task("after", "after-job")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "inner_work")
+        .connect("split", "inner_trigger")
+        .connect("inner_trigger", "inner_stop")
+        .connect("sub", "after")
+        .connect("after", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("sub-term"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Inside the sub-process both inner branches are parked on jobs.
+    assert_eq!(engine.pending_jobs().len(), 2);
+    let inner_work_job = engine.activate_jobs("inner-work-job", "w", 1, 60_000, 0)[0].key;
+
+    // Completing the inner trigger drives its token into the terminate end.
+    let events = complete_one(&mut engine, "inner-trigger-job");
+
+    // The inner sibling token is killed (its job cancelled)...
+    assert!(events.contains(&Event::JobCanceled {
+        job_key: inner_work_job,
+        instance_key,
+    }));
+    // ...and the sub-process completes and continues on its outgoing flow —
+    // the parent instance is NOT terminated.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "sub" && to == "after"
+    )));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+    assert!(!engine.is_completed(instance_key));
+    assert_eq!(
+        engine.instance(instance_key).unwrap().state,
+        crate::state::ProcessInstanceState::Active
+    );
+
+    // The parent proceeds normally: completing the `after` task ends the
+    // instance by ordinary completion, not termination.
+    let final_events = complete_one(&mut engine, "after-job");
+    assert!(final_events.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.is_completed(instance_key));
+}
+
 fn approval_process() -> ProcessDefinition {
     // s -> g(xor): decision==yes -> approved ; else default -> rejected
     ProcessBuilder::new("approval")

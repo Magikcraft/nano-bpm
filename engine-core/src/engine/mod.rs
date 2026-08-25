@@ -7110,6 +7110,24 @@ impl Engine {
             return self.complete_exclusive_gateway(instance_key, element_instance_key, element_id);
         }
 
+        // A terminate end event (`<endEvent>` with `<terminateEventDefinition>`):
+        // it does not merely consume its own token — it kills every other active
+        // token in its enclosing scope and completes that scope (Zeebe/Camunda
+        // terminate semantics). Handled wholly here, off the normal end-event
+        // completion path, because it drives a scope-wide teardown rather than
+        // taking (non-existent) outgoing flows.
+        if matches!(
+            self.element_kind(instance_key, &element_id),
+            Some(ElementKind::TerminateEndEvent)
+        ) {
+            return self.complete_terminate_end(
+                instance_key,
+                element_instance_key,
+                element_id,
+                scope,
+            );
+        }
+
         // Inline-FEEL script task: evaluate its `zeebe:script` expression now.
         // The instance variables already include any input mappings applied when
         // the task activated. On success the result is staged under
@@ -7834,7 +7852,91 @@ impl Engine {
         (events, followups)
     }
 
-    /// Advances an element's execution-listener chain after one listener job
+    /// Completes a terminate end event (`ElementKind::TerminateEndEvent`): it
+    /// kills every other still-active token in its enclosing scope and then
+    /// completes that scope (Zeebe/Camunda terminate semantics). `scope` is the
+    /// terminate-end's enclosing scope — `0` for the top-level process, otherwise
+    /// the enclosing sub-process element-instance key.
+    ///
+    /// * Top-level (`scope == 0`): the terminate-end completes, every other token
+    ///   in the instance is discarded (its jobs/timers/subscriptions cancelled)
+    ///   and the whole instance ends via `ProcessInstanceTerminated`.
+    /// * Sub-process-scoped (`scope != 0`): only the tokens inside that
+    ///   sub-process scope die (this terminate-end among them); the sub-process
+    ///   itself then completes and the parent instance continues on the
+    ///   sub-process's outgoing flow.
+    ///
+    /// Returns events without emitting them so it composes inside the decide-only
+    /// `process_step` result, reusing the same teardown primitives as the
+    /// error-boundary / cancel paths ([`scope_teardown_events`],
+    /// [`discard_instance_events`]).
+    fn complete_terminate_end(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        if scope == 0 {
+            // Top-level terminate end: complete the terminate-end itself, then
+            // discard every remaining token and terminate the whole instance.
+            let mut events = vec![
+                Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                },
+                Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                },
+            ];
+            events.extend(self.discard_instance_events(instance_key));
+            return (events, Vec::new());
+        }
+
+        // Sub-process-scoped terminate end: tear down every token inside the
+        // enclosing sub-process scope (this terminate-end included, as a
+        // descendant of `scope`), then complete the sub-process and continue the
+        // parent on its outgoing flow — the ordinary sub-process completion,
+        // reached by an interrupt rather than a drain.
+        let mut events = self.scope_teardown_events(instance_key, scope);
+        let sp_element_id = self
+            .element_id_of_instance(instance_key, scope)
+            .unwrap_or_default();
+        events.push(Event::ElementCompleting {
+            instance_key,
+            element_instance_key: scope,
+            element_id: sp_element_id.clone(),
+        });
+        events.push(Event::ElementCompleted {
+            instance_key,
+            element_instance_key: scope,
+            element_id: sp_element_id.clone(),
+        });
+        // Disarm any boundary events armed on the sub-process itself.
+        events.extend(self.cancel_boundary_timers_on(scope));
+        events.extend(self.cancel_boundary_message_subscriptions_on(scope));
+        events.extend(self.cancel_boundary_signal_subscriptions_on(scope));
+        events.extend(self.cancel_boundary_conditional_subscriptions_on(scope));
+        // Continue the parent scope on the sub-process's outgoing flow(s).
+        let parent_scope = self.scope_of(instance_key, scope);
+        let mut followups = Vec::new();
+        for flow in self.outgoing(instance_key, &sp_element_id) {
+            events.push(Event::SequenceFlowTaken {
+                instance_key,
+                from: sp_element_id.clone(),
+                to: flow.to.clone(),
+            });
+            followups.push(Step::Activate {
+                instance_key,
+                element_id: flow.to,
+                scope: parent_scope,
+            });
+        }
+        (events, followups)
+    }
     /// completed (ADR 0037). If another listener remains in the chain, its job is
     /// created; otherwise the chain has drained and the deferred lifecycle
     /// transition runs — a `Start` chain enacts the element's activation
@@ -9037,6 +9139,20 @@ impl Engine {
     /// call-activity child — unlike [`Command::CancelInstance`] it never defers on
     /// user-task `canceling` listeners (a cascade cancel is not interruptible).
     fn discard_and_terminate_instance(&mut self, log: &mut Vec<Event>, instance_key: Key) {
+        for event in self.discard_instance_events(instance_key) {
+            self.emit(log, event);
+        }
+    }
+
+    /// The events that discard and terminate a whole process instance: the
+    /// cancellations of every in-play job, armed timer, open message/signal/
+    /// conditional subscription and created user task on the instance, followed
+    /// by `ProcessInstanceTerminated` (whose reducer clears the remaining active
+    /// tokens and scopes). Returns the events (does not emit) so it composes both
+    /// inside an emit-driven command tail ([`discard_and_terminate_instance`])
+    /// and inside a decide-only `process_step` result (a top-level terminate end
+    /// event's completion).
+    fn discard_instance_events(&self, instance_key: Key) -> Vec<Event> {
         let mut cancels: Vec<Event> = Vec::new();
 
         let mut jobs: Vec<&state::Job> = self
@@ -9137,10 +9253,8 @@ impl Engine {
             instance_key,
         }));
 
-        for event in cancels {
-            self.emit(log, event);
-        }
-        self.emit(log, Event::ProcessInstanceTerminated { instance_key });
+        cancels.push(Event::ProcessInstanceTerminated { instance_key });
+        cancels
     }
     fn emit(&mut self, log: &mut Vec<Event>, event: Event) {
         if self.track_dirty_vars {
