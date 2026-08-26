@@ -5,7 +5,7 @@
 //! every mutation here is what makes the engine deterministic and replayable:
 //! replaying the same events over a fresh [`State`] reconstructs it exactly.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::event::Event;
@@ -1958,11 +1958,12 @@ pub fn apply(state: &mut State, event: &Event) {
                 .get_mut(instance_key)
                 .and_then(|inst| inst.agent_history.get_mut(agent_instance_key))
             {
+                let keys: HashSet<Key> = agent_history_keys.iter().copied().collect();
                 for record in log.iter_mut() {
                     // Only PENDING turns transition; a committed/discarded turn
                     // is immutable (append-only).
                     if record.commit_status == crate::agent::AgentHistoryCommitStatus::Pending
-                        && agent_history_keys.contains(&record.agent_history_key)
+                        && keys.contains(&record.agent_history_key)
                     {
                         record.commit_status = crate::agent::AgentHistoryCommitStatus::Committed;
                     }
@@ -1980,9 +1981,10 @@ pub fn apply(state: &mut State, event: &Event) {
                 .get_mut(instance_key)
                 .and_then(|inst| inst.agent_history.get_mut(agent_instance_key))
             {
+                let keys: HashSet<Key> = agent_history_keys.iter().copied().collect();
                 for record in log.iter_mut() {
                     if record.commit_status == crate::agent::AgentHistoryCommitStatus::Pending
-                        && agent_history_keys.contains(&record.agent_history_key)
+                        && keys.contains(&record.agent_history_key)
                     {
                         record.commit_status = crate::agent::AgentHistoryCommitStatus::Discarded;
                     }
