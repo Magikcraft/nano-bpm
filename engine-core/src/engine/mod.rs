@@ -607,7 +607,7 @@ impl Engine {
         // 2. Its element must be agent-eligible and carry an agentDefinition.
         let agent_type = match self.element_kind(process_instance_key, &element_id) {
             Some(crate::model::ElementKind::AgentTask { agent_type, .. }) => agent_type,
-            Some(other) if other.type_name() == "SERVICE_TASK" => {
+            Some(crate::model::ElementKind::ServiceTask { .. }) => {
                 return Err(EngineError::AgentInstanceMissingAgentDefinition {
                     element_instance_key,
                 });
