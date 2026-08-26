@@ -16,6 +16,7 @@ import {
   reconcileGridColumns,
   serializePageNodes,
   toPageDoc,
+  withColumnLink,
   ROOT_ID,
   makeNode,
   type CraftState,
@@ -553,6 +554,48 @@ test("reconcileGridColumns preserves the mobile hint by identity when a column i
     mobile: mobileHint,
   });
   assert.equal(out[1].mobile, undefined);
+});
+
+test("withColumnLink clearing a link preserves the column's mobile hint", () => {
+  // Regression: the link editor rebuilt the column as `{ field, header }` on
+  // "No link", silently dropping the C1 `column.mobile` hint. Clearing must
+  // drop ONLY the `link` key.
+  const col = {
+    field: "status",
+    header: "Status",
+    link: peLink,
+    mobile: mobileHint,
+  };
+  assert.deepEqual(withColumnLink(col, undefined), {
+    field: "status",
+    header: "Status",
+    mobile: mobileHint,
+  });
+});
+
+test("withColumnLink clearing a link drops only the link key", () => {
+  const col = { field: "status", header: "Status", link: peLink };
+  const out = withColumnLink(col, undefined);
+  assert.deepEqual(out, { field: "status", header: "Status" });
+  assert.equal("link" in out, false);
+});
+
+test("withColumnLink sets or replaces a link, preserving the rest of the column", () => {
+  const col = { field: "status", header: "Status", mobile: mobileHint };
+  const next = { kind: "processExplorer" as const, keyField: "process_key" };
+  assert.deepEqual(withColumnLink(col, next), {
+    field: "status",
+    header: "Status",
+    mobile: mobileHint,
+    link: next,
+  });
+  // Replacing an existing link keeps the mobile hint too.
+  assert.deepEqual(withColumnLink({ ...col, link: peLink }, next), {
+    field: "status",
+    header: "Status",
+    mobile: mobileHint,
+    link: next,
+  });
 });
 
 test("parsePageDoc drops a column link with an unknown kind or empty keyField", () => {

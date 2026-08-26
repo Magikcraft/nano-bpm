@@ -9,6 +9,7 @@ import {
   defaultProps,
   emptyPage,
   type GridColumn,
+  type GridColumnLink,
   type PageDoc,
   type PageNode,
   type PageNodeType,
@@ -88,6 +89,25 @@ export function reconcileGridColumns(
     // schema later survives an edit automatically — no drift surface here.
     return prev ? { ...prev, field, header } : { field, header };
   });
+}
+
+/**
+ * Set (or clear, when `link` is `undefined`) a single column's structured
+ * `link`, carrying over the rest of the column untouched. Clearing must drop
+ * ONLY the `link` key — spreading `column` (rather than rebuilding a
+ * `{ field, header }` literal) means the C1 `mobile` hint and any per-column
+ * field added to the schema later survive a link edit automatically, so there
+ * is no drift surface between this editor and `reconcileGridColumns`.
+ */
+export function withColumnLink(
+  column: GridColumn,
+  link: GridColumnLink | undefined,
+): GridColumn {
+  if (!link) {
+    const { link: _dropped, ...rest } = column;
+    return rest;
+  }
+  return { ...column, link };
 }
 
 /** The Craft.js resolver name for our root canvas. */

@@ -63,6 +63,7 @@ import {
   reconcileGridColumns,
   serializePageNodes,
   toPageDoc,
+  withColumnLink,
   type CraftState,
 } from "../lib/pageComposer";
 
@@ -1242,15 +1243,7 @@ function ColumnLinks({
 }): ReactElement | null {
   if (!columns.length) return null;
   const setLink = (i: number, link: GridColumnLink | undefined) => {
-    onChange(
-      columns.map((c, j) => {
-        if (j !== i) return c;
-        if (!link) {
-          return { field: c.field, header: c.header };
-        }
-        return { ...c, link };
-      }),
-    );
+    onChange(columns.map((c, j) => (j === i ? withColumnLink(c, link) : c)));
   };
   const listId = "pc-link-keyfields";
   return (
