@@ -6,6 +6,8 @@ import {
   importProject,
   listProjects,
   renameProject,
+  runProject,
+  stopProject,
   type ProjectSummary,
   type ProjectTemplate,
   type TemplateOption,
@@ -17,6 +19,7 @@ import {
   Input,
   PageHeader,
   Spinner,
+  useIsNarrow,
 } from "../components/ui";
 import { useTemplateUpdate } from "../components/TemplateUpdate";
 import { toUpdateTarget } from "../lib/templateUpdate";
@@ -55,6 +58,11 @@ function iconSrc(icon: string): string {
 export default function Projects() {
   const navigate = useNavigate();
   const tour = useTour();
+  // Below the canonical mobile breakpoint the desktop IDE (ProjectWorkspace) is
+  // unreachable by design (issue #1005 A2): the card surfaces lifecycle actions
+  // inline instead of drilling into it. Drives the responsive presentation of
+  // the SAME route set — no forked mobile route tree.
+  const narrow = useIsNarrow();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [denoAvailable, setDenoAvailable] = useState(true);
   const [nodeAvailable, setNodeAvailable] = useState(true);
@@ -70,6 +78,10 @@ export default function Projects() {
   >({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Name of the project whose start/stop lifecycle call is in flight, so the
+  // inline mobile controls can show progress and block a double-tap. One at a
+  // time is enough — the cards are independent and calls are quick.
+  const [lifecycleBusy, setLifecycleBusy] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
   const [newDesc, setNewDesc] = useState("");
@@ -183,7 +195,12 @@ export default function Projects() {
       });
       // Route by the server's directory-safe slug — for a display name with
       // spaces ("Home Heating") the project lives at /projects/home-heating.
-      navigate(`/projects/${encodeURIComponent(res.data.name)}`);
+      // On mobile `openWorkspace` keeps us on the list (the IDE is gated).
+      if (narrow) {
+        setCreating(false);
+        setBusy(false);
+      }
+      openWorkspace(res.data.name);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setBusy(false);
@@ -216,7 +233,14 @@ export default function Projects() {
     setBusy(true);
     try {
       await importProject({ body: { name, path }, throwOnError: true });
-      navigate(`/projects/${encodeURIComponent(name)}`);
+      // Success: collapse the import panel and clear its inputs so a narrow
+      // viewport (which stays on the list via openWorkspace) isn't left with a
+      // stale, populated panel open after the action completes.
+      setImporting(false);
+      setImportName("");
+      setImportPath("");
+      if (narrow) setBusy(false);
+      openWorkspace(name);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setBusy(false);
@@ -256,6 +280,58 @@ export default function Projects() {
       await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  // The single gate that keeps the desktop IDE off mobile (issue #1005 A2):
+  // ProjectWorkspace is unreachable below the mobile breakpoint, so EVERY path
+  // that would land there — the card drill-in and the post-create / post-import
+  // hand-off — routes through here. On a narrow viewport we stay on the project
+  // list (reloading so a freshly created card appears) instead of navigating
+  // into an editor that can't be used on a phone.
+  const openWorkspace = useCallback(
+    (name: string) => {
+      if (narrow) {
+        void reload();
+        return;
+      }
+      navigate(`/projects/${encodeURIComponent(name)}`);
+    },
+    [narrow, navigate, reload],
+  );
+
+  // Project lifecycle: Start (Run) and Stop are the real, project-level actions
+  // (runProject / stopProject) — surfaced inline on each mobile card so they are
+  // reachable without the (mobile-gated) IDE. Update lives in the shared
+  // template-update flow (`onUpdate` below).
+  const start = async (project: ProjectSummary) => {
+    // Guard against overlapping lifecycle ops: a second call while one is
+    // in-flight would let the first call's `finally` clear `lifecycleBusy`
+    // out from under the second, re-enabling controls mid-request.
+    if (lifecycleBusy) return;
+    setLifecycleBusy(project.name);
+    setError(null);
+    try {
+      await runProject({ path: { name: project.name }, throwOnError: true });
+      await reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const stop = async (project: ProjectSummary) => {
+    if (lifecycleBusy) return;
+    setLifecycleBusy(project.name);
+    setError(null);
+    try {
+      await stopProject({ path: { name: project.name }, throwOnError: true });
+      await reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLifecycleBusy(null);
     }
   };
 
@@ -637,9 +713,14 @@ export default function Projects() {
               key={p.name}
               project={p}
               lang={langMeta[p.lang]}
-              onOpen={() => navigate(`/projects/${encodeURIComponent(p.name)}`)}
+              narrow={narrow}
+              onOpen={() => openWorkspace(p.name)}
               onDelete={() => void remove(p)}
               onRename={() => void rename(p)}
+              onStart={() => void start(p)}
+              onStop={() => void stop(p)}
+              lifecycleBusy={lifecycleBusy === p.name}
+              lifecycleLocked={lifecycleBusy !== null}
               onUpdate={
                 p.updateAvailable && p.source !== "path"
                   ? () => void startUpdate(toUpdateTarget(p))
@@ -754,23 +835,51 @@ function TemplateTile({
 function ProjectTile({
   project,
   lang,
+  narrow = false,
   onOpen,
   onDelete,
   onRename,
+  onStart,
+  onStop,
   onUpdate,
+  lifecycleBusy = false,
+  lifecycleLocked = false,
   updating = false,
   updateDisabled = false,
 }: {
   project: ProjectSummary;
   lang?: LangMeta;
+  narrow?: boolean;
   onOpen: () => void;
   onDelete: () => void;
   onRename: () => void;
+  onStart: () => void;
+  onStop: () => void;
   onUpdate?: () => void;
+  lifecycleBusy?: boolean;
+  lifecycleLocked?: boolean;
   updating?: boolean;
   updateDisabled?: boolean;
 }) {
   const title = project.displayName ?? project.name;
+  if (narrow) {
+    return (
+      <MobileProjectTile
+        project={project}
+        lang={lang}
+        title={title}
+        onDelete={onDelete}
+        onRename={onRename}
+        onStart={onStart}
+        onStop={onStop}
+        onUpdate={onUpdate}
+        lifecycleBusy={lifecycleBusy}
+        lifecycleLocked={lifecycleLocked}
+        updating={updating}
+        updateDisabled={updateDisabled}
+      />
+    );
+  }
   return (
     <Card className="group relative flex flex-col p-4 transition-colors hover:border-edge-strong">
       <div
@@ -900,6 +1009,163 @@ function ProjectTile({
           → {project.deployTarget}
         </div>
       </div>
+    </Card>
+  );
+}
+
+/// The mobile presentation of a project card (issue #1005 A2). The desktop tile
+/// is a drill-in into the ProjectWorkspace IDE; that editor is unreachable on a
+/// phone by design, so this variant NEVER navigates there. Instead the whole
+/// card is static content and the project's lifecycle actions — Start / Stop and
+/// (when applicable) Update, Rename, Delete — are surfaced inline as 44px touch
+/// targets (`.nano-touch`, WCAG 2.5.5). A single-column layout keeps the card
+/// within a 375px viewport with no horizontal scroll.
+function MobileProjectTile({
+  project,
+  lang,
+  title,
+  onDelete,
+  onRename,
+  onStart,
+  onStop,
+  onUpdate,
+  lifecycleBusy,
+  lifecycleLocked,
+  updating,
+  updateDisabled,
+}: {
+  project: ProjectSummary;
+  lang?: LangMeta;
+  title: string;
+  onDelete: () => void;
+  onRename: () => void;
+  onStart: () => void;
+  onStop: () => void;
+  onUpdate?: () => void;
+  lifecycleBusy: boolean;
+  lifecycleLocked: boolean;
+  updating: boolean;
+  updateDisabled: boolean;
+}) {
+  const canUpdate = Boolean(
+    onUpdate && project.updateAvailable && project.source !== "path",
+  );
+  return (
+    <Card className="flex flex-col gap-3 p-4">
+      <div className="flex min-w-0 items-center gap-2">
+        <LangIcon langId={project.lang} lang={lang} />
+        <span
+          className="min-w-0 flex-1 truncate text-base font-semibold text-fg"
+          title={
+            project.displayName
+              ? `${project.displayName} (${project.name})`
+              : project.name
+          }
+        >
+          {title}
+        </span>
+        {project.source === "path" && (
+          <span
+            title="Imported by reference — runs live from an external checked-out directory (ADR 0041)"
+            className="inline-flex shrink-0 items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent"
+          >
+            ⧉ linked
+          </span>
+        )}
+        {project.running && (
+          <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-ok/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-ok">
+            <span className="h-1.5 w-1.5 rounded-full bg-ok" /> running
+          </span>
+        )}
+      </div>
+
+      <p className="line-clamp-2 text-sm text-fg-faint">
+        {project.description || "No description"}
+      </p>
+
+      <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-fg-muted">
+        <Stat label="processes" value={project.processes} />
+        <Stat label="decisions" value={project.decisions} />
+        <Stat label="forms" value={project.forms} />
+        <Stat label="workers" value={project.workers} />
+      </div>
+
+      <TemplateProvenance project={project} />
+      <div className="truncate text-[11px] text-fg-faint">
+        → {project.deployTarget}
+      </div>
+
+      {/* Lifecycle actions — reachable inline, no drill-in required. */}
+      <div className="flex flex-col gap-2">
+        {project.running ? (
+          <Button
+            variant="danger"
+            className="nano-touch w-full"
+            onClick={onStop}
+            disabled={lifecycleLocked}
+            aria-busy={lifecycleBusy}
+            aria-label={`Stop ${title}`}
+          >
+            {lifecycleBusy ? <Spinner /> : "■"} Stop
+          </Button>
+        ) : (
+          <Button
+            variant="primary"
+            className="nano-touch w-full"
+            onClick={onStart}
+            disabled={lifecycleLocked}
+            aria-busy={lifecycleBusy}
+            aria-label={`Start ${title}`}
+          >
+            {lifecycleBusy ? <Spinner /> : "▶"} Start
+          </Button>
+        )}
+        <div className="grid grid-cols-2 gap-2">
+          {canUpdate && (
+            <Button
+              variant="secondary"
+              className="nano-touch col-span-2"
+              onClick={onUpdate}
+              disabled={updateDisabled}
+              aria-busy={updating}
+              aria-label={`Update ${title} from template`}
+              title={`A newer template is available${project.latestVersion ? ` (v${project.latestVersion})` : ""} — review and apply the update`}
+            >
+              {updating ? <Spinner /> : "↑"} Update
+            </Button>
+          )}
+          <Button
+            variant="secondary"
+            className="nano-touch"
+            onClick={onRename}
+            aria-label={`Rename project ${title}`}
+          >
+            ✎ Rename
+          </Button>
+          <Button
+            variant="secondary"
+            className="nano-touch text-danger"
+            onClick={onDelete}
+            aria-label={
+              project.source === "path"
+                ? `Remove link to ${title}`
+                : `Delete project ${title}`
+            }
+          >
+            ✕ {project.source === "path" ? "Remove" : "Delete"}
+          </Button>
+        </div>
+      </div>
+
+      {/* The IDE is desktop-only (issue #1005 A2): say so plainly rather than
+          offering a drill-in that opens a broken editor on a phone. */}
+      <p
+        className="rounded-md border border-edge bg-inset px-3 py-2 text-xs text-fg-faint"
+        role="note"
+      >
+        The project editor is unavailable on this screen — open the console on a
+        larger display to edit this project.
+      </p>
     </Card>
   );
 }
