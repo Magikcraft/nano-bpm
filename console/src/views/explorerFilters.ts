@@ -10,6 +10,40 @@
 //   - `state=Active|Completed|Terminated`  (absent = All)
 //   - `incident=1`                          (absent = no incident constraint)
 
+/**
+ * The name of the deep-link query param that preselects — and, on a narrow
+ * (mobile) viewport, navigates to — a single instance: `?instance=<key>`. This
+ * is the live consumer end of the Urban → Console deep-link contract, so the
+ * wire name lives in exactly one place that the Explorer and any standalone
+ * `/console/explorer?instance=<key>` landing (unit A6) both read.
+ */
+export const INSTANCE_DEEP_LINK_PARAM = "instance";
+
+/**
+ * Read the `?instance=<key>` deep-link target from the URL, or `null` when it is
+ * absent or blank. A whitespace-only value is treated as absent so a malformed
+ * link degrades to the plain list rather than fetching a bogus key.
+ */
+export function readInstanceParam(params: URLSearchParams): string | null {
+  const key = params.get(INSTANCE_DEEP_LINK_PARAM);
+  if (key == null) return null;
+  const trimmed = key.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+/**
+ * Which pane the *stacked* (mobile) Explorer shows: the instance **list** when
+ * nothing is selected, or the **detail** once an instance is selected. This is
+ * exactly what makes `?instance=<key>` land on the detail on mobile — the
+ * deep-link sets the selection (see {@link readInstanceParam}), and a set
+ * selection resolves to the detail view here, rather than merely preselecting a
+ * row in an off-screen desktop pane. Unit A6's standalone
+ * `/console/explorer?instance=<key>` landing relies on this behaviour.
+ */
+export function explorerStackView(selected: string | null): "list" | "detail" {
+  return selected != null && selected !== "" ? "detail" : "list";
+}
+
 /** The lifecycle states the console can filter on (the console-api enum). */
 export type InstanceStateFilter = "Active" | "Completed" | "Terminated";
 
