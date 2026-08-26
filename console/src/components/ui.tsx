@@ -94,12 +94,12 @@ type NavCardBaseProps = {
 
 type NavCardAnchorProps = NavCardBaseProps & { href: string } & Omit<
     AnchorHTMLAttributes<HTMLAnchorElement>,
-    "className" | "href"
+    "className" | "href" | "children" | "dangerouslySetInnerHTML"
   >;
 
 type NavCardButtonProps = NavCardBaseProps & { href?: undefined } & Omit<
     ButtonHTMLAttributes<HTMLButtonElement>,
-    "className" | "href" | "type"
+    "className" | "href" | "type" | "children" | "dangerouslySetInnerHTML"
   >;
 
 export function NavCard(props: NavCardAnchorProps | NavCardButtonProps) {
