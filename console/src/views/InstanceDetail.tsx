@@ -78,11 +78,21 @@ export default function InstanceDetail({
   });
 
   // The execution trace is folded from a bounded in-memory ring, so it may be
-  // absent (never traced, or evicted). A 404 yields no `data`; we surface that
-  // as an explicit empty state rather than an error.
-  const { data: trace, isLoading: traceLoading } = useQuery({
+  // absent (never traced, or evicted). Only a 404 means "no trace" — surfaced as
+  // an explicit empty state. Any other failure (network, 5xx) is a real error we
+  // throw so the section can render an error state instead of hiding it.
+  const {
+    data: trace,
+    isLoading: traceLoading,
+    error: traceError,
+  } = useQuery({
     queryKey: ["trace", instanceKey],
-    queryFn: async () => (await getTrace({ path: { key: instanceKey } })).data,
+    queryFn: async () => {
+      const result = await getTrace({ path: { key: instanceKey } });
+      if (result.response?.status === 404) return undefined;
+      if (result.error) throw result.error;
+      return result.data;
+    },
     enabled: !!instanceKey,
     retry: false,
   });
@@ -221,7 +231,9 @@ export default function InstanceDetail({
       </ScrollX>
     );
 
-  const traceBody = <TraceContent trace={trace} isLoading={traceLoading} />;
+  const traceBody = (
+    <TraceContent trace={trace} isLoading={traceLoading} error={traceError} />
+  );
 
   const incidentsSection = incidents.length > 0 && (
     <Section title="Incidents">
@@ -392,16 +404,25 @@ function ScrollX({ children }: { children: ReactNode }) {
   return <div className="overflow-x-auto">{children}</div>;
 }
 
-/** Renders the shared trace timeline for an instance, or an explicit empty
- * state when no trace was captured (the trace ring is bounded and evicts). */
+/** Renders the shared trace timeline for an instance, an explicit empty state
+ * when no trace was captured (the trace ring is bounded and evicts), or an error
+ * state when the trace fetch failed for a non-404 reason. */
 function TraceContent({
   trace,
   isLoading,
+  error,
 }: {
   trace: InstanceTrace | undefined;
   isLoading: boolean;
+  error?: Error | null;
 }) {
   if (isLoading) return <p className="text-sm text-fg-muted">Loading…</p>;
+  if (error)
+    return (
+      <Empty>
+        Failed to load the trace for this instance. Please try again.
+      </Empty>
+    );
   if (!trace)
     return (
       <Empty>
