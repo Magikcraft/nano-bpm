@@ -167,8 +167,14 @@ export default function Explorer() {
     const key = readInstanceParam(searchParams);
     if (key) {
       setSelected(key);
-      searchParams.delete(INSTANCE_DEEP_LINK_PARAM);
-      setSearchParams(searchParams, { replace: true });
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete(INSTANCE_DEEP_LINK_PARAM);
+          return next;
+        },
+        { replace: true },
+      );
     }
   }, [searchParams, setSearchParams]);
 
