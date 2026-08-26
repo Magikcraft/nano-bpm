@@ -99,7 +99,7 @@ type NavCardAnchorProps = NavCardBaseProps & { href: string } & Omit<
 
 type NavCardButtonProps = NavCardBaseProps & { href?: undefined } & Omit<
     ButtonHTMLAttributes<HTMLButtonElement>,
-    "className" | "href"
+    "className" | "href" | "type"
   >;
 
 export function NavCard(props: NavCardAnchorProps | NavCardButtonProps) {
@@ -150,10 +150,10 @@ export function NavCard(props: NavCardAnchorProps | NavCardButtonProps) {
   }
   return (
     <button
-      type="button"
       aria-current={active ? "page" : undefined}
       className={classes}
       {...(rest as ButtonHTMLAttributes<HTMLButtonElement>)}
+      type="button"
     >
       {inner}
     </button>
