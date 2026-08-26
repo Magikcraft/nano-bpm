@@ -233,6 +233,12 @@ export default function Projects() {
     setBusy(true);
     try {
       await importProject({ body: { name, path }, throwOnError: true });
+      // Success: collapse the import panel and clear its inputs so a narrow
+      // viewport (which stays on the list via openWorkspace) isn't left with a
+      // stale, populated panel open after the action completes.
+      setImporting(false);
+      setImportName("");
+      setImportPath("");
       if (narrow) setBusy(false);
       openWorkspace(name);
     } catch (e) {
@@ -299,6 +305,10 @@ export default function Projects() {
   // reachable without the (mobile-gated) IDE. Update lives in the shared
   // template-update flow (`onUpdate` below).
   const start = async (project: ProjectSummary) => {
+    // Guard against overlapping lifecycle ops: a second call while one is
+    // in-flight would let the first call's `finally` clear `lifecycleBusy`
+    // out from under the second, re-enabling controls mid-request.
+    if (lifecycleBusy) return;
     setLifecycleBusy(project.name);
     setError(null);
     try {
@@ -312,6 +322,7 @@ export default function Projects() {
   };
 
   const stop = async (project: ProjectSummary) => {
+    if (lifecycleBusy) return;
     setLifecycleBusy(project.name);
     setError(null);
     try {
