@@ -17180,3 +17180,90 @@ fn subprocess_end_event_output_propagates_reached_branch_not_last_defined() {
         );
     }
 }
+
+#[test]
+fn agent_task_activation_mints_an_agent_instance_in_initializing() {
+    // Deploying a serviceTask bearing zeebe:agentDefinition agentType="aiAgentTask"
+    // builds an engine-native AgentTask. On activation the engine mints a
+    // first-class AgentInstance keyed by a dedicated key, linked to the active
+    // elementInstanceKey, in status INITIALIZING — and no job is created.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="agent-proc" isExecutable="true">
+          <bpmn:startEvent id="start" />
+          <bpmn:serviceTask id="agent">
+            <bpmn:extensionElements>
+              <zeebe:agentDefinition agentType="aiAgentTask" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="end" />
+          <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="end" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let events = engine
+        .apply_command(Command::create_instance("agent-proc"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The agent element activated (its token parks, like a service task).
+    let agent_eik = events
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivated {
+                element_instance_key,
+                element_id,
+                ..
+            } if element_id == "agent" => Some(*element_instance_key),
+            _ => None,
+        })
+        .expect("the agent element should activate");
+
+    // An AgentInstance was minted, in INITIALIZING, linked to the element instance.
+    let agent_instance = events
+        .iter()
+        .find_map(|e| match e {
+            Event::AgentInstanceCreated { agent_instance, .. } => Some(agent_instance.clone()),
+            _ => None,
+        })
+        .expect("activation should mint an AgentInstance");
+    assert_eq!(
+        agent_instance.status,
+        crate::agent::AgentInstanceStatus::Initializing
+    );
+    assert_eq!(agent_instance.element_instance_key, agent_eik);
+    assert_eq!(agent_instance.process_instance_key, instance_key);
+    assert_eq!(
+        agent_instance.agent_type,
+        crate::agent::AgentType::AiAgentTask
+    );
+    assert_ne!(
+        agent_instance.agent_instance_key, agent_eik,
+        "the AgentInstance must have its own dedicated key, distinct from the element instance"
+    );
+    assert_ne!(agent_instance.agent_instance_key, 0);
+
+    // The instance is the system-of-record: it is held in engine state.
+    let stored = engine
+        .state
+        .instances
+        .get(&instance_key)
+        .and_then(|pi| pi.agent_instances.get(&agent_instance.agent_instance_key))
+        .expect("the AgentInstance should be stored on the process instance");
+    assert_eq!(
+        stored.status,
+        crate::agent::AgentInstanceStatus::Initializing
+    );
+
+    // No job is created for an engine-native agent task.
+    assert!(
+        engine.activate_jobs("agent", "W", 10, 1_000, 0).is_empty(),
+        "an agent task must not create a job"
+    );
+}

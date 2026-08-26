@@ -467,6 +467,18 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
               compensable activities in scope (reverse completion order).",
         attrs: &[],
     },
+    KindSpec {
+        keyword: "agentTask",
+        doc: "Engine-native AI agent task (Camunda stable/8.10). A serviceTask bearing a \
+              `zeebe:agentDefinition` marker; on activation the engine mints a first-class \
+              AgentInstance instead of a job.",
+        attrs: &[AttrSpec {
+            key: "agentType",
+            required: true,
+            ty: AttrType::Str,
+            doc: "The `zeebe:agentDefinition agentType`. An `agentTask` round-trips as a serviceTask, so only `aiAgentTask` or `external` are valid here (`aiAgentSubProcess` is an adHocSubProcess form).",
+        }],
+    },
 ];
 
 /// Element-level attributes shared across every kind (they are emitted by
@@ -844,6 +856,7 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         ConditionalBoundaryEvent { .. } => "conditionalBoundaryEvent",
         CompensationBoundaryEvent { .. } => "compensationBoundaryEvent",
         CompensationThrowEvent => "compensationThrowEvent",
+        AgentTask { .. } => "agentTask",
     }
 }
 
@@ -1001,6 +1014,14 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
         (
             "compensationThrowEvent",
             ElementKind::CompensationThrowEvent,
+        ),
+        (
+            "agentTask",
+            ElementKind::AgentTask {
+                agent_type: nanobpmn_engine_core::AgentType::AiAgentTask,
+                definition: nanobpmn_engine_core::AgentDefinition::default(),
+                limits: None,
+            },
         ),
     ]
 }

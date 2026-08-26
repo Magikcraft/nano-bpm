@@ -502,6 +502,28 @@ impl Engine {
         state::compose_key(self.partition_id, self.next_local)
     }
 
+    /// The root (top-level ancestor) process instance key for `instance_key`:
+    /// walks up the call-activity parent chain, returning `instance_key` itself
+    /// for a top-level instance. Bounded against a pathological cycle.
+    fn root_process_instance_key(&self, instance_key: Key) -> Key {
+        let mut current = instance_key;
+        // A legal parent chain is bounded by the same call-activity nesting
+        // limit that guards deployment, so reuse it (plus one to reach the root
+        // from the deepest legal instance) rather than a separate magic number.
+        for _ in 0..=MAX_CALL_ACTIVITY_DEPTH {
+            match self
+                .state
+                .instances
+                .get(&current)
+                .and_then(|i| i.parent_process_instance_key)
+            {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        current
+    }
+
     /// Installs an already-minted deployment (a slice of [`Event`]s produced by
     /// another partition's [`Command::Deploy`]) into this partition's state
     /// **without minting new keys**, so every partition registers the identical
@@ -3348,6 +3370,27 @@ impl Engine {
                     cancel_remaining,
                 );
             }
+            // AgentInstance lifecycle commands. The engine models the record and
+            // creates instances on agent-element activation (slice S1); the
+            // command-driven CREATE/UPDATE/COMPLETE processors (validation +
+            // history application + limits enforcement) are slice S3. Until then
+            // these commands are rejected rather than silently accepted, so the
+            // surface is wired end-to-end without pretending to process.
+            Command::CreateAgentInstance { .. } => {
+                return Err(EngineError::AgentInstanceProcessorUnavailable {
+                    intent: crate::agent::AgentInstanceIntent::Create,
+                });
+            }
+            Command::UpdateAgentInstance { .. } => {
+                return Err(EngineError::AgentInstanceProcessorUnavailable {
+                    intent: crate::agent::AgentInstanceIntent::Update,
+                });
+            }
+            Command::CompleteAgentInstance { .. } => {
+                return Err(EngineError::AgentInstanceProcessorUnavailable {
+                    intent: crate::agent::AgentInstanceIntent::Complete,
+                });
+            }
         }
 
         Ok((log, queue))
@@ -4895,6 +4938,76 @@ impl Engine {
                         });
                     }
                 }
+            }
+            // An AI agent element (Camunda `zeebe:agentDefinition`). The engine
+            // is the system-of-record for agent state: on activation create a
+            // first-class AgentInstance (status INITIALIZING) keyed by its own
+            // dedicated key and linked to this element instance. LLM calls /
+            // prompt assembly / tool dispatch stay in the worker layer; the
+            // token parks on the element (no completion follow-up) while the
+            // agent runs, exactly like a job-bearing service task.
+            Some(ElementKind::AgentTask {
+                agent_type,
+                definition,
+                limits,
+            }) => {
+                // Only mint an AgentInstance when the owning ProcessInstance is
+                // present: defaulting a missing/corrupt instance would silently
+                // record an agent with an empty bpmn_process_id and a zero
+                // process_definition_key. Resolve-or-skip instead.
+                if let Some((bpmn_process_id, process_definition_key, process_definition_version)) =
+                    self.state.instances.get(&instance_key).map(|inst| {
+                        let version = self
+                            .state
+                            .process_versions
+                            .get(&inst.process_definition_key)
+                            .map(|d| d.version)
+                            .unwrap_or(0);
+                        (
+                            inst.process_id.clone(),
+                            inst.process_definition_key,
+                            version,
+                        )
+                    })
+                {
+                    let agent_instance_key = self.mint_key();
+                    let root_process_instance_key = self.root_process_instance_key(instance_key);
+                    let agent_instance = crate::agent::AgentInstance {
+                        agent_instance_key,
+                        agent_definition_key: 0,
+                        element_instance_key,
+                        element_instance_keys: vec![element_instance_key],
+                        element_id: element_id.clone(),
+                        process_instance_key: instance_key,
+                        root_process_instance_key,
+                        bpmn_process_id,
+                        process_definition_key,
+                        process_definition_version,
+                        process_definition_version_tag: None,
+                        tenant_id: crate::DEFAULT_TENANT.to_string(),
+                        agent_type,
+                        status: crate::agent::AgentInstanceStatus::Initializing,
+                        definition,
+                        limits: limits.unwrap_or_default(),
+                        metrics: crate::agent::AgentInstanceMetrics::default(),
+                        tools: Vec::new(),
+                        job_key: 0,
+                        job_lease: 0,
+                        created_at: self.now,
+                        last_updated_at: self.now,
+                        completed_at: 0,
+                    };
+                    events.push(Event::AgentInstanceCreated {
+                        instance_key,
+                        agent_instance,
+                    });
+                }
+                events.extend(self.arm_boundary_events(
+                    instance_key,
+                    element_instance_key,
+                    scope,
+                    &element_id,
+                ));
             }
             // An inline-FEEL script task is a synchronous activity: it activates
             // and immediately completes (no job). Its FEEL expression is
@@ -9412,6 +9525,18 @@ pub enum EngineError {
         element_id: String,
         reason: String,
     },
+    /// An AgentInstance lifecycle command (CREATE/UPDATE/COMPLETE) was submitted
+    /// but its processor is not implemented in this slice. The engine models the
+    /// AgentInstance record and creates instances on agent-element activation
+    /// (slice S1); the command-driven CREATE/UPDATE/COMPLETE processors land in
+    /// a later slice (S3). Placeholder so the command surface is wired without
+    /// silently succeeding.
+    AgentInstanceProcessorUnavailable {
+        intent: crate::agent::AgentInstanceIntent,
+    },
+    /// An AgentInstance command referenced an `agent_instance_key` that does not
+    /// identify a known agent instance.
+    AgentInstanceNotFound { agent_instance_key: Key },
 }
 
 /// Element classes this migration phase does not remap yet, mirroring Zeebe's
@@ -9638,6 +9763,16 @@ impl std::fmt::Display for EngineError {
                     f,
                     "migration of instance {instance_key} is not supported yet: active element {element_id} ({reason})"
                 )
+            }
+            EngineError::AgentInstanceProcessorUnavailable { intent } => {
+                write!(
+                    f,
+                    "agent-instance {} processor is not implemented in this slice",
+                    intent.as_str()
+                )
+            }
+            EngineError::AgentInstanceNotFound { agent_instance_key } => {
+                write!(f, "no agent instance with key {agent_instance_key}")
             }
         }
     }

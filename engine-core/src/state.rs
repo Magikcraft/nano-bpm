@@ -474,6 +474,13 @@ pub struct ProcessInstance {
     /// instances with no active compensation and for pre-compensation snapshots.
     #[cfg_attr(feature = "serde", serde(default))]
     pub compensation_waits: HashMap<Key, CompensationWait>,
+    /// Engine-native AgentInstance objects owned by this process instance, keyed
+    /// by their dedicated `agent_instance_key` (Camunda 8.10 AgentInstance, ADR
+    /// Stage 3). Empty for instances with no agent element and for snapshots
+    /// written before agent support existed (`serde(default)`). Rides along in
+    /// [`InstanceSnapshot::instance`] on spill like `adhoc_instances`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub agent_instances: HashMap<Key, crate::agent::AgentInstance>,
 }
 
 /// A completed, compensable activity awaiting a possible compensation throw.
@@ -1731,6 +1738,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     scope_variables: HashMap::new(),
                     compensable: Vec::new(),
                     compensation_waits: HashMap::new(),
+                    agent_instances: HashMap::new(),
                 },
             );
         }
@@ -1898,6 +1906,17 @@ pub fn apply(state: &mut State, event: &Event) {
                 .entry(*instance_key)
                 .or_default()
                 .insert(*job_key);
+        }
+
+        Event::AgentInstanceCreated {
+            instance_key,
+            agent_instance,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance
+                    .agent_instances
+                    .insert(agent_instance.agent_instance_key, agent_instance.clone());
+            }
         }
 
         Event::ExecutionListenerJobCreated {

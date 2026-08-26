@@ -370,6 +370,44 @@ pub enum Command {
         /// turn (`cancelRemainingInstances`).
         cancel_remaining: bool,
     },
+    /// Create an engine-native AgentInstance (Camunda `AgentInstanceIntent.CREATE`,
+    /// stable/8.10; `POST /v2/agent-instances`). The engine infers
+    /// `processInstanceKey`, `elementId`, `processDefinitionKey` and `tenantId`
+    /// from the referenced `element_instance_key`. The lifecycle *processor* that
+    /// validates and applies this command is a later slice (S3); this variant is
+    /// defined now so the record/intent surface is wired end-to-end. It is not
+    /// yet callable from the wasm `TestEngine` (classified `NotSurfaced` in
+    /// `engine-wasm`) until that S3 processor lands.
+    CreateAgentInstance {
+        /// The key of the AI Agent Sub-process / AI Agent Task element instance.
+        element_instance_key: Key,
+        /// Static definition set once at creation (model/provider/systemPrompt).
+        definition: crate::agent::AgentDefinition,
+        /// Limits for the agent execution; `None` = all limits default to `-1`.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        limits: Option<crate::agent::AgentInstanceLimits>,
+    },
+    /// Update an engine-native AgentInstance (Camunda `AgentInstanceIntent.UPDATE`,
+    /// stable/8.10; `PATCH /v2/agent-instances/{key}`): advance its status
+    /// (to one of the *active* states) and append the turn history. The
+    /// processor and history application are a later slice (S3/S2).
+    UpdateAgentInstance {
+        agent_instance_key: Key,
+        /// The target status; must be one of the *active* states (`COMPLETED`
+        /// is not settable via UPDATE — it is reached only via COMPLETE).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        status: Option<crate::agent::AgentInstanceStatus>,
+    },
+    /// Complete an engine-native AgentInstance (Camunda `AgentInstanceIntent.COMPLETE`,
+    /// stable/8.10): drive it to `COMPLETED`. The drain processor is a later
+    /// slice (S3).
+    CompleteAgentInstance { agent_instance_key: Key },
 }
 
 /// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].
@@ -508,6 +546,9 @@ impl Command {
             Command::ModifyInstance { .. } => "modify_instance",
             Command::DispatchStartInstance { .. } => "dispatch_start_instance",
             Command::ActivateAdHocActivities { .. } => "activate_ad_hoc_sub_process_activities",
+            Command::CreateAgentInstance { .. } => "create_agent_instance",
+            Command::UpdateAgentInstance { .. } => "update_agent_instance",
+            Command::CompleteAgentInstance { .. } => "complete_agent_instance",
         }
     }
 
