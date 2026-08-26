@@ -11,9 +11,9 @@
 // the schema's, or if palette hex creeps back into the console CSS.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import {
   TOKEN_KEYS as SCHEMA_TOKEN_KEYS,
   NANO_PALETTE,
@@ -54,15 +54,20 @@ test("schema palette defines every console token for both appearances", () => {
 });
 
 test("console CSS inlines no --nano-* palette hex (single source of truth)", () => {
-  // theme/tokens.css must only MAP tokens (var() references); index.css must only
-  // consume/import them. A `--nano-*: #rrggbb` assignment anywhere here means the
-  // palette forked from the schema again.
+  // Every .css under console/src must only MAP tokens (var() references) or
+  // consume/import them. A `--nano-*: #rrggbb` assignment in ANY of them means the
+  // palette forked from the schema again. Scanning the whole tree (rather than a
+  // hard-coded file list) keeps the guard correct as new CSS files are added.
   const inlineHex = /--nano-[a-z0-9-]+\s*:\s*#[0-9a-fA-F]{3,8}/;
-  for (const file of ["tokens.css", join("..", "index.css")]) {
-    const css = readFileSync(join(themeDir, file), "utf8");
+  const srcDir = join(themeDir, "..");
+  const cssFiles = readdirSync(srcDir, { recursive: true, encoding: "utf8" })
+    .filter((entry) => entry.endsWith(".css"));
+  assert.ok(cssFiles.length > 0, "no .css files found under console/src");
+  for (const file of cssFiles) {
+    const css = readFileSync(join(srcDir, file), "utf8");
     assert.ok(
       !inlineHex.test(css),
-      `${file} inlines --nano-* hex — import @nanobpm/nano-app-schema/tokens.css instead`,
+      `${relative(themeDir, join(srcDir, file))} inlines --nano-* hex — import @nanobpm/nano-app-schema/tokens.css instead`,
     );
   }
 });
