@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -447,6 +447,7 @@ function FullScreenPanel({
   bodyClassName?: string;
   children: ReactNode;
 }) {
+  const titleId = useId();
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -461,11 +462,14 @@ function FullScreenPanel({
     <div
       role="dialog"
       aria-modal="true"
-      aria-label={typeof title === "string" ? title : "Detail"}
+      aria-labelledby={titleId}
       className="fixed inset-0 z-50 flex flex-col bg-app"
     >
-      <header className="nano-safe-top flex shrink-0 items-center gap-2 border-b border-edge px-4 py-3">
-        <h2 className="min-w-0 flex-1 truncate text-sm font-semibold text-fg">
+      <header className="nano-safe-top nano-safe-x flex shrink-0 items-center gap-2 border-b border-edge px-4 py-3">
+        <h2
+          id={titleId}
+          className="min-w-0 flex-1 truncate text-sm font-semibold text-fg"
+        >
           {title}
         </h2>
         <button
@@ -477,7 +481,9 @@ function FullScreenPanel({
           ✕
         </button>
       </header>
-      <div className={bodyClassName}>{children}</div>
+      <div className={`nano-safe-bottom nano-safe-x ${bodyClassName}`}>
+        {children}
+      </div>
     </div>,
     document.body,
   );
