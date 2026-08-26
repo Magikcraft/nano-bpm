@@ -105,6 +105,11 @@ tikv-jemalloc-sys = "0.6"
 
 [dev-dependencies]
 serde_json = "1"
+# Drives the response-contract guard end-to-end in unit tests: `ServiceExt::oneshot`
+# feeds a crafted request through a real axum Router + the guard layer so the
+# middleware's routing (MatchedPath), status/schema lookup, and 500-on-violation
+# rewrite are exercised exactly as in production.
+tower = { version = "0.5", features = ["util"] }
 
 # The self-contained single-node distribution: bundle the web console (cluster
 # console, BPMN modeler, process-instance explorer, embedded workers) into the

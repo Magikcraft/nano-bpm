@@ -79,6 +79,45 @@ metered on the Prometheus `/metrics` surface via
 
 ---
 
+## Feature subset — Spec-generated response-contract validation (issue #1011)
+
+A **feature-boundary note** (ADR 0023). The gateway carries an optional outbound
+guard (`server/src/response_contract.rs`) that, for every *implemented* `/v2`
+operation, validates the serialized response body against the OpenAPI response
+schema for its actual status code and fails with **500** on a violation
+(required/type/enum/nullable). Schemas are generated from `spec/` by
+`scripts/gen-response-contract.py` — no hand-maintained duplicate — and the guard
+only runs on the `Ok(Resp)` path of wired operations, so 501 stubs are untouched.
+
+**Hot-path cost.** The guard is a per-response cost of `O(response body size)`:
+when (and only when) a route resolves to an implemented op that returns a JSON
+body for a schema-bearing status, the response body is buffered once
+(`axum::body::to_bytes`), parsed with `serde_json`, and walked once against the
+compiled schema (a recursive descent over the already-in-memory value; no
+allocation per field beyond violation strings, which only materialise on
+failure). Non-JSON/binary/streaming responses, unmatched routes, and
+unimplemented (501) operations short-circuit **before** any buffering, so they
+pay nothing. The dominant added cost on a read is therefore the extra
+serialize→bytes→parse round-trip of the body the handler already produced;
+schema traversal is linear in the number of fields.
+
+**Toggle (`NANOBPM_RESPONSE_VALIDATION`).** Three modes gate the guard so it can
+be adopted aggressively without a prod hot-path foot-gun:
+
+| value | behaviour |
+| --- | --- |
+| unset / `strict` / `on` | validate; **500** on violation (default — always-on in dev/CI/`urban check`) |
+| `lenient` / `warn` | validate; log a `warn` with the violations but pass the response through |
+| `off` / `disabled` / `0` | disabled: no buffering, no validation, zero overhead |
+
+For latency-sensitive production read paths, set `NANOBPM_RESPONSE_VALIDATION=lenient`
+(keep drift observability, drop the fail-closed 500 and the response rewrite) or
+`off` (remove the guard entirely). A dedicated throughput A/B (strict vs off on
+the read hot path) is pending a published re-measurement alongside the next
+ceiling run.
+
+---
+
 ## 2026-07-27 — Current-main baseline (console build): 50KB + negligible payload soaks
 
 Two clean 30-minute soaks on current `main` (`4ff70d4`; #311 throughput fix + #314
