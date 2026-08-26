@@ -97,10 +97,13 @@ export default function InstanceDetail({
     retry: false,
   });
 
-  // Both operator actions refresh the same detail query so the diagram overlay,
-  // the incident list and the variables all reflect the new engine state.
-  const refresh = () =>
+  // Operator actions refresh both detail queries so the diagram overlay, the
+  // incident list, the variables and the Process Trace section all reflect the
+  // new engine state right away rather than waiting for the next SSE signal.
+  const refresh = () => {
     qc.invalidateQueries({ queryKey: ["instance", instanceKey] });
+    qc.invalidateQueries({ queryKey: ["trace", instanceKey] });
+  };
 
   const onResolve = (incidentKey: string) => {
     setBusy(true);
