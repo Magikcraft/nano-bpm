@@ -35,7 +35,7 @@ test("the instance key is trimmed and URL-encoded (path built host-side, never a
       target: "processExplorer",
       params: { instance: "  a b/c?d=e  " },
     }),
-    { kind: "navigate", path: "/explorer?instance=a%20b%2Fc%3Fd%3De" },
+    { kind: "navigate", path: "/explorer?instance=a+b%2Fc%3Fd%3De" },
   );
 });
 
@@ -61,8 +61,7 @@ test("A6: the embedded processExplorer path is consumable by the standalone Expl
     assert.ok(action && action.kind === "navigate");
 
     // The bridge uses the one canonical param name (not a hardcoded synonym).
-    const query = action.path.slice(action.path.indexOf("?") + 1);
-    const params = new URLSearchParams(query);
+    const params = new URL(action.path, "http://console.invalid").searchParams;
     assert.ok(params.has(INSTANCE_DEEP_LINK_PARAM));
 
     // The standalone landing reader recovers exactly the trimmed instance the

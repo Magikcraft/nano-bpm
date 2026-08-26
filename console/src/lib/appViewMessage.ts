@@ -63,13 +63,12 @@ export function decideAppViewMessage(
           ? (params as { instance?: unknown }).instance
           : undefined;
       if (typeof instance === "string" && instance.trim() !== "") {
+        const query = new URLSearchParams({
+          [INSTANCE_DEEP_LINK_PARAM]: instance.trim(),
+        });
         return {
           kind: "navigate",
-          path:
-            "/explorer?" +
-            INSTANCE_DEEP_LINK_PARAM +
-            "=" +
-            encodeURIComponent(instance.trim()),
+          path: "/explorer?" + query.toString(),
         };
       }
     }
