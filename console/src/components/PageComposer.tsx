@@ -28,14 +28,33 @@ import type { ComposerEntity } from "../lib/shapeComposer";
 import {
   GRID_COLUMN_LINK_KINDS,
   asGridColumnLinkKind,
+  isColumnMobilePriority,
+  isDataGridMobilePresentation,
+  isLayoutMobileVariant,
+  isNavItemGroup,
+  isNavOverflow,
+  isNavVariant,
+  COLUMN_MOBILE_PRIORITIES,
+  DATA_GRID_MOBILE_PRESENTATIONS,
+  LAYOUT_MOBILE_VARIANTS,
+  MOBILE_MAX_WIDTH,
+  NAV_ITEM_GROUPS,
+  NAV_OVERFLOW_MODES,
+  NAV_VARIANTS,
   type ActionFormField,
   type ButtonModal,
   type ButtonVariant,
+  type ColumnMobile,
+  type DataGridMobile,
   type DatasourceBinding,
   type GridColumn,
   type GridColumnLink,
   type GridColumnLinkKind,
+  type LayoutMobileVariant,
   type NavItem,
+  type NavItemGroup,
+  type NavOverflow,
+  type NavVariant,
   type TextVariant,
 } from "../lib/pageSchema";
 import {
@@ -102,19 +121,30 @@ TextNode.craft = {
 };
 
 const NavNode: UserComponent<{
-  variant: "bar" | "rail";
+  variant: NavVariant;
   title?: string;
   items:
-    "auto" | { label: string; page?: string; href?: string; icon?: string }[];
-}> = ({ variant, title, items }) => {
+    | "auto"
+    | {
+        label: string;
+        page?: string;
+        href?: string;
+        icon?: string;
+        group?: NavItemGroup;
+      }[];
+  overflow?: NavOverflow;
+}> = ({ variant, title, items, overflow }) => {
   const ref = useSelectableRef();
   const auto = items === "auto";
   const list = auto ? [] : items;
+  const variantClass =
+    variant === "rail"
+      ? "pc-rail"
+      : variant === "cards"
+        ? "pc-cards"
+        : "pc-bar";
   return (
-    <nav
-      ref={ref}
-      className={`pc-node pc-nav ${variant === "rail" ? "pc-rail" : "pc-bar"}`}
-    >
+    <nav ref={ref} className={`pc-node pc-nav ${variantClass}`}>
       {title != null && title !== "" && (
         <div className="pc-nav-title">{title}</div>
       )}
@@ -125,7 +155,12 @@ const NavNode: UserComponent<{
           </span>
         ) : list.length ? (
           list.map((it, i) => (
-            <span key={i} className="pc-nav-link">
+            <span
+              key={i}
+              className={`pc-nav-link${
+                it.group === "secondary" ? " pc-nav-link-secondary" : ""
+              }`}
+            >
               {it.icon ? <span className="pc-nav-icon">{it.icon}</span> : null}
               {it.label || it.page || it.href || "(item)"}
             </span>
@@ -134,6 +169,9 @@ const NavNode: UserComponent<{
           <span className="pc-nav-empty opacity-40">No items</span>
         )}
       </div>
+      {overflow === "menu" && (
+        <span className="pc-nav-overflow opacity-40">⋯ overflow → menu</span>
+      )}
     </nav>
   );
 };
@@ -181,7 +219,8 @@ const DataGridNode: UserComponent<{
   title: string;
   data: { kind: "datasource"; source: string; table: string };
   columns: GridColumn[];
-}> = ({ title, data, columns }) => {
+  mobile?: DataGridMobile;
+}> = ({ title, data, columns, mobile }) => {
   const ref = useSelectableRef();
   return (
     <div ref={ref} className="pc-node pc-card">
@@ -205,6 +244,11 @@ const DataGridNode: UserComponent<{
           </tr>
         </tbody>
       </table>
+      {mobile?.presentation === "table" && (
+        <div className="pc-bind opacity-40">
+          mobile (≤ {MOBILE_MAX_WIDTH}): stays a table
+        </div>
+      )}
     </div>
   );
 };
@@ -481,11 +525,14 @@ function Settings({
         <>
           <Row label="Variant">
             <select
-              value={String(props.variant ?? "bar")}
+              value={isNavVariant(props.variant) ? props.variant : "bar"}
               onChange={(e) => set("variant", e.target.value)}
             >
-              <option value="bar">bar</option>
-              <option value="rail">rail</option>
+              {NAV_VARIANTS.map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
             </select>
           </Row>
           <Row label="Title">
@@ -493,6 +540,24 @@ function Settings({
               value={String(props.title ?? "")}
               onChange={(e) => set("title", e.target.value)}
             />
+          </Row>
+          <Row label={`Overflow (≤ ${MOBILE_MAX_WIDTH})`}>
+            <select
+              value={isNavOverflow(props.overflow) ? props.overflow : ""}
+              onChange={(e) =>
+                set(
+                  "overflow",
+                  isNavOverflow(e.target.value) ? e.target.value : undefined,
+                )
+              }
+            >
+              <option value="">none</option>
+              {NAV_OVERFLOW_MODES.map((o) => (
+                <option key={o} value={o}>
+                  {o}
+                </option>
+              ))}
+            </select>
           </Row>
           <Row label="Items">
             <select
@@ -519,6 +584,7 @@ function Settings({
                 { key: "page", label: "page" },
                 { key: "href", label: "href" },
                 { key: "icon", label: "icon" },
+                { key: "group", label: "group", options: NAV_ITEM_GROUPS },
               ]}
               onChange={(rows) =>
                 set(
@@ -533,6 +599,9 @@ function Settings({
                         ? { href: r.href }
                         : {}),
                     ...(r.icon ? { icon: r.icon } : {}),
+                    // Persist the mobile group only when explicitly chosen; an
+                    // unset group means the default (`primary`) at render time.
+                    ...(isNavItemGroup(r.group) ? { group: r.group } : {}),
                   })),
                 )
               }
@@ -640,12 +709,13 @@ function Settings({
               qualifyTable(props.data as { source?: string; table?: string }),
             )}
             onChange={(rows) => {
-              // Preserve the structured `link` an existing column carries — it
-              // isn't editable in this string-cell ListEditor (see the
-              // ColumnLinks editor below), so rebuilding from field/header alone
-              // would silently drop it. `reconcileGridColumns` is the pure,
-              // unit-tested rule (positional on add/edit, `field`+`header`
-              // identity on delete, dropping ambiguous matches).
+              // Preserve the structured remainder an existing column carries
+              // (its `link` and its C1 `mobile` hint) — none of it is editable in
+              // this string-cell ListEditor (see the ColumnLinks / ColumnMobile
+              // editors below), so rebuilding from field/header alone would
+              // silently drop it. `reconcileGridColumns` is the pure, unit-tested
+              // rule (positional on add/edit, `field`+`header` identity on
+              // delete, dropping ambiguous matches).
               const prevCols =
                 (props.columns as GridColumn[] | undefined) ?? [];
               set("columns", reconcileGridColumns(prevCols, rows));
@@ -658,6 +728,36 @@ function Settings({
             )}
             onChange={(cols) => set("columns", cols)}
           />
+          <ColumnMobiles
+            columns={(props.columns as GridColumn[]) ?? []}
+            onChange={(cols) => set("columns", cols)}
+          />
+          <Row label={`Mobile grid (≤ ${MOBILE_MAX_WIDTH})`}>
+            <select
+              value={
+                isDataGridMobilePresentation(
+                  (props.mobile as DataGridMobile | undefined)?.presentation,
+                )
+                  ? ((props.mobile as DataGridMobile).presentation as string)
+                  : ""
+              }
+              onChange={(e) =>
+                set(
+                  "mobile",
+                  isDataGridMobilePresentation(e.target.value)
+                    ? { presentation: e.target.value }
+                    : undefined,
+                )
+              }
+            >
+              <option value="">default (cards)</option>
+              {DATA_GRID_MOBILE_PRESENTATIONS.map((p) => (
+                <option key={p} value={p}>
+                  {p}
+                </option>
+              ))}
+            </select>
+          </Row>
           <GridAdvanced key={selectedId} props={props} set={set} />
         </>
       )}
@@ -1007,7 +1107,9 @@ function ButtonModalEditor({
   );
 }
 
-/** A tiny repeated-row editor for `fields`/`columns`. */
+/** A tiny repeated-row editor for `fields`/`columns`. A column is a free-text
+ * input by default; giving it `options` renders a `<select>` instead (a blank
+ * first entry means "unset", so an optional enum prop round-trips as omitted). */
 function ListEditor({
   label,
   rows,
@@ -1017,7 +1119,7 @@ function ListEditor({
 }: {
   label: string;
   rows: Record<string, string>[];
-  columns: { key: string; label: string }[];
+  columns: { key: string; label: string; options?: readonly string[] }[];
   suggestions?: string[];
   onChange: (rows: Record<string, string>[]) => void;
 }): ReactElement {
@@ -1033,15 +1135,31 @@ function ListEditor({
       </div>
       {rows.map((r, i) => (
         <div key={i} className="pc-list-row">
-          {columns.map((c) => (
-            <input
-              key={c.key}
-              placeholder={c.label}
-              list={c.key === "field" && suggestions ? listId : undefined}
-              value={r[c.key] ?? ""}
-              onChange={(e) => update(i, c.key, e.target.value)}
-            />
-          ))}
+          {columns.map((c) =>
+            c.options ? (
+              <select
+                key={c.key}
+                title={c.label}
+                value={r[c.key] ?? ""}
+                onChange={(e) => update(i, c.key, e.target.value)}
+              >
+                <option value="">{c.label} —</option>
+                {c.options.map((o) => (
+                  <option key={o} value={o}>
+                    {o}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                key={c.key}
+                placeholder={c.label}
+                list={c.key === "field" && suggestions ? listId : undefined}
+                value={r[c.key] ?? ""}
+                onChange={(e) => update(i, c.key, e.target.value)}
+              />
+            ),
+          )}
           <button
             className="pc-btn-danger"
             onClick={() => onChange(rows.filter((_, j) => j !== i))}
@@ -1189,15 +1307,98 @@ function ColumnLinks({
   );
 }
 
+/** Per-column mobile-presentation editor for a `dataGrid`'s columns (the C1
+ * `column.mobile` vocabulary). The string-cell ListEditor owns field/header and
+ * `ColumnLinks` owns the link; this owns each column's optional `mobile` hint:
+ * a `priority` (primary line / chip / hidden) that tells the runtime how to
+ * surface the column on a card below {@link MOBILE_MAX_WIDTH}, plus an optional
+ * short `label` used in place of the header there. Selecting "default" clears the
+ * hint (the column keeps its normal presentation). */
+function ColumnMobiles({
+  columns,
+  onChange,
+}: {
+  columns: GridColumn[];
+  onChange: (columns: GridColumn[]) => void;
+}): ReactElement | null {
+  if (!columns.length) return null;
+  const setMobile = (i: number, mobile: ColumnMobile | undefined) => {
+    onChange(
+      columns.map((c, j) => {
+        if (j !== i) return c;
+        if (!mobile) {
+          const { mobile: _drop, ...rest } = c;
+          void _drop;
+          return rest;
+        }
+        return { ...c, mobile };
+      }),
+    );
+  };
+  return (
+    <div className="pc-list">
+      <div className="pc-row">
+        <span>Column mobile (≤ {MOBILE_MAX_WIDTH})</span>
+      </div>
+      {columns.map((c, i) => (
+        <div key={`${c.field || "__col"}_${i}`} className="pc-list-row">
+          <span className="pc-col-name">
+            {c.header || c.field || `#${i + 1}`}
+          </span>
+          <select
+            title="priority"
+            value={c.mobile?.priority ?? ""}
+            onChange={(e) =>
+              setMobile(
+                i,
+                isColumnMobilePriority(e.target.value)
+                  ? {
+                      priority: e.target.value,
+                      ...(c.mobile?.label ? { label: c.mobile.label } : {}),
+                    }
+                  : undefined,
+              )
+            }
+          >
+            <option value="">default</option>
+            {COLUMN_MOBILE_PRIORITIES.map((p) => (
+              <option key={p} value={p}>
+                {p}
+              </option>
+            ))}
+          </select>
+          {c.mobile && (
+            <input
+              placeholder="mobile label"
+              value={c.mobile.label ?? ""}
+              onChange={(e) =>
+                setMobile(i, {
+                  priority: c.mobile!.priority,
+                  ...(e.target.value ? { label: e.target.value } : {}),
+                })
+              }
+            />
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ── the imperative bridge (get/set page.json from inside <Editor>) ───────────
 const Bridge = forwardRef<
   PageComposerHandle,
   {
     title: string;
     onTitleChange: (t: string) => void;
+    layoutMobile: LayoutMobileVariant | undefined;
+    onLayoutMobileChange: (v: LayoutMobileVariant | undefined) => void;
     baselineRef: React.MutableRefObject<string | null>;
   }
->(function Bridge({ title, onTitleChange, baselineRef }, ref) {
+>(function Bridge(
+  { title, onTitleChange, layoutMobile, onLayoutMobileChange, baselineRef },
+  ref,
+) {
   const { query, actions } = useEditor();
   useImperativeHandle(
     ref,
@@ -1205,7 +1406,14 @@ const Bridge = forwardRef<
       getPageJson(): string {
         const state = JSON.parse(query.serialize()) as CraftState;
         const doc = toPageDoc(state, title);
-        return JSON.stringify(doc, null, 2);
+        // The page-level `layout.mobile` is a page concern (not a node prop), so
+        // it lives in composer state rather than the Craft tree — splice it back
+        // onto the serialized doc. Omitting it keeps the page on the Tier-1 CSS
+        // reflow, matching the schema's canonical shape.
+        const full = layoutMobile
+          ? { ...doc, layout: { mobile: layoutMobile } }
+          : doc;
+        return JSON.stringify(full, null, 2);
       },
       setPageJson(
         text: string,
@@ -1219,6 +1427,9 @@ const Bridge = forwardRef<
         }
         // Preserve the loaded page's title so a round-trip save doesn't clobber it.
         onTitleChange(res.doc.title);
+        // Restore the page-level mobile layout hook from the loaded doc so it
+        // round-trips through a save (it is not part of the Craft node tree).
+        onLayoutMobileChange(res.doc.layout?.mobile);
         // Capture the loaded canvas as the pristine baseline BEFORE deserialize.
         // Dirtiness is then derived by comparing the live canvas against this, so
         // the load's own onNodesChange (and the initial mount) never reads as an
@@ -1229,7 +1440,15 @@ const Bridge = forwardRef<
         return { ok: true };
       },
     }),
-    [query, actions, title, onTitleChange, baselineRef],
+    [
+      query,
+      actions,
+      title,
+      onTitleChange,
+      layoutMobile,
+      onLayoutMobileChange,
+      baselineRef,
+    ],
   );
   return null;
 });
@@ -1239,6 +1458,12 @@ const Bridge = forwardRef<
 const PageComposer = forwardRef<PageComposerHandle, PageComposerProps>(
   function PageComposer({ onChange, entities = [], processes = [] }, ref) {
     const [title, setTitle] = useState("Page");
+    // The page-level mobile layout variant (`page.layout.mobile`) — a page
+    // concern rather than a node prop, so it lives here and is spliced onto the
+    // serialized doc by the Bridge. `undefined` = no hook (Tier-1 CSS reflow).
+    const [layoutMobile, setLayoutMobile] = useState<
+      LayoutMobileVariant | undefined
+    >(undefined);
     // Pristine baseline (serialized node list) captured at load time. Dirtiness is
     // derived by comparing the live canvas against this on every Craft change, so
     // the programmatic load and the initial mount — which both fire onNodesChange —
@@ -1262,6 +1487,8 @@ const PageComposer = forwardRef<PageComposerHandle, PageComposerProps>(
             ref={ref}
             title={title}
             onTitleChange={setTitle}
+            layoutMobile={layoutMobile}
+            onLayoutMobileChange={setLayoutMobile}
             baselineRef={baselineRef}
           />
           <div className="pc-toolbar">
@@ -1275,6 +1502,31 @@ const PageComposer = forwardRef<PageComposerHandle, PageComposerProps>(
                   onChange?.();
                 }}
               />
+            </label>
+            <label className="pc-row">
+              <span>Mobile layout (≤ {MOBILE_MAX_WIDTH})</span>
+              <select
+                className="pc-layout-mobile"
+                value={layoutMobile ?? ""}
+                onChange={(e) => {
+                  // The page title input is signalled as dirty directly (below);
+                  // do the same for the layout hook since it lives outside the
+                  // Craft node list that `serializePageNodes` compares.
+                  setLayoutMobile(
+                    isLayoutMobileVariant(e.target.value)
+                      ? e.target.value
+                      : undefined,
+                  );
+                  onChange?.();
+                }}
+              >
+                <option value="">default (Tier-1 reflow)</option>
+                {LAYOUT_MOBILE_VARIANTS.map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </select>
             </label>
           </div>
           <div className="pc-layout">
@@ -1317,10 +1569,15 @@ const PAGE_COMPOSER_CSS = `
 .pc-nav { border:1px solid var(--color-edge,#d0d0d8); border-radius:.5rem; padding:.5rem .65rem; }
 .pc-nav.pc-bar { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
 .pc-nav.pc-rail { display:flex; flex-direction:column; gap:.35rem; max-width:14rem; }
+.pc-nav.pc-cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(7rem,1fr)); gap:.5rem; }
+.pc-nav.pc-cards .pc-nav-items { display:contents; }
+.pc-nav.pc-cards .pc-nav-link { flex-direction:column; align-items:flex-start; padding:.55rem .65rem; background:rgba(120,120,160,.16); border-radius:.5rem; }
 .pc-nav-title { font-weight:650; }
 .pc-nav-items { display:flex; gap:.35rem; flex-wrap:wrap; }
 .pc-nav.pc-rail .pc-nav-items { flex-direction:column; }
 .pc-nav-link { display:inline-flex; align-items:center; gap:.35rem; padding:.25rem .55rem; border-radius:.35rem; background:rgba(120,120,160,.12); font-size:.85rem; }
+.pc-nav-link-secondary { opacity:.7; }
+.pc-nav-overflow { font-size:.7rem; opacity:.6; margin-top:.35rem; }
 .pc-nav-icon { opacity:.8; }
 .pc-field { display:flex; flex-direction:column; gap:.15rem; margin-bottom:.4rem; }
 .pc-field label { font-size:.75rem; opacity:.7; }

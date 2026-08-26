@@ -54,13 +54,15 @@ export function loadPageJson(text: string, title: string): LoadPageResult {
 /**
  * Reconcile a grid's edited `field`/`header` rows (from the string-cell
  * ListEditor) back onto the structured `GridColumn[]`, carrying over each
- * column's non-editable `link`. The ListEditor mutates one column at a time:
+ * column's non-editable structured remainder (its `link` and its C1
+ * `mobile` hint — anything the string-cell editor doesn't own). The
+ * ListEditor mutates one column at a time:
  *  - add/edit keeps order + count, so existing columns keep their index and a
- *    positional match preserves a link across a `field` rename.
+ *    positional match preserves the remainder across a `field` rename.
  *  - delete shortens the list and shifts indices, so we instead match on the
  *    stable `field`+`header` identity. Columns may legitimately share a
- *    `field`, so a link is only carried over when EXACTLY ONE previous column
- *    matches — an ambiguous (or absent) match drops the link rather than risk
+ *    `field`, so the remainder is only carried over when EXACTLY ONE previous
+ *    column matches — an ambiguous (or absent) match drops it rather than risk
  *    re-attaching it to the wrong neighbour.
  */
 export function reconcileGridColumns(
@@ -80,8 +82,11 @@ export function reconcileGridColumns(
     } else {
       prev = prevCols[i];
     }
-    const col: GridColumn = { field, header };
-    return prev?.link ? { ...col, link: prev.link } : col;
+    // Carry the matched column's whole structured remainder (link, mobile, …),
+    // overriding only the `field`/`header` the ListEditor owns. Spreading `prev`
+    // (rather than copying named keys) means a per-column field added to the
+    // schema later survives an edit automatically — no drift surface here.
+    return prev ? { ...prev, field, header } : { field, header };
   });
 }
 
