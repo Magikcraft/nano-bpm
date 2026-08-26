@@ -181,7 +181,7 @@ pub(crate) struct IoMappingFailure {
     pub(crate) reason: String,
 }
 
-/// The instance-derived context copied off an [`crate::agent::AgentInstance`]
+/// The instance-derived context copied off an [`AgentInstance`](crate::agent::AgentInstance)
 /// when materialising a batch of AgentHistory turns, so the borrow is released
 /// before keys are minted / events emitted.
 #[allow(dead_code)] // consumed by append_agent_history; S3 wires the callers.
