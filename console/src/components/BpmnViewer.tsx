@@ -4,9 +4,34 @@ import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 
 interface Canvas {
-  zoom(mode: string): void;
+  /// diagram-js canvas zoom: no arg reads the current scale, a number sets it
+  /// (optionally about a `center` point in container-pixel coordinates), and
+  /// the string `"fit-viewport"` fits the whole diagram.
+  zoom(newScale?: number | string, center?: { x: number; y: number }): number;
+  /// Pans the viewport by a pixel delta (used for one-finger touch panning).
+  scroll(delta: { dx: number; dy: number }): void;
   addMarker(elementId: string, marker: string): void;
   removeMarker(elementId: string, marker: string): void;
+}
+
+// Pinch-zoom clamp. Matches diagram-js's own zoom range so a pinch can never
+// shrink the diagram to an unreadable speck (which would also make the
+// `.nano-active` / `.nano-incident` overlays illegible) nor blow it up past use.
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 4;
+
+function touchDistance(touches: TouchList): number {
+  return Math.hypot(
+    touches[0].clientX - touches[1].clientX,
+    touches[0].clientY - touches[1].clientY,
+  );
+}
+
+function touchMidpoint(touches: TouchList): { x: number; y: number } {
+  return {
+    x: (touches[0].clientX + touches[1].clientX) / 2,
+    y: (touches[0].clientY + touches[1].clientY) / 2,
+  };
 }
 
 interface BpmnViewerProps {
@@ -15,6 +40,10 @@ interface BpmnViewerProps {
   activeElementIds?: string[];
   /// Element ids to highlight as having an incident.
   incidentElementIds?: string[];
+  /// Re-fit the diagram to the viewport whenever the container is resized (e.g.
+  /// a phone rotating, or the diagram opening into a full-screen mobile card).
+  /// Off by default so the resizable desktop model pane keeps a manual zoom.
+  fitOnResize?: boolean;
   /// Called when bpmn-js fails to import the supplied XML (malformed /
   /// unsupported), so a caller can surface an explicit error instead of the
   /// otherwise-blank canvas. Optional; omitting it preserves the prior
@@ -32,6 +61,7 @@ export default function BpmnViewer({
   xml,
   activeElementIds = [],
   incidentElementIds = [],
+  fitOnResize = false,
   onImportError,
   onImportSuccess,
 }: BpmnViewerProps) {
@@ -68,13 +98,77 @@ export default function BpmnViewer({
   useEffect(() => {
     if (!containerRef.current) return;
     disposedRef.current = false;
-    const viewer = new NavigatedViewer({ container: containerRef.current });
+    const container = containerRef.current;
+    const viewer = new NavigatedViewer({ container });
     viewerRef.current = viewer;
     importedXmlRef.current = null;
     markedActiveRef.current = [];
     markedIncidentRef.current = [];
+
+    // NavigatedViewer ships mouse/keyboard/wheel navigation only — this
+    // diagram-js has no touch module — so a phone gets neither pan nor
+    // pinch-zoom out of the box. Implement both against the canvas API: one
+    // finger pans (canvas.scroll, mirroring MoveCanvas), two fingers pinch-zoom
+    // about their midpoint (canvas.zoom). The container carries
+    // `touch-action: none` so the browser doesn't hijack the gesture as page
+    // scroll/zoom.
+    const canvas = () => viewer.get<Canvas>("canvas");
+    let lastPan: { x: number; y: number } | null = null;
+    let pinch: { dist: number; zoom: number } | null = null;
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (disposedRef.current) return;
+      if (e.touches.length === 1) {
+        lastPan = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        pinch = null;
+      } else if (e.touches.length === 2) {
+        lastPan = null;
+        pinch = { dist: touchDistance(e.touches), zoom: canvas().zoom() };
+      }
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      if (disposedRef.current) return;
+      if (e.touches.length === 1 && lastPan) {
+        const t = e.touches[0];
+        canvas().scroll({
+          dx: t.clientX - lastPan.x,
+          dy: t.clientY - lastPan.y,
+        });
+        lastPan = { x: t.clientX, y: t.clientY };
+        e.preventDefault();
+      } else if (e.touches.length === 2 && pinch && pinch.dist > 0) {
+        const dist = touchDistance(e.touches);
+        const rect = container.getBoundingClientRect();
+        const mid = touchMidpoint(e.touches);
+        const next = Math.min(
+          MAX_ZOOM,
+          Math.max(MIN_ZOOM, (pinch.zoom * dist) / pinch.dist),
+        );
+        canvas().zoom(next, { x: mid.x - rect.left, y: mid.y - rect.top });
+        e.preventDefault();
+      }
+    };
+    const onTouchEnd = (e: TouchEvent) => {
+      if (e.touches.length >= 2) return;
+      pinch = null;
+      // Continue panning from a remaining finger after a pinch releases one.
+      lastPan =
+        e.touches.length === 1
+          ? { x: e.touches[0].clientX, y: e.touches[0].clientY }
+          : null;
+    };
+
+    container.addEventListener("touchstart", onTouchStart, { passive: true });
+    container.addEventListener("touchmove", onTouchMove, { passive: false });
+    container.addEventListener("touchend", onTouchEnd, { passive: true });
+    container.addEventListener("touchcancel", onTouchEnd, { passive: true });
+
     return () => {
       disposedRef.current = true;
+      container.removeEventListener("touchstart", onTouchStart);
+      container.removeEventListener("touchmove", onTouchMove);
+      container.removeEventListener("touchend", onTouchEnd);
+      container.removeEventListener("touchcancel", onTouchEnd);
       viewer.destroy();
       viewerRef.current = null;
     };
@@ -150,6 +244,30 @@ export default function BpmnViewer({
     opChainRef.current = op.catch(() => {});
   }, [xml, activeKey, incidentKey]);
 
+  // On mobile the diagram opens into a full-screen card and the phone can
+  // rotate; re-fit to the viewport whenever the container resizes so the whole
+  // model stays framed. Serialized on the same op chain as imports so a re-fit
+  // can't race an in-flight importXML. Opt-in (the resizable desktop pane keeps
+  // its manual zoom across a drag).
+  useEffect(() => {
+    if (!fitOnResize || typeof ResizeObserver === "undefined") return;
+    const container = containerRef.current;
+    if (!container) return;
+    const ro = new ResizeObserver(() => {
+      const viewer = viewerRef.current;
+      if (!viewer || disposedRef.current || importedXmlRef.current === null)
+        return;
+      opChainRef.current = opChainRef.current
+        .then(() => {
+          if (disposedRef.current || viewerRef.current !== viewer) return;
+          viewer.get<Canvas>("canvas").zoom("fit-viewport");
+        })
+        .catch(() => {});
+    });
+    ro.observe(container);
+    return () => ro.disconnect();
+  }, [fitOnResize]);
+
   // Render a single, stable structure so the container ref points at the same
   // DOM node for the component's whole life (the viewer is created against it
   // on mount, before the async XML query resolves). The empty-state message is
@@ -157,7 +275,7 @@ export default function BpmnViewer({
   // leave the ref unmounted and prevent the viewer from being created.
   return (
     <div className="relative h-full w-full">
-      <div ref={containerRef} className="h-full w-full" />
+      <div ref={containerRef} className="h-full w-full touch-none" />
       {!xml && (
         <div className="absolute inset-0 flex items-center justify-center text-sm text-fg-faint">
           No diagram available for this definition.
