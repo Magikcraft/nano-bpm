@@ -555,8 +555,11 @@ export type DataGridMobilePresentation = (typeof DATA_GRID_MOBILE_PRESENTATIONS)
 export declare const DATA_GRID_MOBILE_PRESENTATION_DEFAULT: DataGridMobilePresentation;
 /** The mobile presentation hints on a grid (`dataGrid.props.mobile`). */
 export interface DataGridMobile {
-	/** How the grid renders below {@link MOBILE_MAX_WIDTH}. */
-	presentation: DataGridMobilePresentation;
+	/**
+	 * How the grid renders below {@link MOBILE_MAX_WIDTH}. Omitting it defaults to
+	 * {@link DATA_GRID_MOBILE_PRESENTATION_DEFAULT} (`"cards"`).
+	 */
+	presentation?: DataGridMobilePresentation;
 }
 /** Narrowing guard: is `value` a known grid mobile presentation? */
 export declare function isDataGridMobilePresentation(value: unknown): value is DataGridMobilePresentation;
