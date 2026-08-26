@@ -17267,3 +17267,285 @@ fn agent_task_activation_mints_an_agent_instance_in_initializing() {
         "an agent task must not create a job"
     );
 }
+
+// --- AgentHistory turn log (Camunda 8.10 parity, Stage 3 / slice S2) --------
+
+/// Deploy an `aiAgentTask` service task, start an instance, and return the
+/// engine together with the owning process-instance key and the minted
+/// `agent_instance_key` — the fixture every AgentHistory test builds on.
+fn agent_instance_for_history() -> (Engine, Key, Key) {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="agent-proc" isExecutable="true">
+          <bpmn:startEvent id="start" />
+          <bpmn:serviceTask id="agent">
+            <bpmn:extensionElements>
+              <zeebe:agentDefinition agentType="aiAgentTask" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="end" />
+          <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="end" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("agent-proc"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    let agent_instance_key = events
+        .iter()
+        .find_map(|e| match e {
+            Event::AgentInstanceCreated { agent_instance, .. } => {
+                Some(agent_instance.agent_instance_key)
+            }
+            _ => None,
+        })
+        .expect("activation should mint an AgentInstance");
+    (engine, instance_key, agent_instance_key)
+}
+
+/// A minimal AgentHistory turn carrying only the ordering-relevant fields.
+fn history_turn(
+    loop_iteration: i32,
+    produced_at: u64,
+    role: crate::agent::AgentHistoryRole,
+) -> crate::agent::AgentHistoryTurn {
+    crate::agent::AgentHistoryTurn {
+        loop_iteration,
+        produced_at,
+        role,
+        ..Default::default()
+    }
+}
+
+/// The stored, ordered history log for `agent_instance_key`.
+fn stored_history(
+    engine: &Engine,
+    instance_key: Key,
+    agent_instance_key: Key,
+) -> Vec<crate::agent::AgentHistoryRecord> {
+    engine
+        .state
+        .instances
+        .get(&instance_key)
+        .and_then(|pi| pi.agent_history.get(&agent_instance_key))
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[test]
+fn agent_history_append_batch_materialises_one_pending_record_per_turn_in_order() {
+    use crate::agent::{AgentHistoryCommitStatus, AgentHistoryRole};
+    let (mut engine, instance_key, aik) = agent_instance_for_history();
+
+    // A batch handed to the engine deliberately out of (loop_iteration,
+    // produced_at) order — the store must re-order it deterministically.
+    let turns = vec![
+        history_turn(1, 200, AgentHistoryRole::Assistant),
+        history_turn(0, 100, AgentHistoryRole::User),
+        history_turn(0, 50, AgentHistoryRole::Configuration),
+        history_turn(1, 150, AgentHistoryRole::ToolResult),
+    ];
+    let events = engine.append_agent_history(aik, turns);
+
+    // One AGENT_HISTORY record per item, each PENDING and keyed by the agent
+    // instance, all under the owning process instance.
+    assert_eq!(events.len(), 4, "one record per appended turn");
+    for event in &events {
+        match event {
+            Event::AgentHistoryCreated {
+                instance_key: ik,
+                record,
+            } => {
+                assert_eq!(*ik, instance_key);
+                assert_eq!(record.agent_instance_key, aik);
+                assert_eq!(record.process_instance_key, instance_key);
+                assert_eq!(record.commit_status, AgentHistoryCommitStatus::Pending);
+                assert_ne!(record.agent_history_key, 0);
+            }
+            other => panic!("expected AgentHistoryCreated, got {other:?}"),
+        }
+    }
+
+    // Stored deterministically by (loop_iteration, produced_at).
+    let stored = stored_history(&engine, instance_key, aik);
+    let order: Vec<(i32, u64)> = stored
+        .iter()
+        .map(|r| (r.loop_iteration, r.produced_at))
+        .collect();
+    assert_eq!(order, vec![(0, 50), (0, 100), (1, 150), (1, 200)]);
+
+    // Every turn got a distinct, monotonic history key.
+    let mut keys: Vec<Key> = stored.iter().map(|r| r.agent_history_key).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(keys.len(), 4, "history keys are unique");
+}
+
+#[test]
+fn agent_history_append_ties_break_by_mint_order() {
+    use crate::agent::AgentHistoryRole;
+    let (mut engine, instance_key, aik) = agent_instance_for_history();
+
+    // Two turns share an identical (loop_iteration, produced_at); the earlier
+    // appended (smaller minted key) must keep the earlier slot.
+    let events = engine.append_agent_history(
+        aik,
+        vec![
+            history_turn(0, 100, AgentHistoryRole::User),
+            history_turn(0, 100, AgentHistoryRole::Assistant),
+        ],
+    );
+    let first_key = match &events[0] {
+        Event::AgentHistoryCreated { record, .. } => record.agent_history_key,
+        other => panic!("expected AgentHistoryCreated, got {other:?}"),
+    };
+
+    let stored = stored_history(&engine, instance_key, aik);
+    assert_eq!(stored.len(), 2);
+    assert_eq!(
+        stored[0].agent_history_key, first_key,
+        "the first-appended turn stays first on a (loop_iteration, produced_at) tie"
+    );
+    assert_eq!(stored[0].role, AgentHistoryRole::User);
+    assert_eq!(stored[1].role, AgentHistoryRole::Assistant);
+}
+
+#[test]
+fn agent_history_commit_moves_pending_turns_to_committed() {
+    use crate::agent::{AgentHistoryCommitStatus, AgentHistoryRole};
+    let (mut engine, instance_key, aik) = agent_instance_for_history();
+    engine.append_agent_history(
+        aik,
+        vec![
+            history_turn(0, 10, AgentHistoryRole::User),
+            history_turn(0, 20, AgentHistoryRole::Assistant),
+        ],
+    );
+
+    let events = engine.commit_agent_history(aik);
+    assert_eq!(events.len(), 1, "a single commit event names the batch");
+    match &events[0] {
+        Event::AgentHistoryCommitted {
+            instance_key: ik,
+            agent_instance_key,
+            agent_history_keys,
+        } => {
+            assert_eq!(*ik, instance_key);
+            assert_eq!(*agent_instance_key, aik);
+            assert_eq!(agent_history_keys.len(), 2);
+        }
+        other => panic!("expected AgentHistoryCommitted, got {other:?}"),
+    }
+
+    let stored = stored_history(&engine, instance_key, aik);
+    assert!(
+        stored
+            .iter()
+            .all(|r| r.commit_status == AgentHistoryCommitStatus::Committed),
+        "every pending turn is now COMMITTED"
+    );
+
+    // Nothing is pending, so a second commit is a no-op (committed turns are
+    // immutable — the log never re-touches them).
+    assert!(
+        engine.commit_agent_history(aik).is_empty(),
+        "re-committing with no pending turns emits nothing"
+    );
+}
+
+#[test]
+fn agent_history_discard_moves_pending_turns_to_discarded() {
+    use crate::agent::{AgentHistoryCommitStatus, AgentHistoryRole};
+    let (mut engine, instance_key, aik) = agent_instance_for_history();
+    engine.append_agent_history(
+        aik,
+        vec![
+            history_turn(0, 10, AgentHistoryRole::User),
+            history_turn(1, 20, AgentHistoryRole::Assistant),
+        ],
+    );
+
+    let events = engine.discard_agent_history(aik);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        Event::AgentHistoryDiscarded {
+            agent_instance_key,
+            agent_history_keys,
+            ..
+        } => {
+            assert_eq!(*agent_instance_key, aik);
+            assert_eq!(agent_history_keys.len(), 2);
+        }
+        other => panic!("expected AgentHistoryDiscarded, got {other:?}"),
+    }
+
+    let stored = stored_history(&engine, instance_key, aik);
+    assert!(
+        stored
+            .iter()
+            .all(|r| r.commit_status == AgentHistoryCommitStatus::Discarded),
+        "every pending turn is now DISCARDED"
+    );
+    assert!(
+        engine.discard_agent_history(aik).is_empty(),
+        "re-discarding with no pending turns emits nothing"
+    );
+}
+
+#[test]
+fn agent_history_committed_turns_are_immutable_across_later_batches() {
+    use crate::agent::{AgentHistoryCommitStatus, AgentHistoryRole};
+    let (mut engine, instance_key, aik) = agent_instance_for_history();
+
+    // First batch committed.
+    engine.append_agent_history(aik, vec![history_turn(0, 10, AgentHistoryRole::User)]);
+    engine.commit_agent_history(aik);
+    let committed_key = stored_history(&engine, instance_key, aik)[0].agent_history_key;
+
+    // A second batch, then discard — must touch only the pending (second) turns.
+    engine.append_agent_history(aik, vec![history_turn(1, 20, AgentHistoryRole::Assistant)]);
+    let discard = engine.discard_agent_history(aik);
+    match &discard[0] {
+        Event::AgentHistoryDiscarded {
+            agent_history_keys, ..
+        } => assert!(
+            !agent_history_keys.contains(&committed_key),
+            "an already-committed turn is never named by a later discard"
+        ),
+        other => panic!("expected AgentHistoryDiscarded, got {other:?}"),
+    }
+
+    let stored = stored_history(&engine, instance_key, aik);
+    assert_eq!(stored.len(), 2);
+    // The first turn is still COMMITTED; only the second flipped to DISCARDED.
+    let by_key: std::collections::HashMap<Key, AgentHistoryCommitStatus> = stored
+        .iter()
+        .map(|r| (r.agent_history_key, r.commit_status))
+        .collect();
+    assert_eq!(by_key[&committed_key], AgentHistoryCommitStatus::Committed);
+    let discarded = stored
+        .iter()
+        .filter(|r| r.commit_status == AgentHistoryCommitStatus::Discarded)
+        .count();
+    assert_eq!(discarded, 1, "only the second batch was discarded");
+}
+
+#[test]
+fn agent_history_append_to_unknown_instance_is_a_noop() {
+    use crate::agent::AgentHistoryRole;
+    let (mut engine, _instance_key, _aik) = agent_instance_for_history();
+    let bogus = 999_999_999;
+    assert!(
+        engine
+            .append_agent_history(bogus, vec![history_turn(0, 1, AgentHistoryRole::User)])
+            .is_empty(),
+        "appending to an unknown agent instance emits nothing"
+    );
+    assert!(engine.commit_agent_history(bogus).is_empty());
+    assert!(engine.discard_agent_history(bogus).is_empty());
+}

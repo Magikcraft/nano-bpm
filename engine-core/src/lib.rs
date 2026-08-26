@@ -91,8 +91,11 @@ mod validate;
 pub mod ffi;
 
 pub use agent::{
-    AgentDefinition, AgentInstance, AgentInstanceIntent, AgentInstanceLimits, AgentInstanceMetrics,
-    AgentInstanceStatus, AgentTool, AgentType, AGENT_LIMIT_UNLIMITED,
+    AgentDefinition, AgentHistoryCommitStatus, AgentHistoryContent, AgentHistoryContentType,
+    AgentHistoryIntent, AgentHistoryMetrics, AgentHistoryRecord, AgentHistoryRole,
+    AgentHistoryToolCall, AgentHistoryTurn, AgentInstance, AgentInstanceIntent,
+    AgentInstanceLimits, AgentInstanceMetrics, AgentInstanceStatus, AgentTool, AgentType,
+    AGENT_LIMIT_UNLIMITED,
 };
 pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT};
 #[cfg(feature = "serde")]

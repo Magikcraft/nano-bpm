@@ -1000,6 +1000,44 @@ pub enum Event {
         instance_key: Key,
         agent_instance: crate::agent::AgentInstance,
     },
+
+    /// One AgentHistory turn was appended to an agent instance's append-only
+    /// turn log (Camunda `AgentHistoryIntent.CREATED`, stable/8.10). Emitted
+    /// once per turn by the batch-append behavior; the record is materialised
+    /// with a monotonic `agent_history_key` and `commit_status` PENDING. The
+    /// applier inserts it into the owning process instance's `agent_history`
+    /// map (keyed by `agent_instance_key`), ordered by `(loop_iteration,
+    /// produced_at, agent_history_key)`.
+    AgentHistoryCreated {
+        /// The owning process instance key (locates the `agent_history` store).
+        instance_key: Key,
+        /// The materialised, PENDING history record.
+        record: crate::agent::AgentHistoryRecord,
+    },
+
+    /// The pending AgentHistory turns of an agent instance were committed
+    /// (Camunda `AgentHistoryIntent.COMMITTED`, stable/8.10): each listed turn
+    /// moves PENDING -> COMMITTED. Committed turns are immutable.
+    AgentHistoryCommitted {
+        /// The owning process instance key.
+        instance_key: Key,
+        /// The agent instance whose pending turns were committed.
+        agent_instance_key: Key,
+        /// The keys of the turns that transitioned to COMMITTED.
+        agent_history_keys: Vec<Key>,
+    },
+
+    /// The pending AgentHistory turns of an agent instance were discarded
+    /// (Camunda `AgentHistoryIntent.DISCARDED`, stable/8.10): each listed turn
+    /// moves PENDING -> DISCARDED. Discarded turns are immutable.
+    AgentHistoryDiscarded {
+        /// The owning process instance key.
+        instance_key: Key,
+        /// The agent instance whose pending turns were discarded.
+        agent_instance_key: Key,
+        /// The keys of the turns that transitioned to DISCARDED.
+        agent_history_keys: Vec<Key>,
+    },
 }
 
 impl Event {
@@ -1091,6 +1129,9 @@ impl Event {
             Event::ProcessInstanceTerminating { instance_key } => Some(*instance_key),
             Event::ProcessInstanceMigrated { instance_key, .. } => Some(*instance_key),
             Event::AgentInstanceCreated { instance_key, .. } => Some(*instance_key),
+            Event::AgentHistoryCreated { instance_key, .. }
+            | Event::AgentHistoryCommitted { instance_key, .. }
+            | Event::AgentHistoryDiscarded { instance_key, .. } => Some(*instance_key),
             Event::ProcessDeployed { .. }
             | Event::DecisionRequirementsDeployed { .. }
             | Event::DecisionDeployed { .. }
@@ -1391,6 +1432,27 @@ impl Event {
                 m = m
                     .max(agent_instance.agent_instance_key)
                     .max(agent_instance.element_instance_key)
+            }
+            Event::AgentHistoryCreated { record, .. } => {
+                m = m
+                    .max(record.agent_history_key)
+                    .max(record.agent_instance_key)
+                    .max(record.element_instance_key)
+            }
+            Event::AgentHistoryCommitted {
+                agent_instance_key,
+                agent_history_keys,
+                ..
+            }
+            | Event::AgentHistoryDiscarded {
+                agent_instance_key,
+                agent_history_keys,
+                ..
+            } => {
+                m = m.max(*agent_instance_key);
+                if let Some(max_key) = agent_history_keys.iter().copied().max() {
+                    m = m.max(max_key);
+                }
             }
             _ => {}
         }
