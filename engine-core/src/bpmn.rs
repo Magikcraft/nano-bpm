@@ -6415,6 +6415,47 @@ mod feel_timer_tests {
     }
 
     #[test]
+    fn should_accept_ai_agent_subprocess_on_an_ad_hoc_sub_process() {
+        // The valid placement: `agentType="aiAgentSubProcess"` on a
+        // `bpmn:adHocSubProcess`. Unlike `aiAgentTask` (which becomes an
+        // engine-native `AgentTask`), the ad-hoc variant reuses the existing
+        // ad-hoc container machinery in S1 — so the container parses into a
+        // single job-bearing `ServiceTask` at the parent token-flow level, and
+        // its contained "tool" activities are pruned from the executable graph
+        // (invoked out-of-band by the worker, not by token flow).
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="agent-adhoc" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:adHocSubProcess id="agent">
+                <bpmn:extensionElements>
+                  <zeebe:agentDefinition agentType="aiAgentSubProcess" />
+                </bpmn:extensionElements>
+                <bpmn:serviceTask id="tool" />
+              </bpmn:adHocSubProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        // The ad-hoc container is retained as a single job-bearing ServiceTask,
+        // NOT an engine-native AgentTask.
+        let kind = &def.element("agent").unwrap().kind;
+        assert!(
+            matches!(kind, crate::model::ElementKind::ServiceTask { .. }),
+            "expected the ad-hoc agent container to be a ServiceTask, got {kind:?}"
+        );
+        // The contained tool activity is pruned from the executable graph.
+        assert!(
+            def.element("tool").is_none(),
+            "expected the ad-hoc tool `tool` to be pruned from the executable graph"
+        );
+    }
+
+    #[test]
     fn should_reject_an_unknown_agent_type() {
         let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
