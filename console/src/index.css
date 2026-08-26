@@ -1,4 +1,19 @@
+/*
+ * Console entry stylesheet.
+ *
+ * Import order matters:
+ *   1. Tailwind v4 (preflight + utilities).
+ *   2. The canonical `--nano-*` palette — the single source of truth shared with
+ *      the Urban runtime, imported from `@nanobpm/nano-app-schema/tokens.css`
+ *      (issue #1005). No palette hex is inlined here or in theme/tokens.css.
+ *   3. `theme/tokens.css` — maps those `--nano-*` properties onto Tailwind
+ *      utilities (`@theme inline`).
+ *
+ * Base document styling and widget overrides follow. Mobile-first CSS (unit A0)
+ * appends at the end of this file — keep new sections below the existing rules.
+ */
 @import "tailwindcss";
+@import "@nanobpm/nano-app-schema/tokens.css";
 @import "./theme/tokens.css";
 
 html,
@@ -205,3 +220,9 @@ body {
 .markdown-preview img {
   max-width: 100%;
 }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Mobile-first console styles (unit A0) append below this line.
+ * Keep palette/token definitions out of here — they live in the shared
+ * `@nanobpm/nano-app-schema/tokens.css` imported at the top of this file.
+ * ───────────────────────────────────────────────────────────────────────── */

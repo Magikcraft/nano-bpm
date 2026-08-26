@@ -5,74 +5,20 @@
  * one of the `--nano-*` custom properties below. A theme is nothing more than
  * a set of values for these properties:
  *
- *   - the built-in dark/light themes are the two blocks below, switched by
- *     `data-appearance` on <html> (set by ThemeProvider / the boot script);
+ *   - the built-in dark/light palette values live in ONE place —
+ *     `@nanobpm/nano-app-schema/tokens.css` (issue #1005) — imported by
+ *     `index.css` before this file; they are switched by `data-appearance` on
+ *     <html> (set by ThemeProvider / the boot script). The Urban runtime inlines
+ *     the same palette from the package's `./tokens` map, so the console and the
+ *     App renderer can never carry divergent hex again;
  *   - theme packs (nano-ide `kind: "theme"` extensions) and imported theme
  *     JSON override the same properties inline on <html>.
  *
- * The token vocabulary (see themes.ts TOKEN_KEYS) is deliberately small so a
- * theme pack can restyle the whole console with ~18 colours.
+ * The token vocabulary (see themes.ts TOKEN_KEYS, locked to the schema's
+ * TOKEN_KEYS by tokens.drift.test.ts) is deliberately small so a theme pack can
+ * restyle the whole console with ~18 colours. This file only maps those tokens
+ * onto Tailwind utilities — it carries no literal palette hex.
  */
-
-:root,
-:root[data-appearance="dark"] {
-  color-scheme: dark;
-
-  /* Surfaces, from page background up to raised cards. */
-  --nano-app: #0b0b10;
-  --nano-panel: #10101a;
-  --nano-raised: #16161f;
-  --nano-inset: #08080c;
-  --nano-hover: #1e1e2a;
-
-  /* Borders. */
-  --nano-edge: #24242f;
-  --nano-edge-strong: #383848;
-
-  /* Text. */
-  --nano-text: #f2f2f7;
-  --nano-text-muted: #a3a3b2;
-  --nano-text-faint: #6e6e80;
-
-  /* Brand accent (+ secondary accent used in gradients). */
-  --nano-accent: #8b5cf6;
-  --nano-accent-strong: #a78bfa;
-  --nano-accent-2: #22d3ee;
-  --nano-on-accent: #ffffff;
-
-  /* Status. */
-  --nano-ok: #34d399;
-  --nano-warn: #fbbf24;
-  --nano-danger: #fb7185;
-  --nano-info: #38bdf8;
-}
-
-:root[data-appearance="light"] {
-  color-scheme: light;
-
-  --nano-app: #f5f5f9;
-  --nano-panel: #fdfdfe;
-  --nano-raised: #ffffff;
-  --nano-inset: #ededf3;
-  --nano-hover: #e8e8f0;
-
-  --nano-edge: #e2e2ea;
-  --nano-edge-strong: #c5c5d4;
-
-  --nano-text: #1a1a22;
-  --nano-text-muted: #565664;
-  --nano-text-faint: #8c8c9c;
-
-  --nano-accent: #7c3aed;
-  --nano-accent-strong: #6d28d9;
-  --nano-accent-2: #0891b2;
-  --nano-on-accent: #ffffff;
-
-  --nano-ok: #059669;
-  --nano-warn: #b45309;
-  --nano-danger: #e11d48;
-  --nano-info: #0369a1;
-}
 
 /*
  * Tailwind v4 utility mapping. `inline` keeps the var() reference in the

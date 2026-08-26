@@ -18,6 +18,8 @@ wire shape.
 | `src/symbol-index.ts` | The **project symbol index** (ADR 0029): parses the project's BPMN/DMN/form files into the ids/shapes the manifest references. |
 | `src/validate.ts` | The **fail-closed validator** (ADR 0027 §4): schema shape + cross-reference rules, with JSON-pointer diagnostics. |
 | `src/index.ts` | Package entry — re-exports the types, the index, and the validator. |
+| `src/tokens.ts` | The canonical **`--nano-*` colour palette** (issue #1005) — the machine-readable map + CSS renderer behind the `./tokens` and `./tokens.css` subpath exports. |
+| `tokens.css` | **Generated** palette CSS (`:root` custom properties) — the `./tokens.css` subpath export the console imports. Committed; regenerate with `npm run build`. |
 | `examples/*.nano.app.json` | Valid example manifests (fixtures — must pass validation). |
 | `examples/invalid/*.nano.app.json` | Fixtures that must be **rejected** (proves the schema is fail-closed, ADR 0027 §4). |
 | `test/` | `node --test` unit tests + model fixtures for the index and validator. |
@@ -53,6 +55,31 @@ resolve — within the manifest or against the symbol index. These are the same 
 rules the three gates (console save, `deno compile`, App boot) enforce, so a
 mistyped id becomes an inline marker instead of a silent runtime no-op.
 
+
+## The token palette (`./tokens`, `./tokens.css`) — issue #1005
+
+The `--nano-*` colour palette is part of the same shared presentation contract as
+the schema, so it ships as **subpath exports of this one package** rather than a
+separate npm unit — its only consumers (the console and the Urban runtime) are
+exactly the two that already depend on `@nanobpm/nano-app-schema`. The palette
+values live once in `src/tokens.ts` (`NANO_PALETTE`), and are exposed two ways:
+
+```ts
+// Machine-readable map — the console drift test binds against it; the Urban
+// runtime imports it at gen-runtime time to inline the palette.
+import { NANO_PALETTE, TOKEN_KEYS, tokenCssVar, renderPaletteCss } from "@nanobpm/nano-app-schema/tokens";
+```
+
+```css
+/* The palette as :root custom properties — the console @imports this in place
+   of any inline hex, so its rendered theme is byte-identical. */
+@import "@nanobpm/nano-app-schema/tokens.css";
+```
+
+`tokens.css` is **generated** from `NANO_PALETTE` by `npm run build`; a unit test
+locks the committed CSS to the map so the two can never drift. The console's own
+`tokens.drift.test.ts` additionally locks the console's `TOKEN_KEYS`/`cssVar()` to
+these exports — the build-time guard that replaces the old runtime-only bridge.
 
 ## TypeScript-only, by design
 
