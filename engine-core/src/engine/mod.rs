@@ -751,9 +751,11 @@ impl Engine {
         // 3. The referenced element instance must be active and belong to the
         //    same logical element (so a re-entry key is a fresh activation of the
         //    same element, not a foreign one). It may live in another process
-        //    instance only when owned by this same agent instance — cross-owner
-        //    references are rejected as a conflict in step 4.
-        let (_active_pi, active_element_id) = self
+        //    instance only when this same agent instance *already* owns it —
+        //    a fresh (unowned) re-entry key must belong to the agent instance's
+        //    own process instance (step 4a); cross-owner references are rejected
+        //    as a conflict in step 4.
+        let (active_pi, active_element_id) = self
             .resolve_active_element_instance(element_instance_key)
             .ok_or(EngineError::AgentInstanceElementInstanceInactive {
                 element_instance_key,
@@ -771,6 +773,18 @@ impl Engine {
                     conflicting_agent_instance_key: owner,
                 });
             }
+        }
+        // 4a. A fresh (not already owned by this agent instance) re-entry key must
+        //     live in this agent instance's own process instance. An element
+        //     instance in a *foreign* process instance that merely shares the
+        //     element id — and is not agent-eligible, so no owner minted it —
+        //     would otherwise be linkable and corrupt ownership/re-entry tracking.
+        if !updated
+            .element_instance_keys
+            .contains(&element_instance_key)
+            && active_pi != process_instance_key
+        {
+            return Err(EngineError::AgentInstanceOwnershipMismatch { agent_instance_key });
         }
         // 5. The target status (if any) must be an active state.
         if let Some(target) = status {

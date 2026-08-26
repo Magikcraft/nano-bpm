@@ -191,24 +191,30 @@ pub struct AgentInstanceMetrics {
 
 impl AgentInstanceMetrics {
     /// This counter set with `delta` folded in (each field summed). Counters
-    /// only ever grow, so this is a saturating add. Used by the UPDATE processor
-    /// to compute the post-batch totals it both limit-checks and stores, keeping
-    /// the accumulation in one place.
+    /// only ever grow, so this is a saturating add and each delta field is
+    /// **clamped to `>= 0`** before accumulation: a negative delta would
+    /// otherwise decrease a counter (even below zero), breaking the
+    /// "counters only ever grow" invariant and letting an UPDATE bypass
+    /// [`AgentInstanceLimits::first_breach`] enforcement. Used by the UPDATE
+    /// processor to compute the post-batch totals it both limit-checks and
+    /// stores, keeping the accumulation in one place.
     pub fn with_delta(&self, delta: &AgentInstanceMetricsDelta) -> AgentInstanceMetrics {
         AgentInstanceMetrics {
-            input_tokens: self.input_tokens.saturating_add(delta.input_tokens),
-            output_tokens: self.output_tokens.saturating_add(delta.output_tokens),
+            input_tokens: self.input_tokens.saturating_add(delta.input_tokens.max(0)),
+            output_tokens: self
+                .output_tokens
+                .saturating_add(delta.output_tokens.max(0)),
             reasoning_token_count: self
                 .reasoning_token_count
-                .saturating_add(delta.reasoning_token_count),
+                .saturating_add(delta.reasoning_token_count.max(0)),
             cache_creation_token_count: self
                 .cache_creation_token_count
-                .saturating_add(delta.cache_creation_token_count),
+                .saturating_add(delta.cache_creation_token_count.max(0)),
             cache_read_token_count: self
                 .cache_read_token_count
-                .saturating_add(delta.cache_read_token_count),
-            model_calls: self.model_calls.saturating_add(delta.model_calls),
-            tool_calls: self.tool_calls.saturating_add(delta.tool_calls),
+                .saturating_add(delta.cache_read_token_count.max(0)),
+            model_calls: self.model_calls.saturating_add(delta.model_calls.max(0)),
+            tool_calls: self.tool_calls.saturating_add(delta.tool_calls.max(0)),
         }
     }
 }

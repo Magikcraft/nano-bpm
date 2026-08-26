@@ -18036,6 +18036,111 @@ fn agent_instance_update_with_conflicting_instance_is_rejected() {
 }
 
 #[test]
+fn agent_instance_update_with_foreign_process_element_instance_is_rejected() {
+    use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus};
+    // A *different* process whose active element merely shares the id "agent"
+    // but is not agent-eligible (a userTask, so no owning AgentInstance is
+    // minted). Referencing that foreign, unowned element instance from an UPDATE
+    // must be rejected as an ownership mismatch — it would otherwise be linked as
+    // a re-entry key and corrupt ownership/re-entry tracking across process
+    // instances.
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let foreign_xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="foreign-proc" isExecutable="true">
+          <bpmn:startEvent id="start" />
+          <bpmn:userTask id="agent" />
+          <bpmn:endEvent id="end" />
+          <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="end" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(foreign_xml).unwrap().remove(0);
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("foreign-proc"))
+        .unwrap();
+    let foreign_eik = events
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivated {
+                element_instance_key,
+                element_id,
+                ..
+            } if element_id == "agent" => Some(*element_instance_key),
+            _ => None,
+        })
+        .expect("the foreign userTask should activate and wait");
+
+    let err = engine
+        .apply_command(Command::UpdateAgentInstance {
+            agent_instance_key: aik,
+            element_instance_key: foreign_eik,
+            element_id: "agent".to_string(),
+            process_instance_key: pi,
+            status: Some(AgentInstanceStatus::Thinking),
+            metrics: AgentInstanceMetricsDelta::default(),
+            tools: None,
+            history: vec![],
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::AgentInstanceOwnershipMismatch { .. }
+    ));
+}
+
+#[test]
+fn agent_instance_update_clamps_negative_metric_deltas() {
+    use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus};
+    // First accumulate some real usage.
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+    engine
+        .apply_command(update_agent(
+            aik,
+            eik,
+            pi,
+            AgentInstanceStatus::Thinking,
+            AgentInstanceMetricsDelta {
+                input_tokens: 100,
+                output_tokens: 40,
+                model_calls: 3,
+                tool_calls: 2,
+                ..Default::default()
+            },
+            vec![],
+        ))
+        .unwrap();
+
+    // A negative delta must NOT decrease the (monotonic) counters: each field is
+    // clamped to >= 0, so the totals are unchanged. This keeps limit enforcement
+    // impossible to bypass by "refunding" prior usage.
+    engine
+        .apply_command(update_agent(
+            aik,
+            eik,
+            pi,
+            AgentInstanceStatus::Thinking,
+            AgentInstanceMetricsDelta {
+                input_tokens: -1_000,
+                output_tokens: -1_000,
+                model_calls: -10,
+                tool_calls: -10,
+                ..Default::default()
+            },
+            vec![],
+        ))
+        .unwrap();
+    let stored = stored_agent_instance(&engine, pi, aik);
+    assert_eq!(stored.metrics.input_tokens, 100);
+    assert_eq!(stored.metrics.output_tokens, 40);
+    assert_eq!(stored.metrics.model_calls, 3);
+    assert_eq!(stored.metrics.tool_calls, 2);
+}
+
+#[test]
 fn agent_instance_update_on_unknown_instance_is_rejected() {
     use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus};
     let (mut engine, pi, aik) = agent_instance_for_history();
