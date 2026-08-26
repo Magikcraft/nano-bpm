@@ -4,6 +4,8 @@
 // trusted* message means, so the console's node:test unit suite can cover the
 // routing table directly without a renderer.
 
+import { INSTANCE_DEEP_LINK_PARAM } from "../views/explorerFilters.ts";
+
 /// The sessionStorage key the host stashes a raw-XML definition preview under
 /// before navigating to `/explorer?preview=1`. The XML is carried out-of-band
 /// (in same-origin storage) rather than in the URL because a laid-out BPMN
@@ -39,8 +41,11 @@ export type AppViewMessageAction =
  *   whitelisted targets are honoured, and the path is constructed HERE from
  *   structured params (never a raw href from the app), so app/row data can't
  *   smuggle a path or scheme across the frame boundary. The `instance` key is
- *   trimmed and URL-encoded, mirroring the Explorer deep-link contract
- *   (`/console/explorer?instance=<key>`).
+ *   trimmed and URL-encoded, and the query param name is the single canonical
+ *   {@link INSTANCE_DEEP_LINK_PARAM} the standalone Explorer landing reads — so
+ *   the embedded (`hostNavigate`) and standalone
+ *   (`/console/explorer?instance=<key>`) deep-link paths provably converge on
+ *   the one mobile instance-view target instead of duplicating the wire name.
  */
 export function decideAppViewMessage(
   data: unknown,
@@ -60,7 +65,11 @@ export function decideAppViewMessage(
       if (typeof instance === "string" && instance.trim() !== "") {
         return {
           kind: "navigate",
-          path: "/explorer?instance=" + encodeURIComponent(instance.trim()),
+          path:
+            "/explorer?" +
+            INSTANCE_DEEP_LINK_PARAM +
+            "=" +
+            encodeURIComponent(instance.trim()),
         };
       }
     }

@@ -5,6 +5,11 @@ import {
   DEFINITION_PREVIEW_MAX_XML,
   DEFINITION_PREVIEW_STASH_KEY,
 } from "./appViewMessage.ts";
+import {
+  INSTANCE_DEEP_LINK_PARAM,
+  readInstanceParam,
+  explorerStackView,
+} from "../views/explorerFilters.ts";
 
 test("nano-app-ready asks the host to reply with the theme", () => {
   assert.deepEqual(decideAppViewMessage({ type: "nano-app-ready" }), {
@@ -32,6 +37,40 @@ test("the instance key is trimmed and URL-encoded (path built host-side, never a
     }),
     { kind: "navigate", path: "/explorer?instance=a%20b%2Fc%3Fd%3De" },
   );
+});
+
+// A6 deep-link convergence lock: the embedded (`hostNavigate` → processExplorer)
+// path and the standalone (`/console/explorer?instance=<key>`) landing must hit
+// the ONE mobile instance-view target. The bridge builds its query from A3's
+// canonical `INSTANCE_DEEP_LINK_PARAM`, and its output must be readable by the
+// same `readInstanceParam` the Explorer landing uses — so producer and consumer
+// can't silently drift onto different wire names. `explorerStackView` then
+// confirms a read key resolves to the mobile *detail* pane, not the list.
+test("A6: the embedded processExplorer path is consumable by the standalone Explorer landing", () => {
+  for (const key of [
+    "2251799813685249",
+    "  a b/c?d=e  ",
+    "weird=&key",
+    "key with spaces",
+  ]) {
+    const action = decideAppViewMessage({
+      type: "nano-navigate",
+      target: "processExplorer",
+      params: { instance: key },
+    });
+    assert.ok(action && action.kind === "navigate");
+
+    // The bridge uses the one canonical param name (not a hardcoded synonym).
+    const query = action.path.slice(action.path.indexOf("?") + 1);
+    const params = new URLSearchParams(query);
+    assert.ok(params.has(INSTANCE_DEEP_LINK_PARAM));
+
+    // The standalone landing reader recovers exactly the trimmed instance the
+    // app asked for, and that selection resolves to the mobile detail view.
+    const landed = readInstanceParam(params);
+    assert.equal(landed, key.trim());
+    assert.equal(explorerStackView(landed), "detail");
+  }
 });
 
 test("an unknown navigate target is ignored (whitelist, not passthrough)", () => {
