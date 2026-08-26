@@ -640,6 +640,29 @@ impl Command {
                 .iter()
                 .map(|a| a.element_id.len() as u64 + vars(&a.variables))
                 .sum(),
+            Command::CreateAgentInstance {
+                definition,
+                history,
+                ..
+            } => {
+                definition.approx_bytes()
+                    + history
+                        .iter()
+                        .map(crate::agent::AgentHistoryTurn::approx_bytes)
+                        .sum::<u64>()
+            }
+            Command::UpdateAgentInstance { tools, history, .. } => {
+                let tools: u64 = tools
+                    .iter()
+                    .flatten()
+                    .map(crate::agent::AgentTool::approx_bytes)
+                    .sum();
+                let history: u64 = history
+                    .iter()
+                    .map(crate::agent::AgentHistoryTurn::approx_bytes)
+                    .sum();
+                tools + history
+            }
             _ => 0,
         };
         BASE + payload
@@ -1049,6 +1072,60 @@ mod kind_tests {
         assert!(
             tick <= empty,
             "tick={tick} should be <= empty create={empty}"
+        );
+    }
+
+    #[test]
+    fn approx_bytes_scales_with_agent_instance_payload() {
+        use crate::agent::{
+            AgentDefinition, AgentHistoryContent, AgentHistoryContentType, AgentHistoryTurn,
+            AgentTool,
+        };
+        let big = "x".repeat(50_000);
+        let turn = AgentHistoryTurn {
+            content: vec![AgentHistoryContent {
+                content_type: AgentHistoryContentType::Text,
+                text: Some(big.clone()),
+                document_reference: None,
+                object: None,
+            }],
+            ..Default::default()
+        };
+
+        // A CREATE carrying a big history turn must be dominated by that payload,
+        // not underestimated to the fixed base (which would let the Raft batcher
+        // build an oversized log entry that fails to replicate).
+        let create = Command::CreateAgentInstance {
+            element_instance_key: 1,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![turn.clone()],
+        }
+        .approx_bytes();
+        assert!(
+            create >= 50_000,
+            "create history payload must dominate: create={create}"
+        );
+
+        // An UPDATE is metered across both its tools and history payloads.
+        let update = Command::UpdateAgentInstance {
+            agent_instance_key: 1,
+            element_instance_key: 2,
+            element_id: String::new(),
+            process_instance_key: 3,
+            status: None,
+            metrics: Default::default(),
+            tools: Some(vec![AgentTool {
+                name: big.clone(),
+                description: None,
+                element_id: None,
+            }]),
+            history: vec![turn],
+        }
+        .approx_bytes();
+        assert!(
+            update >= 100_000,
+            "update tools+history payload must dominate: update={update}"
         );
     }
 }

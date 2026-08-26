@@ -74,6 +74,23 @@ pub struct AgentDefinition {
     pub system_prompt: Option<String>,
 }
 
+impl AgentDefinition {
+    /// A cheap O(n) estimate of this definition's heap payload in bytes,
+    /// dominated by the (potentially large) system prompt. Used by
+    /// [`crate::command::Command::approx_bytes`] so the Raft propose batcher can
+    /// bound coalesced agent-instance command entries by bytes.
+    pub fn approx_bytes(&self) -> u64 {
+        opt_str_bytes(&self.model)
+            + opt_str_bytes(&self.provider)
+            + opt_str_bytes(&self.system_prompt)
+    }
+}
+
+/// The heap payload of an optional string field, in bytes (`0` when absent).
+fn opt_str_bytes(s: &Option<String>) -> u64 {
+    s.as_ref().map_or(0, |v| v.len() as u64)
+}
+
 /// A limit value meaning "no limit is configured".
 pub const AGENT_LIMIT_UNLIMITED: i64 = -1;
 
@@ -231,6 +248,15 @@ pub struct AgentTool {
     /// The BPMN element id of the tool element within the ad-hoc sub-process.
     #[cfg_attr(feature = "serde", serde(default))]
     pub element_id: Option<ElementId>,
+}
+
+impl AgentTool {
+    /// A cheap O(n) estimate of this tool's heap payload in bytes, used by
+    /// [`crate::command::Command::approx_bytes`] to meter agent-instance command
+    /// sizes for the Raft propose batcher.
+    pub fn approx_bytes(&self) -> u64 {
+        self.name.len() as u64 + opt_str_bytes(&self.description) + opt_str_bytes(&self.element_id)
+    }
 }
 
 /// The AgentInstance status state machine (`AgentInstanceStatus`).
@@ -461,6 +487,15 @@ pub struct AgentHistoryContent {
     pub object: Option<String>,
 }
 
+impl AgentHistoryContent {
+    /// A cheap O(n) estimate of this content block's heap payload in bytes.
+    pub fn approx_bytes(&self) -> u64 {
+        opt_str_bytes(&self.text)
+            + opt_str_bytes(&self.document_reference)
+            + opt_str_bytes(&self.object)
+    }
+}
+
 /// A tool call recorded on an AgentHistory turn
 /// (`toolCalls[]{toolCallId,toolName,elementId,arguments}`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -476,6 +511,17 @@ pub struct AgentHistoryToolCall {
     /// The tool arguments, as an opaque JSON string.
     #[cfg_attr(feature = "serde", serde(default))]
     pub arguments: Option<String>,
+}
+
+impl AgentHistoryToolCall {
+    /// A cheap O(n) estimate of this tool call's heap payload in bytes,
+    /// dominated by the (potentially large) opaque `arguments` JSON.
+    pub fn approx_bytes(&self) -> u64 {
+        self.tool_call_id.len() as u64
+            + self.tool_name.len() as u64
+            + opt_str_bytes(&self.element_id)
+            + opt_str_bytes(&self.arguments)
+    }
 }
 
 /// Per-turn LLM metrics (`metrics{...}`) recorded on an AgentHistory turn.
@@ -611,7 +657,34 @@ pub struct AgentHistoryTurn {
     pub job_lease: u64,
 }
 
-/// A single, materialised AgentHistory turn record (the `AgentHistoryRecordValue`,
+impl AgentHistoryTurn {
+    /// A cheap O(n) estimate of this turn's heap payload in bytes, summing its
+    /// content blocks, tool calls, available tools, and string fields. Used by
+    /// [`crate::command::Command::approx_bytes`] so the Raft propose batcher can
+    /// bound coalesced agent-instance command entries by bytes rather than count
+    /// (large histories otherwise underestimate to zero and can form oversized
+    /// log entries that fail to replicate within the AppendEntries timeout).
+    pub fn approx_bytes(&self) -> u64 {
+        let content: u64 = self
+            .content
+            .iter()
+            .map(AgentHistoryContent::approx_bytes)
+            .sum();
+        let tool_calls: u64 = self
+            .tool_calls
+            .iter()
+            .map(AgentHistoryToolCall::approx_bytes)
+            .sum();
+        let tools: u64 = self.tools.iter().map(AgentTool::approx_bytes).sum();
+        content
+            + tool_calls
+            + tools
+            + opt_str_bytes(&self.system_prompt)
+            + opt_str_bytes(&self.history_item_id)
+            + opt_str_bytes(&self.model)
+            + opt_str_bytes(&self.provider)
+    }
+}
 /// Camunda stable/8.10). One is produced per [`AgentHistoryTurn`] appended.
 ///
 /// Records are held append-only in
