@@ -720,6 +720,7 @@ export default function Projects() {
               onStart={() => void start(p)}
               onStop={() => void stop(p)}
               lifecycleBusy={lifecycleBusy === p.name}
+              lifecycleLocked={lifecycleBusy !== null}
               onUpdate={
                 p.updateAvailable && p.source !== "path"
                   ? () => void startUpdate(toUpdateTarget(p))
@@ -842,6 +843,7 @@ function ProjectTile({
   onStop,
   onUpdate,
   lifecycleBusy = false,
+  lifecycleLocked = false,
   updating = false,
   updateDisabled = false,
 }: {
@@ -855,6 +857,7 @@ function ProjectTile({
   onStop: () => void;
   onUpdate?: () => void;
   lifecycleBusy?: boolean;
+  lifecycleLocked?: boolean;
   updating?: boolean;
   updateDisabled?: boolean;
 }) {
@@ -871,6 +874,7 @@ function ProjectTile({
         onStop={onStop}
         onUpdate={onUpdate}
         lifecycleBusy={lifecycleBusy}
+        lifecycleLocked={lifecycleLocked}
         updating={updating}
         updateDisabled={updateDisabled}
       />
@@ -1026,6 +1030,7 @@ function MobileProjectTile({
   onStop,
   onUpdate,
   lifecycleBusy,
+  lifecycleLocked,
   updating,
   updateDisabled,
 }: {
@@ -1038,6 +1043,7 @@ function MobileProjectTile({
   onStop: () => void;
   onUpdate?: () => void;
   lifecycleBusy: boolean;
+  lifecycleLocked: boolean;
   updating: boolean;
   updateDisabled: boolean;
 }) {
@@ -1096,7 +1102,7 @@ function MobileProjectTile({
             variant="danger"
             className="nano-touch w-full"
             onClick={onStop}
-            disabled={lifecycleBusy}
+            disabled={lifecycleLocked}
             aria-busy={lifecycleBusy}
             aria-label={`Stop ${title}`}
           >
@@ -1107,7 +1113,7 @@ function MobileProjectTile({
             variant="primary"
             className="nano-touch w-full"
             onClick={onStart}
-            disabled={lifecycleBusy}
+            disabled={lifecycleLocked}
             aria-busy={lifecycleBusy}
             aria-label={`Start ${title}`}
           >
