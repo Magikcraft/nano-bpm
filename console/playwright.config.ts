@@ -87,9 +87,10 @@ export default defineConfig({
   // paper over either.
   // One worker: the suite shares the vite dev servers, and running specs in
   // parallel against them made first-hit lazy-chunk compilation the slowest thing
-  // in the run — which showed up as different tests failing on different runs. A
-  // deterministic serial run beats a flaky parallel one, and this repo does not
-  // tolerate flaky tests.
+  // in the run — a race whose losers surfaced as different tests failing on
+  // different runs. That is a real ordering defect, not something to absorb: a
+  // deterministic serial run removes the race so every run exercises the same
+  // path, which is what this repo's no-intermittent-failures rule requires.
   workers: 1,
   retries: 0,
   forbidOnly: !!process.env.CI,
