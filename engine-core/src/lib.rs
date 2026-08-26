@@ -94,8 +94,8 @@ pub use agent::{
     AgentDefinition, AgentHistoryCommitStatus, AgentHistoryContent, AgentHistoryContentType,
     AgentHistoryIntent, AgentHistoryMetrics, AgentHistoryRecord, AgentHistoryRole,
     AgentHistoryToolCall, AgentHistoryTurn, AgentInstance, AgentInstanceIntent,
-    AgentInstanceLimits, AgentInstanceMetrics, AgentInstanceStatus, AgentTool, AgentType,
-    AGENT_LIMIT_UNLIMITED,
+    AgentInstanceLimits, AgentInstanceMetrics, AgentInstanceMetricsDelta, AgentInstanceStatus,
+    AgentLimitKind, AgentTool, AgentType, AGENT_LIMIT_UNLIMITED,
 };
 pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT};
 #[cfg(feature = "serde")]

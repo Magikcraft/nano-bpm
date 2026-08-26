@@ -1001,6 +1001,29 @@ pub enum Event {
         agent_instance: crate::agent::AgentInstance,
     },
 
+    /// An engine-native AgentInstance was updated (Camunda
+    /// `AgentInstanceIntent.UPDATED`, stable/8.10). Emitted by the UPDATE
+    /// processor after it validated ownership, advanced the status to one of the
+    /// *active* states, accumulated the metric deltas (within the configured
+    /// limits) and replaced the tool set. The associated history batch is
+    /// carried by separate `AgentHistoryCreated`/`AgentHistoryCommitted` events.
+    /// Carries the whole post-update record so state rebuilds by replay (the
+    /// applier upserts it).
+    AgentInstanceUpdated {
+        instance_key: Key,
+        agent_instance: crate::agent::AgentInstance,
+    },
+
+    /// An engine-native AgentInstance was completed (Camunda
+    /// `AgentInstanceIntent.COMPLETED`, stable/8.10). Emitted by the COMPLETE
+    /// processor: the record moves to the terminal `COMPLETED` status (the only
+    /// path to it). Carries the whole post-completion record so state rebuilds
+    /// by replay (the applier upserts it).
+    AgentInstanceCompleted {
+        instance_key: Key,
+        agent_instance: crate::agent::AgentInstance,
+    },
+
     /// One AgentHistory turn was appended to an agent instance's append-only
     /// turn log (Camunda `AgentHistoryIntent.CREATED`, stable/8.10). Emitted
     /// once per turn by the batch-append behavior; the record is materialised
@@ -1129,6 +1152,8 @@ impl Event {
             Event::ProcessInstanceTerminating { instance_key } => Some(*instance_key),
             Event::ProcessInstanceMigrated { instance_key, .. } => Some(*instance_key),
             Event::AgentInstanceCreated { instance_key, .. } => Some(*instance_key),
+            Event::AgentInstanceUpdated { instance_key, .. }
+            | Event::AgentInstanceCompleted { instance_key, .. } => Some(*instance_key),
             Event::AgentHistoryCreated { instance_key, .. }
             | Event::AgentHistoryCommitted { instance_key, .. }
             | Event::AgentHistoryDiscarded { instance_key, .. } => Some(*instance_key),
@@ -1428,7 +1453,9 @@ impl Event {
             | Event::UserTaskTransitionDeferred { user_task_key, .. }
             | Event::UserTaskCorrectionsApplied { user_task_key, .. }
             | Event::UserTaskTransitionResolved { user_task_key, .. } => m = m.max(*user_task_key),
-            Event::AgentInstanceCreated { agent_instance, .. } => {
+            Event::AgentInstanceCreated { agent_instance, .. }
+            | Event::AgentInstanceUpdated { agent_instance, .. }
+            | Event::AgentInstanceCompleted { agent_instance, .. } => {
                 m = m
                     .max(agent_instance.agent_instance_key)
                     .max(agent_instance.element_instance_key)

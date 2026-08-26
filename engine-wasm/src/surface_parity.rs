@@ -176,18 +176,20 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
                 "external ad-hoc activity activation is a server/REST seam; the studio wasm engine \
                  drives ad-hoc tools through the agent-job path, not this direct command",
         },
-        // AgentInstance write commands (engine-native AgentInstance parity). In
-        // S1 these are record/intent stubs: the CREATE/UPDATE/COMPLETE processors
-        // and their TestEngine drivers land in S3, so there is no `#[wasm_bindgen]`
-        // method to surface them through yet. Classified `NotSurfaced` until then.
+        // AgentInstance write commands (engine-native AgentInstance parity). The
+        // CREATE/UPDATE/COMPLETE lifecycle processors land in S3 (this slice),
+        // but no `#[wasm_bindgen]` TestEngine driver exposes them through the wasm
+        // surface yet — that driver (and the JSON wire contract) is a later slice
+        // (S6, alongside the regenerated `pkg/` artifact). Classified
+        // `NotSurfaced` until that driver exists.
         Command::CreateAgentInstance { .. } => Surface::NotSurfaced {
-            reason: "AgentInstance CREATE processor + TestEngine driver arrive in agent-instance-parity S3",
+            reason: "AgentInstance CREATE processor landed (S3); its TestEngine driver arrives in agent-instance-parity S6",
         },
         Command::UpdateAgentInstance { .. } => Surface::NotSurfaced {
-            reason: "AgentInstance UPDATE processor + TestEngine driver arrive in agent-instance-parity S3",
+            reason: "AgentInstance UPDATE processor landed (S3); its TestEngine driver arrives in agent-instance-parity S6",
         },
         Command::CompleteAgentInstance { .. } => Surface::NotSurfaced {
-            reason: "AgentInstance COMPLETE processor + TestEngine driver arrive in agent-instance-parity S3",
+            reason: "AgentInstance COMPLETE processor landed (S3); its TestEngine driver arrives in agent-instance-parity S6",
         },
     }
 }

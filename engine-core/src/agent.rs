@@ -74,6 +74,23 @@ pub struct AgentDefinition {
     pub system_prompt: Option<String>,
 }
 
+impl AgentDefinition {
+    /// A cheap O(n) estimate of this definition's heap payload in bytes,
+    /// dominated by the (potentially large) system prompt. Used by
+    /// [`crate::command::Command::approx_bytes`] so the Raft propose batcher can
+    /// bound coalesced agent-instance command entries by bytes.
+    pub fn approx_bytes(&self) -> u64 {
+        opt_str_bytes(&self.model)
+            + opt_str_bytes(&self.provider)
+            + opt_str_bytes(&self.system_prompt)
+    }
+}
+
+/// The heap payload of an optional string field, in bytes (`0` when absent).
+fn opt_str_bytes(s: &Option<String>) -> u64 {
+    s.as_ref().map_or(0, |v| v.len() as u64)
+}
+
 /// A limit value meaning "no limit is configured".
 pub const AGENT_LIMIT_UNLIMITED: i64 = -1;
 
@@ -100,6 +117,80 @@ impl Default for AgentInstanceLimits {
     }
 }
 
+/// The kind of limit a batch would breach — the single source of truth for
+/// which counter a configured (`!= -1`) limit governs. Returned by
+/// [`AgentInstanceLimits::first_breach`] so the processor can report a precise
+/// rejection without re-deriving the mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentLimitKind {
+    /// Total tokens (`input_tokens + output_tokens`) exceeded `max_tokens`.
+    Tokens,
+    /// `model_calls` exceeded `max_model_calls`.
+    ModelCalls,
+    /// `tool_calls` exceeded `max_tool_calls`.
+    ToolCalls,
+}
+
+impl AgentLimitKind {
+    /// The canonical label used in rejection messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentLimitKind::Tokens => "maxTokens",
+            AgentLimitKind::ModelCalls => "maxModelCalls",
+            AgentLimitKind::ToolCalls => "maxToolCalls",
+        }
+    }
+}
+
+impl AgentInstanceLimits {
+    /// The first limit that `metrics` breaches, or `None` when every configured
+    /// limit still has headroom. A limit of `-1` ([`AGENT_LIMIT_UNLIMITED`]) is
+    /// unbounded and never breached. `max_tokens` governs the combined
+    /// `input_tokens + output_tokens` total; `max_model_calls` / `max_tool_calls`
+    /// govern their same-named counters. This is the sole place the limit ->
+    /// counter mapping lives, so the CREATE/UPDATE processors enforce limits by
+    /// calling it rather than duplicating the comparison.
+    pub fn first_breach(&self, metrics: &AgentInstanceMetrics) -> Option<AgentLimitKind> {
+        let total_tokens = metrics.input_tokens.saturating_add(metrics.output_tokens);
+        if self.max_tokens != AGENT_LIMIT_UNLIMITED && total_tokens > self.max_tokens {
+            return Some(AgentLimitKind::Tokens);
+        }
+        if self.max_model_calls != AGENT_LIMIT_UNLIMITED
+            && metrics.model_calls > self.max_model_calls
+        {
+            return Some(AgentLimitKind::ModelCalls);
+        }
+        if self.max_tool_calls != AGENT_LIMIT_UNLIMITED && metrics.tool_calls > self.max_tool_calls
+        {
+            return Some(AgentLimitKind::ToolCalls);
+        }
+        None
+    }
+}
+
+/// Metric increments applied to an agent instance's aggregate counters on
+/// UPDATE (Camunda 8.10 `AgentInstanceMetricsDelta`). Each field is a
+/// non-negative delta folded into the running totals; omitted fields default to
+/// `0` (no change). Mirrors the spec `AgentInstanceMetricsDelta` request shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AgentInstanceMetricsDelta {
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub input_tokens: i64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub output_tokens: i64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub reasoning_token_count: i64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cache_creation_token_count: i64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cache_read_token_count: i64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub model_calls: i64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tool_calls: i64,
+}
+
 /// Aggregated metrics for an agent instance across all loop iterations. All
 /// counters start at zero and only grow (UPDATE processors — a later slice —
 /// advance them).
@@ -115,6 +206,36 @@ pub struct AgentInstanceMetrics {
     pub tool_calls: i64,
 }
 
+impl AgentInstanceMetrics {
+    /// This counter set with `delta` folded in (each field summed). Counters
+    /// only ever grow, so this is a saturating add and each delta field is
+    /// **clamped to `>= 0`** before accumulation: a negative delta would
+    /// otherwise decrease a counter (even below zero), breaking the
+    /// "counters only ever grow" invariant and letting an UPDATE bypass
+    /// [`AgentInstanceLimits::first_breach`] enforcement. Used by the UPDATE
+    /// processor to compute the post-batch totals it both limit-checks and
+    /// stores, keeping the accumulation in one place.
+    pub fn with_delta(&self, delta: &AgentInstanceMetricsDelta) -> AgentInstanceMetrics {
+        AgentInstanceMetrics {
+            input_tokens: self.input_tokens.saturating_add(delta.input_tokens.max(0)),
+            output_tokens: self
+                .output_tokens
+                .saturating_add(delta.output_tokens.max(0)),
+            reasoning_token_count: self
+                .reasoning_token_count
+                .saturating_add(delta.reasoning_token_count.max(0)),
+            cache_creation_token_count: self
+                .cache_creation_token_count
+                .saturating_add(delta.cache_creation_token_count.max(0)),
+            cache_read_token_count: self
+                .cache_read_token_count
+                .saturating_add(delta.cache_read_token_count.max(0)),
+            model_calls: self.model_calls.saturating_add(delta.model_calls.max(0)),
+            tool_calls: self.tool_calls.saturating_add(delta.tool_calls.max(0)),
+        }
+    }
+}
+
 /// A tool available to the agent (`tools[]{name,description,elementId}`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -127,6 +248,15 @@ pub struct AgentTool {
     /// The BPMN element id of the tool element within the ad-hoc sub-process.
     #[cfg_attr(feature = "serde", serde(default))]
     pub element_id: Option<ElementId>,
+}
+
+impl AgentTool {
+    /// A cheap O(n) estimate of this tool's heap payload in bytes, used by
+    /// [`crate::command::Command::approx_bytes`] to meter agent-instance command
+    /// sizes for the Raft propose batcher.
+    pub fn approx_bytes(&self) -> u64 {
+        self.name.len() as u64 + opt_str_bytes(&self.description) + opt_str_bytes(&self.element_id)
+    }
 }
 
 /// The AgentInstance status state machine (`AgentInstanceStatus`).
@@ -357,6 +487,15 @@ pub struct AgentHistoryContent {
     pub object: Option<String>,
 }
 
+impl AgentHistoryContent {
+    /// A cheap O(n) estimate of this content block's heap payload in bytes.
+    pub fn approx_bytes(&self) -> u64 {
+        opt_str_bytes(&self.text)
+            + opt_str_bytes(&self.document_reference)
+            + opt_str_bytes(&self.object)
+    }
+}
+
 /// A tool call recorded on an AgentHistory turn
 /// (`toolCalls[]{toolCallId,toolName,elementId,arguments}`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -372,6 +511,17 @@ pub struct AgentHistoryToolCall {
     /// The tool arguments, as an opaque JSON string.
     #[cfg_attr(feature = "serde", serde(default))]
     pub arguments: Option<String>,
+}
+
+impl AgentHistoryToolCall {
+    /// A cheap O(n) estimate of this tool call's heap payload in bytes,
+    /// dominated by the (potentially large) opaque `arguments` JSON.
+    pub fn approx_bytes(&self) -> u64 {
+        self.tool_call_id.len() as u64
+            + self.tool_name.len() as u64
+            + opt_str_bytes(&self.element_id)
+            + opt_str_bytes(&self.arguments)
+    }
 }
 
 /// Per-turn LLM metrics (`metrics{...}`) recorded on an AgentHistory turn.
@@ -507,7 +657,34 @@ pub struct AgentHistoryTurn {
     pub job_lease: u64,
 }
 
-/// A single, materialised AgentHistory turn record (the `AgentHistoryRecordValue`,
+impl AgentHistoryTurn {
+    /// A cheap O(n) estimate of this turn's heap payload in bytes, summing its
+    /// content blocks, tool calls, available tools, and string fields. Used by
+    /// [`crate::command::Command::approx_bytes`] so the Raft propose batcher can
+    /// bound coalesced agent-instance command entries by bytes rather than count
+    /// (large histories otherwise underestimate to zero and can form oversized
+    /// log entries that fail to replicate within the AppendEntries timeout).
+    pub fn approx_bytes(&self) -> u64 {
+        let content: u64 = self
+            .content
+            .iter()
+            .map(AgentHistoryContent::approx_bytes)
+            .sum();
+        let tool_calls: u64 = self
+            .tool_calls
+            .iter()
+            .map(AgentHistoryToolCall::approx_bytes)
+            .sum();
+        let tools: u64 = self.tools.iter().map(AgentTool::approx_bytes).sum();
+        content
+            + tool_calls
+            + tools
+            + opt_str_bytes(&self.system_prompt)
+            + opt_str_bytes(&self.history_item_id)
+            + opt_str_bytes(&self.model)
+            + opt_str_bytes(&self.provider)
+    }
+}
 /// Camunda stable/8.10). One is produced per [`AgentHistoryTurn`] appended.
 ///
 /// Records are held append-only in

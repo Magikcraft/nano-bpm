@@ -1931,6 +1931,24 @@ pub fn apply(state: &mut State, event: &Event) {
             }
         }
 
+        // UPDATE and COMPLETE both replay as an upsert of the whole record — the
+        // event carries the full post-transition value, mirroring
+        // `AgentInstanceCreated`, so state rebuilds identically on replay.
+        Event::AgentInstanceUpdated {
+            instance_key,
+            agent_instance,
+        }
+        | Event::AgentInstanceCompleted {
+            instance_key,
+            agent_instance,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance
+                    .agent_instances
+                    .insert(agent_instance.agent_instance_key, agent_instance.clone());
+            }
+        }
+
         Event::AgentHistoryCreated {
             instance_key,
             record,

@@ -374,28 +374,53 @@ pub enum Command {
     /// stable/8.10; `POST /v2/agent-instances`). The engine infers
     /// `processInstanceKey`, `elementId`, `processDefinitionKey` and `tenantId`
     /// from the referenced `element_instance_key`. The lifecycle *processor* that
-    /// validates and applies this command is a later slice (S3); this variant is
-    /// defined now so the record/intent surface is wired end-to-end. It is not
+    /// validates and applies this command landed in this slice (S3). It is not
     /// yet callable from the wasm `TestEngine` (classified `NotSurfaced` in
-    /// `engine-wasm`) until that S3 processor lands.
+    /// `engine-wasm`) until its driver lands in agent-instance-parity S6.
     CreateAgentInstance {
         /// The key of the AI Agent Sub-process / AI Agent Task element instance.
         element_instance_key: Key,
         /// Static definition set once at creation (model/provider/systemPrompt).
         definition: crate::agent::AgentDefinition,
         /// Limits for the agent execution; `None` = all limits default to `-1`.
+        /// An explicit value wins; absent that, the last `limits` carried by a
+        /// turn in `history` (a CONFIGURATION item) is used; absent both, limits
+        /// default to unlimited (`-1/-1/-1`).
         #[cfg_attr(
             feature = "serde",
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         limits: Option<crate::agent::AgentInstanceLimits>,
+        /// An optional initial batch of AgentHistory turns applied (append +
+        /// commit, slice S2 behavior) at creation. Each becomes its own
+        /// AGENT_HISTORY record.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        history: Vec<crate::agent::AgentHistoryTurn>,
     },
     /// Update an engine-native AgentInstance (Camunda `AgentInstanceIntent.UPDATE`,
     /// stable/8.10; `PATCH /v2/agent-instances/{key}`): advance its status
-    /// (to one of the *active* states) and append the turn history. The
-    /// processor and history application are a later slice (S3/S2).
+    /// (to one of the *active* states), accumulate metric deltas, replace the
+    /// tool set, and append the turn history (slice S2 behavior). The processor
+    /// enforces the configured limits.
     UpdateAgentInstance {
         agent_instance_key: Key,
+        /// The element instance asserting ownership of this update. Must be an
+        /// *active* element instance of the same element as the target agent
+        /// instance; a new (re-entry) key is appended to the instance's
+        /// `element_instance_keys`.
+        #[cfg_attr(feature = "serde", serde(default))]
+        element_instance_key: Key,
+        /// The element id the caller believes this agent instance runs on; must
+        /// match the stored instance (guards against a stale/misrouted update).
+        #[cfg_attr(feature = "serde", serde(default))]
+        element_id: crate::model::ElementId,
+        /// The process instance key the caller believes owns this agent
+        /// instance; must match the stored instance.
+        #[cfg_attr(feature = "serde", serde(default))]
+        process_instance_key: Key,
         /// The target status; must be one of the *active* states (`COMPLETED`
         /// is not settable via UPDATE — it is reached only via COMPLETE).
         #[cfg_attr(
@@ -403,10 +428,29 @@ pub enum Command {
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         status: Option<crate::agent::AgentInstanceStatus>,
+        /// Metric increments folded into the instance's running totals. The
+        /// processor rejects the batch if the resulting totals would breach a
+        /// configured (`!= -1`) limit.
+        #[cfg_attr(feature = "serde", serde(default))]
+        metrics: crate::agent::AgentInstanceMetricsDelta,
+        /// The new tool set (replaces the stored one) when present.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        tools: Option<Vec<crate::agent::AgentTool>>,
+        /// A batch of AgentHistory turns appended (append + commit, slice S2
+        /// behavior) as part of this update.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        history: Vec<crate::agent::AgentHistoryTurn>,
     },
     /// Complete an engine-native AgentInstance (Camunda `AgentInstanceIntent.COMPLETE`,
-    /// stable/8.10): drive it to `COMPLETED`. The drain processor is a later
-    /// slice (S3).
+    /// stable/8.10): drive it to `COMPLETED`. The completion processor landed in
+    /// this slice (S3); its wasm `TestEngine` surface is deferred (classified
+    /// `NotSurfaced` in `engine-wasm` until agent-instance-parity S6).
     CompleteAgentInstance { agent_instance_key: Key },
 }
 
@@ -596,6 +640,29 @@ impl Command {
                 .iter()
                 .map(|a| a.element_id.len() as u64 + vars(&a.variables))
                 .sum(),
+            Command::CreateAgentInstance {
+                definition,
+                history,
+                ..
+            } => {
+                definition.approx_bytes()
+                    + history
+                        .iter()
+                        .map(crate::agent::AgentHistoryTurn::approx_bytes)
+                        .sum::<u64>()
+            }
+            Command::UpdateAgentInstance { tools, history, .. } => {
+                let tools: u64 = tools
+                    .iter()
+                    .flatten()
+                    .map(crate::agent::AgentTool::approx_bytes)
+                    .sum();
+                let history: u64 = history
+                    .iter()
+                    .map(crate::agent::AgentHistoryTurn::approx_bytes)
+                    .sum();
+                tools + history
+            }
             _ => 0,
         };
         BASE + payload
@@ -1005,6 +1072,60 @@ mod kind_tests {
         assert!(
             tick <= empty,
             "tick={tick} should be <= empty create={empty}"
+        );
+    }
+
+    #[test]
+    fn approx_bytes_scales_with_agent_instance_payload() {
+        use crate::agent::{
+            AgentDefinition, AgentHistoryContent, AgentHistoryContentType, AgentHistoryTurn,
+            AgentTool,
+        };
+        let big = "x".repeat(50_000);
+        let turn = AgentHistoryTurn {
+            content: vec![AgentHistoryContent {
+                content_type: AgentHistoryContentType::Text,
+                text: Some(big.clone()),
+                document_reference: None,
+                object: None,
+            }],
+            ..Default::default()
+        };
+
+        // A CREATE carrying a big history turn must be dominated by that payload,
+        // not underestimated to the fixed base (which would let the Raft batcher
+        // build an oversized log entry that fails to replicate).
+        let create = Command::CreateAgentInstance {
+            element_instance_key: 1,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![turn.clone()],
+        }
+        .approx_bytes();
+        assert!(
+            create >= 50_000,
+            "create history payload must dominate: create={create}"
+        );
+
+        // An UPDATE is metered across both its tools and history payloads.
+        let update = Command::UpdateAgentInstance {
+            agent_instance_key: 1,
+            element_instance_key: 2,
+            element_id: String::new(),
+            process_instance_key: 3,
+            status: None,
+            metrics: Default::default(),
+            tools: Some(vec![AgentTool {
+                name: big.clone(),
+                description: None,
+                element_id: None,
+            }]),
+            history: vec![turn],
+        }
+        .approx_bytes();
+        assert!(
+            update >= 100_000,
+            "update tools+history payload must dominate: update={update}"
         );
     }
 }

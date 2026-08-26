@@ -17549,3 +17549,874 @@ fn agent_history_append_to_unknown_instance_is_a_noop() {
     assert!(engine.commit_agent_history(bogus).is_empty());
     assert!(engine.discard_agent_history(bogus).is_empty());
 }
+
+// --- AgentInstance lifecycle processors (Camunda 8.10 parity, slice S3) ------
+//
+// CREATE/UPDATE/COMPLETE processors with the stable/8.10 validation rules and
+// AgentInstanceLimits enforcement. History application reuses the S2
+// batch-append behavior. Parity reference: camunda/camunda stable/8.10
+// (8.10.0-SNAPSHOT).
+
+/// The owning `element_instance_key` of the auto-created AgentInstance `aik`.
+fn agent_element_instance_key(engine: &Engine, instance_key: Key, aik: Key) -> Key {
+    engine
+        .state
+        .instances
+        .get(&instance_key)
+        .and_then(|pi| pi.agent_instances.get(&aik))
+        .map(|ai| ai.element_instance_key)
+        .expect("the agent instance should be stored")
+}
+
+/// The stored AgentInstance record for `aik`.
+fn stored_agent_instance(
+    engine: &Engine,
+    instance_key: Key,
+    aik: Key,
+) -> crate::agent::AgentInstance {
+    engine
+        .state
+        .instances
+        .get(&instance_key)
+        .and_then(|pi| pi.agent_instances.get(&aik))
+        .cloned()
+        .expect("the agent instance should be stored")
+}
+
+#[test]
+fn agent_instance_create_from_active_agent_element_reconciles_to_initializing() {
+    use crate::agent::{
+        AgentDefinition, AgentHistoryRole, AgentInstanceLimits, AgentInstanceStatus,
+    };
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+
+    let limits = AgentInstanceLimits {
+        max_tokens: 1_000,
+        max_model_calls: 10,
+        max_tool_calls: 5,
+    };
+    let events = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            definition: AgentDefinition {
+                model: Some("gpt-4o".to_string()),
+                ..Default::default()
+            },
+            limits: Some(limits),
+            history: vec![history_turn(0, 10, AgentHistoryRole::Configuration)],
+        })
+        .unwrap();
+
+    // Reconciles with the auto-created record (same key), status INITIALIZING,
+    // carrying the CREATE-time configuration.
+    let created = events
+        .iter()
+        .find_map(|e| match e {
+            Event::AgentInstanceCreated { agent_instance, .. } => Some(agent_instance.clone()),
+            _ => None,
+        })
+        .expect("CREATE emits AgentInstanceCreated");
+    assert_eq!(
+        created.agent_instance_key, aik,
+        "reconciles, no duplicate key"
+    );
+    assert_eq!(created.status, AgentInstanceStatus::Initializing);
+    assert_eq!(created.limits, limits);
+    assert_eq!(created.definition.model.as_deref(), Some("gpt-4o"));
+
+    // The initial history batch became one committed AGENT_HISTORY record.
+    let hist = stored_history(&engine, pi, aik);
+    assert_eq!(hist.len(), 1, "one record per initial-batch turn");
+    assert_eq!(
+        hist[0].commit_status,
+        crate::agent::AgentHistoryCommitStatus::Committed
+    );
+    assert_eq!(stored_agent_instance(&engine, pi, aik).limits, limits);
+}
+
+#[test]
+fn agent_instance_create_without_explicit_limits_defaults_to_unlimited() {
+    use crate::agent::{AgentDefinition, AgentInstanceLimits};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+
+    engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aik).limits,
+        AgentInstanceLimits::default(),
+        "absent limits default to -1/-1/-1"
+    );
+}
+
+#[test]
+fn agent_instance_create_takes_limits_from_configuration_history_item() {
+    use crate::agent::{AgentDefinition, AgentHistoryRole, AgentInstanceLimits};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+
+    let cfg_limits = AgentInstanceLimits {
+        max_tokens: 42,
+        max_model_calls: -1,
+        max_tool_calls: 7,
+    };
+    let mut cfg_turn = history_turn(0, 5, AgentHistoryRole::Configuration);
+    cfg_turn.limits = Some(cfg_limits);
+    engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![cfg_turn],
+        })
+        .unwrap();
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aik).limits,
+        cfg_limits,
+        "limits fall back to the CONFIGURATION history item"
+    );
+}
+
+#[test]
+fn agent_instance_create_ignores_limits_from_non_configuration_history_item() {
+    use crate::agent::{AgentDefinition, AgentHistoryRole, AgentInstanceLimits};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+
+    // An ASSISTANT turn carrying `limits` must NOT seed the record's limits:
+    // only a CONFIGURATION turn may. With no CONFIGURATION turn and no explicit
+    // limits, the record must fall back to the unlimited default.
+    let mut assistant_turn = history_turn(0, 5, AgentHistoryRole::Assistant);
+    assistant_turn.limits = Some(AgentInstanceLimits {
+        max_tokens: 42,
+        max_model_calls: 3,
+        max_tool_calls: 7,
+    });
+    engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![assistant_turn],
+        })
+        .unwrap();
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aik).limits,
+        AgentInstanceLimits::default(),
+        "a non-CONFIGURATION turn must not seed limits; default to unlimited"
+    );
+}
+
+#[test]
+fn agent_instance_create_takes_limits_from_last_configuration_not_later_turn() {
+    use crate::agent::{AgentDefinition, AgentHistoryRole, AgentInstanceLimits};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+
+    // CONFIGURATION seeds limits; a LATER ASSISTANT turn carrying different
+    // limits must not override the CONFIGURATION-supplied value.
+    let cfg_limits = AgentInstanceLimits {
+        max_tokens: 100,
+        max_model_calls: 5,
+        max_tool_calls: 9,
+    };
+    let mut cfg_turn = history_turn(0, 5, AgentHistoryRole::Configuration);
+    cfg_turn.limits = Some(cfg_limits);
+    let mut later_assistant = history_turn(1, 10, AgentHistoryRole::Assistant);
+    later_assistant.limits = Some(AgentInstanceLimits {
+        max_tokens: 1,
+        max_model_calls: 1,
+        max_tool_calls: 1,
+    });
+    engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![cfg_turn, later_assistant],
+        })
+        .unwrap();
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aik).limits,
+        cfg_limits,
+        "the CONFIGURATION turn wins; a later non-CONFIGURATION turn cannot override it"
+    );
+}
+
+#[test]
+fn agent_instance_create_on_inactive_element_instance_is_rejected() {
+    use crate::agent::AgentDefinition;
+    let (mut engine, _pi, _aik) = agent_instance_for_history();
+    let err = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: 999_999_999,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::AgentInstanceElementInstanceInactive { .. }
+    ));
+}
+
+#[test]
+fn agent_instance_create_on_plain_service_task_missing_agent_definition_is_rejected() {
+    use crate::agent::AgentDefinition;
+    // A job-worker service task is an eligible TYPE (SERVICE_TASK) but carries no
+    // agentDefinition, so CREATE rejects it as missing the agentDefinitionKey.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="plain-proc" isExecutable="true">
+          <bpmn:startEvent id="start" />
+          <bpmn:serviceTask id="job">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="worker" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="end" />
+          <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="job" />
+          <bpmn:sequenceFlow id="f2" sourceRef="job" targetRef="end" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("plain-proc"))
+        .unwrap();
+    let eik = events
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivated {
+                element_instance_key,
+                element_id,
+                ..
+            } if element_id == "job" => Some(*element_instance_key),
+            _ => None,
+        })
+        .expect("the service task should activate and park");
+
+    let err = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::AgentInstanceMissingAgentDefinition { .. }
+    ));
+}
+
+#[test]
+fn agent_instance_create_on_non_eligible_element_is_rejected() {
+    use crate::agent::AgentDefinition;
+    // A timer intermediate catch event is active-but-not-eligible.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="catch-proc" isExecutable="true">
+          <bpmn:startEvent id="start" />
+          <bpmn:intermediateCatchEvent id="await">
+            <bpmn:timerEventDefinition>
+              <bpmn:timeDuration>PT1H</bpmn:timeDuration>
+            </bpmn:timerEventDefinition>
+          </bpmn:intermediateCatchEvent>
+          <bpmn:endEvent id="end" />
+          <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="await" />
+          <bpmn:sequenceFlow id="f2" sourceRef="await" targetRef="end" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("catch-proc"))
+        .unwrap();
+    let eik = events
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivated {
+                element_instance_key,
+                element_id,
+                ..
+            } if element_id == "await" => Some(*element_instance_key),
+            _ => None,
+        })
+        .expect("the catch event should activate and wait");
+
+    let err = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::AgentInstanceElementNotEligible { .. }
+    ));
+}
+
+/// Build an UPDATE command with the given status/metrics/history, asserting the
+/// stored ownership fields (`element_id` "agent").
+fn update_agent(
+    aik: Key,
+    eik: Key,
+    pi: Key,
+    status: crate::agent::AgentInstanceStatus,
+    metrics: crate::agent::AgentInstanceMetricsDelta,
+    history: Vec<crate::agent::AgentHistoryTurn>,
+) -> Command {
+    Command::UpdateAgentInstance {
+        agent_instance_key: aik,
+        element_instance_key: eik,
+        element_id: "agent".to_string(),
+        process_instance_key: pi,
+        status: Some(status),
+        metrics,
+        tools: None,
+        history,
+    }
+}
+
+#[test]
+fn agent_instance_update_advances_status_appends_history_and_accumulates_metrics() {
+    use crate::agent::{AgentHistoryRole, AgentInstanceMetricsDelta, AgentInstanceStatus};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+
+    let delta = AgentInstanceMetricsDelta {
+        input_tokens: 100,
+        output_tokens: 20,
+        model_calls: 1,
+        tool_calls: 1,
+        ..Default::default()
+    };
+    // Advance through each active state, appending one turn per update.
+    let steps = [
+        AgentInstanceStatus::ToolDiscovery,
+        AgentInstanceStatus::Thinking,
+        AgentInstanceStatus::ToolCalling,
+        AgentInstanceStatus::Idle,
+    ];
+    for (i, status) in steps.iter().enumerate() {
+        let events = engine
+            .apply_command(update_agent(
+                aik,
+                eik,
+                pi,
+                *status,
+                delta,
+                vec![history_turn(
+                    i as i32,
+                    (i as u64) * 10,
+                    AgentHistoryRole::Assistant,
+                )],
+            ))
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::AgentInstanceUpdated { .. })),
+            "each UPDATE emits AgentInstanceUpdated"
+        );
+        assert_eq!(stored_agent_instance(&engine, pi, aik).status, *status);
+    }
+
+    // Metrics accumulated across the four updates; four committed history turns.
+    let stored = stored_agent_instance(&engine, pi, aik);
+    assert_eq!(stored.metrics.input_tokens, 400);
+    assert_eq!(stored.metrics.output_tokens, 80);
+    assert_eq!(stored.metrics.model_calls, 4);
+    assert_eq!(stored.metrics.tool_calls, 4);
+    let hist = stored_history(&engine, pi, aik);
+    assert_eq!(hist.len(), 4);
+    assert!(hist
+        .iter()
+        .all(|r| r.commit_status == crate::agent::AgentHistoryCommitStatus::Committed));
+}
+
+#[test]
+fn agent_instance_update_replaces_tools() {
+    use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus, AgentTool};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+
+    let tool = AgentTool {
+        name: "search".to_string(),
+        description: None,
+        element_id: None,
+    };
+    engine
+        .apply_command(Command::UpdateAgentInstance {
+            agent_instance_key: aik,
+            element_instance_key: eik,
+            element_id: "agent".to_string(),
+            process_instance_key: pi,
+            status: Some(AgentInstanceStatus::ToolDiscovery),
+            metrics: AgentInstanceMetricsDelta::default(),
+            tools: Some(vec![tool.clone()]),
+            history: vec![],
+        })
+        .unwrap();
+    assert_eq!(stored_agent_instance(&engine, pi, aik).tools, vec![tool]);
+}
+
+#[test]
+fn agent_instance_update_to_completed_is_rejected() {
+    use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+    let err = engine
+        .apply_command(update_agent(
+            aik,
+            eik,
+            pi,
+            AgentInstanceStatus::Completed,
+            AgentInstanceMetricsDelta::default(),
+            vec![],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::AgentInstanceStatusNotSettable { .. }
+    ));
+}
+
+#[test]
+fn agent_instance_update_with_wrong_element_id_or_process_instance_is_rejected() {
+    use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+
+    let wrong_element = engine
+        .apply_command(Command::UpdateAgentInstance {
+            agent_instance_key: aik,
+            element_instance_key: eik,
+            element_id: "not-agent".to_string(),
+            process_instance_key: pi,
+            status: Some(AgentInstanceStatus::Thinking),
+            metrics: AgentInstanceMetricsDelta::default(),
+            tools: None,
+            history: vec![],
+        })
+        .unwrap_err();
+    assert!(matches!(
+        wrong_element,
+        EngineError::AgentInstanceOwnershipMismatch { .. }
+    ));
+
+    let wrong_pi = engine
+        .apply_command(Command::UpdateAgentInstance {
+            agent_instance_key: aik,
+            element_instance_key: eik,
+            element_id: "agent".to_string(),
+            process_instance_key: 424_242,
+            status: Some(AgentInstanceStatus::Thinking),
+            metrics: AgentInstanceMetricsDelta::default(),
+            tools: None,
+            history: vec![],
+        })
+        .unwrap_err();
+    assert!(matches!(
+        wrong_pi,
+        EngineError::AgentInstanceOwnershipMismatch { .. }
+    ));
+}
+
+#[test]
+fn agent_instance_update_on_inactive_element_instance_is_rejected() {
+    use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let err = engine
+        .apply_command(update_agent(
+            aik,
+            888_888_888,
+            pi,
+            AgentInstanceStatus::Thinking,
+            AgentInstanceMetricsDelta::default(),
+            vec![],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::AgentInstanceElementInstanceInactive { .. }
+    ));
+}
+
+#[test]
+fn agent_instance_update_with_conflicting_instance_is_rejected() {
+    use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus};
+    // Two process instances of the same agent process: each owns an AgentInstance
+    // on element "agent". Updating instance A while referencing instance B's
+    // element instance (owned by B) is a conflict.
+    let (mut engine, pi_a, aik_a) = agent_instance_for_history();
+    let events_b = engine
+        .apply_command(Command::create_instance("agent-proc"))
+        .unwrap();
+    let pi_b = events_b.iter().find_map(|e| e.instance_key()).unwrap();
+    let aik_b = events_b
+        .iter()
+        .find_map(|e| match e {
+            Event::AgentInstanceCreated { agent_instance, .. } => {
+                Some(agent_instance.agent_instance_key)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let eik_b = agent_element_instance_key(&engine, pi_b, aik_b);
+
+    let err = engine
+        .apply_command(Command::UpdateAgentInstance {
+            agent_instance_key: aik_a,
+            element_instance_key: eik_b,
+            element_id: "agent".to_string(),
+            process_instance_key: pi_a,
+            status: Some(AgentInstanceStatus::Thinking),
+            metrics: AgentInstanceMetricsDelta::default(),
+            tools: None,
+            history: vec![],
+        })
+        .unwrap_err();
+    match err {
+        EngineError::AgentInstanceConflict {
+            conflicting_agent_instance_key,
+            ..
+        } => assert_eq!(conflicting_agent_instance_key, aik_b),
+        other => panic!("expected AgentInstanceConflict, got {other:?}"),
+    }
+}
+
+#[test]
+fn agent_instance_update_with_foreign_process_element_instance_is_rejected() {
+    use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus};
+    // A *different* process whose active element merely shares the id "agent"
+    // but is not agent-eligible (a userTask, so no owning AgentInstance is
+    // minted). Referencing that foreign, unowned element instance from an UPDATE
+    // must be rejected as an ownership mismatch — it would otherwise be linked as
+    // a re-entry key and corrupt ownership/re-entry tracking across process
+    // instances.
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let foreign_xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="foreign-proc" isExecutable="true">
+          <bpmn:startEvent id="start" />
+          <bpmn:userTask id="agent" />
+          <bpmn:endEvent id="end" />
+          <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="end" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(foreign_xml).unwrap().remove(0);
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("foreign-proc"))
+        .unwrap();
+    let foreign_eik = events
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivated {
+                element_instance_key,
+                element_id,
+                ..
+            } if element_id == "agent" => Some(*element_instance_key),
+            _ => None,
+        })
+        .expect("the foreign userTask should activate and wait");
+
+    let err = engine
+        .apply_command(Command::UpdateAgentInstance {
+            agent_instance_key: aik,
+            element_instance_key: foreign_eik,
+            element_id: "agent".to_string(),
+            process_instance_key: pi,
+            status: Some(AgentInstanceStatus::Thinking),
+            metrics: AgentInstanceMetricsDelta::default(),
+            tools: None,
+            history: vec![],
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::AgentInstanceOwnershipMismatch { .. }
+    ));
+}
+
+#[test]
+fn agent_instance_update_clamps_negative_metric_deltas() {
+    use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus};
+    // First accumulate some real usage.
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+    engine
+        .apply_command(update_agent(
+            aik,
+            eik,
+            pi,
+            AgentInstanceStatus::Thinking,
+            AgentInstanceMetricsDelta {
+                input_tokens: 100,
+                output_tokens: 40,
+                model_calls: 3,
+                tool_calls: 2,
+                ..Default::default()
+            },
+            vec![],
+        ))
+        .unwrap();
+
+    // A negative delta must NOT decrease the (monotonic) counters: each field is
+    // clamped to >= 0, so the totals are unchanged. This keeps limit enforcement
+    // impossible to bypass by "refunding" prior usage.
+    engine
+        .apply_command(update_agent(
+            aik,
+            eik,
+            pi,
+            AgentInstanceStatus::Thinking,
+            AgentInstanceMetricsDelta {
+                input_tokens: -1_000,
+                output_tokens: -1_000,
+                model_calls: -10,
+                tool_calls: -10,
+                ..Default::default()
+            },
+            vec![],
+        ))
+        .unwrap();
+    let stored = stored_agent_instance(&engine, pi, aik);
+    assert_eq!(stored.metrics.input_tokens, 100);
+    assert_eq!(stored.metrics.output_tokens, 40);
+    assert_eq!(stored.metrics.model_calls, 3);
+    assert_eq!(stored.metrics.tool_calls, 2);
+}
+
+#[test]
+fn agent_instance_update_on_unknown_instance_is_rejected() {
+    use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+    let err = engine
+        .apply_command(update_agent(
+            123_456_789,
+            eik,
+            pi,
+            AgentInstanceStatus::Thinking,
+            AgentInstanceMetricsDelta::default(),
+            vec![],
+        ))
+        .unwrap_err();
+    assert!(matches!(err, EngineError::AgentInstanceNotFound { .. }));
+}
+
+#[test]
+fn agent_instance_update_over_budget_batch_is_rejected_but_unlimited_passes() {
+    use crate::agent::{
+        AgentDefinition, AgentInstanceLimits, AgentInstanceMetricsDelta, AgentInstanceStatus,
+    };
+    // Unlimited (-1) instance: a large batch is accepted.
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+    engine
+        .apply_command(update_agent(
+            aik,
+            eik,
+            pi,
+            AgentInstanceStatus::Thinking,
+            AgentInstanceMetricsDelta {
+                input_tokens: 10_000,
+                model_calls: 999,
+                tool_calls: 999,
+                ..Default::default()
+            },
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aik).metrics.input_tokens,
+        10_000
+    );
+
+    // Tighten the token limit via CREATE, then an over-budget batch is rejected
+    // and nothing is applied.
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+    engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            definition: AgentDefinition::default(),
+            limits: Some(AgentInstanceLimits {
+                max_tokens: 50,
+                max_model_calls: -1,
+                max_tool_calls: -1,
+            }),
+            history: vec![],
+        })
+        .unwrap();
+    let before = stored_agent_instance(&engine, pi, aik);
+    let err = engine
+        .apply_command(update_agent(
+            aik,
+            eik,
+            pi,
+            AgentInstanceStatus::Thinking,
+            AgentInstanceMetricsDelta {
+                input_tokens: 100,
+                ..Default::default()
+            },
+            vec![history_turn(
+                0,
+                1,
+                crate::agent::AgentHistoryRole::Assistant,
+            )],
+        ))
+        .unwrap_err();
+    match err {
+        EngineError::AgentInstanceLimitExceeded { limit, .. } => {
+            assert_eq!(limit, crate::agent::AgentLimitKind::Tokens)
+        }
+        other => panic!("expected AgentInstanceLimitExceeded, got {other:?}"),
+    }
+    // Rejected atomically: neither metrics nor history changed.
+    let after = stored_agent_instance(&engine, pi, aik);
+    assert_eq!(after.metrics, before.metrics);
+    assert_eq!(after.status, before.status);
+    assert!(stored_history(&engine, pi, aik).is_empty());
+}
+
+/// Deploy a fork/join process with two parallel agent tasks and start it,
+/// returning the engine, process-instance key, and the two agent-instance keys.
+fn two_agent_instances() -> (Engine, Key, Vec<Key>) {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="two-agents" isExecutable="true">
+          <bpmn:startEvent id="start" />
+          <bpmn:parallelGateway id="fork" />
+          <bpmn:serviceTask id="agentA">
+            <bpmn:extensionElements>
+              <zeebe:agentDefinition agentType="aiAgentTask" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:serviceTask id="agentB">
+            <bpmn:extensionElements>
+              <zeebe:agentDefinition agentType="aiAgentTask" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:sequenceFlow id="f0" sourceRef="start" targetRef="fork" />
+          <bpmn:sequenceFlow id="fa" sourceRef="fork" targetRef="agentA" />
+          <bpmn:sequenceFlow id="fb" sourceRef="fork" targetRef="agentB" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("two-agents"))
+        .unwrap();
+    let pi = events.iter().find_map(|e| e.instance_key()).unwrap();
+    let aiks: Vec<Key> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentInstanceCreated { agent_instance, .. } => {
+                Some(agent_instance.agent_instance_key)
+            }
+            _ => None,
+        })
+        .collect();
+    (engine, pi, aiks)
+}
+
+#[test]
+fn agent_instance_complete_drives_to_completed_and_drains_remaining() {
+    use crate::agent::AgentInstanceStatus;
+    let (mut engine, pi, aiks) = two_agent_instances();
+    assert_eq!(aiks.len(), 2, "two parallel agent tasks mint two instances");
+
+    let active_count = |engine: &Engine| -> usize {
+        engine
+            .state
+            .instances
+            .get(&pi)
+            .map(|p| {
+                p.agent_instances
+                    .values()
+                    .filter(|ai| ai.status.is_active())
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    assert_eq!(active_count(&engine), 2);
+
+    // Complete each by key; the active set drains one at a time.
+    let events = engine
+        .apply_command(Command::CompleteAgentInstance {
+            agent_instance_key: aiks[0],
+        })
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::AgentInstanceCompleted { .. })));
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aiks[0]).status,
+        AgentInstanceStatus::Completed
+    );
+    assert_eq!(active_count(&engine), 1);
+
+    engine
+        .apply_command(Command::CompleteAgentInstance {
+            agent_instance_key: aiks[1],
+        })
+        .unwrap();
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aiks[1]).status,
+        AgentInstanceStatus::Completed
+    );
+    assert_eq!(active_count(&engine), 0, "no active agent instances remain");
+}
+
+#[test]
+fn agent_instance_complete_is_the_only_path_to_completed_and_rejects_re_completion() {
+    let (mut engine, _pi, aiks) = two_agent_instances();
+    engine
+        .apply_command(Command::CompleteAgentInstance {
+            agent_instance_key: aiks[0],
+        })
+        .unwrap();
+    // Re-completing a terminal instance is rejected.
+    let err = engine
+        .apply_command(Command::CompleteAgentInstance {
+            agent_instance_key: aiks[0],
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::AgentInstanceAlreadyCompleted { .. }
+    ));
+}
+
+#[test]
+fn agent_instance_complete_on_unknown_instance_is_rejected() {
+    let (mut engine, _pi, _aiks) = agent_instance_for_history();
+    let err = engine
+        .apply_command(Command::CompleteAgentInstance {
+            agent_instance_key: 777_777_777,
+        })
+        .unwrap_err();
+    assert!(matches!(err, EngineError::AgentInstanceNotFound { .. }));
+}
