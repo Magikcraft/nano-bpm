@@ -167,7 +167,10 @@ export async function stubConsoleApi(
       });
     }
     if (url.endsWith("/console/api/cluster/health")) {
-      return json({ nodes: [] });
+      // Match the generated `ClusterHealth` contract (types.gen.ts): the real
+      // endpoint always includes `checkedAtMs`, so the stub must too or a view
+      // reading the timestamp diverges from production shape.
+      return json({ checkedAtMs: 0, nodes: [] });
     }
     if (url.endsWith("/console/api/metrics")) return json(metricsSnapshot());
     if (url.endsWith("/console/api/cluster/metrics")) {
