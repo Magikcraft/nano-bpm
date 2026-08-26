@@ -374,10 +374,9 @@ pub enum Command {
     /// stable/8.10; `POST /v2/agent-instances`). The engine infers
     /// `processInstanceKey`, `elementId`, `processDefinitionKey` and `tenantId`
     /// from the referenced `element_instance_key`. The lifecycle *processor* that
-    /// validates and applies this command is a later slice (S3); this variant is
-    /// defined now so the record/intent surface is wired end-to-end. It is not
+    /// validates and applies this command landed in this slice (S3). It is not
     /// yet callable from the wasm `TestEngine` (classified `NotSurfaced` in
-    /// `engine-wasm`) until that S3 processor lands.
+    /// `engine-wasm`) until its driver lands in agent-instance-parity S6.
     CreateAgentInstance {
         /// The key of the AI Agent Sub-process / AI Agent Task element instance.
         element_instance_key: Key,
@@ -449,8 +448,9 @@ pub enum Command {
         history: Vec<crate::agent::AgentHistoryTurn>,
     },
     /// Complete an engine-native AgentInstance (Camunda `AgentInstanceIntent.COMPLETE`,
-    /// stable/8.10): drive it to `COMPLETED`. The drain processor is a later
-    /// slice (S3).
+    /// stable/8.10): drive it to `COMPLETED`. The completion processor landed in
+    /// this slice (S3); its wasm `TestEngine` surface is deferred (classified
+    /// `NotSurfaced` in `engine-wasm` until agent-instance-parity S6).
     CompleteAgentInstance { agent_instance_key: Key },
 }
 
