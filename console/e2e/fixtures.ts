@@ -559,7 +559,9 @@ export async function stubApp(
 
   await page.route("**/console/api/**", async (route) => {
     const url = new URL(route.request().url()).pathname;
-    if (url.endsWith(`/console/api/projects/${name}/logs`)) {
+    if (
+      url.endsWith(`/console/api/projects/${encodeURIComponent(name)}/logs`)
+    ) {
       return route.fulfill({
         status: 200,
         contentType: "text/event-stream",
@@ -577,11 +579,13 @@ export async function stubApp(
     return route.fallback();
   });
 
-  await page.route(`**/console/app-view/${name}/**`, (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: "text/html",
-      body: opts.appViewHtml ?? APP_VIEW_HTML,
-    }),
+  await page.route(
+    `**/console/app-view/${encodeURIComponent(name)}/**`,
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "text/html",
+        body: opts.appViewHtml ?? APP_VIEW_HTML,
+      }),
   );
 }
