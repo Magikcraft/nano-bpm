@@ -164,8 +164,8 @@ export interface GridColumn {
   header: string;
   /** An optional structured link the cell value becomes (e.g. a process-explorer
    * deep link). This is the only per-column link mechanism the parser preserves
-   * — `parseColumns` keeps `field`, `header`, and `link` and drops anything
-   * else. (Not to be confused with `DetailSpec.linkField`, which is a
+   * — `parseColumns` keeps `field`, `header`, `link`, and `mobile` and drops
+   * anything else. (Not to be confused with `DetailSpec.linkField`, which is a
    * detail-panel concern, unrelated to grid columns.) */
   link?: GridColumnLink;
   /** How this column is presented on mobile (`column.mobile`). The Urban runtime

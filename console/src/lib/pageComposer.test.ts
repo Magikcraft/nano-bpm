@@ -514,6 +514,47 @@ test("reconcileGridColumns drops a link when the delete match is ambiguous", () 
   assert.equal(out[1].link, undefined);
 });
 
+const mobileHint = { priority: "primary" as const, label: "State" };
+
+test("reconcileGridColumns preserves the mobile hint across a field rename (edit keeps count)", () => {
+  const prev = [
+    { field: "status", header: "Status", mobile: mobileHint },
+    { field: "url", header: "URL" },
+  ];
+  // Renaming a column's `field` (count unchanged) must carry the whole
+  // structured remainder — `mobile`, not just `link` — across the edit.
+  const out = reconcileGridColumns(prev, [
+    { field: "state", header: "Status" },
+    { field: "url", header: "URL" },
+  ]);
+  assert.deepEqual(out[0], {
+    field: "state",
+    header: "Status",
+    mobile: mobileHint,
+  });
+  assert.equal(out[1].mobile, undefined);
+});
+
+test("reconcileGridColumns preserves the mobile hint by identity when a column is deleted", () => {
+  const prev = [
+    { field: "a", header: "A" },
+    { field: "status", header: "Status", mobile: mobileHint },
+    { field: "b", header: "B" },
+  ];
+  // Deleting the first column shifts indices; identity match keeps the mobile
+  // hint on `status` rather than mis-attaching it positionally.
+  const out = reconcileGridColumns(prev, [
+    { field: "status", header: "Status" },
+    { field: "b", header: "B" },
+  ]);
+  assert.deepEqual(out[0], {
+    field: "status",
+    header: "Status",
+    mobile: mobileHint,
+  });
+  assert.equal(out[1].mobile, undefined);
+});
+
 test("parsePageDoc drops a column link with an unknown kind or empty keyField", () => {
   const r = parsePageDoc({
     schemaVersion: PAGE_SCHEMA_VERSION,
