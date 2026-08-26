@@ -1,6 +1,7 @@
 import {
   type AnchorHTMLAttributes,
   type ButtonHTMLAttributes,
+  type HTMLAttributes,
   type InputHTMLAttributes,
   type ReactNode,
   useCallback,
@@ -65,7 +66,10 @@ export function CardGrid({
   className = "",
   children,
   ...rest
-}: { className?: string; children: ReactNode } & Record<string, unknown>) {
+}: { className?: string; children: ReactNode } & Omit<
+  HTMLAttributes<HTMLDivElement>,
+  "className" | "children"
+>) {
   return (
     <div className={`nano-card-grid ${className}`} {...rest}>
       {children}
@@ -199,7 +203,7 @@ export function BottomSheet({
         role="dialog"
         aria-modal="true"
         aria-labelledby={title ? titleId : undefined}
-        aria-label={title ? undefined : "Menu"}
+        aria-label={title ? undefined : "Dialog"}
         className={`nano-safe-bottom flex max-h-[85vh] w-full flex-col overflow-hidden rounded-t-2xl border-t border-edge-strong bg-raised shadow-xl ${className}`}
         onClick={(e) => e.stopPropagation()}
       >
