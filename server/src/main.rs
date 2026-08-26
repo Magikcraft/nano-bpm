@@ -24032,6 +24032,13 @@ mod clustered_startup_tests {
         assert_eq!(jd.job_kind, models::JobKindEnum::BpmnElement);
         // An ordinary element job has no listener event type.
         assert_eq!(jd.listener_event_type, types::Nullable::Null);
+        // Camunda 8 marks `retries` required on JobWaitStateDetails, so it must be
+        // present (never null) for a live activatable job (#1010).
+        assert!(
+            matches!(jd.retries, types::Nullable::Present(r) if r > 0),
+            "JOB wait state carries a present, positive retries count, got {:?}",
+            jd.retries
+        );
         assert!(matches!(job.message_details, types::Nullable::Null));
 
         // MESSAGE wait state: the message catch parked on its open subscription.
@@ -24100,6 +24107,88 @@ mod clustered_startup_tests {
         };
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].element_id, "charge");
+    }
+
+    #[tokio::test]
+    async fn wait_state_job_details_survive_activation() {
+        // #1010 regression guard: a JOB wait state parked on an *activated* (locked)
+        // job — the shape a worker-driven deployment like nano-workforce sits in,
+        // where an agent service task is picked up and held by a worker — must still
+        // carry the Camunda-8-required `jobType`/`jobKind`/`retries`. The read model
+        // materialises `job_type` on `JobCreated`; `JobActivated` only rewrites
+        // state/worker/deadline, so this pins that activation does not drop the type.
+        let server = ServerImpl::default();
+
+        let charger = ProcessBuilder::new("charger")
+            .start_event("s")
+            .service_task("charge", "pay")
+            .end_event("e")
+            .connect("s", "charge")
+            .connect("charge", "e")
+            .build()
+            .expect("valid service-task process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("charger".to_string(), "charger.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![charger],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let (charger_key, _) = server
+            .create_for_stream(
+                Some("charger".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create charger");
+
+        // Park the job (Created), then activate it (Activated) as a worker would.
+        let _ = loop_until_wait_states(&server, None, 1).await;
+        let mut req = models::JobActivationRequest::new("pay".into(), 60_000, 10);
+        req.request_timeout = Some(-1);
+        let resp = server.activate_jobs_impl(&req).await.expect("activate ok");
+        use apis::job::ActivateJobsResponse as ActR;
+        let jobs = match resp {
+            ActR::Status200_TheListOfActivatedJobs(r) => r.jobs,
+            other => panic!("expected 200 list, got {other:?}"),
+        };
+        assert_eq!(jobs.len(), 1, "the 'pay' job activates");
+
+        // The still-parked, now-activated job remains a JOB wait state with its
+        // required contract fields intact.
+        let items = loop_until_wait_states(&server, None, 1).await;
+        let job = items
+            .iter()
+            .find(|w| {
+                w.wait_state_type == models::WaitStateTypeEnum::Job
+                    && w.process_instance_key.0 == charger_key.to_string()
+            })
+            .expect("the activated service-task job is still a JOB wait state");
+        let jd = match &job.job_details {
+            types::Nullable::Present(d) => d,
+            types::Nullable::Null => panic!("JOB wait state carries job details"),
+        };
+        assert_eq!(
+            jd.job_type, "pay",
+            "activation must not drop the required jobType"
+        );
+        assert!(
+            !jd.job_type.is_empty(),
+            "jobType is required (Zeebe parity) and must never be empty"
+        );
+        assert_eq!(jd.job_kind, models::JobKindEnum::BpmnElement);
+        assert!(
+            matches!(jd.retries, types::Nullable::Present(r) if r > 0),
+            "retries is required and stays present across activation, got {:?}",
+            jd.retries
+        );
     }
 
     #[tokio::test]
