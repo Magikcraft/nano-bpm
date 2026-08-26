@@ -5,7 +5,7 @@
 //! every mutation here is what makes the engine deterministic and replayable:
 //! replaying the same events over a fresh [`State`] reconstructs it exactly.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::event::Event;
@@ -481,6 +481,17 @@ pub struct ProcessInstance {
     /// [`InstanceSnapshot::instance`] on spill like `adhoc_instances`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub agent_instances: HashMap<Key, crate::agent::AgentInstance>,
+    /// Append-only AgentHistory turn log, keyed by the owning
+    /// `agent_instance_key` (Camunda 8.10 AgentHistory, ADR Stage 3 / slice S2).
+    /// Each value is the ordered list of turns for that agent instance, sorted
+    /// by `(loop_iteration, produced_at, agent_history_key)`; turns are only ever
+    /// appended and their `commit_status` only ever transitions Pending ->
+    /// Committed / Discarded. Empty for instances with no agent element and for
+    /// snapshots written before agent-history support existed (`serde(default)`).
+    /// Rides along in [`InstanceSnapshot::instance`] on spill like
+    /// `agent_instances`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub agent_history: HashMap<Key, Vec<crate::agent::AgentHistoryRecord>>,
 }
 
 /// A completed, compensable activity awaiting a possible compensation throw.
@@ -1739,6 +1750,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     compensable: Vec::new(),
                     compensation_waits: HashMap::new(),
                     agent_instances: HashMap::new(),
+                    agent_history: HashMap::new(),
                 },
             );
         }
@@ -1916,6 +1928,67 @@ pub fn apply(state: &mut State, event: &Event) {
                 instance
                     .agent_instances
                     .insert(agent_instance.agent_instance_key, agent_instance.clone());
+            }
+        }
+
+        Event::AgentHistoryCreated {
+            instance_key,
+            record,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                let log = instance
+                    .agent_history
+                    .entry(record.agent_instance_key)
+                    .or_default();
+                // Append-only, kept sorted by (loop_iteration, produced_at,
+                // agent_history_key): find the insertion point rather than
+                // pushing + re-sorting so replay is deterministic and cheap.
+                let pos = log.partition_point(|r| r.order_key() <= record.order_key());
+                log.insert(pos, record.clone());
+            }
+        }
+
+        Event::AgentHistoryCommitted {
+            instance_key,
+            agent_instance_key,
+            agent_history_keys,
+        } => {
+            if let Some(log) = state
+                .instances
+                .get_mut(instance_key)
+                .and_then(|inst| inst.agent_history.get_mut(agent_instance_key))
+            {
+                let keys: HashSet<Key> = agent_history_keys.iter().copied().collect();
+                for record in log.iter_mut() {
+                    // Only PENDING turns transition; a committed/discarded turn
+                    // is immutable (append-only).
+                    if record.commit_status == crate::agent::AgentHistoryCommitStatus::Pending
+                        && keys.contains(&record.agent_history_key)
+                    {
+                        record.commit_status = crate::agent::AgentHistoryCommitStatus::Committed;
+                    }
+                }
+            }
+        }
+
+        Event::AgentHistoryDiscarded {
+            instance_key,
+            agent_instance_key,
+            agent_history_keys,
+        } => {
+            if let Some(log) = state
+                .instances
+                .get_mut(instance_key)
+                .and_then(|inst| inst.agent_history.get_mut(agent_instance_key))
+            {
+                let keys: HashSet<Key> = agent_history_keys.iter().copied().collect();
+                for record in log.iter_mut() {
+                    if record.commit_status == crate::agent::AgentHistoryCommitStatus::Pending
+                        && keys.contains(&record.agent_history_key)
+                    {
+                        record.commit_status = crate::agent::AgentHistoryCommitStatus::Discarded;
+                    }
+                }
             }
         }
 

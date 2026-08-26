@@ -290,6 +290,7 @@ mod tests {
             compensable: Vec::new(),
             compensation_waits: HashMap::new(),
             agent_instances: HashMap::new(),
+            agent_history: HashMap::new(),
         }
     }
 

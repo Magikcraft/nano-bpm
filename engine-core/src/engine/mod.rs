@@ -181,6 +181,20 @@ pub(crate) struct IoMappingFailure {
     pub(crate) reason: String,
 }
 
+/// The instance-derived context copied off an [`AgentInstance`](crate::agent::AgentInstance)
+/// when materialising a batch of AgentHistory turns, so the borrow is released
+/// before keys are minted / events emitted.
+#[allow(dead_code)] // consumed by append_agent_history; S3 wires the callers.
+struct AgentHistoryBase {
+    instance_key: Key,
+    element_instance_key: Key,
+    process_instance_key: Key,
+    root_process_instance_key: Key,
+    bpmn_process_id: String,
+    process_definition_key: Key,
+    tenant_id: String,
+}
+
 /// A unit of internal work in the processing loop — one transition of the BPMN
 /// element lifecycle.
 enum Step {
@@ -524,10 +538,157 @@ impl Engine {
         current
     }
 
-    /// Installs an already-minted deployment (a slice of [`Event`]s produced by
-    /// another partition's [`Command::Deploy`]) into this partition's state
-    /// **without minting new keys**, so every partition registers the identical
-    /// process definition under the identical `processDefinitionKey`.
+    /// Locate the AgentInstance identified by `agent_instance_key`, returning a
+    /// reference. Agent instances live inside their owning
+    /// [`crate::state::ProcessInstance::agent_instances`], so this scans the
+    /// live instances; the S3 processors call it once per command and the live
+    /// set is small relative to a turn's cost.
+    #[allow(dead_code)] // AgentHistory (S2) behavior; S3 processors wire the callers.
+    fn find_agent_instance(&self, agent_instance_key: Key) -> Option<&crate::agent::AgentInstance> {
+        self.state
+            .instances
+            .values()
+            .find_map(|inst| inst.agent_instances.get(&agent_instance_key))
+    }
+
+    /// Append a batch of AgentHistory turns to `agent_instance_key`'s
+    /// append-only turn log (Camunda 8.10 AgentHistory, slice S2). Each turn is
+    /// materialised into its own [`crate::agent::AgentHistoryRecord`] with a
+    /// freshly-minted, monotonic `agent_history_key` and `commit_status`
+    /// PENDING, emitted as an [`Event::AgentHistoryCreated`]. The
+    /// instance-derived context (element/process/root instance keys, bpmn
+    /// process id, process-definition key, tenant) is copied from the owning
+    /// AgentInstance; an unknown `agent_instance_key` yields no events.
+    ///
+    /// This is the internal behavior the S3 CREATE/UPDATE processors invoke to
+    /// apply a `history[]` batch. It emits (and applies) the events and returns
+    /// them so the caller folds them into its command result.
+    #[allow(dead_code)] // AgentHistory (S2) behavior; S3 processors wire the callers.
+    pub(crate) fn append_agent_history(
+        &mut self,
+        agent_instance_key: Key,
+        turns: Vec<crate::agent::AgentHistoryTurn>,
+    ) -> Vec<Event> {
+        let mut log = Vec::new();
+        // Copy the instance-derived context up front, releasing the immutable
+        // borrow before we mint keys / emit (both need `&mut self`).
+        let base = match self.find_agent_instance(agent_instance_key) {
+            Some(ai) => AgentHistoryBase {
+                instance_key: ai.process_instance_key,
+                element_instance_key: ai.element_instance_key,
+                process_instance_key: ai.process_instance_key,
+                root_process_instance_key: ai.root_process_instance_key,
+                bpmn_process_id: ai.bpmn_process_id.clone(),
+                process_definition_key: ai.process_definition_key,
+                tenant_id: ai.tenant_id.clone(),
+            },
+            None => return log,
+        };
+        for turn in turns {
+            let agent_history_key = self.mint_key();
+            let record = crate::agent::AgentHistoryRecord {
+                agent_history_key,
+                agent_instance_key,
+                element_instance_key: base.element_instance_key,
+                process_instance_key: base.process_instance_key,
+                root_process_instance_key: base.root_process_instance_key,
+                bpmn_process_id: base.bpmn_process_id.clone(),
+                process_definition_key: base.process_definition_key,
+                tenant_id: base.tenant_id.clone(),
+                job_key: turn.job_key,
+                job_lease: turn.job_lease,
+                loop_iteration: turn.loop_iteration,
+                role: turn.role,
+                produced_at: turn.produced_at,
+                content: turn.content,
+                system_prompt: turn.system_prompt,
+                tool_calls: turn.tool_calls,
+                metrics: turn.metrics,
+                history_item_id: turn.history_item_id,
+                tools: turn.tools,
+                model: turn.model,
+                provider: turn.provider,
+                limits: turn.limits,
+                is_duplicate: turn.is_duplicate,
+                commit_status: crate::agent::AgentHistoryCommitStatus::Pending,
+            };
+            self.emit(
+                &mut log,
+                Event::AgentHistoryCreated {
+                    instance_key: base.instance_key,
+                    record,
+                },
+            );
+        }
+        log
+    }
+
+    /// Commit `agent_instance_key`'s pending AgentHistory turns (PENDING ->
+    /// COMMITTED). Emits a single [`Event::AgentHistoryCommitted`] naming the
+    /// affected turns, or nothing when there are no pending turns / the instance
+    /// is unknown. Internal behavior the S3 processors call on turn accept.
+    #[allow(dead_code)] // AgentHistory (S2) behavior; S3 processors wire the callers.
+    pub(crate) fn commit_agent_history(&mut self, agent_instance_key: Key) -> Vec<Event> {
+        self.transition_pending_agent_history(agent_instance_key, true)
+    }
+
+    /// Discard `agent_instance_key`'s pending AgentHistory turns (PENDING ->
+    /// DISCARDED). Emits a single [`Event::AgentHistoryDiscarded`] naming the
+    /// affected turns, or nothing when there are no pending turns / the instance
+    /// is unknown. Internal behavior the S3 processors call on turn reject.
+    #[allow(dead_code)] // AgentHistory (S2) behavior; S3 processors wire the callers.
+    pub(crate) fn discard_agent_history(&mut self, agent_instance_key: Key) -> Vec<Event> {
+        self.transition_pending_agent_history(agent_instance_key, false)
+    }
+
+    /// Shared body of [`Self::commit_agent_history`] / [`Self::discard_agent_history`]:
+    /// collect the currently-PENDING turn keys and emit the single lifecycle
+    /// event (`commit` selects COMMITTED vs DISCARDED). Only PENDING turns are
+    /// named, so committed/discarded turns stay immutable.
+    #[allow(dead_code)] // AgentHistory (S2) behavior; S3 processors wire the callers.
+    fn transition_pending_agent_history(
+        &mut self,
+        agent_instance_key: Key,
+        commit: bool,
+    ) -> Vec<Event> {
+        let mut log = Vec::new();
+        let instance_key = match self.find_agent_instance(agent_instance_key) {
+            Some(ai) => ai.process_instance_key,
+            None => return log,
+        };
+        let pending: Vec<Key> = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|inst| inst.agent_history.get(&agent_instance_key))
+            .map(|records| {
+                records
+                    .iter()
+                    .filter(|r| r.commit_status == crate::agent::AgentHistoryCommitStatus::Pending)
+                    .map(|r| r.agent_history_key)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return log;
+        }
+        let event = if commit {
+            Event::AgentHistoryCommitted {
+                instance_key,
+                agent_instance_key,
+                agent_history_keys: pending,
+            }
+        } else {
+            Event::AgentHistoryDiscarded {
+                instance_key,
+                agent_instance_key,
+                agent_history_keys: pending,
+            }
+        };
+        self.emit(&mut log, event);
+        log
+    }
+
     ///
     /// Only [`Event::ProcessDeployed`] events are applied: message-start
     /// subscriptions and timer-start arming are intentionally skipped so those
