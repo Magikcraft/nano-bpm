@@ -17685,6 +17685,72 @@ fn agent_instance_create_takes_limits_from_configuration_history_item() {
 }
 
 #[test]
+fn agent_instance_create_ignores_limits_from_non_configuration_history_item() {
+    use crate::agent::{AgentDefinition, AgentHistoryRole, AgentInstanceLimits};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+
+    // An ASSISTANT turn carrying `limits` must NOT seed the record's limits:
+    // only a CONFIGURATION turn may. With no CONFIGURATION turn and no explicit
+    // limits, the record must fall back to the unlimited default.
+    let mut assistant_turn = history_turn(0, 5, AgentHistoryRole::Assistant);
+    assistant_turn.limits = Some(AgentInstanceLimits {
+        max_tokens: 42,
+        max_model_calls: 3,
+        max_tool_calls: 7,
+    });
+    engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![assistant_turn],
+        })
+        .unwrap();
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aik).limits,
+        AgentInstanceLimits::default(),
+        "a non-CONFIGURATION turn must not seed limits; default to unlimited"
+    );
+}
+
+#[test]
+fn agent_instance_create_takes_limits_from_last_configuration_not_later_turn() {
+    use crate::agent::{AgentDefinition, AgentHistoryRole, AgentInstanceLimits};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+
+    // CONFIGURATION seeds limits; a LATER ASSISTANT turn carrying different
+    // limits must not override the CONFIGURATION-supplied value.
+    let cfg_limits = AgentInstanceLimits {
+        max_tokens: 100,
+        max_model_calls: 5,
+        max_tool_calls: 9,
+    };
+    let mut cfg_turn = history_turn(0, 5, AgentHistoryRole::Configuration);
+    cfg_turn.limits = Some(cfg_limits);
+    let mut later_assistant = history_turn(1, 10, AgentHistoryRole::Assistant);
+    later_assistant.limits = Some(AgentInstanceLimits {
+        max_tokens: 1,
+        max_model_calls: 1,
+        max_tool_calls: 1,
+    });
+    engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![cfg_turn, later_assistant],
+        })
+        .unwrap();
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aik).limits,
+        cfg_limits,
+        "the CONFIGURATION turn wins; a later non-CONFIGURATION turn cannot override it"
+    );
+}
+
+#[test]
 fn agent_instance_create_on_inactive_element_instance_is_rejected() {
     use crate::agent::AgentDefinition;
     let (mut engine, _pi, _aik) = agent_instance_for_history();

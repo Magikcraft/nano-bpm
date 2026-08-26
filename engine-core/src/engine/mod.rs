@@ -630,9 +630,17 @@ impl Engine {
                     .cloned()
             });
         // Limits: explicit wins, else the last CONFIGURATION history item, else
-        // the existing record's limits, else unlimited default.
+        // the existing record's limits, else unlimited default. Only a
+        // CONFIGURATION turn may seed limits — a non-CONFIGURATION turn (e.g.
+        // ASSISTANT) carrying `limits` must not silently override them, per the
+        // stable/8.10 semantics documented above.
         let resolved_limits = limits
-            .or_else(|| history.iter().rev().find_map(|turn| turn.limits))
+            .or_else(|| {
+                history.iter().rev().find_map(|turn| {
+                    turn.limits
+                        .filter(|_| turn.role == crate::agent::AgentHistoryRole::Configuration)
+                })
+            })
             .or_else(|| existing.as_ref().map(|ai| ai.limits))
             .unwrap_or_default();
         let agent_instance_key = existing
