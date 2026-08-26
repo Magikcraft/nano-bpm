@@ -100,6 +100,80 @@ impl Default for AgentInstanceLimits {
     }
 }
 
+/// The kind of limit a batch would breach — the single source of truth for
+/// which counter a configured (`!= -1`) limit governs. Returned by
+/// [`AgentInstanceLimits::first_breach`] so the processor can report a precise
+/// rejection without re-deriving the mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentLimitKind {
+    /// Total tokens (`input_tokens + output_tokens`) exceeded `max_tokens`.
+    Tokens,
+    /// `model_calls` exceeded `max_model_calls`.
+    ModelCalls,
+    /// `tool_calls` exceeded `max_tool_calls`.
+    ToolCalls,
+}
+
+impl AgentLimitKind {
+    /// The canonical label used in rejection messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentLimitKind::Tokens => "maxTokens",
+            AgentLimitKind::ModelCalls => "maxModelCalls",
+            AgentLimitKind::ToolCalls => "maxToolCalls",
+        }
+    }
+}
+
+impl AgentInstanceLimits {
+    /// The first limit that `metrics` breaches, or `None` when every configured
+    /// limit still has headroom. A limit of `-1` ([`AGENT_LIMIT_UNLIMITED`]) is
+    /// unbounded and never breached. `max_tokens` governs the combined
+    /// `input_tokens + output_tokens` total; `max_model_calls` / `max_tool_calls`
+    /// govern their same-named counters. This is the sole place the limit ->
+    /// counter mapping lives, so the CREATE/UPDATE processors enforce limits by
+    /// calling it rather than duplicating the comparison.
+    pub fn first_breach(&self, metrics: &AgentInstanceMetrics) -> Option<AgentLimitKind> {
+        let total_tokens = metrics.input_tokens.saturating_add(metrics.output_tokens);
+        if self.max_tokens != AGENT_LIMIT_UNLIMITED && total_tokens > self.max_tokens {
+            return Some(AgentLimitKind::Tokens);
+        }
+        if self.max_model_calls != AGENT_LIMIT_UNLIMITED
+            && metrics.model_calls > self.max_model_calls
+        {
+            return Some(AgentLimitKind::ModelCalls);
+        }
+        if self.max_tool_calls != AGENT_LIMIT_UNLIMITED && metrics.tool_calls > self.max_tool_calls
+        {
+            return Some(AgentLimitKind::ToolCalls);
+        }
+        None
+    }
+}
+
+/// Metric increments applied to an agent instance's aggregate counters on
+/// UPDATE (Camunda 8.10 `AgentInstanceMetricsDelta`). Each field is a
+/// non-negative delta folded into the running totals; omitted fields default to
+/// `0` (no change). Mirrors the spec `AgentInstanceMetricsDelta` request shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AgentInstanceMetricsDelta {
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub input_tokens: i64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub output_tokens: i64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub reasoning_token_count: i64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cache_creation_token_count: i64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cache_read_token_count: i64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub model_calls: i64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tool_calls: i64,
+}
+
 /// Aggregated metrics for an agent instance across all loop iterations. All
 /// counters start at zero and only grow (UPDATE processors — a later slice —
 /// advance them).
@@ -113,6 +187,30 @@ pub struct AgentInstanceMetrics {
     pub cache_read_token_count: i64,
     pub model_calls: i64,
     pub tool_calls: i64,
+}
+
+impl AgentInstanceMetrics {
+    /// This counter set with `delta` folded in (each field summed). Counters
+    /// only ever grow, so this is a saturating add. Used by the UPDATE processor
+    /// to compute the post-batch totals it both limit-checks and stores, keeping
+    /// the accumulation in one place.
+    pub fn with_delta(&self, delta: &AgentInstanceMetricsDelta) -> AgentInstanceMetrics {
+        AgentInstanceMetrics {
+            input_tokens: self.input_tokens.saturating_add(delta.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(delta.output_tokens),
+            reasoning_token_count: self
+                .reasoning_token_count
+                .saturating_add(delta.reasoning_token_count),
+            cache_creation_token_count: self
+                .cache_creation_token_count
+                .saturating_add(delta.cache_creation_token_count),
+            cache_read_token_count: self
+                .cache_read_token_count
+                .saturating_add(delta.cache_read_token_count),
+            model_calls: self.model_calls.saturating_add(delta.model_calls),
+            tool_calls: self.tool_calls.saturating_add(delta.tool_calls),
+        }
+    }
 }
 
 /// A tool available to the agent (`tools[]{name,description,elementId}`).

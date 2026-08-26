@@ -384,18 +384,44 @@ pub enum Command {
         /// Static definition set once at creation (model/provider/systemPrompt).
         definition: crate::agent::AgentDefinition,
         /// Limits for the agent execution; `None` = all limits default to `-1`.
+        /// An explicit value wins; absent that, the last `limits` carried by a
+        /// turn in `history` (a CONFIGURATION item) is used; absent both, limits
+        /// default to unlimited (`-1/-1/-1`).
         #[cfg_attr(
             feature = "serde",
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         limits: Option<crate::agent::AgentInstanceLimits>,
+        /// An optional initial batch of AgentHistory turns applied (append +
+        /// commit, slice S2 behavior) at creation. Each becomes its own
+        /// AGENT_HISTORY record.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        history: Vec<crate::agent::AgentHistoryTurn>,
     },
     /// Update an engine-native AgentInstance (Camunda `AgentInstanceIntent.UPDATE`,
     /// stable/8.10; `PATCH /v2/agent-instances/{key}`): advance its status
-    /// (to one of the *active* states) and append the turn history. The
-    /// processor and history application are a later slice (S3/S2).
+    /// (to one of the *active* states), accumulate metric deltas, replace the
+    /// tool set, and append the turn history (slice S2 behavior). The processor
+    /// enforces the configured limits.
     UpdateAgentInstance {
         agent_instance_key: Key,
+        /// The element instance asserting ownership of this update. Must be an
+        /// *active* element instance of the same element as the target agent
+        /// instance; a new (re-entry) key is appended to the instance's
+        /// `element_instance_keys`.
+        #[cfg_attr(feature = "serde", serde(default))]
+        element_instance_key: Key,
+        /// The element id the caller believes this agent instance runs on; must
+        /// match the stored instance (guards against a stale/misrouted update).
+        #[cfg_attr(feature = "serde", serde(default))]
+        element_id: crate::model::ElementId,
+        /// The process instance key the caller believes owns this agent
+        /// instance; must match the stored instance.
+        #[cfg_attr(feature = "serde", serde(default))]
+        process_instance_key: Key,
         /// The target status; must be one of the *active* states (`COMPLETED`
         /// is not settable via UPDATE — it is reached only via COMPLETE).
         #[cfg_attr(
@@ -403,6 +429,24 @@ pub enum Command {
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         status: Option<crate::agent::AgentInstanceStatus>,
+        /// Metric increments folded into the instance's running totals. The
+        /// processor rejects the batch if the resulting totals would breach a
+        /// configured (`!= -1`) limit.
+        #[cfg_attr(feature = "serde", serde(default))]
+        metrics: crate::agent::AgentInstanceMetricsDelta,
+        /// The new tool set (replaces the stored one) when present.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        tools: Option<Vec<crate::agent::AgentTool>>,
+        /// A batch of AgentHistory turns appended (append + commit, slice S2
+        /// behavior) as part of this update.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        history: Vec<crate::agent::AgentHistoryTurn>,
     },
     /// Complete an engine-native AgentInstance (Camunda `AgentInstanceIntent.COMPLETE`,
     /// stable/8.10): drive it to `COMPLETED`. The drain processor is a later
