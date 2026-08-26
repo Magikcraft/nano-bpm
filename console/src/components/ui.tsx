@@ -1,12 +1,218 @@
-import type {
-  ButtonHTMLAttributes,
-  InputHTMLAttributes,
-  ReactNode,
+import {
+  type AnchorHTMLAttributes,
+  type ButtonHTMLAttributes,
+  type InputHTMLAttributes,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useSyncExternalStore,
 } from "react";
+import { createPortal } from "react-dom";
+import { MOBILE_MAX_WIDTH } from "@nanobpm/nano-app-schema";
 
 // Shared UI primitives — the building blocks every view composes so the
 // console reads as one product. All colours come from theme tokens
 // (src/theme/tokens.css); never hardcode a palette colour in a view.
+
+// ─────────────────────────────────────────────────────────────────────────
+// Mobile-first primitives (unit A0)
+//
+// The single responsive breakpoint for the whole console is `MOBILE_MAX_WIDTH`
+// imported from `@nanobpm/nano-app-schema` — never restate `640px` here. Every
+// A-task consumes these primitives, so they are self-contained: a consumer at
+// 375×812 gets no horizontal scroll from them.
+// ─────────────────────────────────────────────────────────────────────────
+
+/** The `matchMedia` query string for "narrow" (mobile) viewports, derived from
+ * the one canonical breakpoint. Exported so callers and tests can bind to the
+ * single source of truth rather than re-typing a width. */
+export function mobileMediaQuery(maxWidth: string = MOBILE_MAX_WIDTH): string {
+  return `(max-width: ${maxWidth})`;
+}
+
+const NARROW_QUERY = mobileMediaQuery();
+
+function subscribeNarrow(onChange: () => void): () => void {
+  if (typeof window === "undefined" || !window.matchMedia) return () => {};
+  const mql = window.matchMedia(NARROW_QUERY);
+  // Safari <14 only supports the deprecated addListener API.
+  if (mql.addEventListener) {
+    mql.addEventListener("change", onChange);
+    return () => mql.removeEventListener("change", onChange);
+  }
+  mql.addListener(onChange);
+  return () => mql.removeListener(onChange);
+}
+
+function getNarrowSnapshot(): boolean {
+  if (typeof window === "undefined" || !window.matchMedia) return false;
+  return window.matchMedia(NARROW_QUERY).matches;
+}
+
+/** `true` when the viewport is at or below the canonical mobile breakpoint
+ * (`MOBILE_MAX_WIDTH`). Drives the responsive presentation of the SAME routes —
+ * views branch on this rather than forking a mobile route tree. SSR-safe
+ * (returns `false` on the server). */
+export function useIsNarrow(): boolean {
+  return useSyncExternalStore(subscribeNarrow, getNarrowSnapshot, () => false);
+}
+
+/** Responsive card grid used across the home rail, project/instance/app cards
+ * and filter sheets. Columns collapse to one on a phone (intrinsic auto-fill —
+ * no width breakpoint literal) so content never overflows horizontally. */
+export function CardGrid({
+  className = "",
+  children,
+  ...rest
+}: { className?: string; children: ReactNode } & Record<string, unknown>) {
+  return (
+    <div className={`nano-card-grid ${className}`} {...rest}>
+      {children}
+    </div>
+  );
+}
+
+/** A tappable launcher/navigation card — the mobile counterpart of a rail item,
+ * reused for the home rail and project/instance/app cards. Renders an `<a>`
+ * when `href` is given, otherwise a `<button>`. Meets the 44px minimum touch
+ * target (`.nano-touch`). */
+export function NavCard({
+  label,
+  description,
+  icon,
+  active = false,
+  href,
+  className = "",
+  ...rest
+}: {
+  label: ReactNode;
+  description?: ReactNode;
+  icon?: ReactNode;
+  active?: boolean;
+  href?: string;
+  className?: string;
+} & Omit<
+  ButtonHTMLAttributes<HTMLButtonElement> &
+    AnchorHTMLAttributes<HTMLAnchorElement>,
+  "className"
+>) {
+  const classes = `nano-touch flex w-full items-center gap-3 rounded-xl border bg-raised p-4 text-left shadow-sm transition-colors outline-none focus-visible:ring-2 focus-visible:ring-accent/60 ${
+    active
+      ? "border-accent/60 bg-accent/10"
+      : "border-edge hover:border-edge-strong hover:bg-hover"
+  } ${className}`;
+  const inner = (
+    <>
+      {icon && (
+        <span className="flex shrink-0 items-center text-fg-muted" aria-hidden>
+          {icon}
+        </span>
+      )}
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium text-fg">
+          {label}
+        </span>
+        {description && (
+          <span className="mt-0.5 block truncate text-xs text-fg-muted">
+            {description}
+          </span>
+        )}
+      </span>
+    </>
+  );
+  if (href !== undefined) {
+    return (
+      <a
+        href={href}
+        aria-current={active ? "page" : undefined}
+        className={classes}
+        {...(rest as AnchorHTMLAttributes<HTMLAnchorElement>)}
+      >
+        {inner}
+      </a>
+    );
+  }
+  return (
+    <button
+      type="button"
+      aria-current={active ? "page" : undefined}
+      className={classes}
+      {...(rest as ButtonHTMLAttributes<HTMLButtonElement>)}
+    >
+      {inner}
+    </button>
+  );
+}
+
+/** A bottom-anchored sheet for mobile — the home hamburger menu, filter panels
+ * and card drill-ins all use it. Slides up from the bottom edge, clears the
+ * home indicator (`env(safe-area-inset-bottom)`), traps nothing but closes on
+ * Escape or backdrop tap. Renders `null` when closed. */
+export function BottomSheet({
+  open,
+  onClose,
+  title,
+  children,
+  className = "",
+}: {
+  open: boolean;
+  onClose: () => void;
+  title?: ReactNode;
+  children: ReactNode;
+  className?: string;
+}) {
+  const handleKey = useCallback(
+    (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    },
+    [onClose],
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [open, handleKey]);
+
+  if (!open || typeof document === "undefined") return null;
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-end justify-center bg-black/50"
+      onClick={onClose}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        className={`nano-safe-bottom flex max-h-[85vh] w-full flex-col overflow-hidden rounded-t-2xl border-t border-edge-strong bg-raised shadow-xl ${className}`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex justify-center pt-2 pb-1">
+          <span aria-hidden className="nano-sheet-grip" />
+        </div>
+        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-edge px-4 pb-3">
+          {title ? (
+            <h2 className="min-w-0 flex-1 truncate text-sm font-semibold text-fg">
+              {title}
+            </h2>
+          ) : (
+            <span className="flex-1" />
+          )}
+          <button
+            type="button"
+            className="nano-touch -mr-2 rounded p-2 text-fg-muted hover:bg-hover hover:text-fg"
+            aria-label="Close"
+            onClick={onClose}
+          >
+            ✕
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto p-4">{children}</div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
 
 /** Standard page chrome: title, one-line subtitle, optional right-side actions. */
 export function PageHeader({
