@@ -59,8 +59,7 @@ impl AgentType {
 
 /// The static definition of an agent, set once at creation
 /// (`definition{model,provider,systemPrompt}`). Fields are optional because the
-/// concrete values are typically supplied by the worker/config at CREATE time;
-/// an empty string is normalised to `None`.
+/// concrete values are typically supplied by the worker/config at CREATE time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AgentDefinition {

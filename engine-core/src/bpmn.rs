@@ -955,12 +955,17 @@ fn parse_with_captures(
                                     let is_adhoc = acc.nodes[idx].is_adhoc;
                                     match agent_type {
                                         None => {
+                                            let reason = if raw.is_empty() {
+                                                "missing agentType attribute (expected aiAgentTask, aiAgentSubProcess or external)".to_string()
+                                            } else {
+                                                format!(
+                                                    "unknown agentType '{raw}' (expected aiAgentTask, aiAgentSubProcess or external)"
+                                                )
+                                            };
                                             return Err(ParseError::InvalidAgentDefinition {
                                                 process_id: acc.id.clone(),
                                                 element_id,
-                                                reason: format!(
-                                                    "unknown agentType '{raw}' (expected aiAgentTask, aiAgentSubProcess or external)"
-                                                ),
+                                                reason,
                                             });
                                         }
                                         Some(crate::agent::AgentType::AiAgentTask) if is_adhoc => {
@@ -6429,8 +6434,35 @@ mod feel_timer_tests {
 
         let err = parse_bpmn(xml).unwrap_err();
         assert!(
-            matches!(err, ParseError::InvalidAgentDefinition { .. }),
-            "expected InvalidAgentDefinition, got {err:?}"
+            matches!(err, ParseError::InvalidAgentDefinition { ref reason, .. } if reason.contains("unknown agentType 'wat'")),
+            "expected InvalidAgentDefinition naming the unknown value, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_a_missing_agent_type_with_a_clear_reason() {
+        // An empty/absent `agentType` must not be reported as `unknown agentType ''`;
+        // the reason should say the attribute is missing.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="bad-agent4" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="agent">
+                <bpmn:extensionElements>
+                  <zeebe:agentDefinition />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidAgentDefinition { ref reason, .. } if reason.contains("missing agentType attribute")),
+            "expected InvalidAgentDefinition citing a missing attribute, got {err:?}"
         );
     }
 

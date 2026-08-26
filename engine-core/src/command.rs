@@ -375,8 +375,9 @@ pub enum Command {
     /// `processInstanceKey`, `elementId`, `processDefinitionKey` and `tenantId`
     /// from the referenced `element_instance_key`. The lifecycle *processor* that
     /// validates and applies this command is a later slice (S3); this variant is
-    /// defined now so the record/intent surface is wired end-to-end and the wasm
-    /// `TestEngine` can drive it.
+    /// defined now so the record/intent surface is wired end-to-end. It is not
+    /// yet callable from the wasm `TestEngine` (classified `NotSurfaced` in
+    /// `engine-wasm`) until that S3 processor lands.
     CreateAgentInstance {
         /// The key of the AI Agent Sub-process / AI Agent Task element instance.
         element_instance_key: Key,

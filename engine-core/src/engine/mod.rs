@@ -507,7 +507,10 @@ impl Engine {
     /// for a top-level instance. Bounded against a pathological cycle.
     fn root_process_instance_key(&self, instance_key: Key) -> Key {
         let mut current = instance_key;
-        for _ in 0..10_000 {
+        // A legal parent chain is bounded by the same call-activity nesting
+        // limit that guards deployment, so reuse it (plus one to reach the root
+        // from the deepest legal instance) rather than a separate magic number.
+        for _ in 0..=MAX_CALL_ACTIVITY_DEPTH {
             match self
                 .state
                 .instances
