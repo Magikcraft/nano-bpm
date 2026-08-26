@@ -5,6 +5,7 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useId,
   useSyncExternalStore,
 } from "react";
 import { createPortal } from "react-dom";
@@ -75,27 +76,38 @@ export function CardGrid({
 /** A tappable launcher/navigation card — the mobile counterpart of a rail item,
  * reused for the home rail and project/instance/app cards. Renders an `<a>`
  * when `href` is given, otherwise a `<button>`. Meets the 44px minimum touch
- * target (`.nano-touch`). */
-export function NavCard({
-  label,
-  description,
-  icon,
-  active = false,
-  href,
-  className = "",
-  ...rest
-}: {
+ * target (`.nano-touch`). The props are a discriminated union keyed on `href`:
+ * anchor attributes are only permitted when `href` is set, button attributes
+ * otherwise — so invalid props (e.g. `disabled` on a link, `href` on a button)
+ * are rejected at compile time rather than spread onto the wrong element. */
+type NavCardBaseProps = {
   label: ReactNode;
   description?: ReactNode;
   icon?: ReactNode;
   active?: boolean;
-  href?: string;
   className?: string;
-} & Omit<
-  ButtonHTMLAttributes<HTMLButtonElement> &
+};
+
+type NavCardAnchorProps = NavCardBaseProps & { href: string } & Omit<
     AnchorHTMLAttributes<HTMLAnchorElement>,
-  "className"
->) {
+    "className" | "href"
+  >;
+
+type NavCardButtonProps = NavCardBaseProps & { href?: undefined } & Omit<
+    ButtonHTMLAttributes<HTMLButtonElement>,
+    "className" | "href"
+  >;
+
+export function NavCard(props: NavCardAnchorProps | NavCardButtonProps) {
+  const {
+    label,
+    description,
+    icon,
+    active = false,
+    href,
+    className = "",
+    ...rest
+  } = props;
   const classes = `nano-touch flex w-full items-center gap-3 rounded-xl border bg-raised p-4 text-left shadow-sm transition-colors outline-none focus-visible:ring-2 focus-visible:ring-accent/60 ${
     active
       ? "border-accent/60 bg-accent/10"
@@ -168,6 +180,8 @@ export function BottomSheet({
     [onClose],
   );
 
+  const titleId = useId();
+
   useEffect(() => {
     if (!open) return;
     window.addEventListener("keydown", handleKey);
@@ -184,6 +198,8 @@ export function BottomSheet({
       <div
         role="dialog"
         aria-modal="true"
+        aria-labelledby={title ? titleId : undefined}
+        aria-label={title ? undefined : "Menu"}
         className={`nano-safe-bottom flex max-h-[85vh] w-full flex-col overflow-hidden rounded-t-2xl border-t border-edge-strong bg-raised shadow-xl ${className}`}
         onClick={(e) => e.stopPropagation()}
       >
@@ -192,7 +208,10 @@ export function BottomSheet({
         </div>
         <div className="flex shrink-0 items-center justify-between gap-2 border-b border-edge px-4 pb-3">
           {title ? (
-            <h2 className="min-w-0 flex-1 truncate text-sm font-semibold text-fg">
+            <h2
+              id={titleId}
+              className="min-w-0 flex-1 truncate text-sm font-semibold text-fg"
+            >
               {title}
             </h2>
           ) : (
