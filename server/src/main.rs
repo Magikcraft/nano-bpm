@@ -19303,14 +19303,19 @@ fn agent_history_metrics_from(
 }
 
 /// Projects an [`readstore::AgentInstanceRow`] into the REST `AgentInstanceResult`.
-/// `version_tag` has no engine counterpart (the read model stores no tag), so it
-/// maps to null; tools are decoded from the row's stored JSON, defaulting to an
-/// empty list when absent or malformed.
+/// `version_tag` is the projected `process_definition_version_tag` (null when the
+/// deployment carried no tag); tools are decoded from the row's stored JSON,
+/// defaulting to an empty list when absent or malformed; `elementInstanceKeys`
+/// reports every element instance associated with the agent instance.
 fn agent_instance_result(row: &readstore::AgentInstanceRow) -> models::AgentInstanceResult {
     let tools: Vec<agent_model::AgentTool> =
         serde_json::from_str(&row.tools_json).unwrap_or_default();
     let completion_date = match row.completion_date_ms {
         Some(ms) => types::Nullable::Present(ms_to_datetime(ms)),
+        None => types::Nullable::Null,
+    };
+    let version_tag = match &row.process_definition_version_tag {
+        Some(tag) => types::Nullable::Present(tag.clone()),
         None => types::Nullable::Null,
     };
     models::AgentInstanceResult::new(
@@ -19339,12 +19344,15 @@ fn agent_instance_result(row: &readstore::AgentInstanceRow) -> models::AgentInst
         models::ProcessDefinitionKey(row.process_definition_key.to_string()),
         row.process_definition_id.clone(),
         row.process_definition_version,
-        types::Nullable::Null,
+        version_tag,
         tenant_or_default(&row.tenant_id),
         ms_to_datetime(row.creation_date_ms),
         ms_to_datetime(row.last_updated_date_ms),
         completion_date,
-        vec![row.element_instance_key.to_string()],
+        row.element_instance_keys
+            .iter()
+            .map(|k| k.to_string())
+            .collect(),
     )
 }
 
@@ -35058,6 +35066,69 @@ mod call_activity_hierarchy_read_model_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(cleared, "tools: null clears the stored tool set");
+    }
+
+    /// The `AgentInstanceResult` mapper must propagate the projected
+    /// `process_definition_version_tag` and the full `element_instance_keys` set
+    /// (not a hardcoded null / the owning key alone).
+    #[test]
+    fn agent_instance_result_maps_version_tag_and_all_element_keys() {
+        fn row(tag: Option<&str>) -> readstore::AgentInstanceRow {
+            readstore::AgentInstanceRow {
+                agent_instance_key: 11,
+                agent_definition_key: 7,
+                element_instance_key: 1011,
+                element_id: "agent".to_string(),
+                process_instance_key: 42,
+                root_process_instance_key: 42,
+                process_definition_key: 99,
+                process_definition_id: "proc".to_string(),
+                process_definition_version: 3,
+                tenant_id: "<default>".to_string(),
+                status: agent_model::AgentInstanceStatus::Thinking,
+                agent_type: "aiAgentTask".to_string(),
+                model: Some("gpt".to_string()),
+                provider: Some("openai".to_string()),
+                system_prompt: Some("be helpful".to_string()),
+                max_tokens: 1000,
+                max_model_calls: 10,
+                max_tool_calls: 10,
+                input_tokens: 1,
+                output_tokens: 2,
+                reasoning_token_count: 0,
+                cache_creation_token_count: 0,
+                cache_read_token_count: 0,
+                model_calls: 1,
+                tool_calls: 0,
+                job_key: 0,
+                tools_json: "[]".to_string(),
+                creation_date_ms: 100,
+                last_updated_date_ms: 200,
+                completion_date_ms: None,
+                process_definition_version_tag: tag.map(str::to_string),
+                element_instance_keys: vec![1011, 2011, 3011],
+            }
+        }
+
+        let tagged = agent_instance_result(&row(Some("v1.2.3")));
+        assert!(
+            matches!(&tagged.process_definition_version_tag, types::Nullable::Present(t) if t == "v1.2.3"),
+            "a projected version tag surfaces in the result, not a hardcoded null"
+        );
+        assert_eq!(
+            tagged.element_instance_keys,
+            vec!["1011".to_string(), "2011".to_string(), "3011".to_string()],
+            "every associated element instance key is reported, not just the owner"
+        );
+
+        let untagged = agent_instance_result(&row(None));
+        assert!(
+            matches!(
+                untagged.process_definition_version_tag,
+                types::Nullable::Null
+            ),
+            "an absent version tag maps to null"
+        );
     }
 
     /// Runs `search` with a `parentProcessInstanceKey` filter, returning the keys.

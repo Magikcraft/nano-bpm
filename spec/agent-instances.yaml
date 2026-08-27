@@ -643,9 +643,15 @@ components:
             - $ref: 'keys.yaml#/components/schemas/JobKey'
         jobLease:
           description: |
-            Opaque lease token received from the job activation response, disambiguating this
-            activation from any other of the same job.
+            Lease token received from the job activation response, disambiguating this
+            activation from any other of the same job. It is the activation's lease
+            deadline serialized as a decimal string (an unsigned 64-bit integer), so
+            the server rejects any non-numeric value with 400.
           type: string
+          pattern: ^[0-9]+$
+          minLength: 1
+          maxLength: 20
+          example: "1717000000000"
         metrics:
           description: Metric increments to apply to the aggregate counters.
           allOf:

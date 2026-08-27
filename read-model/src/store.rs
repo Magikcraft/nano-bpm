@@ -5126,6 +5126,7 @@ fn project_agent_instance(tx: &rusqlite::Transaction, ai: &AgentInstance) -> rus
              job_key = excluded.job_key, tools_json = excluded.tools_json, \
              last_updated_date_ms = excluded.last_updated_date_ms, \
              completion_date_ms = excluded.completion_date_ms, \
+             process_definition_version_tag = excluded.process_definition_version_tag, \
              element_instance_keys_json = excluded.element_instance_keys_json",
         params![
             ai.agent_instance_key as i64,
@@ -8633,6 +8634,30 @@ mod agent_projection_tests {
             row.element_instance_keys,
             vec![1005, 2005, 3005],
             "the full element-instance-key set is projected as a JSON array"
+        );
+
+        // ON CONFLICT must refresh the version tag: a later UPDATED event carrying a
+        // non-null tag replaces a previously-projected NULL (additive projection
+        // preserves the row, so the UPSERT must update the tag, not keep it stale).
+        let mut untagged = instance(6, "agent-d", AgentInstanceStatus::Initializing, 400);
+        untagged.process_definition_version_tag = None;
+        let mut tagged = instance(6, "agent-d", AgentInstanceStatus::Thinking, 400);
+        tagged.process_definition_version_tag = Some("v9.9.9".to_string());
+        let store = store_with(&[
+            Event::AgentInstanceCreated {
+                instance_key: 42,
+                agent_instance: untagged,
+            },
+            Event::AgentInstanceUpdated {
+                instance_key: 42,
+                agent_instance: tagged,
+            },
+        ]);
+        let row = store.agent_instance(6).expect("instance projects");
+        assert_eq!(
+            row.process_definition_version_tag.as_deref(),
+            Some("v9.9.9"),
+            "the version tag is refreshed on conflicting UPSERT, not left NULL"
         );
     }
 
