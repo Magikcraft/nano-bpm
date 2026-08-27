@@ -21,6 +21,7 @@ import {
   stubInstances,
   suppressStartupPanel,
 } from "../fixtures.ts";
+import { expectNoHorizontalScroll } from "./helpers.ts";
 
 const INSTANCE_KEY = "2251799813685250";
 
@@ -44,6 +45,8 @@ test.describe("mobile instance deep-link", () => {
       page.getByRole("button", { name: "← Instances" }),
     ).toBeVisible();
     await expect(page.getByRole("button", { name: /Model/ })).toBeVisible();
+
+    await expectNoHorizontalScroll(page);
 
     noCrash();
   });
@@ -91,6 +94,8 @@ test.describe("mobile instance deep-link", () => {
       page.getByRole("button", { name: "← Instances" }),
     ).toBeVisible();
     await expect(page.getByRole("button", { name: /Model/ })).toBeVisible();
+
+    await expectNoHorizontalScroll(page);
 
     noCrash();
   });
