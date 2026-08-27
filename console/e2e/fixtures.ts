@@ -30,6 +30,7 @@ export interface StubOptions {
   /** Both false ⇒ `hasJsRuntime` resolves to "repair". */
   denoAvailable?: boolean;
   nodeAvailable?: boolean;
+  urbanAvailable?: boolean;
   /** 0 ⇒ `hasTraces` resolves to "skip". */
   traceCount?: number;
   /** Empty ⇒ `hasProject` resolves to "skip", and the picker's empty state shows. */
@@ -96,6 +97,7 @@ export async function stubConsoleApi(
   const {
     denoAvailable = true,
     nodeAvailable = true,
+    urbanAvailable = true,
     traceCount = 0,
     nodeCount = 1,
     projects = [{ name: "demo", lang: "deno" }],
@@ -117,6 +119,7 @@ export async function stubConsoleApi(
     })),
     denoAvailable,
     nodeAvailable,
+    urbanAvailable,
     platforms: [],
     templates: [
       template("starter", "Starter app"),
