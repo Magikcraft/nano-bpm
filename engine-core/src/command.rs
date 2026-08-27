@@ -374,9 +374,9 @@ pub enum Command {
     /// stable/8.10; `POST /v2/agent-instances`). The engine infers
     /// `processInstanceKey`, `elementId`, `processDefinitionKey` and `tenantId`
     /// from the referenced `element_instance_key`. The lifecycle *processor* that
-    /// validates and applies this command landed in this slice (S3). It is not
-    /// yet callable from the wasm `TestEngine` (classified `NotSurfaced` in
-    /// `engine-wasm`) until its driver lands in agent-instance-parity S6.
+    /// validates and applies this command landed in this slice (S3), and its wasm
+    /// `TestEngine` driver (`createAgentInstance`) is surfaced in `engine-wasm`
+    /// (agent-instance-parity S6).
     CreateAgentInstance {
         /// The key of the AI Agent Sub-process / AI Agent Task element instance.
         element_instance_key: Key,
@@ -449,8 +449,8 @@ pub enum Command {
     },
     /// Complete an engine-native AgentInstance (Camunda `AgentInstanceIntent.COMPLETE`,
     /// stable/8.10): drive it to `COMPLETED`. The completion processor landed in
-    /// this slice (S3); its wasm `TestEngine` surface is deferred (classified
-    /// `NotSurfaced` in `engine-wasm` until agent-instance-parity S6).
+    /// this slice (S3); its wasm `TestEngine` driver (`completeAgentInstance`) is
+    /// surfaced in `engine-wasm` (agent-instance-parity S6).
     CompleteAgentInstance { agent_instance_key: Key },
 }
 
