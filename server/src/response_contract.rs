@@ -315,10 +315,10 @@ fn validate(
 
     // $ref -> resolve within the shared defs pool.
     if let Some(reference) = obj.get("$ref").and_then(Value::as_str) {
-        if let Some(name) = reference.strip_prefix("#/defs/") {
-            if let Some(target) = defs.get(name) {
-                validate(defs, target, instance, pointer, out, depth + 1);
-            }
+        if let Some(name) = reference.strip_prefix("#/defs/")
+            && let Some(target) = defs.get(name)
+        {
+            validate(defs, target, instance, pointer, out, depth + 1);
         }
         return;
     }
@@ -350,31 +350,31 @@ fn validate(
     }
 
     // enum
-    if let Some(Value::Array(values)) = obj.get("enum") {
-        if !values.iter().any(|v| v == instance) {
-            out.push(Violation::new(
-                pointer,
-                "enum",
-                format!(
-                    "value {} is not one of the permitted enum values",
-                    compact(instance)
-                ),
-            ));
-        }
+    if let Some(Value::Array(values)) = obj.get("enum")
+        && !values.iter().any(|v| v == instance)
+    {
+        out.push(Violation::new(
+            pointer,
+            "enum",
+            format!(
+                "value {} is not one of the permitted enum values",
+                compact(instance)
+            ),
+        ));
     }
 
     // const
-    if let Some(expected) = obj.get("const") {
-        if expected != instance {
-            out.push(Violation::new(
-                pointer,
-                "const",
-                format!(
-                    "value {} does not equal the required const",
-                    compact(instance)
-                ),
-            ));
-        }
+    if let Some(expected) = obj.get("const")
+        && expected != instance
+    {
+        out.push(Violation::new(
+            pointer,
+            "const",
+            format!(
+                "value {} does not equal the required const",
+                compact(instance)
+            ),
+        ));
     }
 
     // allOf: every subschema must hold.
