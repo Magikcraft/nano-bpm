@@ -839,6 +839,7 @@ components:
             Caller-assigned identifier used to detect and dedupe retries of the same item.
             Must be non-blank.
           type: string
+          minLength: 1
         loopIteration:
           type: integer
           format: int32

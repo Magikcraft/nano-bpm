@@ -11409,54 +11409,38 @@ impl ServerImpl {
                 commit.wait().await;
                 self.spawn_routing_if_needed(&events);
                 // Correlate each emitted AgentHistoryCreated to its submitted item
-                // by position; the processor emits them in request order.
-                let mut created: Vec<(String, Key, bool)> = events
+                // in request order; the processor emits them in submission order.
+                let created: Vec<(String, String, bool)> = events
                     .iter()
                     .filter_map(|e| match e {
                         Event::AgentHistoryCreated { record, .. } => Some((
                             record.history_item_id.clone().unwrap_or_default(),
-                            record.agent_history_key,
+                            record.agent_history_key.to_string(),
                             record.is_duplicate,
                         )),
                         _ => None,
                     })
                     .collect();
-                let mut created_history = Vec::with_capacity(submitted_ids.len());
-                for (idx, id) in submitted_ids.into_iter().enumerate() {
-                    // Prefer the event whose historyItemId matches; fall back to
-                    // positional order for items created without an id.
-                    let ev = created
-                        .iter()
-                        .position(|(eid, _, _)| !id.is_empty() && *eid == id)
-                        .or(if idx < created.len() { Some(idx) } else { None });
-                    match ev {
-                        Some(pos) => {
-                            let (eid, key, dup) = created.remove(pos);
-                            created_history.push(models::AgentInstanceCreatedHistoryItem::new(
-                                if id.is_empty() { eid } else { id },
-                                models::AgentHistoryKey(key.to_string()),
-                                dup,
-                            ));
-                        }
-                        // No emitted event correlates to this submitted item: the
-                        // processor produced fewer AgentHistoryCreated events than
-                        // submitted turns. Returning a synthetic "0" key would 200
-                        // with a meaningless key, so fail the request instead.
-                        None => {
-                            return Ok(
-                                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                                    problem(
-                                        "Agent instance update incomplete",
-                                        500,
-                                        "The update emitted fewer history events than submitted \
-                                         turns; no key exists for at least one submitted item."
-                                            .to_string(),
-                                    ),
+                let created_history = match correlate_created_history(submitted_ids, created) {
+                    Some(v) => v,
+                    // No emitted event correlates to some submitted item: the
+                    // processor produced fewer AgentHistoryCreated events than
+                    // submitted turns. Returning a synthetic "0" key would 200
+                    // with a meaningless key, so fail the request instead.
+                    None => {
+                        return Ok(
+                            Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                problem(
+                                    "Agent instance update incomplete",
+                                    500,
+                                    "The update emitted fewer history events than submitted \
+                                     turns; no key exists for at least one submitted item."
+                                        .to_string(),
                                 ),
-                            );
-                        }
+                            ),
+                        );
                     }
-                }
+                };
                 Ok(Resp::Status200_TheAgentInstanceWasUpdatedSuccessfully(
                     models::AgentInstanceUpdateResult::new(created_history),
                 ))
@@ -19373,6 +19357,116 @@ fn agent_instance_result(row: &readstore::AgentInstanceRow) -> models::AgentInst
             .map(|k| k.to_string())
             .collect(),
     )
+}
+
+/// Correlates each emitted `AgentHistoryCreated` event (in request/emission
+/// order) to a submitted history item, yielding exactly one result per submitted
+/// item in submission order.
+///
+/// Matching prefers a non-empty `historyItemId` equality; failing that it falls
+/// back to *request order* by consuming the next remaining event (position 0 of
+/// the shrinking `created` list). Consuming position 0 — rather than the
+/// submitted index — is what keeps the pairing correct: matched events are
+/// removed, so `created` shrinks while a submitted index would grow, and an
+/// index-based fallback would mis-pair (or spuriously fail) as soon as any id
+/// fails to match (e.g. two blank ids, or an event emitted without an id).
+///
+/// Returns `None` when a submitted item has no correlatable event (the processor
+/// emitted fewer events than submitted turns); the caller maps that to a 500
+/// rather than fabricating a meaningless key.
+fn correlate_created_history(
+    submitted_ids: Vec<String>,
+    mut created: Vec<(String, String, bool)>,
+) -> Option<Vec<models::AgentInstanceCreatedHistoryItem>> {
+    let mut out = Vec::with_capacity(submitted_ids.len());
+    for id in submitted_ids.into_iter() {
+        let pos = created
+            .iter()
+            .position(|(eid, _, _)| !id.is_empty() && *eid == id)
+            .or(if created.is_empty() { None } else { Some(0) })?;
+        let (eid, key, dup) = created.remove(pos);
+        out.push(models::AgentInstanceCreatedHistoryItem::new(
+            if id.is_empty() { eid } else { id },
+            models::AgentHistoryKey(key),
+            dup,
+        ));
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod correlate_created_history_tests {
+    use super::*;
+
+    fn ev(id: &str, key: &str, dup: bool) -> (String, String, bool) {
+        (id.to_string(), key.to_string(), dup)
+    }
+
+    #[test]
+    fn matches_each_submitted_id_to_its_event() {
+        let out = correlate_created_history(
+            vec!["a".into(), "b".into()],
+            vec![ev("a", "10", false), ev("b", "11", true)],
+        )
+        .expect("all ids correlate");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].history_item_id, "a");
+        assert_eq!(out[0].history_item_key.0, "10");
+        assert!(!out[0].is_duplicate);
+        assert_eq!(out[1].history_item_id, "b");
+        assert_eq!(out[1].history_item_key.0, "11");
+        assert!(out[1].is_duplicate);
+    }
+
+    #[test]
+    fn matches_by_id_out_of_emission_order() {
+        // Events arrive in a different order than submitted; id match must win.
+        let out = correlate_created_history(
+            vec!["a".into(), "b".into()],
+            vec![ev("b", "11", false), ev("a", "10", false)],
+        )
+        .expect("all ids correlate");
+        assert_eq!(out[0].history_item_key.0, "10");
+        assert_eq!(out[1].history_item_key.0, "11");
+    }
+
+    #[test]
+    fn two_blank_ids_consume_events_in_request_order() {
+        // Regression: an index-based positional fallback used to 500 on the
+        // second blank-id item because `created` shrinks while the index grows.
+        // Consuming position 0 correctly pairs both blank ids in request order.
+        let out = correlate_created_history(
+            vec![String::new(), String::new()],
+            vec![ev("", "10", false), ev("", "11", true)],
+        )
+        .expect("blank ids correlate positionally");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].history_item_key.0, "10");
+        assert!(!out[0].is_duplicate);
+        assert_eq!(out[1].history_item_key.0, "11");
+        assert!(out[1].is_duplicate);
+    }
+
+    #[test]
+    fn blank_id_falls_back_after_id_match_consumed() {
+        // Mixed: a matched id removes its event, and the blank item must take the
+        // earliest surviving event (not the submitted index).
+        let out = correlate_created_history(
+            vec!["a".into(), String::new()],
+            vec![ev("a", "10", false), ev("", "11", false)],
+        )
+        .expect("mixed ids correlate");
+        assert_eq!(out[0].history_item_key.0, "10");
+        assert_eq!(out[1].history_item_key.0, "11");
+    }
+
+    #[test]
+    fn fewer_events_than_submitted_fails() {
+        assert!(
+            correlate_created_history(vec!["a".into(), "b".into()], vec![ev("a", "10", false)],)
+                .is_none()
+        );
+    }
 }
 
 /// Projects an [`readstore::AgentHistoryRow`] into the REST
