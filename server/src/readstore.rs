@@ -70,6 +70,9 @@ pub(crate) fn read_store_method(query: ReadQuery) -> &'static str {
         ReadQuery::GetDecisionDefinitionXml => "decision_definition_xml",
         ReadQuery::SearchDecisionRequirements => "decision_requirements",
         ReadQuery::GetDecisionRequirementsXml => "decision_requirements_xml",
+        ReadQuery::SearchAgentInstances => "agent_instances",
+        ReadQuery::GetAgentInstance => "agent_instance",
+        ReadQuery::SearchAgentHistory => "agent_history",
     }
 }
 

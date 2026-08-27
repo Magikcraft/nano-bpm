@@ -327,6 +327,18 @@ pub(crate) fn classify_read(query: &ReadQuery) -> Surface {
         ReadQuery::GetDecisionRequirementsXml => Surface::NotSurfaced {
             reason: "DMN requirements-graph XML; the in-browser test engine exercises BPMN only",
         },
+
+        // ---- AgentInstance / AgentHistory reads (Camunda 8.10 parity). The two
+        // search surfaces are surfaced through the read-model build so the wasm
+        // read-model TestEngine can query the projected agent state; the
+        // single-key get mirrors the other single-lookup gets (GetProcessInstance)
+        // and stays out — the modeler enumerates via searchAgentInstances. ----
+        ReadQuery::SearchAgentInstances => read_model_read("searchAgentInstances"),
+        ReadQuery::SearchAgentHistory => read_model_read("searchAgentInstanceHistory"),
+        ReadQuery::GetAgentInstance => Surface::NotSurfaced {
+            reason: "single AgentInstance lookup by key; the modeler enumerates via \
+                     searchAgentInstances (mirrors GetProcessInstance/GetUserTask)",
+        },
     }
 }
 
