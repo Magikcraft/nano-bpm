@@ -139,4 +139,16 @@ pub enum ReadQuery {
     /// `getDecisionRequirementsXML` — a decision requirements graph's DMN XML
     /// (`ReadStore::decision_requirements_xml`).
     GetDecisionRequirementsXml,
+
+    /// `searchAgentInstances` — engine-native AgentInstance records
+    /// (`ReadStore::agent_instances`, Camunda 8.10 `/v2/agent-instances/search`).
+    SearchAgentInstances,
+    /// `getAgentInstance` — a single AgentInstance by key
+    /// (`ReadStore::agent_instance`, Camunda 8.10 `/v2/agent-instances/{key}`).
+    GetAgentInstance,
+    /// `searchAgentInstanceHistory` — an AgentInstance's append-only history turn
+    /// log (`ReadStore::agent_history`, Camunda 8.10
+    /// `/v2/agent-instances/{key}/history/search`). Defaults to the COMMITTED
+    /// turns; PENDING/DISCARDED are returned only when explicitly filtered.
+    SearchAgentHistory,
 }
