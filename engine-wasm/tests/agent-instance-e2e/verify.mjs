@@ -122,8 +122,10 @@ assert(
 );
 
 // 4. UPDATE advances the status to THINKING, accumulates metrics, and pushes an
-//    ASSISTANT turn. Exercise the REST parity surface deliberately: a `producedAt`
-//    as an RFC-3339 string (not epoch millis), and an OBJECT content item whose
+//    ASSISTANT turn. Exercise the REST parity surface deliberately: the canonical
+//    history-item shape with a non-blank `historyItemId` (required by the REST
+//    schema for retry dedup + createdHistory correlation), a `producedAt` as an
+//    RFC-3339 string (not epoch millis), and an OBJECT content item whose
 //    `object` is a real JSON object (not a JSON-encoded string).
 engine.updateAgentInstance(
   JSON.stringify({
@@ -135,6 +137,7 @@ engine.updateAgentInstance(
     metrics: { inputTokens: 100, outputTokens: 20, modelCalls: 1 },
     history: [
       {
+        historyItemId: "asst-1",
         loopIteration: 1,
         producedAt: "2026-01-02T03:04:05.250Z",
         role: "ASSISTANT",
