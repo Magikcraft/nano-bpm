@@ -289,6 +289,16 @@ fn validate(
     depth: usize,
 ) {
     if depth > MAX_DEPTH {
+        // The recursion guard is a drift-detection surface: silently returning
+        // here would accept the value, turning a pathologically deep response
+        // (or a cyclic `$ref` alias) into a false negative. Surface it as a
+        // structured violation so the guard fails loudly instead of quietly
+        // treating an unvalidated value as conformant.
+        out.push(Violation::new(
+            pointer,
+            "depth",
+            format!("validation depth exceeded {MAX_DEPTH} levels"),
+        ));
         return;
     }
     let Some(obj) = schema.as_object() else {
@@ -783,6 +793,25 @@ mod tests {
         let mut out = Vec::new();
         validate(&defs(), schema, instance, "", &mut out, 0);
         out
+    }
+
+    #[test]
+    fn depth_cap_surfaces_a_violation_instead_of_silently_accepting() {
+        // The recursion guard must fail loudly on drift, not silently accept a
+        // value once MAX_DEPTH is exceeded (a false negative). Build a schema +
+        // instance nested past the cap and assert a structured `depth` violation
+        // surfaces rather than an empty (conformant) result.
+        let mut schema = json!({"type": "object"});
+        let mut instance = json!({});
+        for _ in 0..(MAX_DEPTH + 2) {
+            schema = json!({"type": "object", "properties": {"a": schema}});
+            instance = json!({"a": instance});
+        }
+        let out = v(&schema, &instance);
+        assert!(
+            out.iter().any(|viol| viol.rule == "depth"),
+            "expected a depth-cap violation, got {out:?}"
+        );
     }
 
     #[test]
