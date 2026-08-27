@@ -1104,12 +1104,16 @@ export class TestEngine {
      * rejected here with a targeted error), accumulate `metrics`, optionally
      * replace `tools`, and append a `history` batch. `request_json` is
      * `{ agentInstanceKey, elementInstanceKey, elementId, processInstanceKey,
-     * status?, metrics?, tools?, history? }`. A turn is `{ loopIteration?,
-     * producedAt?, role?, content?, systemPrompt?, historyItemId?, model?,
-     * provider? }`, where `producedAt` is an RFC-3339 `date-time` string (the
-     * REST spelling; a bare epoch-millis number is also accepted); `content`
-     * items are `{ contentType?, text?, documentReference?, object? }`, where
-     * `object` is arbitrary JSON (the REST wire shape). Returns the snapshot.
+     * status?, metrics?, tools?, jobKey?, jobLease?, history? }`. `tools` is a
+     * nullable changeset: omit it to leave the stored set unchanged, pass `null`
+     * to clear it, or an array to replace it. `jobKey`/`jobLease` are the
+     * activation's job attribution, stamped onto every appended turn (as the
+     * gateway does). A turn is `{ loopIteration?, producedAt?, role?, content?,
+     * systemPrompt?, historyItemId?, model?, provider? }`, where `producedAt` is
+     * an RFC-3339 `date-time` string (the REST spelling; a bare epoch-millis
+     * number is also accepted); `content` items are `{ contentType?, text?,
+     * documentReference?, object? }`, where `object` is arbitrary JSON (the REST
+     * wire shape). Returns the snapshot.
      * @param {string} request_json
      * @returns {string}
      */

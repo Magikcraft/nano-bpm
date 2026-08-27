@@ -924,7 +924,7 @@ impl TestEngine {
         let req: CreateAgentInstanceReq = serde_json::from_str(request_json)
             .map_err(|e| js_err(&format!("createAgentInstance: invalid request JSON: {e}")))?;
         let element_instance_key = parse_key(&req.element_instance_key)?;
-        let history = agent_turns_from(req.history)?;
+        let history = agent_turns_from(req.history, 0, 0)?;
         self.apply(Command::CreateAgentInstance {
             element_instance_key,
             definition: req.definition.into(),
@@ -940,12 +940,16 @@ impl TestEngine {
     /// rejected here with a targeted error), accumulate `metrics`, optionally
     /// replace `tools`, and append a `history` batch. `request_json` is
     /// `{ agentInstanceKey, elementInstanceKey, elementId, processInstanceKey,
-    /// status?, metrics?, tools?, history? }`. A turn is `{ loopIteration?,
-    /// producedAt?, role?, content?, systemPrompt?, historyItemId?, model?,
-    /// provider? }`, where `producedAt` is an RFC-3339 `date-time` string (the
-    /// REST spelling; a bare epoch-millis number is also accepted); `content`
-    /// items are `{ contentType?, text?, documentReference?, object? }`, where
-    /// `object` is arbitrary JSON (the REST wire shape). Returns the snapshot.
+    /// status?, metrics?, tools?, jobKey?, jobLease?, history? }`. `tools` is a
+    /// nullable changeset: omit it to leave the stored set unchanged, pass `null`
+    /// to clear it, or an array to replace it. `jobKey`/`jobLease` are the
+    /// activation's job attribution, stamped onto every appended turn (as the
+    /// gateway does). A turn is `{ loopIteration?, producedAt?, role?, content?,
+    /// systemPrompt?, historyItemId?, model?, provider? }`, where `producedAt` is
+    /// an RFC-3339 `date-time` string (the REST spelling; a bare epoch-millis
+    /// number is also accepted); `content` items are `{ contentType?, text?,
+    /// documentReference?, object? }`, where `object` is arbitrary JSON (the REST
+    /// wire shape). Returns the snapshot.
     #[wasm_bindgen(js_name = updateAgentInstance)]
     pub fn update_agent_instance(&mut self, request_json: &str) -> Result<String, JsValue> {
         self.guard_paused()?;
@@ -959,10 +963,22 @@ impl TestEngine {
             Some(s) => Some(parse_agent_status(s)?),
             None => None,
         };
-        let tools = req
-            .tools
-            .map(|list| list.into_iter().map(Into::into).collect());
-        let history = agent_turns_from(req.history)?;
+        // Mirror the gateway's nullable `tools` changeset: an absent field leaves
+        // the stored set unchanged (`None`); an explicit `null` clears it (an
+        // empty replacement); a present array replaces it.
+        let tools = match req.tools {
+            None => None,
+            Some(None) => Some(Vec::new()),
+            Some(Some(list)) => Some(list.into_iter().map(Into::into).collect()),
+        };
+        // A present-but-unparsable jobKey/jobLease is rejected rather than
+        // coerced to 0 (which would change attribution and defeat dedupe),
+        // mirroring the gateway's 400. Absent = 0 (no attribution).
+        let job_key =
+            parse_job_attribution("jobKey", req.job_key.as_deref()).map_err(|m| js_err(&m))?;
+        let job_lease =
+            parse_job_attribution("jobLease", req.job_lease.as_deref()).map_err(|m| js_err(&m))?;
+        let history = agent_turns_from(req.history, job_key, job_lease)?;
         self.apply(Command::UpdateAgentInstance {
             agent_instance_key,
             element_instance_key,
@@ -2534,6 +2550,24 @@ fn parse_key(s: &str) -> Result<u64, JsValue> {
         .map_err(|_| js_err(&format!("invalid key: {s}")))
 }
 
+/// Parse an optional request-level job-attribution field (`jobKey`/`jobLease`)
+/// carried as a REST string. An absent field is `0` (no attribution); a present
+/// value must parse as a `u64`, otherwise it is rejected — mirroring the
+/// gateway, which returns a 400 rather than silently coercing a malformed value
+/// to `0` (which would change ownership/attribution and defeat retry dedupe).
+/// Returns the `&str`-typed error so the reject path is natively testable (the
+/// `JsValue` wrapper aborts off the wasm target); the caller lifts it via
+/// [`js_err`].
+fn parse_job_attribution(field: &str, value: Option<&str>) -> Result<u64, String> {
+    match value {
+        None => Ok(0),
+        Some(s) => s
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("updateAgentInstance: invalid {field}: {s}")),
+    }
+}
+
 // --- AgentInstance driver request shapes (Camunda 8.10 REST-parity JSON) ------
 //
 // The wasm agent drivers accept camelCase JSON mirroring the Camunda v2
@@ -2857,6 +2891,20 @@ struct CreateAgentInstanceReq {
     history: Vec<AgentTurnReq>,
 }
 
+/// A serde `deserialize_with` that distinguishes an explicit JSON `null` from an
+/// absent field for an optional value: an omitted field is `None`, an explicit
+/// `null` is `Some(None)`, and a present value is `Some(Some(value))`. Mirrors
+/// the gateway's `Nullable` changeset handling (`server/src/main.rs`
+/// `update_agent_instance_impl`) so a REST `"tools": null` clears the tool set
+/// while an omitted `tools` leaves the stored set unchanged.
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
 /// The `updateAgentInstance` request body.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2869,19 +2917,43 @@ struct UpdateAgentInstanceReq {
     status: Option<String>,
     #[serde(default)]
     metrics: AgentMetricsDeltaReq,
+    /// The replacement tool set. Absent leaves the stored set unchanged;
+    /// an explicit `null` clears it (an empty replacement); a present array
+    /// replaces it — mirroring the gateway's nullable `tools` changeset.
+    #[serde(default, deserialize_with = "double_option")]
+    tools: Option<Option<Vec<AgentToolReq>>>,
+    /// The agent job key whose activation produced this batch of turns; the
+    /// gateway attributes it to every appended turn (`0`/absent = none).
     #[serde(default)]
-    tools: Option<Vec<AgentToolReq>>,
+    job_key: Option<String>,
+    /// The agent job's lease deadline for this batch; attributed to every
+    /// appended turn alongside `jobKey` (`0`/absent = none).
+    #[serde(default)]
+    job_lease: Option<String>,
     #[serde(default)]
     history: Vec<AgentTurnReq>,
 }
 
 /// Convert a batch of request turns into engine [`AgentHistoryTurn`]s, resolving
-/// each REST role/content-type spelling.
-fn agent_turns_from(turns: Vec<AgentTurnReq>) -> Result<Vec<AgentHistoryTurn>, JsValue> {
-    turns.into_iter().map(agent_turn_from).collect()
+/// each REST role/content-type spelling. `job_key`/`job_lease` are the request's
+/// job attribution, stamped onto every turn in the batch — mirroring the
+/// gateway, which attributes the activation's `jobKey`/`jobLease` to each turn.
+fn agent_turns_from(
+    turns: Vec<AgentTurnReq>,
+    job_key: u64,
+    job_lease: u64,
+) -> Result<Vec<AgentHistoryTurn>, JsValue> {
+    turns
+        .into_iter()
+        .map(|t| agent_turn_from(t, job_key, job_lease))
+        .collect()
 }
 
-fn agent_turn_from(t: AgentTurnReq) -> Result<AgentHistoryTurn, JsValue> {
+fn agent_turn_from(
+    t: AgentTurnReq,
+    job_key: u64,
+    job_lease: u64,
+) -> Result<AgentHistoryTurn, JsValue> {
     let role = match t.role.as_deref() {
         Some(s) => parse_agent_role(s)?,
         None => AgentHistoryRole::default(),
@@ -2900,6 +2972,8 @@ fn agent_turn_from(t: AgentTurnReq) -> Result<AgentHistoryTurn, JsValue> {
         history_item_id: t.history_item_id,
         model: t.model,
         provider: t.provider,
+        job_key,
+        job_lease,
         ..Default::default()
     })
 }
@@ -3965,6 +4039,8 @@ mod tests {
                     "content":[{"contentType":"OBJECT","object":{"a":1,"b":[2,3]}}]}"#,
             )
             .unwrap(),
+            0,
+            0,
         )
         .unwrap();
         assert_eq!(
@@ -3979,11 +4055,18 @@ mod tests {
 
         let numeric = agent_turn_from(
             serde_json::from_str::<AgentTurnReq>(r#"{"producedAt":100,"role":"USER"}"#).unwrap(),
+            42,
+            99,
         )
         .unwrap();
         assert_eq!(
             numeric.produced_at, 100,
             "a bare numeric epoch-millis is still accepted"
+        );
+        assert_eq!(
+            (numeric.job_key, numeric.job_lease),
+            (42, 99),
+            "the request job attribution is stamped onto the turn"
         );
     }
 
@@ -4693,6 +4776,164 @@ mod read_channel_tests {
 
         // toolCalls / tools are present as arrays in the REST shape.
         assert!(turn["toolCalls"].is_array() && turn["tools"].is_array());
+    }
+
+    /// Mints an agent instance for `AGENT_TASK_XML` and returns its minted
+    /// identity JSON (`agentInstanceKey`, `elementInstanceKey`, …).
+    fn mint_agent_instance(eng: &mut TestEngine) -> J {
+        eng.deploy(AGENT_TASK_XML).unwrap();
+        eng.create_instance("p", "{}", None).unwrap();
+        parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone()
+    }
+
+    /// The instance's current `tools` array via the read channel.
+    fn instance_tools(eng: &TestEngine, key: &str) -> Vec<J> {
+        let inst = parse(
+            &eng.search_agent_instances(&format!(r#"{{"agentInstanceKey":"{key}"}}"#))
+                .unwrap(),
+        )["items"][0]
+            .clone();
+        inst["tools"].as_array().cloned().unwrap_or_default()
+    }
+
+    // `updateAgentInstance` must treat `tools` as a nullable changeset, exactly
+    // like the gateway (`server/src/main.rs` `update_agent_instance_impl`): an
+    // absent field leaves the stored set unchanged, an explicit `null` clears it,
+    // and a present array replaces it. Without distinguishing `null` from absent,
+    // a wasm caller could never clear a tool set through the TestEngine — a
+    // parity gap with the REST surface.
+    #[test]
+    fn update_agent_instance_treats_tools_as_a_nullable_changeset() {
+        let mut eng = TestEngine::new();
+        let minted = mint_agent_instance(&mut eng);
+        let key = minted["agentInstanceKey"].as_str().unwrap().to_string();
+        let base = |extra: serde_json::Value| {
+            let mut req = serde_json::json!({
+                "agentInstanceKey": minted["agentInstanceKey"],
+                "elementInstanceKey": minted["elementInstanceKey"],
+                "elementId": minted["elementId"],
+                "processInstanceKey": minted["processInstanceKey"],
+                "status": "THINKING",
+            });
+            let obj = req.as_object_mut().unwrap();
+            for (k, v) in extra.as_object().unwrap() {
+                obj.insert(k.clone(), v.clone());
+            }
+            req.to_string()
+        };
+
+        // A present array replaces the tool set.
+        eng.update_agent_instance(&base(serde_json::json!({
+            "tools": [{ "name": "search", "description": "web search", "elementId": "toolA" }],
+        })))
+        .unwrap();
+        let tools = instance_tools(&eng, &key);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "search");
+
+        // An absent `tools` leaves the stored set unchanged.
+        eng.update_agent_instance(&base(serde_json::json!({ "status": "THINKING" })))
+            .unwrap();
+        assert_eq!(
+            instance_tools(&eng, &key).len(),
+            1,
+            "absent tools = no change"
+        );
+
+        // An explicit `null` clears the tool set (an empty replacement).
+        eng.update_agent_instance(&base(
+            serde_json::json!({ "tools": serde_json::Value::Null }),
+        ))
+        .unwrap();
+        assert!(
+            instance_tools(&eng, &key).is_empty(),
+            "explicit null tools clears the set"
+        );
+
+        // A present empty array is also an explicit clear.
+        eng.update_agent_instance(&base(serde_json::json!({
+            "tools": [{ "name": "x" }],
+        })))
+        .unwrap();
+        assert_eq!(instance_tools(&eng, &key).len(), 1);
+        eng.update_agent_instance(&base(serde_json::json!({ "tools": [] })))
+            .unwrap();
+        assert!(
+            instance_tools(&eng, &key).is_empty(),
+            "empty array clears too"
+        );
+    }
+
+    // The request-level `jobKey`/`jobLease` must be attributed to every appended
+    // history turn, mirroring the gateway (`agent_history_turn_from`). The read
+    // channel projects `jobKey` onto each history item, so a turn pushed with a
+    // `jobKey` must carry it — otherwise wasm callers cannot exercise the job
+    // attribution/dedupe semantics the gateway supports.
+    #[test]
+    fn update_agent_instance_stamps_job_attribution_onto_each_turn() {
+        let mut eng = TestEngine::new();
+        let minted = mint_agent_instance(&mut eng);
+        let key = minted["agentInstanceKey"].as_str().unwrap().to_string();
+        let req = serde_json::json!({
+            "agentInstanceKey": minted["agentInstanceKey"],
+            "elementInstanceKey": minted["elementInstanceKey"],
+            "elementId": minted["elementId"],
+            "processInstanceKey": minted["processInstanceKey"],
+            "status": "THINKING",
+            "jobKey": "7788990011",
+            "jobLease": "123456",
+            "history": [
+                {
+                    "loopIteration": 1,
+                    "producedAt": "2026-01-02T03:04:05.250Z",
+                    "role": "ASSISTANT",
+                    "content": [{ "contentType": "TEXT", "text": "a" }],
+                },
+                {
+                    "loopIteration": 1,
+                    "producedAt": "2026-01-02T03:04:06.250Z",
+                    "role": "ASSISTANT",
+                    "content": [{ "contentType": "TEXT", "text": "b" }],
+                },
+            ],
+        });
+        eng.update_agent_instance(&req.to_string()).unwrap();
+
+        let history = parse(&eng.search_agent_instance_history(&key, "{}").unwrap());
+        let assistant: Vec<&J> = history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["role"] == "ASSISTANT")
+            .collect();
+        assert_eq!(assistant.len(), 2, "both pushed turns are present");
+        for turn in assistant {
+            assert_eq!(
+                turn["jobKey"], "7788990011",
+                "each turn carries the request jobKey: {turn}"
+            );
+        }
+    }
+
+    // A present-but-malformed `jobKey`/`jobLease` is rejected rather than coerced
+    // to 0 (which would silently change attribution), mirroring the gateway's 400.
+    // Asserted against the `&str`-typed core `parse_job_attribution` — the
+    // `#[wasm_bindgen]` mutator's `JsValue` reject path aborts off the wasm target.
+    #[test]
+    fn update_agent_instance_rejects_malformed_job_attribution() {
+        // Absent = 0 (no attribution); a well-formed decimal parses.
+        assert_eq!(parse_job_attribution("jobKey", None).unwrap(), 0);
+        assert_eq!(parse_job_attribution("jobKey", Some(" 42 ")).unwrap(), 42);
+        // A malformed value is rejected with a message naming the offending field.
+        let key_err = parse_job_attribution("jobKey", Some("not-a-number"))
+            .expect_err("a malformed jobKey is rejected");
+        assert!(key_err.contains("jobKey"), "names the field: {key_err}");
+        let lease_err = parse_job_attribution("jobLease", Some("nope"))
+            .expect_err("a malformed jobLease is rejected");
+        assert!(
+            lease_err.contains("jobLease"),
+            "names the field: {lease_err}"
+        );
     }
 
     #[test]
