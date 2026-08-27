@@ -1099,8 +1099,9 @@ impl TestEngine {
     /// filter is `{ agentInstanceKey?, agentDefinitionKey?, processInstanceKey?,
     /// rootProcessInstanceKey?, processDefinitionKey?, status?, elementId?,
     /// tenantId? }` (`status` a REST spelling, e.g. `"INITIALIZING"`); an
-    /// empty/absent filter returns every instance. Mirrors
-    /// `POST /agent-instances/search`.
+    /// empty/absent filter returns every instance. Accepts the canonical REST
+    /// envelope `{ "filter": { … } }` as well as the top-level shorthand.
+    /// Mirrors `POST /agent-instances/search`.
     #[wasm_bindgen(js_name = searchAgentInstances)]
     pub fn search_agent_instances(&self, filter_json: &str) -> Result<String, JsValue> {
         let filter = parse_agent_instance_filter(filter_json)?;
@@ -1118,7 +1119,9 @@ impl TestEngine {
     /// in the engine's canonical `(loopIteration, producedAt, historyItemKey)`
     /// order. `filter_json` is `{ commitStatus? }` where `commitStatus` is a REST
     /// spelling or array of them; **omitting it defaults to COMMITTED only**
-    /// (PENDING/DISCARDED surface only when asked for explicitly). Mirrors
+    /// (PENDING/DISCARDED surface only when asked for explicitly). Accepts the
+    /// canonical REST envelope `{ "filter": { commitStatus? } }` as well as the
+    /// top-level shorthand. Mirrors
     /// `POST /agent-instances/{agentInstanceKey}/history/search`.
     #[wasm_bindgen(js_name = searchAgentInstanceHistory)]
     pub fn search_agent_instance_history(
@@ -1250,6 +1253,23 @@ fn validate_search_filter_body_inner(filter_json: &str) -> Result<(), String> {
     parse_state_filter_inner(filter_json, "\0__nano_validate_shape_only__").map(|_| ())
 }
 
+/// Select the map that actually carries filter fields, honouring the canonical
+/// REST envelope `{ "filter": { … } }` (matching the `*SearchQuery` request
+/// bodies) as well as the top-level `{ … }` shorthand. A present-but-non-object
+/// `filter` is malformed and is rejected. Shared by every search-filter parser
+/// (`searchUserTasks`, `searchAgentInstances`, `searchAgentInstanceHistory`) so
+/// the envelope contract has a single implementation and cannot drift.
+#[cfg(feature = "read-model")]
+fn rest_filter_target(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<&serde_json::Map<String, serde_json::Value>, String> {
+    match obj.get("filter") {
+        None | Some(serde_json::Value::Null) => Ok(obj),
+        Some(serde_json::Value::Object(nested)) => Ok(nested),
+        Some(_) => Err("filter `filter` must be a JSON object".to_string()),
+    }
+}
+
 /// Pure core of [`parse_state_filter`] (host-testable: constructs no `JsValue`).
 #[cfg(feature = "read-model")]
 fn parse_state_filter_inner(filter_json: &str, field: &str) -> Result<Option<String>, String> {
@@ -1264,15 +1284,7 @@ fn parse_state_filter_inner(filter_json: &str, field: &str) -> Result<Option<Str
         serde_json::Value::Object(map) => map,
         _ => return Err("filter body must be a JSON object".to_string()),
     };
-    // The canonical REST body nests the filter fields under `filter`
-    // (`{ "filter": { "state": … } }`, matching `UserTaskSearchQuery`), so honour
-    // that shape as well as the top-level `{ "state": … }` shorthand. A
-    // present-but-non-object `filter` is malformed and is rejected.
-    let target = match obj.get("filter") {
-        None | Some(serde_json::Value::Null) => obj,
-        Some(serde_json::Value::Object(nested)) => nested,
-        Some(_) => return Err("filter `filter` must be a JSON object".to_string()),
-    };
+    let target = rest_filter_target(obj)?;
     match target.get(field) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
@@ -1427,8 +1439,10 @@ fn variable_search_result(v: &VariableRow) -> serde_json::Value {
 /// Parse the `searchAgentInstances` filter body:
 /// `{ agentInstanceKey?, agentDefinitionKey?, processInstanceKey?,
 /// rootProcessInstanceKey?, processDefinitionKey?, status?, elementId?,
-/// tenantId? }`. Empty/whitespace ⇒ an unfiltered search. Keys are decimal
-/// strings; `status` is a REST spelling.
+/// tenantId? }`. Accepts the canonical REST envelope `{ "filter": { … } }`
+/// (matching `AgentInstanceSearchQuery`) as well as this top-level shorthand.
+/// Empty/whitespace ⇒ an unfiltered search. Keys are decimal strings; `status`
+/// is a REST spelling.
 #[cfg(feature = "read-model")]
 fn parse_agent_instance_filter(filter_json: &str) -> Result<AgentInstanceFilter, JsValue> {
     let t = filter_json.trim();
@@ -1443,6 +1457,7 @@ fn parse_agent_instance_filter(filter_json: &str) -> Result<AgentInstanceFilter,
         serde_json::Value::Null => return Ok(filter),
         _ => return Err(js_err("searchAgentInstances filter must be a JSON object")),
     };
+    let map = rest_filter_target(map).map_err(|e| js_err(&e))?;
     filter.agent_instance_key = agent_filter_key(map, "agentInstanceKey")?;
     filter.agent_definition_key = agent_filter_key(map, "agentDefinitionKey")?;
     filter.process_instance_key = agent_filter_key(map, "processInstanceKey")?;
@@ -1462,9 +1477,11 @@ fn parse_agent_instance_filter(filter_json: &str) -> Result<AgentInstanceFilter,
 }
 
 /// Parse the `searchAgentInstanceHistory` filter body: `{ commitStatus? }` where
-/// `commitStatus` is a REST spelling or an array of them. Omitted/empty ⇒ the
-/// COMMITTED default (enforced by the read model). The `agent_instance_key` is
-/// bound from the method argument, not the body.
+/// `commitStatus` is a REST spelling or an array of them. Accepts the canonical
+/// REST envelope `{ "filter": { commitStatus? } }` as well as this top-level
+/// shorthand. Omitted/empty ⇒ the COMMITTED default (enforced by the read
+/// model). The `agent_instance_key` is bound from the method argument, not the
+/// body.
 #[cfg(feature = "read-model")]
 fn parse_agent_history_filter(
     agent_instance_key: u64,
@@ -1492,6 +1509,7 @@ fn parse_agent_history_filter(
             ))
         }
     };
+    let map = rest_filter_target(map).map_err(|e| js_err(&e))?;
     if let Some(v) = map.get("commitStatus") {
         let spellings: Vec<&str> = match v {
             serde_json::Value::Null => Vec::new(),
@@ -4675,5 +4693,98 @@ mod read_channel_tests {
 
         // toolCalls / tools are present as arrays in the REST shape.
         assert!(turn["toolCalls"].is_array() && turn["tools"].is_array());
+    }
+
+    #[test]
+    fn agent_instance_search_honours_the_nested_rest_filter_shape() {
+        let mut eng = TestEngine::new();
+        eng.deploy(AGENT_TASK_XML).unwrap();
+        eng.create_instance("p", "{}", None).unwrap();
+        let minted = parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone();
+        let key = minted["agentInstanceKey"].as_str().unwrap().to_string();
+
+        let count = |body: &str| {
+            parse(&eng.search_agent_instances(body).unwrap())["items"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+
+        // The canonical REST envelope `{ "filter": { … } }` is honoured, not
+        // silently ignored: a nested key that matches returns the instance, and a
+        // nested key that does not match filters it out. Without the unwrap the
+        // nested body would be treated as unfiltered and always return 1.
+        assert_eq!(
+            count(&format!(r#"{{"filter":{{"agentInstanceKey":"{key}"}}}}"#)),
+            1
+        );
+        assert_eq!(count(r#"{"filter":{"agentInstanceKey":"999999999"}}"#), 0);
+        // The top-level shorthand keeps working.
+        assert_eq!(count(&format!(r#"{{"agentInstanceKey":"{key}"}}"#)), 1);
+        assert_eq!(count(r#"{"agentInstanceKey":"999999999"}"#), 0);
+    }
+
+    #[test]
+    fn agent_history_search_honours_the_nested_rest_filter_shape() {
+        let mut eng = TestEngine::new();
+        eng.deploy(AGENT_TASK_XML).unwrap();
+        eng.create_instance("p", "{}", None).unwrap();
+        let minted = parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone();
+        let key = minted["agentInstanceKey"].as_str().unwrap().to_string();
+        let req = serde_json::json!({
+            "agentInstanceKey": minted["agentInstanceKey"],
+            "elementInstanceKey": minted["elementInstanceKey"],
+            "elementId": minted["elementId"],
+            "processInstanceKey": minted["processInstanceKey"],
+            "status": "THINKING",
+            "history": [{
+                "loopIteration": 1,
+                "producedAt": "2026-01-02T03:04:05.250Z",
+                "role": "ASSISTANT",
+                "content": [{ "contentType": "TEXT", "text": "hello" }],
+            }],
+        });
+        eng.update_agent_instance(&req.to_string()).unwrap();
+
+        let has_assistant = |body: &str| {
+            parse(&eng.search_agent_instance_history(&key, body).unwrap())["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["role"] == "ASSISTANT")
+        };
+
+        // The pushed turn is COMMITTED, so the COMMITTED default surfaces it.
+        assert!(has_assistant("{}"));
+        // A nested `commitStatus` filter is honoured: asking for PENDING only
+        // excludes the COMMITTED turn. Without the unwrap the nested body would be
+        // ignored and the COMMITTED default would still surface it.
+        assert!(!has_assistant(r#"{"filter":{"commitStatus":["PENDING"]}}"#));
+        // The top-level shorthand keeps working.
+        assert!(!has_assistant(r#"{"commitStatus":["PENDING"]}"#));
+    }
+
+    #[test]
+    fn rest_filter_target_unwraps_the_envelope_and_rejects_a_non_object_filter() {
+        let obj = |s: &str| match parse(s) {
+            J::Object(m) => m,
+            _ => unreachable!("test inputs are objects"),
+        };
+        // Top-level shorthand: the object itself carries the fields.
+        let top = obj(r#"{"state":"CREATED"}"#);
+        assert_eq!(rest_filter_target(&top).unwrap()["state"], "CREATED");
+        // Nested REST envelope: fields come from the `filter` object.
+        let nested = obj(r#"{"filter":{"state":"CREATED"}}"#);
+        assert_eq!(rest_filter_target(&nested).unwrap()["state"], "CREATED");
+        // A null `filter` falls back to the outer object (⇒ unfiltered).
+        let null = obj(r#"{"filter":null}"#);
+        assert!(rest_filter_target(&null).unwrap().get("state").is_none());
+        // A present-but-non-object `filter` is malformed and rejected.
+        for bad in [r#"{"filter":42}"#, r#"{"filter":[]}"#, r#"{"filter":"x"}"#] {
+            assert!(
+                rest_filter_target(&obj(bad)).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 }

@@ -244,7 +244,9 @@ export class TestEngine {
      * in the engine's canonical `(loopIteration, producedAt, historyItemKey)`
      * order. `filter_json` is `{ commitStatus? }` where `commitStatus` is a REST
      * spelling or array of them; **omitting it defaults to COMMITTED only**
-     * (PENDING/DISCARDED surface only when asked for explicitly). Mirrors
+     * (PENDING/DISCARDED surface only when asked for explicitly). Accepts the
+     * canonical REST envelope `{ "filter": { commitStatus? } }` as well as the
+     * top-level shorthand. Mirrors
      * `POST /agent-instances/{agentInstanceKey}/history/search`.
      */
     searchAgentInstanceHistory(agent_instance_key: string, filter_json: string): string;
@@ -254,8 +256,9 @@ export class TestEngine {
      * filter is `{ agentInstanceKey?, agentDefinitionKey?, processInstanceKey?,
      * rootProcessInstanceKey?, processDefinitionKey?, status?, elementId?,
      * tenantId? }` (`status` a REST spelling, e.g. `"INITIALIZING"`); an
-     * empty/absent filter returns every instance. Mirrors
-     * `POST /agent-instances/search`.
+     * empty/absent filter returns every instance. Accepts the canonical REST
+     * envelope `{ "filter": { … } }` as well as the top-level shorthand.
+     * Mirrors `POST /agent-instances/search`.
      */
     searchAgentInstances(filter_json: string): string;
     /**
