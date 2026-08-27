@@ -595,8 +595,11 @@ impl Engine {
 
     /// Process a `Command::CreateAgentInstance` (Camunda `AgentInstanceIntent.CREATE`,
     /// stable/8.10). The referenced `element_instance_key` must be an **active**
-    /// element instance of an agent-eligible element carrying an `agentDefinition`
-    /// (a `SERVICE_TASK` / ad-hoc sub-process). The engine already mints an
+    /// element instance modelled as an [`ElementKind::AgentTask`](crate::model::ElementKind::AgentTask)
+    /// — a `serviceTask` bearing a `zeebe:agentDefinition` (`aiAgentTask` or
+    /// `external`). A plain `SERVICE_TASK` without that marker is rejected as
+    /// missing an agentDefinition, and any other element kind is not eligible.
+    /// The engine already mints an
     /// AgentInstance when such an element activates (slice S1); this processor
     /// **reconciles** with that record — configuring its definition/limits and
     /// applying any initial `history[]` batch — rather than minting a duplicate,
