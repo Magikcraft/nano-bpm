@@ -13,10 +13,18 @@ import {
   Route,
   Routes,
   useLocation,
+  useNavigate,
   useSearchParams,
 } from "react-router-dom";
 import Topology from "./views/Topology";
 import { useTheme } from "./theme/ThemeProvider";
+import {
+  BottomSheet,
+  CardGrid,
+  NavCard,
+  SectionLabel,
+  useIsNarrow,
+} from "./components/ui";
 import {
   getExtensions,
   getMarketplace,
@@ -176,6 +184,8 @@ const icons = {
   // Chevrons-left: points left to "collapse"; rotated 180° to point right for
   // "expand" when the rail is already collapsed.
   collapse: <Icon d="M11 17l-5-5 5-5M18 17l-5-5 5-5" />,
+  // Hamburger — opens the mobile menu bottom-sheet (the lower rail off-canvas).
+  menu: <Icon d="M4 6h16M4 12h16M4 18h16" />,
   // Default glyph for a supervised running app that declares no icon (issue
   // #638): an app window. The rail keys identity on the project name, so this
   // fallback is shared by every un-iconed app.
@@ -273,6 +283,51 @@ function sameApps(a: ProjectSummary[], b: ProjectSummary[]): boolean {
   });
 }
 
+/** A running app's presence in the navigation surface, normalised once so every
+ * consumer renders the same identity/label/target. The desktop rail, the mobile
+ * card home and the hamburger sheet all bind to these — and unit A5 (embedded
+ * app cards) feeds off the same shape rather than re-deriving the rail's
+ * disambiguation. Identity is the stable project `name`; `label`/`icon` are
+ * display hints only (same-template apps share a manifest), so a label
+ * collision is disambiguated with the unique name. */
+export type RunningAppRailEntry = {
+  /** Stable project name — the identity the route and React key are built on. */
+  name: string;
+  /** Display label; suffixed with the project name when two apps collide. */
+  label: string;
+  /** Title/aria hover text always exposing the unique project name. */
+  hover: string;
+  /** SPA route for the app's UI/Logs view (`/apps/<encoded name>`). */
+  href: string;
+  /** Manifest icon hint (bundled glyph name or app-shipped asset path). */
+  icon: string | null | undefined;
+};
+
+/** Build the running-app rail entries from the raw running-app set: resolves the
+ * display label, disambiguates collisions against the unique project name, and
+ * computes the SPA target. The one place the rail's identity rules live, shared
+ * by the desktop rail, the mobile presentation and unit A5. */
+export function buildRunningAppRailEntries(
+  apps: ProjectSummary[],
+): RunningAppRailEntry[] {
+  const labelCounts = new Map<string, number>();
+  for (const app of apps) {
+    const base = app.appUi?.label || app.displayName || app.name;
+    labelCounts.set(base, (labelCounts.get(base) ?? 0) + 1);
+  }
+  return apps.map((app) => {
+    const base = app.appUi?.label || app.displayName || app.name;
+    const collides = (labelCounts.get(base) ?? 0) > 1;
+    return {
+      name: app.name,
+      label: collides ? `${base} · ${app.name}` : base,
+      hover: base === app.name ? app.name : `${base} (${app.name})`,
+      href: `/apps/${encodeURIComponent(app.name)}`,
+      icon: app.appUi?.icon,
+    };
+  });
+}
+
 function railItemClass(active: boolean, collapsed = false): string {
   return `relative flex items-center ${
     collapsed ? "justify-center px-2" : "gap-2.5 px-3"
@@ -339,6 +394,21 @@ const STARTUP_PANEL_DELAY_MS = 500;
 
 export default function App() {
   const location = useLocation();
+  const navigate = useNavigate();
+  // Below `MOBILE_MAX_WIDTH` the persistent left rail can't fit, so the SAME
+  // routes are presented mobile-first: the primary nav becomes a card home and
+  // the lower rail collapses into a hamburger bottom-sheet. This is a
+  // presentation switch only — the route tree and every `/console/...` deep
+  // link are unchanged (single targets), so a wide/narrow toggle never changes
+  // where a link lands.
+  const isNarrow = useIsNarrow();
+  const [menuOpen, setMenuOpen] = useState(false);
+  // The card home renders on the profile's landing route (`/projects` in studio,
+  // `/topology` in observe) — never a hardcoded `studio` assumption.
+  const isHome = location.pathname === HOME_ROUTE;
+  // Any client navigation dismisses the menu sheet so it never lingers over the
+  // destination.
+  useEffect(() => setMenuOpen(false), [location.pathname]);
   // The one product-tour instance for the whole app. Published via TourContext
   // so the rail button here AND the empty-state journey pickers (#411) drive the
   // same runner and journey state.
@@ -551,17 +621,13 @@ export default function App() {
     };
   }, []);
 
-  // How many running apps resolve to each base label. Same-template apps share a
-  // manifest (identical `appUi.label`), so a collision means the label alone is
-  // ambiguous and the rail must fall back to the unique project name.
-  const runningAppLabelCounts = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const a of runningApps) {
-      const base = a.appUi?.label || a.displayName || a.name;
-      m.set(base, (m.get(base) ?? 0) + 1);
-    }
-    return m;
-  }, [runningApps]);
+  // Running apps normalised to their shared rail entries (label disambiguation +
+  // SPA target). One source of truth for the desktop rail, the mobile card home
+  // / hamburger sheet, and unit A5's embedded app cards.
+  const runningAppEntries = useMemo(
+    () => buildRunningAppRailEntries(runningApps),
+    [runningApps],
+  );
   // ext→language map at boot, and again whenever the user navigates — so a
   // pack installed via the Extensions view during this session takes effect
   // as soon as they open a project, without a hard reload. Extensions.tsx
@@ -582,263 +648,484 @@ export default function App() {
       });
   }, [location.pathname]);
 
+  // Primary navigation resolved to card models — the mobile card home and the
+  // hamburger sheet both render these (the rail turned into a card grid). Mirrors
+  // the desktop rail: Studio returns to the last-visited project route, and the
+  // Extensions card carries the update-count badge.
+  const primaryNavCards = navItems.map((item) => {
+    const isProjects = item.to === "/projects";
+    const to = isProjects ? projectsRoute.current : item.to;
+    const active = isProjects
+      ? location.pathname.startsWith("/projects")
+      : location.pathname === item.to;
+    const badge =
+      item.to === "/extensions" && updateCount > 0 ? updateCount : 0;
+    return {
+      key: item.to,
+      to,
+      label: item.label,
+      icon: item.icon,
+      active,
+      badge,
+    };
+  });
+
+  // A card tap navigates within the SPA and dismisses the menu sheet.
+  const goMobile = (to: string) => {
+    setMenuOpen(false);
+    navigate(to);
+  };
+
+  const renderNavCard = (m: (typeof primaryNavCards)[number]) => (
+    <NavCard
+      key={m.key}
+      active={m.active}
+      icon={m.icon}
+      onClick={() => goMobile(m.to)}
+      label={
+        m.badge > 0 ? (
+          <span className="flex items-center gap-2">
+            {m.label}
+            <span
+              className="inline-flex min-w-[18px] items-center justify-center rounded-full bg-danger px-1.5 text-[10px] font-bold leading-none text-white"
+              style={{ height: "18px" }}
+              aria-label={`${m.badge} extension update${m.badge === 1 ? "" : "s"} available`}
+            >
+              {m.badge > 99 ? "99+" : m.badge}
+            </span>
+          </span>
+        ) : (
+          m.label
+        )
+      }
+    />
+  );
+
+  const renderAppCard = (entry: RunningAppRailEntry) => (
+    <NavCard
+      key={entry.name}
+      active={location.pathname === entry.href}
+      icon={<AppRailGlyph name={entry.name} icon={entry.icon} />}
+      label={entry.label}
+      title={entry.hover}
+      onClick={() => goMobile(entry.href)}
+    />
+  );
+
+  // The mobile card home: the primary rail as a card grid plus the running-app
+  // cards, shown on the profile's landing route. The routed home view renders
+  // below it — this is navigation chrome, not a route of its own.
+  const cardHome = (
+    <section className="nano-safe-x border-b border-edge p-4">
+      <SectionLabel>Navigate</SectionLabel>
+      <div className="mt-2">
+        <CardGrid>{primaryNavCards.map(renderNavCard)}</CardGrid>
+      </div>
+      {IS_STUDIO && runningAppEntries.length > 0 && (
+        <div className="mt-4">
+          <SectionLabel>Running apps</SectionLabel>
+          <div className="mt-2">
+            <CardGrid>{runningAppEntries.map(renderAppCard)}</CardGrid>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+
+  // The version chrome text mirrors the desktop sidebar's "What's new" line.
+  const versionLabel = serverVersion
+    ? `gateway ${gatewayLabel(serverVersion) ?? serverVersion}`
+    : undefined;
+
+  // The lower rail (theme, tour, changelog, version, Config, Credits, Feedback,
+  // Documentation, Whitepaper) collapses into this hamburger bottom-sheet.
+  const menuSheet = (
+    <BottomSheet
+      open={menuOpen}
+      onClose={() => setMenuOpen(false)}
+      title="Menu"
+    >
+      <div className="flex flex-col gap-5">
+        <section>
+          <SectionLabel>Navigate</SectionLabel>
+          <div className="mt-2">
+            <CardGrid>{primaryNavCards.map(renderNavCard)}</CardGrid>
+          </div>
+        </section>
+
+        {IS_STUDIO && runningAppEntries.length > 0 && (
+          <section>
+            <SectionLabel>Running apps</SectionLabel>
+            <div className="mt-2">
+              <CardGrid>{runningAppEntries.map(renderAppCard)}</CardGrid>
+            </div>
+          </section>
+        )}
+
+        <section>
+          <SectionLabel>Appearance</SectionLabel>
+          <div className="mt-2">
+            <ThemeToggle />
+          </div>
+        </section>
+
+        <section>
+          <SectionLabel>More</SectionLabel>
+          <div className="mt-2 flex flex-col gap-2">
+            <NavCard
+              icon={
+                <Icon>
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M9.1 9a3 3 0 1 1 4.3 3.2c-.8.5-1.4 1-1.4 1.9" />
+                  <path d="M12 17h.01" />
+                </Icon>
+              }
+              label={canResume ? "Resume tour" : "Take a tour"}
+              onClick={() => {
+                setMenuOpen(false);
+                if (canResume) resumeJourney();
+                else startTour();
+              }}
+            />
+
+            {(serverVersion || changelog || changelogError) && (
+              <NavCard
+                icon={icons.whitepaper}
+                label={
+                  <span className="flex items-center gap-2">
+                    What's new
+                    {changelogHasUnseen && (
+                      <>
+                        <span className="sr-only">New changes available</span>
+                        <span
+                          className="inline-block h-1.5 w-1.5 rounded-full bg-accent"
+                          aria-hidden="true"
+                        />
+                      </>
+                    )}
+                  </span>
+                }
+                description={versionLabel}
+                onClick={() => {
+                  setMenuOpen(false);
+                  openChangelog();
+                }}
+              />
+            )}
+
+            <NavCard
+              icon={icons.config}
+              label="Config"
+              active={location.pathname.startsWith("/config")}
+              onClick={() => goMobile("/config")}
+            />
+            <NavCard
+              icon={icons.credits}
+              label="Credits"
+              active={location.pathname.startsWith("/credits")}
+              onClick={() => goMobile("/credits")}
+            />
+            <NavCard
+              icon={icons.feedback}
+              label="Feedback"
+              href="https://github.com/nanobpm/nano-ide/issues/new/choose"
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={() => setMenuOpen(false)}
+            />
+            <NavCard icon={icons.docs} label="Documentation" href="/docs" />
+            <NavCard
+              icon={icons.whitepaper}
+              label="Whitepaper"
+              href="/whitepaper"
+            />
+          </div>
+        </section>
+      </div>
+    </BottomSheet>
+  );
+
   return (
     <TourContext.Provider value={tour}>
-      <div className="flex h-full bg-app text-fg">
-        <aside
-          className={`flex shrink-0 flex-col border-r border-edge bg-panel transition-[width] duration-150 ${
-            railCollapsed ? "w-14" : "w-56"
-          }`}
-        >
-          <div className={railCollapsed ? "px-2 py-4" : "px-5 py-4"}>
-            <a
-              href="/"
-              className="block no-underline"
-              title="nano BPM — single-node console"
+      <div
+        className={`flex h-full bg-app text-fg ${isNarrow ? "flex-col" : ""}`}
+      >
+        {isNarrow ? (
+          <header className="nano-safe-top nano-safe-x flex shrink-0 items-center gap-2 border-b border-edge bg-panel px-3 py-2">
+            <button
+              type="button"
+              onClick={() => setMenuOpen(true)}
+              className="nano-touch relative flex items-center justify-center rounded-md px-2 text-fg-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-accent"
+              aria-label="Open menu"
+              aria-haspopup="dialog"
+              aria-expanded={menuOpen}
             >
-              {railCollapsed ? (
-                <div className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-center text-xl font-bold tracking-tight text-transparent">
-                  n
-                </div>
-              ) : (
+              {icons.menu}
+              {changelogHasUnseen && (
                 <>
-                  <div className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-lg font-bold tracking-tight text-transparent">
-                    nano BPM
-                  </div>
-                  <div className="text-xs text-fg-faint">
-                    single-node console
-                  </div>
-                  <div className="mt-2 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-strong">
-                    Advanced Research Prototype
-                  </div>
-                  <div className="mt-1.5 text-[10px] text-fg-faint">
-                    Free for personal or evaluation use
-                  </div>
+                  <span className="sr-only">New changes available</span>
+                  <span
+                    className="absolute right-1 top-1 inline-block h-1.5 w-1.5 rounded-full bg-accent"
+                    aria-hidden="true"
+                  />
                 </>
               )}
+            </button>
+            <a
+              href="/"
+              className="min-w-0 flex-1 truncate bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-base font-bold tracking-tight text-transparent no-underline"
+              title="nano BPM — single-node console"
+            >
+              nano BPM
             </a>
-            {/* Version chrome doubles as the "What's new" entry point. It sits
+          </header>
+        ) : (
+          <aside
+            className={`flex shrink-0 flex-col border-r border-edge bg-panel transition-[width] duration-150 ${
+              railCollapsed ? "w-14" : "w-56"
+            }`}
+          >
+            <div className={railCollapsed ? "px-2 py-4" : "px-5 py-4"}>
+              <a
+                href="/"
+                className="block no-underline"
+                title="nano BPM — single-node console"
+              >
+                {railCollapsed ? (
+                  <div className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-center text-xl font-bold tracking-tight text-transparent">
+                    n
+                  </div>
+                ) : (
+                  <>
+                    <div className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-lg font-bold tracking-tight text-transparent">
+                      nano BPM
+                    </div>
+                    <div className="text-xs text-fg-faint">
+                      single-node console
+                    </div>
+                    <div className="mt-2 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-strong">
+                      Advanced Research Prototype
+                    </div>
+                    <div className="mt-1.5 text-[10px] text-fg-faint">
+                      Free for personal or evaluation use
+                    </div>
+                  </>
+                )}
+              </a>
+              {/* Version chrome doubles as the "What's new" entry point. It sits
                 outside the home <a> (a button can't nest in an anchor) and wears
                 a dot until the newest release has been opened. Hidden while the
                 rail is collapsed (no room in the narrow rail). */}
-            {!railCollapsed &&
-              (serverVersion || changelog || changelogError) && (
-                <button
-                  type="button"
-                  onClick={openChangelog}
-                  title="See what's new in Nano"
-                  className="mt-1 flex items-center gap-1.5 rounded font-mono text-[10px] text-fg-faint outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-accent"
-                >
-                  <span title={serverVersion ?? undefined}>
-                    {serverVersion
-                      ? `gateway ${gatewayLabel(serverVersion) ?? serverVersion}`
-                      : "What's new"}
-                  </span>
-                  {serverVersion && (
-                    <span className="underline decoration-dotted underline-offset-2">
-                      What's new
+              {!railCollapsed &&
+                (serverVersion || changelog || changelogError) && (
+                  <button
+                    type="button"
+                    onClick={openChangelog}
+                    title="See what's new in Nano"
+                    className="mt-1 flex items-center gap-1.5 rounded font-mono text-[10px] text-fg-faint outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-accent"
+                  >
+                    <span title={serverVersion ?? undefined}>
+                      {serverVersion
+                        ? `gateway ${gatewayLabel(serverVersion) ?? serverVersion}`
+                        : "What's new"}
                     </span>
-                  )}
-                  {changelogHasUnseen && (
-                    <>
-                      <span className="sr-only">New changes available</span>
-                      <span
-                        className="inline-block h-1.5 w-1.5 rounded-full bg-accent"
-                        aria-hidden="true"
-                      />
-                    </>
-                  )}
-                </button>
-              )}
-          </div>
-          <nav className="flex flex-col gap-1 px-3">
-            {navItems.map((item) => {
-              // The Studio item is special: it links back to wherever the user
-              // last was in that section and stays highlighted across all
-              // /projects/* routes.
-              const isProjects = item.to === "/projects";
-              const to = isProjects ? projectsRoute.current : item.to;
-              const active = isProjects
-                ? location.pathname.startsWith("/projects")
-                : location.pathname === item.to;
-              return (
-                <NavLink
-                  key={item.to}
-                  to={to}
-                  data-tour={navAnchor(item.to)}
-                  className={railItemClass(active, railCollapsed)}
-                  title={railCollapsed ? item.label : undefined}
-                  aria-label={railCollapsed ? item.label : undefined}
-                >
-                  <ActiveBar show={active} />
-                  {item.icon}
-                  {!railCollapsed && item.label}
-                  {item.to === "/extensions" && updateCount > 0 && (
-                    <span
-                      className={`inline-flex min-w-[18px] items-center justify-center rounded-full bg-danger px-1.5 text-[10px] font-bold leading-none text-white ${
-                        railCollapsed
-                          ? "absolute -right-0.5 -top-0.5"
-                          : "ml-auto"
-                      }`}
-                      style={{ height: "18px" }}
-                      title={`${updateCount} extension update${updateCount === 1 ? "" : "s"} available`}
-                      aria-label={`${updateCount} extension updates available`}
-                    >
-                      {updateCount > 99 ? "99+" : updateCount}
-                    </span>
-                  )}
-                </NavLink>
-              );
-            })}
-          </nav>
-
-          {IS_STUDIO && runningApps.length > 0 && (
-            <nav className="mt-2 flex flex-col gap-1 border-t border-edge px-3 pt-2">
-              {!railCollapsed && (
-                <div className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wide text-fg-muted">
-                  Running apps
-                </div>
-              )}
-              {runningApps.map((app) => {
-                const to = `/apps/${encodeURIComponent(app.name)}`;
-                const active = location.pathname === to;
-                // Label is a display hint; the manifest is not unique, so the
-                // project name is the stable identity. When two running apps
-                // resolve to the same label, disambiguate the visible text with
-                // the unique project name; always expose the name via title/aria.
-                const base = app.appUi?.label || app.displayName || app.name;
-                const collides = (runningAppLabelCounts.get(base) ?? 0) > 1;
-                const label = collides ? `${base} · ${app.name}` : base;
-                const hover =
-                  base === app.name ? app.name : `${base} (${app.name})`;
+                    {serverVersion && (
+                      <span className="underline decoration-dotted underline-offset-2">
+                        What's new
+                      </span>
+                    )}
+                    {changelogHasUnseen && (
+                      <>
+                        <span className="sr-only">New changes available</span>
+                        <span
+                          className="inline-block h-1.5 w-1.5 rounded-full bg-accent"
+                          aria-hidden="true"
+                        />
+                      </>
+                    )}
+                  </button>
+                )}
+            </div>
+            <nav className="flex flex-col gap-1 px-3">
+              {navItems.map((item) => {
+                // The Studio item is special: it links back to wherever the user
+                // last was in that section and stays highlighted across all
+                // /projects/* routes.
+                const isProjects = item.to === "/projects";
+                const to = isProjects ? projectsRoute.current : item.to;
+                const active = isProjects
+                  ? location.pathname.startsWith("/projects")
+                  : location.pathname === item.to;
                 return (
                   <NavLink
-                    key={app.name}
+                    key={item.to}
                     to={to}
+                    data-tour={navAnchor(item.to)}
                     className={railItemClass(active, railCollapsed)}
-                    title={hover}
-                    aria-label={railCollapsed ? hover : undefined}
+                    title={railCollapsed ? item.label : undefined}
+                    aria-label={railCollapsed ? item.label : undefined}
                   >
                     <ActiveBar show={active} />
-                    <AppRailGlyph name={app.name} icon={app.appUi?.icon} />
-                    {!railCollapsed && (
-                      <span className="truncate">{label}</span>
+                    {item.icon}
+                    {!railCollapsed && item.label}
+                    {item.to === "/extensions" && updateCount > 0 && (
+                      <span
+                        className={`inline-flex min-w-[18px] items-center justify-center rounded-full bg-danger px-1.5 text-[10px] font-bold leading-none text-white ${
+                          railCollapsed
+                            ? "absolute -right-0.5 -top-0.5"
+                            : "ml-auto"
+                        }`}
+                        style={{ height: "18px" }}
+                        title={`${updateCount} extension update${updateCount === 1 ? "" : "s"} available`}
+                        aria-label={`${updateCount} extension updates available`}
+                      >
+                        {updateCount > 99 ? "99+" : updateCount}
+                      </span>
                     )}
-                    <span
-                      className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-success ${
-                        railCollapsed
-                          ? "absolute -right-0.5 -top-0.5"
-                          : "ml-auto"
-                      }`}
-                      title="Running"
-                      aria-hidden="true"
-                    />
                   </NavLink>
                 );
               })}
             </nav>
-          )}
 
-          <button
-            type="button"
-            onClick={canResume ? resumeJourney : startTour}
-            data-tour={TOUR_ANCHOR.takeATour}
-            className={`mt-auto mx-3 ${railItemClass(false, railCollapsed)}`}
-            title={
-              canResume
-                ? `Pick up “${activeJourney.title}” where you left off`
-                : "Replay the product tour"
-            }
-            aria-label={
-              railCollapsed
-                ? canResume
-                  ? "Resume tour"
-                  : "Take a tour"
-                : undefined
-            }
-          >
-            <Icon>
-              <circle cx="12" cy="12" r="9" />
-              <path d="M9.1 9a3 3 0 1 1 4.3 3.2c-.8.5-1.4 1-1.4 1.9" />
-              <path d="M12 17h.01" />
-            </Icon>
-            {!railCollapsed && (canResume ? "Resume tour" : "Take a tour")}
-          </button>
+            {IS_STUDIO && runningAppEntries.length > 0 && (
+              <nav className="mt-2 flex flex-col gap-1 border-t border-edge px-3 pt-2">
+                {!railCollapsed && (
+                  <div className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wide text-fg-muted">
+                    Running apps
+                  </div>
+                )}
+                {runningAppEntries.map((entry) => {
+                  const active = location.pathname === entry.href;
+                  return (
+                    <NavLink
+                      key={entry.name}
+                      to={entry.href}
+                      className={railItemClass(active, railCollapsed)}
+                      title={entry.hover}
+                      aria-label={railCollapsed ? entry.hover : undefined}
+                    >
+                      <ActiveBar show={active} />
+                      <AppRailGlyph name={entry.name} icon={entry.icon} />
+                      {!railCollapsed && (
+                        <span className="truncate">{entry.label}</span>
+                      )}
+                      <span
+                        className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-success ${
+                          railCollapsed
+                            ? "absolute -right-0.5 -top-0.5"
+                            : "ml-auto"
+                        }`}
+                        title="Running"
+                        aria-hidden="true"
+                      />
+                    </NavLink>
+                  );
+                })}
+              </nav>
+            )}
 
-          <a
-            href="https://github.com/nanobpm/nano-ide/issues/new/choose"
-            target="_blank"
-            rel="noopener noreferrer"
-            className={`mx-3 ${railItemClass(false, railCollapsed)}`}
-            title="Send feedback or report an issue"
-            aria-label={railCollapsed ? "Feedback" : undefined}
-          >
-            {icons.feedback}
-            {!railCollapsed && "Feedback"}
-          </a>
-
-          <a
-            href="/docs"
-            className={`mx-3 ${railItemClass(false, railCollapsed)}`}
-            title="Documentation"
-            aria-label={railCollapsed ? "Documentation" : undefined}
-          >
-            {icons.docs}
-            {!railCollapsed && "Documentation"}
-          </a>
-
-          <a
-            href="/whitepaper"
-            className={`mx-3 ${railItemClass(false, railCollapsed)}`}
-            title="Whitepaper"
-            aria-label={railCollapsed ? "Whitepaper" : undefined}
-          >
-            {icons.whitepaper}
-            {!railCollapsed && "Whitepaper"}
-          </a>
-
-          <NavLink
-            to="/credits"
-            className={`mx-3 ${railItemClass(location.pathname.startsWith("/credits"), railCollapsed)}`}
-            title="Credits"
-            aria-label={railCollapsed ? "Credits" : undefined}
-          >
-            <ActiveBar show={location.pathname.startsWith("/credits")} />
-            {icons.credits}
-            {!railCollapsed && "Credits"}
-          </NavLink>
-
-          <NavLink
-            to="/config"
-            className={`mx-3 mb-3 ${railItemClass(location.pathname.startsWith("/config"), railCollapsed)}`}
-            title="Configuration"
-            aria-label={railCollapsed ? "Config" : undefined}
-          >
-            <ActiveBar show={location.pathname.startsWith("/config")} />
-            {icons.config}
-            {!railCollapsed && "Config"}
-          </NavLink>
-
-          <button
-            type="button"
-            onClick={toggleRail}
-            className={`mx-3 mb-1 ${railItemClass(false, railCollapsed)}`}
-            title={railCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-            aria-label={railCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-            aria-expanded={!railCollapsed}
-          >
-            <span
-              className={`inline-flex ${railCollapsed ? "rotate-180" : ""}`}
+            <button
+              type="button"
+              onClick={canResume ? resumeJourney : startTour}
+              data-tour={TOUR_ANCHOR.takeATour}
+              className={`mt-auto mx-3 ${railItemClass(false, railCollapsed)}`}
+              title={
+                canResume
+                  ? `Pick up “${activeJourney.title}” where you left off`
+                  : "Replay the product tour"
+              }
+              aria-label={
+                railCollapsed
+                  ? canResume
+                    ? "Resume tour"
+                    : "Take a tour"
+                  : undefined
+              }
             >
-              {icons.collapse}
-            </span>
-            {!railCollapsed && "Collapse"}
-          </button>
+              <Icon>
+                <circle cx="12" cy="12" r="9" />
+                <path d="M9.1 9a3 3 0 1 1 4.3 3.2c-.8.5-1.4 1-1.4 1.9" />
+                <path d="M12 17h.01" />
+              </Icon>
+              {!railCollapsed && (canResume ? "Resume tour" : "Take a tour")}
+            </button>
 
-          <ThemeToggle collapsed={railCollapsed} />
-        </aside>
+            <a
+              href="https://github.com/nanobpm/nano-ide/issues/new/choose"
+              target="_blank"
+              rel="noopener noreferrer"
+              className={`mx-3 ${railItemClass(false, railCollapsed)}`}
+              title="Send feedback or report an issue"
+              aria-label={railCollapsed ? "Feedback" : undefined}
+            >
+              {icons.feedback}
+              {!railCollapsed && "Feedback"}
+            </a>
+
+            <a
+              href="/docs"
+              className={`mx-3 ${railItemClass(false, railCollapsed)}`}
+              title="Documentation"
+              aria-label={railCollapsed ? "Documentation" : undefined}
+            >
+              {icons.docs}
+              {!railCollapsed && "Documentation"}
+            </a>
+
+            <a
+              href="/whitepaper"
+              className={`mx-3 ${railItemClass(false, railCollapsed)}`}
+              title="Whitepaper"
+              aria-label={railCollapsed ? "Whitepaper" : undefined}
+            >
+              {icons.whitepaper}
+              {!railCollapsed && "Whitepaper"}
+            </a>
+
+            <NavLink
+              to="/credits"
+              className={`mx-3 ${railItemClass(location.pathname.startsWith("/credits"), railCollapsed)}`}
+              title="Credits"
+              aria-label={railCollapsed ? "Credits" : undefined}
+            >
+              <ActiveBar show={location.pathname.startsWith("/credits")} />
+              {icons.credits}
+              {!railCollapsed && "Credits"}
+            </NavLink>
+
+            <NavLink
+              to="/config"
+              className={`mx-3 mb-3 ${railItemClass(location.pathname.startsWith("/config"), railCollapsed)}`}
+              title="Configuration"
+              aria-label={railCollapsed ? "Config" : undefined}
+            >
+              <ActiveBar show={location.pathname.startsWith("/config")} />
+              {icons.config}
+              {!railCollapsed && "Config"}
+            </NavLink>
+
+            <button
+              type="button"
+              onClick={toggleRail}
+              className={`mx-3 mb-1 ${railItemClass(false, railCollapsed)}`}
+              title={railCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-label={railCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-expanded={!railCollapsed}
+            >
+              <span
+                className={`inline-flex ${railCollapsed ? "rotate-180" : ""}`}
+              >
+                {icons.collapse}
+              </span>
+              {!railCollapsed && "Collapse"}
+            </button>
+
+            <ThemeToggle collapsed={railCollapsed} />
+          </aside>
+        )}
 
         <main className="min-w-0 flex-1 overflow-auto">
+          {isNarrow && isHome && cardHome}
           <Suspense
             fallback={
               <div className="flex h-full items-center justify-center text-sm text-fg-faint">
@@ -885,6 +1172,7 @@ export default function App() {
           </Suspense>
         </main>
       </div>
+      {isNarrow && menuSheet}
       {startupOpen && (
         <StartupJourneyPanel
           journeys={personaJourneys}

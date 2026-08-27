@@ -10,6 +10,7 @@ import {
 import { projectLogs, type ProjectLogLine } from "../lib/api";
 import { isAssetIcon } from "../lib/appRailIcon";
 import { AppIcon } from "../components/AppIcon";
+import { CardGrid, NavCard, SectionLabel, useIsNarrow } from "../components/ui";
 import { cssVar, TOKEN_KEYS } from "../theme/themes";
 import { decideAppViewMessage } from "../lib/appViewMessage";
 
@@ -61,12 +62,20 @@ export default function AppView() {
   const [busy, setBusy] = useState(false);
   const [logs, setLogs] = useState<KeyedLogLine[]>([]);
   const [tab, setTab] = useState<"app" | "logs">("app");
+  // On a phone the App/Logs tab strip is presented as drill-in cards that open
+  // a view full-screen; `drilled` tracks whether one is open (false = show the
+  // card chooser). The desktop presentation ignores this and keeps the tab
+  // strip. Reset to the chooser whenever the routed app changes, since AppView
+  // stays mounted across `/apps/a` → `/apps/b`.
+  const [drilled, setDrilled] = useState(false);
+  const isNarrow = useIsNarrow();
   // Hide the header icon when the server 404s a missing/oversized/wrong-type
   // asset, mirroring the rail's fallback. Reset when the icon hint or the app
   // route changes so a fixed/renamed icon — or a different app that reuses the
   // same icon string — recovers without a remount.
   const [iconFailed, setIconFailed] = useState(false);
   useEffect(() => setIconFailed(false), [name, appUi?.icon]);
+  useEffect(() => setDrilled(false), [name]);
   const logRef = useRef<HTMLDivElement | null>(null);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   // Monotonic id source for stable React keys: assigning a per-line id on
@@ -440,6 +449,216 @@ export default function AppView() {
   const btn =
     "rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50";
 
+  // Start/Stop/Restart cluster, shared by the desktop header and the mobile
+  // chooser so lifecycle controls stay reachable in either presentation.
+  const controls = running ? (
+    <>
+      <button
+        type="button"
+        onClick={restart}
+        disabled={busy}
+        className={`${btn} border border-edge text-fg hover:bg-hover`}
+      >
+        Restart
+      </button>
+      <button
+        type="button"
+        onClick={stop}
+        disabled={busy}
+        className={`${btn} bg-danger text-white hover:opacity-90`}
+      >
+        Stop
+      </button>
+    </>
+  ) : (
+    <button
+      type="button"
+      onClick={start}
+      disabled={busy}
+      className={`${btn} bg-accent text-white hover:opacity-90`}
+    >
+      Start
+    </button>
+  );
+
+  // The app's active view — the embedded UI iframe (or its start-prompt
+  // placeholder) or the live log stream. Rendered verbatim by the desktop tab
+  // body and the mobile full-screen drill-in: the iframe sandbox flags, the
+  // theme bridge (`onLoad`/`iframeRef`) and the log stream are identical in both,
+  // so the mobile branch changes layout only — never the bridge. `flex-1` /
+  // `min-h-0` make it full-bleed under whichever header is above it, so the
+  // embedded app gets full-bleed height on mobile.
+  const body =
+    activeTab === "app" && !headless ? (
+      canEmbed ? (
+        <iframe
+          // Sandboxed embed of the app's own UI. `allow-same-origin` is
+          // required because the app is proxied same-origin (posture A) so
+          // its fetches/cookies work; `referrerpolicy=no-referrer` avoids
+          // leaking console URLs. No `allow-top-navigation` — a framed app
+          // can't navigate the studio away.
+          //
+          // `allow-popups-to-escape-sandbox` pairs with `allow-popups`: an
+          // app's external links (a grid `linkField` PR URL, the "API docs"
+          // badge — plain `target=_blank rel=noopener noreferrer` anchors)
+          // must open as a normal new tab. With only `allow-popups`, the
+          // popup would INHERIT this sandbox, and Safari then refuses to open
+          // it on a trusted left-click (right-click "open in new tab" bypasses
+          // the frame sandbox, which is why that still worked). The escape
+          // flag lets the new tab drop the sandbox; `rel=noopener noreferrer`
+          // already severs any back-reference to the opener. In-host targets
+          // (processExplorer) don't rely on this — they route via the
+          // nano-navigate postMessage bridge, no popup.
+          key={appSrc}
+          ref={iframeRef}
+          title={`${appUi?.label || displayName} UI`}
+          src={appSrc}
+          onLoad={postTheme}
+          className="min-h-0 flex-1 border-0 bg-app"
+          sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-downloads"
+          referrerPolicy="no-referrer"
+        />
+      ) : (
+        <div className="flex min-h-0 flex-1 items-center justify-center bg-inset px-6 text-center text-sm text-fg-muted">
+          <p>
+            Start the app to view its UI.
+            <br />
+            The embedded view loads once the app is running.
+          </p>
+        </div>
+      )
+    ) : (
+      <div
+        ref={logRef}
+        className="min-h-0 flex-1 overflow-auto bg-inset px-6 py-3 font-mono text-xs leading-relaxed"
+      >
+        {logs.length === 0 ? (
+          <p className="text-fg-muted">
+            No output yet. Start the app to see logs.
+          </p>
+        ) : (
+          logs.map((l) => (
+            <div key={l._key} className={streamTone(l.stream)}>
+              {l.text}
+            </div>
+          ))
+        )}
+      </div>
+    );
+
+  // Mobile drill-in cards: one card per available view. A UI app offers the
+  // embedded App and the Logs; a headless app has no server to embed, so it
+  // stays Logs-only (no UI card). Tapping a card opens that view full-screen.
+  const mobileViews: {
+    key: "app" | "logs";
+    label: string;
+    description: string;
+  }[] = [
+    ...(headless
+      ? []
+      : [
+          {
+            key: "app" as const,
+            label: "App UI",
+            description: canEmbed
+              ? "Open the embedded app"
+              : "Start the app to view its UI",
+          },
+        ]),
+    {
+      key: "logs" as const,
+      label: "Logs",
+      description: "Live output from the app",
+    },
+  ];
+
+  if (isNarrow) {
+    return (
+      <div className="flex h-full flex-col">
+        {drilled ? (
+          <>
+            <div className="nano-safe-x flex items-center gap-2 border-b border-edge px-2 py-2">
+              <button
+                type="button"
+                onClick={() => setDrilled(false)}
+                className="nano-touch flex items-center gap-1 rounded-md px-2 text-sm font-medium text-fg-muted hover:bg-hover hover:text-fg"
+              >
+                <span aria-hidden>←</span> Back
+              </button>
+              <span className="min-w-0 flex-1 truncate text-sm font-medium text-fg">
+                {appUi?.label || displayName}
+              </span>
+              <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-fg-muted">
+                {activeTab === "app" ? "App" : "Logs"}
+              </span>
+            </div>
+            {body}
+          </>
+        ) : (
+          <>
+            <header className="nano-safe-x border-b border-edge px-4 py-3">
+              <div className="flex items-center gap-2">
+                {iconIsAsset && !iconFailed && (
+                  <AppIcon
+                    name={name}
+                    icon={appUi?.icon}
+                    sizeClass="h-6 w-6 rounded"
+                    onError={() => setIconFailed(true)}
+                  />
+                )}
+                <span
+                  className={`inline-block h-2.5 w-2.5 rounded-full ${tone.dot}`}
+                  aria-hidden="true"
+                />
+                <h1 className="min-w-0 flex-1 truncate text-base font-semibold text-fg">
+                  {appUi?.label || displayName}
+                </h1>
+                <span className={`shrink-0 text-xs ${tone.text}`}>
+                  {tone.label}
+                </span>
+              </div>
+              <dl className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-fg-muted">
+                <div className="flex gap-1.5">
+                  <dt>Mode</dt>
+                  <dd className="text-fg">{headless ? "Headless" : "UI"}</dd>
+                </div>
+                {appUi?.port != null && (
+                  <div className="flex gap-1.5">
+                    <dt>UI port</dt>
+                    <dd className="font-mono text-fg">{appUi.port}</dd>
+                  </div>
+                )}
+              </dl>
+              <div className="mt-3 flex flex-wrap gap-2">{controls}</div>
+              {runState?.lastError && (
+                <p className="mt-2 text-xs text-danger">{runState.lastError}</p>
+              )}
+              {error && <p className="mt-2 text-xs text-danger">{error}</p>}
+            </header>
+            <div className="nano-safe-x min-h-0 flex-1 overflow-auto p-4">
+              <SectionLabel>Open</SectionLabel>
+              <div className="mt-2">
+                <CardGrid>
+                  {mobileViews.map((v) => (
+                    <NavCard
+                      key={v.key}
+                      label={v.label}
+                      description={v.description}
+                      onClick={() => {
+                        setTab(v.key);
+                        setDrilled(true);
+                      }}
+                    />
+                  ))}
+                </CardGrid>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full flex-col">
       <header className="border-b border-edge px-6 py-4">
@@ -460,37 +679,7 @@ export default function AppView() {
             {appUi?.label || displayName}
           </h1>
           <span className={`text-sm ${tone.text}`}>{tone.label}</span>
-          <span className="ml-auto flex items-center gap-2">
-            {running ? (
-              <>
-                <button
-                  type="button"
-                  onClick={restart}
-                  disabled={busy}
-                  className={`${btn} border border-edge text-fg hover:bg-hover`}
-                >
-                  Restart
-                </button>
-                <button
-                  type="button"
-                  onClick={stop}
-                  disabled={busy}
-                  className={`${btn} bg-danger text-white hover:opacity-90`}
-                >
-                  Stop
-                </button>
-              </>
-            ) : (
-              <button
-                type="button"
-                onClick={start}
-                disabled={busy}
-                className={`${btn} bg-accent text-white hover:opacity-90`}
-              >
-                Start
-              </button>
-            )}
-          </span>
+          <span className="ml-auto flex items-center gap-2">{controls}</span>
         </div>
         <dl className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-fg-muted">
           <div className="flex gap-1.5">
@@ -554,62 +743,7 @@ export default function AppView() {
           </button>
         </div>
 
-        {activeTab === "app" && !headless ? (
-          canEmbed ? (
-            <iframe
-              // Sandboxed embed of the app's own UI. `allow-same-origin` is
-              // required because the app is proxied same-origin (posture A) so
-              // its fetches/cookies work; `referrerpolicy=no-referrer` avoids
-              // leaking console URLs. No `allow-top-navigation` — a framed app
-              // can't navigate the studio away.
-              //
-              // `allow-popups-to-escape-sandbox` pairs with `allow-popups`: an
-              // app's external links (a grid `linkField` PR URL, the "API docs"
-              // badge — plain `target=_blank rel=noopener noreferrer` anchors)
-              // must open as a normal new tab. With only `allow-popups`, the
-              // popup would INHERIT this sandbox, and Safari then refuses to open
-              // it on a trusted left-click (right-click "open in new tab" bypasses
-              // the frame sandbox, which is why that still worked). The escape
-              // flag lets the new tab drop the sandbox; `rel=noopener noreferrer`
-              // already severs any back-reference to the opener. In-host targets
-              // (processExplorer) don't rely on this — they route via the
-              // nano-navigate postMessage bridge, no popup.
-              key={appSrc}
-              ref={iframeRef}
-              title={`${appUi?.label || displayName} UI`}
-              src={appSrc}
-              onLoad={postTheme}
-              className="min-h-0 flex-1 border-0 bg-app"
-              sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-downloads"
-              referrerPolicy="no-referrer"
-            />
-          ) : (
-            <div className="flex min-h-0 flex-1 items-center justify-center bg-inset px-6 text-center text-sm text-fg-muted">
-              <p>
-                Start the app to view its UI.
-                <br />
-                The embedded view loads once the app is running.
-              </p>
-            </div>
-          )
-        ) : (
-          <div
-            ref={logRef}
-            className="min-h-0 flex-1 overflow-auto bg-inset px-6 py-3 font-mono text-xs leading-relaxed"
-          >
-            {logs.length === 0 ? (
-              <p className="text-fg-muted">
-                No output yet. Start the app to see logs.
-              </p>
-            ) : (
-              logs.map((l) => (
-                <div key={l._key} className={streamTone(l.stream)}>
-                  {l.text}
-                </div>
-              ))
-            )}
-          </div>
-        )}
+        {body}
       </section>
     </div>
   );
