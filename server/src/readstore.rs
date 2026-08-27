@@ -445,7 +445,8 @@ impl ReadModel {
             .collect()
     }
 
-    /// A single agent instance by its dedicated key, routed to the owning shard.
+    /// A single agent instance by its dedicated key, returning the first shard's
+    /// match (keys are unique across shards, so at most one shard answers).
     pub fn agent_instance(&self, key: Key) -> Option<AgentInstanceRow> {
         self.shards.iter().find_map(|s| s.agent_instance(key))
     }

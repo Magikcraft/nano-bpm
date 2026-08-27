@@ -19067,9 +19067,14 @@ fn present<T>(field: &Option<types::Nullable<T>>) -> Option<&T> {
 }
 
 /// Builds a `chrono` UTC datetime from a `_ms` epoch stamp, clamping to the epoch
-/// on the (impossible) overflow so the mapper is total.
+/// on the (impossible) overflow so the mapper is total. A `u64` past `i64::MAX`
+/// would wrap to a negative instant under an `as` cast, so the conversion is
+/// checked (`i64::try_from`) and falls back to the epoch out of range.
 fn ms_to_datetime(ms: u64) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64).unwrap_or_else(epoch)
+    i64::try_from(ms)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .unwrap_or_else(epoch)
 }
 
 /// A row's tenant id, defensively mapping an unset/empty tenant to the engine's
@@ -19600,8 +19605,10 @@ fn agent_create_error_response(
 }
 
 /// Resolves a REST commit-status filter to the read-model's inclusion list, or
-/// `None` (the COMMITTED-only default) when the filter cannot be expressed as an
-/// inclusion set (a bare `$neq`/`$exists`). Exact match and `$eq`/`$in` map to
+/// `None` when the filter cannot be expressed as an inclusion set (a bare
+/// `$neq`/`$exists`). The caller rejects a `None` with HTTP 400 rather than
+/// silently applying the COMMITTED-only default, so `None` signals an
+/// unsupported filter shape — not a fallback. Exact match and `$eq`/`$in` map to
 /// their listed statuses.
 fn agent_commit_status_filter_values(
     filter: &models::AgentInstanceHistoryCommitStatusFilterProperty,
@@ -35709,5 +35716,24 @@ mod call_activity_hierarchy_read_model_tests {
                  instance despite a COMPLETED filter (honour_hierarchy={honour_hierarchy:?})"
             );
         }
+    }
+
+    #[test]
+    fn ms_to_datetime_clamps_out_of_range_stamps_to_the_epoch() {
+        // An in-range stamp round-trips.
+        assert_eq!(ms_to_datetime(0), epoch());
+        assert_eq!(ms_to_datetime(1_000).timestamp_millis(), 1_000);
+
+        // A `u64` past `i64::MAX` would wrap to a *negative* instant under an
+        // `as i64` cast — which `from_timestamp_millis` happily accepts, so the
+        // `unwrap_or_else(epoch)` fallback never fires and the mapper silently
+        // emits a pre-epoch timestamp. The checked conversion must clamp instead.
+        let overflow = (i64::MAX as u64) + 1;
+        assert_eq!(
+            ms_to_datetime(overflow),
+            epoch(),
+            "an out-of-i64-range epoch stamp must clamp to the epoch, not wrap negative"
+        );
+        assert_eq!(ms_to_datetime(u64::MAX), epoch());
     }
 }
