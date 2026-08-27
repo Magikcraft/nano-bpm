@@ -550,6 +550,21 @@ impl Engine {
             .find_map(|inst| inst.agent_instances.get(&agent_instance_key))
     }
 
+    /// The authoritative ownership tuple `(element_id, process_instance_key)` of
+    /// the agent instance identified by `agent_instance_key`, or `None` when no
+    /// such instance is live. The 8.10 `PATCH /agent-instances/{key}` REST
+    /// request carries neither field, yet [`Command::UpdateAgentInstance`]
+    /// asserts them for its ownership guard; the gateway resolves them here — on
+    /// the engine thread, against the primary state — so the update is never
+    /// built from an eventually-consistent read-model row.
+    pub fn agent_instance_ownership(
+        &self,
+        agent_instance_key: Key,
+    ) -> Option<(crate::model::ElementId, Key)> {
+        self.find_agent_instance(agent_instance_key)
+            .map(|inst| (inst.element_id.clone(), inst.process_instance_key))
+    }
+
     /// Resolve an `element_instance_key` to its owning process-instance key and
     /// element id **only when it is active** (present in that instance's `active`
     /// map). Returns `None` for an unknown or already-completed element instance.

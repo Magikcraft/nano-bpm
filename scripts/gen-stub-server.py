@@ -107,6 +107,13 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("cluster_variable", "delete_tenant_cluster_variable"): "self.delete_tenant_cluster_variable_impl(path_params).await",
     ("cluster_variable", "search_cluster_variables"): "self.search_cluster_variables_impl(query_params, body).await",
     # --- END issue-906 cluster-variables delegations ---
+    # --- BEGIN issue-984 agent-instances (S5) delegations ---
+    ("agent_instance", "create_agent_instance"): "self.create_agent_instance_impl(body).await",
+    ("agent_instance", "get_agent_instance"): "self.get_agent_instance_impl(path_params).await",
+    ("agent_instance", "update_agent_instance"): "self.update_agent_instance_impl(path_params, body).await",
+    ("agent_instance", "search_agent_instances"): "self.search_agent_instances_impl(body).await",
+    ("agent_instance", "search_agent_instance_history"): "self.search_agent_instance_history_impl(path_params, body).await",
+    # --- END issue-984 agent-instances (S5) delegations ---
     # --- BEGIN issue-907 jobs & job-statistics delegations ---
     ("job", "batch_update_jobs"): "self.batch_update_jobs_impl(body).await",
     ("job", "get_global_job_statistics"): "self.get_global_job_statistics_impl(query_params).await",

@@ -56,6 +56,7 @@ use axum::extract::Multipart;
 use axum::response::Response;
 use http::StatusCode;
 use nanobpm_gateway_rest::{apis, models, types};
+use nanobpmn_engine_core as agent_model;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
     ActivatedJob, AdHocActivateElement, AdHocJobResult, ClusterVariableSnapshot, ClusterVariables,
@@ -11174,6 +11175,438 @@ impl ServerImpl {
         }
     }
 
+    /// `POST /v2/agent-instances` — create an engine-native agent instance on the
+    /// AI-Agent element instance named by the request. Wires to the S3
+    /// [`Command::CreateAgentInstance`] processor; the created instance's dedicated
+    /// key is read back from the emitted `AgentInstanceCreated` event.
+    async fn create_agent_instance_impl(
+        &self,
+        body: &models::AgentInstanceCreationRequest,
+    ) -> Result<apis::agent_instance::CreateAgentInstanceResponse, ()> {
+        use apis::agent_instance::CreateAgentInstanceResponse as Resp;
+
+        let element_instance_key: Key = match body.element_instance_key.0.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid element instance key",
+                    400,
+                    format!(
+                        "Element instance key '{}' is not a valid key.",
+                        body.element_instance_key.0
+                    ),
+                )));
+            }
+        };
+
+        let definition = agent_model::AgentDefinition {
+            model: Some(body.definition.model.clone()),
+            provider: Some(body.definition.provider.clone()),
+            system_prompt: Some(body.definition.system_prompt.clone()),
+        };
+        let limits = body
+            .limits
+            .as_ref()
+            .map(|l| agent_model::AgentInstanceLimits {
+                max_tokens: l.max_tokens,
+                max_model_calls: l.max_model_calls as i64,
+                max_tool_calls: l.max_tool_calls as i64,
+            });
+        let command = Command::CreateAgentInstance {
+            element_instance_key,
+            definition,
+            limits,
+            history: Vec::new(),
+        };
+
+        match self
+            .engine
+            .by_key(element_instance_key)
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
+            .await
+        {
+            Ok((events, commit)) => {
+                commit.wait().await;
+                self.spawn_routing_if_needed(&events);
+                let agent_instance_key = events.iter().find_map(|e| match e {
+                    Event::AgentInstanceCreated { agent_instance, .. } => {
+                        Some(agent_instance.agent_instance_key)
+                    }
+                    _ => None,
+                });
+                match agent_instance_key {
+                    Some(key) => Ok(Resp::Status200_TheAgentInstanceWasCreated(
+                        models::AgentInstanceCreationResult::new(models::AgentInstanceKey(
+                            key.to_string(),
+                        )),
+                    )),
+                    None => Ok(
+                        Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                            "Agent instance not created",
+                            500,
+                            "The create command emitted no AgentInstanceCreated event.".to_string(),
+                        )),
+                    ),
+                }
+            }
+            Err(e) => Ok(agent_create_error_response(e)),
+        }
+    }
+
+    /// `GET /v2/agent-instances/{agentInstanceKey}` — return a single agent
+    /// instance from the S4 read model, or 404 when unknown.
+    async fn get_agent_instance_impl(
+        &self,
+        path_params: &models::GetAgentInstancePathParams,
+    ) -> Result<apis::agent_instance::GetAgentInstanceResponse, ()> {
+        use apis::agent_instance::GetAgentInstanceResponse as Resp;
+
+        let key: Key = match path_params.agent_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid agent instance key",
+                    400,
+                    format!(
+                        "Agent instance key '{}' is not a valid key.",
+                        path_params.agent_instance_key
+                    ),
+                )));
+            }
+        };
+
+        match self.store.agent_instance(key) {
+            Some(row) => Ok(Resp::Status200_TheAgentInstanceIsSuccessfullyReturned(
+                agent_instance_result(&row),
+            )),
+            None => Ok(Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(
+                problem(
+                    "Agent instance not found",
+                    404,
+                    format!("No agent instance with key {key}."),
+                ),
+            )),
+        }
+    }
+
+    /// `PATCH /v2/agent-instances/{agentInstanceKey}` — advance an agent
+    /// instance's status and append a batch of history turns. Wires to the S3
+    /// [`Command::UpdateAgentInstance`] processor; the ownership fields the 8.10
+    /// request omits are resolved on the engine thread against primary state, and
+    /// the created history keys are read back from the emitted events.
+    async fn update_agent_instance_impl(
+        &self,
+        path_params: &models::UpdateAgentInstancePathParams,
+        body: &models::AgentInstanceUpdateRequest,
+    ) -> Result<apis::agent_instance::UpdateAgentInstanceResponse, ()> {
+        use apis::agent_instance::UpdateAgentInstanceResponse as Resp;
+
+        let agent_instance_key: Key = match path_params.agent_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid agent instance key",
+                    400,
+                    format!(
+                        "Agent instance key '{}' is not a valid key.",
+                        path_params.agent_instance_key
+                    ),
+                )));
+            }
+        };
+        let element_instance_key: Key = match body.element_instance_key.0.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid element instance key",
+                    400,
+                    format!(
+                        "Element instance key '{}' is not a valid key.",
+                        body.element_instance_key.0
+                    ),
+                )));
+            }
+        };
+
+        // A present-but-unparsable jobKey/jobLease must be rejected rather than
+        // silently coerced to 0: 0 changes ownership/attribution and can defeat
+        // retry de-duplication, so a malformed value is a 400, not a default.
+        let job_key: Key = match body.job_key.as_ref() {
+            None => 0,
+            Some(k) => match k.0.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid job key",
+                        400,
+                        format!("Job key '{}' is not a valid key.", k.0),
+                    )));
+                }
+            },
+        };
+        let job_lease: u64 = match body.job_lease.as_ref() {
+            None => 0,
+            Some(l) => match l.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid job lease",
+                        400,
+                        format!("Job lease '{l}' is not a valid value."),
+                    )));
+                }
+            },
+        };
+        let status = body.status.map(agent_update_status);
+        let metrics = body
+            .metrics
+            .as_ref()
+            .map(agent_metrics_delta_from)
+            .unwrap_or_default();
+        // Distinguish an explicit `tools: null` (clear the tool set) from an
+        // absent field (no change): `Null` maps to an empty replacement set,
+        // mirroring how nullable changesets clear a value elsewhere.
+        let tools = match &body.tools {
+            Some(types::Nullable::Present(v)) => Some(v.iter().map(agent_tool_from).collect()),
+            Some(types::Nullable::Null) => Some(Vec::new()),
+            None => None,
+        };
+        let history: Vec<agent_model::AgentHistoryTurn> = match &body.history {
+            Some(types::Nullable::Present(items)) => items
+                .iter()
+                .map(|i| agent_history_turn_from(i, job_key, job_lease))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let submitted_ids: Vec<String> = history
+            .iter()
+            .map(|t| t.history_item_id.clone().unwrap_or_default())
+            .collect();
+
+        let outcome = self
+            .engine
+            .by_key(agent_instance_key)
+            .with(move |engine| {
+                let (element_id, process_instance_key) = engine
+                    .agent_instance_ownership(agent_instance_key)
+                    .ok_or(EngineError::AgentInstanceNotFound { agent_instance_key })?;
+                let command = Command::UpdateAgentInstance {
+                    agent_instance_key,
+                    element_instance_key,
+                    element_id,
+                    process_instance_key,
+                    status,
+                    metrics,
+                    tools,
+                    history,
+                };
+                engine.apply_command_at(command, now_millis())
+            })
+            .await;
+
+        match outcome {
+            Ok((events, commit)) => {
+                commit.wait().await;
+                self.spawn_routing_if_needed(&events);
+                // Correlate each emitted AgentHistoryCreated to its submitted item
+                // in request order; the processor emits them in submission order.
+                let created: Vec<(String, String, bool)> = events
+                    .iter()
+                    .filter_map(|e| match e {
+                        Event::AgentHistoryCreated { record, .. } => Some((
+                            record.history_item_id.clone().unwrap_or_default(),
+                            record.agent_history_key.to_string(),
+                            record.is_duplicate,
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                let created_history = match correlate_created_history(submitted_ids, created) {
+                    Some(v) => v,
+                    // No emitted event correlates to some submitted item: the
+                    // processor produced fewer AgentHistoryCreated events than
+                    // submitted turns. Returning a synthetic "0" key would 200
+                    // with a meaningless key, so fail the request instead.
+                    None => {
+                        return Ok(
+                            Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                problem(
+                                    "Agent instance update incomplete",
+                                    500,
+                                    "The update emitted fewer history events than submitted \
+                                     turns; no key exists for at least one submitted item."
+                                        .to_string(),
+                                ),
+                            ),
+                        );
+                    }
+                };
+                Ok(Resp::Status200_TheAgentInstanceWasUpdatedSuccessfully(
+                    models::AgentInstanceUpdateResult::new(created_history),
+                ))
+            }
+            Err(EngineError::AgentInstanceNotFound { agent_instance_key }) => Ok(
+                Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(problem(
+                    "Agent instance not found",
+                    404,
+                    format!("No agent instance with key {agent_instance_key}."),
+                )),
+            ),
+            Err(e) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Agent instance update rejected",
+                400,
+                e.to_string(),
+            ))),
+        }
+    }
+
+    /// `POST /v2/agent-instances/search` — filter, sort and paginate agent
+    /// instances from the S4 read model (mirrors `search_element_instances_impl`).
+    async fn search_agent_instances_impl(
+        &self,
+        body: &Option<models::AgentInstanceSearchQuery>,
+    ) -> Result<apis::agent_instance::SearchAgentInstancesResponse, ()> {
+        use apis::agent_instance::SearchAgentInstancesResponse as Resp;
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let rows = self.store.agent_instances();
+        let mut matched: Vec<&readstore::AgentInstanceRow> = rows
+            .iter()
+            .filter(|row| match filter {
+                None => true,
+                Some(f) => match_agent_instance_filter(row, f),
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::AgentInstanceSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |row, field| agent_instance_sort_val(row, field),
+            |row| row.agent_instance_key,
+        );
+
+        let sorted: Vec<(u64, &readstore::AgentInstanceRow)> = matched
+            .into_iter()
+            .map(|row| (row.agent_instance_key, row))
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::AgentInstanceResult> =
+            page.items.into_iter().map(agent_instance_result).collect();
+
+        Ok(Resp::Status200_TheAgentInstanceSearchResult(
+            models::AgentInstanceSearchQueryResult::new(page.response, items),
+        ))
+    }
+
+    /// `POST /v2/agent-instances/{agentInstanceKey}/history/search` — search an
+    /// agent instance's conversation history from the S4 read model, defaulting to
+    /// COMMITTED-only turns (the default lives in [`readstore::AgentHistoryFilter`]).
+    async fn search_agent_instance_history_impl(
+        &self,
+        path_params: &models::SearchAgentInstanceHistoryPathParams,
+        body: &Option<models::AgentInstanceHistorySearchQuery>,
+    ) -> Result<apis::agent_instance::SearchAgentInstanceHistoryResponse, ()> {
+        use apis::agent_instance::SearchAgentInstanceHistoryResponse as Resp;
+
+        let key: Key = match path_params.agent_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid agent instance key",
+                    400,
+                    format!(
+                        "Agent instance key '{}' is not a valid key.",
+                        path_params.agent_instance_key
+                    ),
+                )));
+            }
+        };
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        // A commitStatus filter that is present but not expressible as an
+        // inclusion set ($eq/$in) cannot be honoured by the read-model query, so
+        // reject it rather than silently falling back to the COMMITTED-only
+        // default and violating the caller's filter intent.
+        let commit_status = match filter.and_then(|f| f.commit_status.as_ref()) {
+            None => None,
+            Some(cs) => match agent_commit_status_filter_values(cs) {
+                Some(values) => Some(values),
+                None => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Unsupported commitStatus filter",
+                        400,
+                        "The commitStatus filter must be an exact value or an inclusion set \
+                         ($eq/$in); other operators are not supported."
+                            .to_string(),
+                    )));
+                }
+            },
+        };
+        let history_filter = readstore::AgentHistoryFilter {
+            agent_instance_key: Some(key),
+            process_instance_key: None,
+            commit_status,
+        };
+        // An explicit empty inclusion set (`commitStatus: { $in: [] }`) matches
+        // nothing. The read-model collapses `Some(vec![])` to the COMMITTED-only
+        // default (see `AgentHistoryFilter`), so honour "match nothing" here by
+        // skipping the query rather than silently returning committed rows.
+        let rows = if matches!(&history_filter.commit_status, Some(v) if v.is_empty()) {
+            Vec::new()
+        } else {
+            self.store.agent_history(&history_filter)
+        };
+
+        let mut matched: Vec<&readstore::AgentHistoryRow> = rows
+            .iter()
+            .filter(|row| match filter {
+                None => true,
+                Some(f) => {
+                    f.loop_iteration.as_ref().is_none_or(|lf| {
+                        query::match_integer(&Some(lf.clone()), Some(row.loop_iteration as i64))
+                    }) && f
+                        .role
+                        .as_ref()
+                        .is_none_or(|rf| match_agent_history_role(rf, row.role))
+                        && query::match_date_time_ms(
+                            &f.produced_at,
+                            Some(row.produced_at_ms as i64),
+                        )
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::AgentInstanceHistorySearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |row, field| agent_history_sort_val(row, field),
+            |row| row.agent_history_key,
+        );
+
+        let sorted: Vec<(u64, &readstore::AgentHistoryRow)> = matched
+            .into_iter()
+            .map(|row| (row.agent_history_key, row))
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::AgentInstanceHistoryItemResult> = page
+            .items
+            .into_iter()
+            .map(agent_history_item_result)
+            .collect();
+
+        Ok(Resp::Status200_TheAgentInstanceHistorySearchResult(
+            models::AgentInstanceHistorySearchQueryResult::new(page.response, items),
+        ))
+    }
+
     async fn search_user_tasks_impl(
         &self,
         body: &Option<models::UserTaskSearchQuery>,
@@ -18606,6 +19039,713 @@ fn element_instance_result(
         models::ProcessDefinitionKey(row.process_definition_key.clone()),
         incident_key,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Agent-instance (`/v2/agent-instances`, Camunda 8.10) mappers.
+// ---------------------------------------------------------------------------
+
+/// Flattens an `Option<Nullable<T>>` (field absent vs. explicit null) to an
+/// `Option<&T>` — a value is only "there" when the field was present AND not null.
+fn present<T>(field: &Option<types::Nullable<T>>) -> Option<&T> {
+    match field {
+        Some(types::Nullable::Present(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// Builds a `chrono` UTC datetime from a `_ms` epoch stamp, clamping to the epoch
+/// on the (impossible) overflow so the mapper is total. A `u64` past `i64::MAX`
+/// would wrap to a negative instant under an `as` cast, so the conversion is
+/// checked (`i64::try_from`) and falls back to the epoch out of range.
+fn ms_to_datetime(ms: u64) -> chrono::DateTime<chrono::Utc> {
+    i64::try_from(ms)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .unwrap_or_else(epoch)
+}
+
+/// A row's tenant id, defensively mapping an unset/empty tenant to the engine's
+/// canonical default tenant ([`nanobpmn_engine_core::DEFAULT_TENANT`], the literal
+/// `<default>`) the REST surface reports elsewhere. Engine rows normally already
+/// carry `DEFAULT_TENANT`; this only backfills a row that somehow lacks one.
+fn tenant_or_default(tenant_id: &str) -> String {
+    if tenant_id.is_empty() {
+        nanobpmn_engine_core::DEFAULT_TENANT.to_string()
+    } else {
+        tenant_id.to_string()
+    }
+}
+
+/// Maps an engine agent-instance status to the REST status enum.
+fn agent_instance_status_enum(
+    status: agent_model::AgentInstanceStatus,
+) -> models::AgentInstanceStatusEnum {
+    use agent_model::AgentInstanceStatus as S;
+    match status {
+        S::Initializing => models::AgentInstanceStatusEnum::Initializing,
+        S::ToolDiscovery => models::AgentInstanceStatusEnum::ToolDiscovery,
+        S::Thinking => models::AgentInstanceStatusEnum::Thinking,
+        S::ToolCalling => models::AgentInstanceStatusEnum::ToolCalling,
+        S::Idle => models::AgentInstanceStatusEnum::Idle,
+        S::Completed => models::AgentInstanceStatusEnum::Completed,
+    }
+}
+
+/// Maps a REST update-status enum to the engine agent-instance status. `UPDATE`
+/// can only drive the instance to one of the *active* states (`COMPLETED` is
+/// reached solely via `COMPLETE`), so the enum has no completed arm.
+fn agent_update_status(
+    status: models::AgentInstanceUpdateStatusEnum,
+) -> agent_model::AgentInstanceStatus {
+    use agent_model::AgentInstanceStatus as S;
+    use models::AgentInstanceUpdateStatusEnum as U;
+    match status {
+        U::Idle => S::Idle,
+        U::Thinking => S::Thinking,
+        U::ToolCalling => S::ToolCalling,
+        U::ToolDiscovery => S::ToolDiscovery,
+    }
+}
+
+/// Maps an engine agent-history role to the REST role enum.
+fn agent_history_role_enum(
+    role: agent_model::AgentHistoryRole,
+) -> models::AgentInstanceHistoryRoleEnum {
+    use agent_model::AgentHistoryRole as R;
+    match role {
+        R::User => models::AgentInstanceHistoryRoleEnum::User,
+        R::Assistant => models::AgentInstanceHistoryRoleEnum::Assistant,
+        R::ToolResult => models::AgentInstanceHistoryRoleEnum::ToolResult,
+        R::Configuration => models::AgentInstanceHistoryRoleEnum::Configuration,
+    }
+}
+
+/// Maps a REST role enum to the engine agent-history role.
+fn agent_history_role_from(
+    role: &models::AgentInstanceHistoryRoleEnum,
+) -> agent_model::AgentHistoryRole {
+    use agent_model::AgentHistoryRole as R;
+    match role {
+        models::AgentInstanceHistoryRoleEnum::User => R::User,
+        models::AgentInstanceHistoryRoleEnum::Assistant => R::Assistant,
+        models::AgentInstanceHistoryRoleEnum::ToolResult => R::ToolResult,
+        models::AgentInstanceHistoryRoleEnum::Configuration => R::Configuration,
+    }
+}
+
+/// Maps an engine commit status to the REST commit-status enum.
+fn agent_commit_status_enum(
+    status: agent_model::AgentHistoryCommitStatus,
+) -> models::AgentInstanceHistoryCommitStatusEnum {
+    use agent_model::AgentHistoryCommitStatus as C;
+    match status {
+        C::Committed => models::AgentInstanceHistoryCommitStatusEnum::Committed,
+        C::Pending => models::AgentInstanceHistoryCommitStatusEnum::Pending,
+        C::Discarded => models::AgentInstanceHistoryCommitStatusEnum::Discarded,
+    }
+}
+
+/// Maps a REST commit-status enum to the engine commit status.
+fn agent_commit_status_from(
+    status: &models::AgentInstanceHistoryCommitStatusEnum,
+) -> agent_model::AgentHistoryCommitStatus {
+    use agent_model::AgentHistoryCommitStatus as C;
+    match status {
+        models::AgentInstanceHistoryCommitStatusEnum::Committed => C::Committed,
+        models::AgentInstanceHistoryCommitStatusEnum::Pending => C::Pending,
+        models::AgentInstanceHistoryCommitStatusEnum::Discarded => C::Discarded,
+    }
+}
+
+/// Maps an engine content block to the REST message-content shape. The engine's
+/// `object` payload is an opaque JSON string; it is re-parsed into a structured
+/// value so the wire carries JSON, not a JSON-in-a-string.
+fn agent_message_content(
+    c: &agent_model::AgentHistoryContent,
+) -> models::AgentInstanceMessageContent {
+    use agent_model::AgentHistoryContentType as CT;
+    let content_type = match c.content_type {
+        CT::Text => models::AgentInstanceContentTypeEnum::Text,
+        CT::Document => models::AgentInstanceContentTypeEnum::Document,
+        CT::Object => models::AgentInstanceContentTypeEnum::Object,
+    };
+    let mut m = models::AgentInstanceMessageContent::new(content_type);
+    m.text = c.text.clone().map(types::Nullable::Present);
+    m.document_reference = c.document_reference.clone().map(types::Nullable::Present);
+    m.object = c.object.as_ref().map(|s| {
+        let value = serde_json::from_str::<serde_json::Value>(s)
+            .unwrap_or_else(|_| serde_json::Value::String(s.to_string()));
+        types::Nullable::Present(types::Object(value))
+    });
+    m
+}
+
+/// Maps a REST message-content block to the engine content shape. The structured
+/// `object` payload is serialised back to the opaque JSON string the engine core
+/// stores (it stays free of a `serde_json::Value` dependency).
+fn agent_content_from(c: &models::AgentInstanceMessageContent) -> agent_model::AgentHistoryContent {
+    use agent_model::AgentHistoryContentType as CT;
+    let content_type = match c.content_type {
+        models::AgentInstanceContentTypeEnum::Text => CT::Text,
+        models::AgentInstanceContentTypeEnum::Document => CT::Document,
+        models::AgentInstanceContentTypeEnum::Object => CT::Object,
+    };
+    agent_model::AgentHistoryContent {
+        content_type,
+        text: present(&c.text).cloned(),
+        document_reference: present(&c.document_reference).cloned(),
+        object: present(&c.object).map(|o| o.0.to_string()),
+    }
+}
+
+/// Maps an engine tool descriptor to the REST `AgentTool`.
+fn agent_tool_result(t: &agent_model::AgentTool) -> models::AgentTool {
+    models::AgentTool::new(
+        t.name.clone(),
+        match &t.description {
+            Some(d) => types::Nullable::Present(d.clone()),
+            None => types::Nullable::Null,
+        },
+        match &t.element_id {
+            Some(e) => types::Nullable::Present(e.clone()),
+            None => types::Nullable::Null,
+        },
+    )
+}
+
+/// Maps a REST `AgentTool` to the engine tool descriptor.
+fn agent_tool_from(t: &models::AgentTool) -> agent_model::AgentTool {
+    agent_model::AgentTool {
+        name: t.name.clone(),
+        description: match &t.description {
+            types::Nullable::Present(d) => Some(d.clone()),
+            types::Nullable::Null => None,
+        },
+        element_id: match &t.element_id {
+            types::Nullable::Present(e) => Some(e.clone()),
+            types::Nullable::Null => None,
+        },
+    }
+}
+
+/// Maps an engine tool call to the REST `AgentInstanceToolCall`. The opaque
+/// arguments string is re-parsed into a JSON object; a non-object or unparsable
+/// payload maps to null so the field stays schema-valid.
+fn agent_tool_call_result(c: &agent_model::AgentHistoryToolCall) -> models::AgentInstanceToolCall {
+    let arguments = c
+        .arguments
+        .as_ref()
+        .and_then(|s| {
+            serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(s).ok()
+        })
+        .map(|m| {
+            types::Nullable::Present(m.into_iter().map(|(k, v)| (k, types::Object(v))).collect())
+        })
+        .unwrap_or(types::Nullable::Null);
+    models::AgentInstanceToolCall::new(
+        c.tool_call_id.clone(),
+        c.tool_name.clone(),
+        match &c.element_id {
+            Some(e) => types::Nullable::Present(e.clone()),
+            None => types::Nullable::Null,
+        },
+        arguments,
+    )
+}
+
+/// Maps a REST tool call to the engine tool call. The structured arguments map is
+/// serialised back to the opaque JSON string the engine stores.
+fn agent_tool_call_from(c: &models::AgentInstanceToolCall) -> agent_model::AgentHistoryToolCall {
+    let arguments = match &c.arguments {
+        types::Nullable::Present(m) => {
+            let obj: serde_json::Map<String, serde_json::Value> =
+                m.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect();
+            Some(serde_json::Value::Object(obj).to_string())
+        }
+        types::Nullable::Null => None,
+    };
+    agent_model::AgentHistoryToolCall {
+        tool_call_id: c.tool_call_id.clone(),
+        tool_name: c.tool_name.clone(),
+        element_id: match &c.element_id {
+            types::Nullable::Present(e) => Some(e.clone()),
+            types::Nullable::Null => None,
+        },
+        arguments,
+    }
+}
+
+/// Maps engine per-turn metrics to the REST `AgentInstanceHistoryItemMetrics`
+/// (the canonical 8.10 subset: input/output tokens + duration).
+fn agent_history_metrics_result(
+    m: &agent_model::AgentHistoryMetrics,
+) -> models::AgentInstanceHistoryItemMetrics {
+    models::AgentInstanceHistoryItemMetrics::new(
+        types::Nullable::Present(m.input_tokens),
+        types::Nullable::Present(m.output_tokens),
+        types::Nullable::Present(m.duration_ms),
+    )
+}
+
+/// Maps a REST per-turn metrics block to the engine metrics (the extra token
+/// counters the engine carries are not part of the 8.10 request, so default to 0).
+fn agent_history_metrics_from(
+    m: &models::AgentInstanceHistoryItemMetrics,
+) -> agent_model::AgentHistoryMetrics {
+    let val = |n: &types::Nullable<i64>| match n {
+        types::Nullable::Present(v) => *v,
+        types::Nullable::Null => 0,
+    };
+    agent_model::AgentHistoryMetrics {
+        input_tokens: val(&m.input_tokens),
+        output_tokens: val(&m.output_tokens),
+        duration_ms: val(&m.duration_ms),
+        ..Default::default()
+    }
+}
+
+/// Projects an [`readstore::AgentInstanceRow`] into the REST `AgentInstanceResult`.
+/// `version_tag` is the projected `process_definition_version_tag` (null when the
+/// deployment carried no tag); tools are decoded from the row's stored JSON,
+/// defaulting to an empty list when absent or malformed; `elementInstanceKeys`
+/// reports every element instance associated with the agent instance.
+fn agent_instance_result(row: &readstore::AgentInstanceRow) -> models::AgentInstanceResult {
+    let tools: Vec<agent_model::AgentTool> =
+        serde_json::from_str(&row.tools_json).unwrap_or_default();
+    let completion_date = match row.completion_date_ms {
+        Some(ms) => types::Nullable::Present(ms_to_datetime(ms)),
+        None => types::Nullable::Null,
+    };
+    let version_tag = match &row.process_definition_version_tag {
+        Some(tag) => types::Nullable::Present(tag.clone()),
+        None => types::Nullable::Null,
+    };
+    models::AgentInstanceResult::new(
+        models::AgentInstanceKey(row.agent_instance_key.to_string()),
+        agent_instance_status_enum(row.status),
+        models::AgentInstanceDefinition::new(
+            row.model.clone().unwrap_or_default(),
+            row.provider.clone().unwrap_or_default(),
+            row.system_prompt.clone().unwrap_or_default(),
+        ),
+        models::AgentInstanceMetrics::new(
+            row.input_tokens,
+            row.output_tokens,
+            row.model_calls as i32,
+            row.tool_calls as i32,
+        ),
+        models::AgentInstanceLimits::new(
+            row.max_model_calls as i32,
+            row.max_tool_calls as i32,
+            row.max_tokens,
+        ),
+        tools.iter().map(agent_tool_result).collect(),
+        row.element_id.clone(),
+        models::ProcessInstanceKey(row.process_instance_key.to_string()),
+        models::ProcessInstanceKey(row.root_process_instance_key.to_string()),
+        models::ProcessDefinitionKey(row.process_definition_key.to_string()),
+        row.process_definition_id.clone(),
+        row.process_definition_version,
+        version_tag,
+        tenant_or_default(&row.tenant_id),
+        ms_to_datetime(row.creation_date_ms),
+        ms_to_datetime(row.last_updated_date_ms),
+        completion_date,
+        row.element_instance_keys
+            .iter()
+            .map(|k| k.to_string())
+            .collect(),
+    )
+}
+
+/// Correlates each emitted `AgentHistoryCreated` event (in request/emission
+/// order) to a submitted history item, yielding exactly one result per submitted
+/// item in submission order.
+///
+/// Matching prefers a non-empty `historyItemId` equality; failing that it falls
+/// back to *request order* by consuming the next remaining event (position 0 of
+/// the shrinking `created` list). Consuming position 0 — rather than the
+/// submitted index — is what keeps the pairing correct: matched events are
+/// removed, so `created` shrinks while a submitted index would grow, and an
+/// index-based fallback would mis-pair (or spuriously fail) as soon as any id
+/// fails to match (e.g. two blank ids, or an event emitted without an id).
+///
+/// Returns `None` when a submitted item has no correlatable event (the processor
+/// emitted fewer events than submitted turns); the caller maps that to a 500
+/// rather than fabricating a meaningless key.
+fn correlate_created_history(
+    submitted_ids: Vec<String>,
+    mut created: Vec<(String, String, bool)>,
+) -> Option<Vec<models::AgentInstanceCreatedHistoryItem>> {
+    let mut out = Vec::with_capacity(submitted_ids.len());
+    for id in submitted_ids.into_iter() {
+        let pos = created
+            .iter()
+            .position(|(eid, _, _)| !id.is_empty() && *eid == id)
+            .or(if created.is_empty() { None } else { Some(0) })?;
+        let (eid, key, dup) = created.remove(pos);
+        out.push(models::AgentInstanceCreatedHistoryItem::new(
+            if id.is_empty() { eid } else { id },
+            models::AgentHistoryKey(key),
+            dup,
+        ));
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod correlate_created_history_tests {
+    use super::*;
+
+    fn ev(id: &str, key: &str, dup: bool) -> (String, String, bool) {
+        (id.to_string(), key.to_string(), dup)
+    }
+
+    #[test]
+    fn matches_each_submitted_id_to_its_event() {
+        let out = correlate_created_history(
+            vec!["a".into(), "b".into()],
+            vec![ev("a", "10", false), ev("b", "11", true)],
+        )
+        .expect("all ids correlate");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].history_item_id, "a");
+        assert_eq!(out[0].history_item_key.0, "10");
+        assert!(!out[0].is_duplicate);
+        assert_eq!(out[1].history_item_id, "b");
+        assert_eq!(out[1].history_item_key.0, "11");
+        assert!(out[1].is_duplicate);
+    }
+
+    #[test]
+    fn matches_by_id_out_of_emission_order() {
+        // Events arrive in a different order than submitted; id match must win.
+        let out = correlate_created_history(
+            vec!["a".into(), "b".into()],
+            vec![ev("b", "11", false), ev("a", "10", false)],
+        )
+        .expect("all ids correlate");
+        assert_eq!(out[0].history_item_key.0, "10");
+        assert_eq!(out[1].history_item_key.0, "11");
+    }
+
+    #[test]
+    fn two_blank_ids_consume_events_in_request_order() {
+        // Regression: an index-based positional fallback used to 500 on the
+        // second blank-id item because `created` shrinks while the index grows.
+        // Consuming position 0 correctly pairs both blank ids in request order.
+        let out = correlate_created_history(
+            vec![String::new(), String::new()],
+            vec![ev("", "10", false), ev("", "11", true)],
+        )
+        .expect("blank ids correlate positionally");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].history_item_key.0, "10");
+        assert!(!out[0].is_duplicate);
+        assert_eq!(out[1].history_item_key.0, "11");
+        assert!(out[1].is_duplicate);
+    }
+
+    #[test]
+    fn blank_id_falls_back_after_id_match_consumed() {
+        // Mixed: a matched id removes its event, and the blank item must take the
+        // earliest surviving event (not the submitted index).
+        let out = correlate_created_history(
+            vec!["a".into(), String::new()],
+            vec![ev("a", "10", false), ev("", "11", false)],
+        )
+        .expect("mixed ids correlate");
+        assert_eq!(out[0].history_item_key.0, "10");
+        assert_eq!(out[1].history_item_key.0, "11");
+    }
+
+    #[test]
+    fn fewer_events_than_submitted_fails() {
+        assert!(
+            correlate_created_history(vec!["a".into(), "b".into()], vec![ev("a", "10", false)],)
+                .is_none()
+        );
+    }
+}
+
+/// Projects an [`readstore::AgentHistoryRow`] into the REST
+/// `AgentInstanceHistoryItemResult`. Content, tool calls and tools are decoded
+/// from the row's stored JSON columns; metrics are the canonical input/output/
+/// duration subset.
+fn agent_history_item_result(
+    row: &readstore::AgentHistoryRow,
+) -> models::AgentInstanceHistoryItemResult {
+    let content: Vec<agent_model::AgentHistoryContent> =
+        serde_json::from_str(&row.content_json).unwrap_or_default();
+    let tool_calls: Vec<agent_model::AgentHistoryToolCall> =
+        serde_json::from_str(&row.tool_calls_json).unwrap_or_default();
+    let tools: Vec<agent_model::AgentTool> =
+        serde_json::from_str(&row.tools_json).unwrap_or_default();
+    // Per the contract, per-call `metrics` are present on ASSISTANT items only;
+    // for USER/TOOL_RESULT/CONFIGURATION turns the field is required-but-nullable
+    // and must be null rather than leaking meaningless zero metrics.
+    let metrics = match row.role {
+        agent_model::AgentHistoryRole::Assistant => types::Nullable::Present(
+            agent_history_metrics_result(&agent_model::AgentHistoryMetrics {
+                input_tokens: row.input_tokens,
+                output_tokens: row.output_tokens,
+                reasoning_token_count: row.reasoning_token_count,
+                cache_creation_token_count: row.cache_creation_token_count,
+                cache_read_token_count: row.cache_read_token_count,
+                duration_ms: row.duration_ms,
+            }),
+        ),
+        _ => types::Nullable::Null,
+    };
+    models::AgentInstanceHistoryItemResult::new(
+        models::AgentHistoryKey(row.agent_history_key.to_string()),
+        row.history_item_id.clone().unwrap_or_default(),
+        models::AgentInstanceKey(row.agent_instance_key.to_string()),
+        models::ElementInstanceKey(row.element_instance_key.to_string()),
+        models::ProcessInstanceKey(row.process_instance_key.to_string()),
+        models::ProcessInstanceKey(row.root_process_instance_key.to_string()),
+        models::ProcessDefinitionKey(row.process_definition_key.to_string()),
+        row.process_definition_id.clone(),
+        tenant_or_default(&row.tenant_id),
+        models::JobKey(row.job_key.to_string()),
+        row.loop_iteration,
+        agent_history_role_enum(row.role),
+        content.iter().map(agent_message_content).collect(),
+        tool_calls.iter().map(agent_tool_call_result).collect(),
+        metrics,
+        agent_commit_status_enum(row.commit_status),
+        ms_to_datetime(row.produced_at_ms),
+        tools.iter().map(agent_tool_result).collect(),
+        match &row.model {
+            Some(m) => types::Nullable::Present(m.clone()),
+            None => types::Nullable::Null,
+        },
+        match &row.provider {
+            Some(p) => types::Nullable::Present(p.clone()),
+            None => types::Nullable::Null,
+        },
+        row.is_duplicate,
+    )
+}
+
+/// Builds an engine [`agent_model::AgentHistoryTurn`] from a REST history item.
+/// The request-level `jobKey`/`jobLease` are attributed to every turn in the
+/// batch (the activation during which the batch was produced).
+fn agent_history_turn_from(
+    item: &models::AgentInstanceHistoryItem,
+    job_key: Key,
+    job_lease: u64,
+) -> agent_model::AgentHistoryTurn {
+    let tool_calls = match &item.tool_calls {
+        Some(types::Nullable::Present(v)) => v.iter().map(agent_tool_call_from).collect(),
+        _ => Vec::new(),
+    };
+    let tools = match &item.tools {
+        Some(types::Nullable::Present(v)) => v.iter().map(agent_tool_from).collect(),
+        _ => Vec::new(),
+    };
+    let metrics = match &item.metrics {
+        Some(types::Nullable::Present(m)) => agent_history_metrics_from(m),
+        _ => agent_model::AgentHistoryMetrics::default(),
+    };
+    let limits = item
+        .limits
+        .as_ref()
+        .map(|l| agent_model::AgentInstanceLimits {
+            max_tokens: l.max_tokens,
+            max_model_calls: l.max_model_calls as i64,
+            max_tool_calls: l.max_tool_calls as i64,
+        });
+    agent_model::AgentHistoryTurn {
+        loop_iteration: item.loop_iteration,
+        produced_at: item.produced_at.timestamp_millis().max(0) as u64,
+        role: agent_history_role_from(&item.role),
+        content: item.content.iter().map(agent_content_from).collect(),
+        system_prompt: present(&item.system_prompt).cloned(),
+        tool_calls,
+        metrics,
+        history_item_id: Some(item.history_item_id.clone()),
+        tools,
+        model: present(&item.model).cloned(),
+        provider: present(&item.provider).cloned(),
+        limits,
+        job_key,
+        job_lease,
+        ..Default::default()
+    }
+}
+
+/// The [`query::SortVal`] for an agent-instance row on the given REST sort field.
+fn agent_instance_sort_val(row: &readstore::AgentInstanceRow, field: &str) -> query::SortVal {
+    match field {
+        "agentDefinitionKey" => query::SortVal::Num(row.agent_definition_key as i64),
+        "status" => query::SortVal::Str(row.status.as_str().to_string()),
+        "elementId" => query::SortVal::Str(row.element_id.clone()),
+        "processInstanceKey" => query::SortVal::Num(row.process_instance_key as i64),
+        "rootProcessInstanceKey" => query::SortVal::Num(row.root_process_instance_key as i64),
+        "processDefinitionKey" => query::SortVal::Num(row.process_definition_key as i64),
+        "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
+        "creationDate" => query::SortVal::Num(row.creation_date_ms as i64),
+        "lastUpdatedDate" => query::SortVal::Num(row.last_updated_date_ms as i64),
+        "completionDate" => query::SortVal::Num(row.completion_date_ms.unwrap_or(0) as i64),
+        _ => query::SortVal::Num(row.agent_instance_key as i64),
+    }
+}
+
+/// The [`query::SortVal`] for an agent-history row on the given REST sort field.
+fn agent_history_sort_val(row: &readstore::AgentHistoryRow, field: &str) -> query::SortVal {
+    match field {
+        "producedAt" => query::SortVal::Num(row.produced_at_ms as i64),
+        "loopIteration" => query::SortVal::Num(row.loop_iteration as i64),
+        _ => query::SortVal::Num(row.agent_history_key as i64),
+    }
+}
+
+/// Matches an [`readstore::AgentInstanceRow`] against a REST agent-instance filter.
+fn match_agent_instance_filter(
+    row: &readstore::AgentInstanceRow,
+    f: &models::AgentInstanceFilter,
+) -> bool {
+    query::match_agent_instance_key(&f.agent_instance_key, &row.agent_instance_key.to_string())
+        && query::match_agent_instance_status(&f.status, row.status.as_str())
+        && query::match_element_id(&f.element_id, &row.element_id)
+        && query::match_process_instance_key(
+            &f.process_instance_key,
+            &row.process_instance_key.to_string(),
+        )
+        && query::match_process_definition_key(
+            &f.process_definition_key,
+            &row.process_definition_key.to_string(),
+        )
+        && query::match_string_opt(&f.tenant_id, Some(&row.tenant_id))
+        && query::match_date_time_ms(&f.creation_date, Some(row.creation_date_ms as i64))
+        && query::match_date_time_ms(&f.last_updated_date, Some(row.last_updated_date_ms as i64))
+        && query::match_date_time_ms(&f.completion_date, row.completion_date_ms.map(|v| v as i64))
+        && query::match_string_opt(&f.process_definition_id, Some(&row.process_definition_id))
+        && query::match_integer(
+            &f.process_definition_version,
+            Some(row.process_definition_version as i64),
+        )
+        && query::match_string_opt(
+            &f.process_definition_version_tag,
+            row.process_definition_version_tag.as_deref(),
+        )
+        && match_agent_instance_element_keys(&f.element_instance_keys, &row.element_instance_keys)
+}
+
+/// Matches the `elementInstanceKeys` filter: every provided key filter must be
+/// satisfied by at least one of the instance's associated element instance keys
+/// (the contract's "associated with all of the provided keys" semantics).
+fn match_agent_instance_element_keys(
+    filters: &Option<Vec<models::ElementInstanceKeyFilterProperty>>,
+    keys: &[Key],
+) -> bool {
+    match filters {
+        None => true,
+        Some(fs) => fs.iter().all(|f| {
+            keys.iter()
+                .any(|k| query::match_element_instance_key(&Some(f.clone()), &k.to_string()))
+        }),
+    }
+}
+
+/// Maps a REST metrics-delta to the engine's delta (the engine carries extra
+/// token counters not part of the 8.10 request, so they default to 0).
+fn agent_metrics_delta_from(
+    d: &models::AgentInstanceMetricsDelta,
+) -> agent_model::AgentInstanceMetricsDelta {
+    agent_model::AgentInstanceMetricsDelta {
+        input_tokens: d.input_tokens.unwrap_or(0),
+        output_tokens: d.output_tokens.unwrap_or(0),
+        model_calls: d.model_calls.unwrap_or(0) as i64,
+        tool_calls: d.tool_calls.unwrap_or(0) as i64,
+        ..Default::default()
+    }
+}
+
+/// Maps a create-command [`EngineError`] to the create endpoint's response. The
+/// spec defines 404 for an inactive/unknown element instance and 400 for an
+/// element that cannot host an agent; everything else is a 500.
+fn agent_create_error_response(
+    e: EngineError,
+) -> apis::agent_instance::CreateAgentInstanceResponse {
+    use apis::agent_instance::CreateAgentInstanceResponse as Resp;
+    match e {
+        EngineError::AgentInstanceElementInstanceInactive {
+            element_instance_key,
+        } => Resp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(
+            problem(
+                "Element instance not active",
+                404,
+                format!(
+                    "Element instance {element_instance_key} is not an active element instance."
+                ),
+            ),
+        ),
+        EngineError::AgentInstanceElementNotEligible { .. }
+        | EngineError::AgentInstanceMissingAgentDefinition { .. } => {
+            Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Element not eligible for an agent instance",
+                400,
+                e.to_string(),
+            ))
+        }
+        EngineError::AgentInstanceConflict { .. } => Resp::Status400_TheProvidedDataIsNotValid(
+            problem("Agent instance conflict", 400, e.to_string()),
+        ),
+        other => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+            "Agent instance creation failed",
+            500,
+            other.to_string(),
+        )),
+    }
+}
+
+/// Resolves a REST commit-status filter to the read-model's inclusion list, or
+/// `None` when the filter cannot be expressed as an inclusion set (a bare
+/// `$neq`/`$exists`). The caller rejects a `None` with HTTP 400 rather than
+/// silently applying the COMMITTED-only default, so `None` signals an
+/// unsupported filter shape — not a fallback. Exact match and `$eq`/`$in` map to
+/// their listed statuses.
+fn agent_commit_status_filter_values(
+    filter: &models::AgentInstanceHistoryCommitStatusFilterProperty,
+) -> Option<Vec<agent_model::AgentHistoryCommitStatus>> {
+    use models::AgentInstanceHistoryCommitStatusFilterProperty as P;
+    match filter {
+        P::AgentInstanceHistoryCommitStatusEnum(e) => Some(vec![agent_commit_status_from(e)]),
+        P::AdvancedAgentInstanceHistoryCommitStatusFilter(a) => {
+            if let Some(list) = &a.dollar_in {
+                Some(list.iter().map(agent_commit_status_from).collect())
+            } else {
+                a.dollar_eq
+                    .as_ref()
+                    .map(|e| vec![agent_commit_status_from(e)])
+            }
+        }
+    }
+}
+
+/// Matches an agent-history row's role against a REST role filter (exact enum or
+/// advanced `$eq`/`$neq`/`$exists`/`$in`). A role is always present, so
+/// `$exists: false` never matches.
+fn match_agent_history_role(
+    filter: &models::AgentInstanceHistoryRoleFilterProperty,
+    role: agent_model::AgentHistoryRole,
+) -> bool {
+    use models::AgentInstanceHistoryRoleFilterProperty as P;
+    let actual = agent_history_role_enum(role);
+    match filter {
+        P::AgentInstanceHistoryRoleEnum(e) => *e == actual,
+        P::AdvancedAgentInstanceHistoryRoleFilter(a) => {
+            a.dollar_eq.as_ref().is_none_or(|v| *v == actual)
+                && a.dollar_neq.as_ref().is_none_or(|v| *v != actual)
+                && a.dollar_exists.is_none_or(|ex| ex)
+                && a.dollar_in
+                    .as_ref()
+                    .is_none_or(|list| list.contains(&actual))
+        }
+    }
 }
 
 /// Maps an engine [`nanobpmn_engine_core::JobState`] to the REST job state enum.
@@ -33585,6 +34725,640 @@ mod call_activity_hierarchy_read_model_tests {
         panic!("read model never projected {want} instances");
     }
 
+    /// A TEXT content block carrying `t` (8.10 `contentType: TEXT`).
+    fn text_content(t: &str) -> models::AgentInstanceMessageContent {
+        let mut c =
+            models::AgentInstanceMessageContent::new(models::AgentInstanceContentTypeEnum::Text);
+        c.text = Some(types::Nullable::Present(t.to_string()));
+        c
+    }
+
+    /// Polls `search_agent_instances_impl` (no filter) until at least `want`
+    /// agent instances are projected.
+    async fn agent_search_until(
+        server: &ServerImpl,
+        want: usize,
+    ) -> Vec<models::AgentInstanceResult> {
+        use apis::agent_instance::SearchAgentInstancesResponse as Resp;
+        for _ in 0..200 {
+            let Resp::Status200_TheAgentInstanceSearchResult(r) = server
+                .search_agent_instances_impl(&None)
+                .await
+                .expect("agent search returns")
+            else {
+                panic!("expected a 200 agent search result");
+            };
+            if r.items.len() >= want {
+                return r.items;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("read model never projected {want} agent instances");
+    }
+
+    /// End-to-end contract test for the `/v2/agent-instances` REST channel (S5):
+    /// every endpoint round-trips the Camunda 8.10 schema field names and the
+    /// documented behaviours (create → INITIALIZING; PATCH appends turns and
+    /// advances status; GET; instance-search filters/sorts; history-search
+    /// returns the turns and defaults to COMMITTED).
+    #[tokio::test]
+    async fn agent_instances_rest_roundtrips_the_810_schema() {
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="agent-proc" isExecutable="true">
+              <bpmn:startEvent id="start" />
+              <bpmn:serviceTask id="agent">
+                <bpmn:extensionElements>
+                  <zeebe:agentDefinition agentType="aiAgentTask" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="end" />
+              <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent" />
+              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="end" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let srv = build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1));
+        deploy(&srv, parse_bpmn(xml).expect("parse agent-proc")).await;
+
+        // Start an instance; S1 auto-mints an AgentInstance on agent-task activation.
+        let instr = models::ProcessInstanceCreationInstruction::from(
+            models::ProcessInstanceCreationInstructionById::new("agent-proc".to_string()),
+        );
+        let _created = srv
+            .create_process_instance_impl(&instr)
+            .await
+            .expect("create process instance");
+
+        let minted = agent_search_until(&srv, 1).await;
+        let inst = &minted[0];
+        assert_eq!(
+            inst.status,
+            models::AgentInstanceStatusEnum::Initializing,
+            "a freshly-minted agent instance is INITIALIZING"
+        );
+        let agent_key = inst.agent_instance_key.0.clone();
+        let element_instance_key = inst
+            .element_instance_keys
+            .first()
+            .cloned()
+            .expect("minted instance carries its element instance key");
+
+        // POST create is idempotent — reconciles to the same key, INITIALIZING.
+        use apis::agent_instance::CreateAgentInstanceResponse as CResp;
+        let create_body = models::AgentInstanceCreationRequest {
+            element_instance_key: models::ElementInstanceKey(element_instance_key.clone()),
+            definition: models::AgentInstanceDefinition::new(
+                "gpt".to_string(),
+                "openai".to_string(),
+                "be helpful".to_string(),
+            ),
+            limits: None,
+        };
+        let CResp::Status200_TheAgentInstanceWasCreated(created) = srv
+            .create_agent_instance_impl(&create_body)
+            .await
+            .expect("create agent instance")
+        else {
+            panic!("expected a 200 create result");
+        };
+        assert_eq!(
+            created.agent_instance_key.0, agent_key,
+            "create reconciles to the auto-minted instance's key"
+        );
+
+        // GET returns it in INITIALIZING.
+        use apis::agent_instance::GetAgentInstanceResponse as GResp;
+        let gp = models::GetAgentInstancePathParams {
+            agent_instance_key: agent_key.clone(),
+        };
+        let GResp::Status200_TheAgentInstanceIsSuccessfullyReturned(got) = srv
+            .get_agent_instance_impl(&gp)
+            .await
+            .expect("get agent instance")
+        else {
+            panic!("expected a 200 get result");
+        };
+        assert_eq!(got.status, models::AgentInstanceStatusEnum::Initializing);
+
+        // PATCH: append two history turns and advance status to THINKING.
+        use apis::agent_instance::UpdateAgentInstanceResponse as UResp;
+        let mut upd = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
+            element_instance_key.clone(),
+        ));
+        upd.status = Some(models::AgentInstanceUpdateStatusEnum::Thinking);
+        upd.history = Some(types::Nullable::Present(vec![
+            models::AgentInstanceHistoryItem::new(
+                "h1".to_string(),
+                0,
+                models::AgentInstanceHistoryRoleEnum::User,
+                vec![text_content("hello")],
+                epoch(),
+            ),
+            models::AgentInstanceHistoryItem::new(
+                "h2".to_string(),
+                0,
+                models::AgentInstanceHistoryRoleEnum::Assistant,
+                vec![text_content("hi there")],
+                epoch(),
+            ),
+        ]));
+        let up = models::UpdateAgentInstancePathParams {
+            agent_instance_key: agent_key.clone(),
+        };
+        let UResp::Status200_TheAgentInstanceWasUpdatedSuccessfully(updated) = srv
+            .update_agent_instance_impl(&up, &upd)
+            .await
+            .expect("update agent instance")
+        else {
+            panic!("expected a 200 update result");
+        };
+        assert_eq!(
+            updated.created_history.len(),
+            2,
+            "the update echoes one created-history entry per submitted turn"
+        );
+        assert_eq!(updated.created_history[0].history_item_id, "h1");
+        assert!(!updated.created_history[0].is_duplicate);
+
+        // GET now reports THINKING (poll: the read model projects asynchronously).
+        let mut thinking = false;
+        for _ in 0..200 {
+            let GResp::Status200_TheAgentInstanceIsSuccessfullyReturned(got2) = srv
+                .get_agent_instance_impl(&gp)
+                .await
+                .expect("get agent instance after update")
+            else {
+                panic!("expected a 200 get result after update");
+            };
+            if got2.status == models::AgentInstanceStatusEnum::Thinking {
+                thinking = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            thinking,
+            "the update advances the projected status to THINKING"
+        );
+
+        // instance-search filters by status THINKING.
+        use apis::agent_instance::SearchAgentInstancesResponse as SResp;
+        let filter = models::AgentInstanceFilter {
+            status: Some(
+                models::AgentInstanceStatusFilterProperty::AgentInstanceStatusEnum(
+                    models::AgentInstanceStatusEnum::Thinking,
+                ),
+            ),
+            ..models::AgentInstanceFilter::new()
+        };
+        let sq = Some(models::AgentInstanceSearchQuery {
+            page: None,
+            sort: Some(vec![models::AgentInstanceSearchQuerySortRequest {
+                field: "creationDate".to_string(),
+                order: Some(models::SortOrderEnum::Asc),
+            }]),
+            filter: Some(filter),
+        });
+        let SResp::Status200_TheAgentInstanceSearchResult(sr) = srv
+            .search_agent_instances_impl(&sq)
+            .await
+            .expect("search agent instances")
+        else {
+            panic!("expected a 200 search result");
+        };
+        assert_eq!(
+            sr.items.len(),
+            1,
+            "the THINKING filter matches the one instance"
+        );
+        assert_eq!(sr.items[0].agent_instance_key.0, agent_key);
+
+        // history-search defaults to COMMITTED and returns the two appended turns.
+        use apis::agent_instance::SearchAgentInstanceHistoryResponse as HResp;
+        let hp = models::SearchAgentInstanceHistoryPathParams {
+            agent_instance_key: agent_key.clone(),
+        };
+        let mut items = Vec::new();
+        for _ in 0..200 {
+            let HResp::Status200_TheAgentInstanceHistorySearchResult(hr) = srv
+                .search_agent_instance_history_impl(&hp, &None)
+                .await
+                .expect("history search")
+            else {
+                panic!("expected a 200 history search result");
+            };
+            if hr.items.len() >= 2 {
+                items = hr.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            items.len(),
+            2,
+            "history-search returns the committed turns by default"
+        );
+        assert_eq!(items[0].history_item_id, "h1");
+        assert_eq!(items[0].role, models::AgentInstanceHistoryRoleEnum::User);
+        assert!(
+            matches!(items[0].metrics, types::Nullable::Null),
+            "non-ASSISTANT (USER) history items carry null metrics, not zeroed metrics"
+        );
+        assert!(
+            matches!(
+                items[1].role,
+                models::AgentInstanceHistoryRoleEnum::Assistant
+            ) && matches!(items[1].metrics, types::Nullable::Present(_)),
+            "ASSISTANT history items carry present per-call metrics"
+        );
+        assert_eq!(
+            items[0].commit_status,
+            models::AgentInstanceHistoryCommitStatusEnum::Committed,
+            "the default history search returns COMMITTED turns"
+        );
+        assert!(
+            matches!(
+                items[1].content[0].content_type,
+                models::AgentInstanceContentTypeEnum::Text
+            ),
+            "content round-trips the 8.10 TEXT contentType"
+        );
+        assert_eq!(
+            items[1].agent_instance_key.0, agent_key,
+            "each history item carries its owning agentInstanceKey"
+        );
+
+        // --- Validation & filter behaviour (review-convergence coverage) ---
+
+        // Malformed keys are 400 InvalidData (not 404), per the OpenAPI contract.
+        let bad_get = models::GetAgentInstancePathParams {
+            agent_instance_key: "not-a-key".to_string(),
+        };
+        assert!(
+            matches!(
+                srv.get_agent_instance_impl(&bad_get).await.unwrap(),
+                GResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "GET with a malformed agentInstanceKey is 400"
+        );
+        let bad_create = models::AgentInstanceCreationRequest {
+            element_instance_key: models::ElementInstanceKey("not-a-key".to_string()),
+            definition: models::AgentInstanceDefinition::new(
+                "gpt".to_string(),
+                "openai".to_string(),
+                "be helpful".to_string(),
+            ),
+            limits: None,
+        };
+        assert!(
+            matches!(
+                srv.create_agent_instance_impl(&bad_create).await.unwrap(),
+                CResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "POST create with a malformed elementInstanceKey is 400"
+        );
+        let bad_patch_path = models::UpdateAgentInstancePathParams {
+            agent_instance_key: "not-a-key".to_string(),
+        };
+        let patch_body = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
+            element_instance_key.clone(),
+        ));
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&bad_patch_path, &patch_body)
+                    .await
+                    .unwrap(),
+                UResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "PATCH with a malformed agentInstanceKey is 400"
+        );
+        let bad_hist_path = models::SearchAgentInstanceHistoryPathParams {
+            agent_instance_key: "not-a-key".to_string(),
+        };
+        assert!(
+            matches!(
+                srv.search_agent_instance_history_impl(&bad_hist_path, &None)
+                    .await
+                    .unwrap(),
+                HResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "history-search with a malformed agentInstanceKey is 400"
+        );
+
+        // A present-but-unparsable jobKey is rejected (not coerced to 0).
+        let mut bad_job = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
+            element_instance_key.clone(),
+        ));
+        bad_job.job_key = Some(models::JobKey("not-a-number".to_string()));
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &bad_job).await.unwrap(),
+                UResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "PATCH with a malformed jobKey is 400, not a silent 0"
+        );
+
+        // A commitStatus filter that is not an inclusion set ($eq/$in) is 400.
+        let unsupported_commit = models::AgentInstanceHistoryFilter {
+            commit_status: Some(
+                models::AgentInstanceHistoryCommitStatusFilterProperty::AdvancedAgentInstanceHistoryCommitStatusFilter(
+                    models::AdvancedAgentInstanceHistoryCommitStatusFilter {
+                        dollar_eq: None,
+                        dollar_neq: Some(models::AgentInstanceHistoryCommitStatusEnum::Committed),
+                        dollar_exists: None,
+                        dollar_in: None,
+                    },
+                ),
+            ),
+            ..models::AgentInstanceHistoryFilter::new()
+        };
+        let unsupported_query = Some(models::AgentInstanceHistorySearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(unsupported_commit),
+        });
+        assert!(
+            matches!(
+                srv.search_agent_instance_history_impl(&hp, &unsupported_query)
+                    .await
+                    .unwrap(),
+                HResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "an unsupported commitStatus filter shape is 400, not a silent default"
+        );
+
+        // An explicit empty inclusion set (`$in: []`) matches nothing — it must
+        // NOT silently fall back to the COMMITTED-only default and return rows.
+        let empty_in_commit = models::AgentInstanceHistoryFilter {
+            commit_status: Some(
+                models::AgentInstanceHistoryCommitStatusFilterProperty::AdvancedAgentInstanceHistoryCommitStatusFilter(
+                    models::AdvancedAgentInstanceHistoryCommitStatusFilter {
+                        dollar_eq: None,
+                        dollar_neq: None,
+                        dollar_exists: None,
+                        dollar_in: Some(vec![]),
+                    },
+                ),
+            ),
+            ..models::AgentInstanceHistoryFilter::new()
+        };
+        let empty_in_query = Some(models::AgentInstanceHistorySearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(empty_in_commit),
+        });
+        let HResp::Status200_TheAgentInstanceHistorySearchResult(empty_in_result) = srv
+            .search_agent_instance_history_impl(&hp, &empty_in_query)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a 200 history search result");
+        };
+        assert!(
+            empty_in_result.items.is_empty(),
+            "commitStatus $in: [] must match nothing, not fall back to the COMMITTED default"
+        );
+
+        // producedAt filter is honoured, not silently ignored (defect class:
+        // a filter declared in the contract must narrow results). A $gt far in
+        // the future matches nothing; a $lte far in the future matches every
+        // committed turn. If producedAt were a no-op, the $gt query would still
+        // return the two committed rows and fail this assertion.
+        let far_future = chrono::DateTime::from_timestamp_millis(32_503_680_000_000).unwrap();
+        let produced_after_future = models::AgentInstanceHistoryFilter {
+            produced_at: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                models::AdvancedDateTimeFilter {
+                    dollar_gt: Some(far_future),
+                    ..models::AdvancedDateTimeFilter::new()
+                },
+            )),
+            ..models::AgentInstanceHistoryFilter::new()
+        };
+        let HResp::Status200_TheAgentInstanceHistorySearchResult(produced_future_result) = srv
+            .search_agent_instance_history_impl(
+                &hp,
+                &Some(models::AgentInstanceHistorySearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(produced_after_future),
+                }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected a 200 history search result");
+        };
+        assert!(
+            produced_future_result.items.is_empty(),
+            "producedAt $gt (far future) matches nothing — the filter must not be ignored"
+        );
+        let produced_before_future = models::AgentInstanceHistoryFilter {
+            produced_at: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                models::AdvancedDateTimeFilter {
+                    dollar_lte: Some(far_future),
+                    ..models::AdvancedDateTimeFilter::new()
+                },
+            )),
+            ..models::AgentInstanceHistoryFilter::new()
+        };
+        let HResp::Status200_TheAgentInstanceHistorySearchResult(produced_all_result) = srv
+            .search_agent_instance_history_impl(
+                &hp,
+                &Some(models::AgentInstanceHistorySearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(produced_before_future),
+                }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected a 200 history search result");
+        };
+        assert_eq!(
+            produced_all_result.items.len(),
+            2,
+            "producedAt $lte (far future) matches every committed turn"
+        );
+
+        // Search now honours the previously-ignored filters: processDefinitionId,
+        // processDefinitionVersion and elementInstanceKeys all narrow to the one
+        // instance, and a non-matching value excludes it.
+        let filter_by_pd_id = models::AgentInstanceFilter {
+            process_definition_id: Some(models::StringFilterProperty::String(
+                "agent-proc".to_string(),
+            )),
+            element_instance_keys: Some(vec![
+                models::ElementInstanceKeyFilterProperty::ElementInstanceKey(
+                    models::ElementInstanceKey(element_instance_key.clone()),
+                ),
+            ]),
+            ..models::AgentInstanceFilter::new()
+        };
+        let SResp::Status200_TheAgentInstanceSearchResult(pd_sr) = srv
+            .search_agent_instances_impl(&Some(models::AgentInstanceSearchQuery {
+                page: None,
+                sort: None,
+                filter: Some(filter_by_pd_id),
+            }))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a 200 search result");
+        };
+        assert_eq!(
+            pd_sr.items.len(),
+            1,
+            "processDefinitionId + elementInstanceKeys filters match the instance"
+        );
+        let filter_no_match = models::AgentInstanceFilter {
+            process_definition_id: Some(models::StringFilterProperty::String(
+                "other-proc".to_string(),
+            )),
+            ..models::AgentInstanceFilter::new()
+        };
+        let SResp::Status200_TheAgentInstanceSearchResult(none_sr) = srv
+            .search_agent_instances_impl(&Some(models::AgentInstanceSearchQuery {
+                page: None,
+                sort: None,
+                filter: Some(filter_no_match),
+            }))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a 200 search result");
+        };
+        assert!(
+            none_sr.items.is_empty(),
+            "a non-matching processDefinitionId excludes the instance (filter is not ignored)"
+        );
+
+        // tools: null clears the stored tool set. First set a tool, then clear it.
+        let mut set_tools = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
+            element_instance_key.clone(),
+        ));
+        set_tools.tools = Some(types::Nullable::Present(vec![models::AgentTool::new(
+            "search".to_string(),
+            types::Nullable::Null,
+            types::Nullable::Null,
+        )]));
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &set_tools)
+                    .await
+                    .expect("set tools"),
+                UResp::Status200_TheAgentInstanceWasUpdatedSuccessfully(_)
+            ),
+            "setting tools succeeds"
+        );
+        let mut has_tool = false;
+        for _ in 0..200 {
+            let GResp::Status200_TheAgentInstanceIsSuccessfullyReturned(g) =
+                srv.get_agent_instance_impl(&gp).await.unwrap()
+            else {
+                panic!("expected 200");
+            };
+            if g.tools.len() == 1 {
+                has_tool = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(has_tool, "the tool set was stored");
+
+        let mut clear_tools = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
+            element_instance_key.clone(),
+        ));
+        clear_tools.tools = Some(types::Nullable::Null);
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &clear_tools)
+                    .await
+                    .expect("clear tools"),
+                UResp::Status200_TheAgentInstanceWasUpdatedSuccessfully(_)
+            ),
+            "clearing tools succeeds"
+        );
+        let mut cleared = false;
+        for _ in 0..200 {
+            let GResp::Status200_TheAgentInstanceIsSuccessfullyReturned(g) =
+                srv.get_agent_instance_impl(&gp).await.unwrap()
+            else {
+                panic!("expected 200");
+            };
+            if g.tools.is_empty() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(cleared, "tools: null clears the stored tool set");
+    }
+
+    /// The `AgentInstanceResult` mapper must propagate the projected
+    /// `process_definition_version_tag` and the full `element_instance_keys` set
+    /// (not a hardcoded null / the owning key alone).
+    #[test]
+    fn agent_instance_result_maps_version_tag_and_all_element_keys() {
+        fn row(tag: Option<&str>) -> readstore::AgentInstanceRow {
+            readstore::AgentInstanceRow {
+                agent_instance_key: 11,
+                agent_definition_key: 7,
+                element_instance_key: 1011,
+                element_id: "agent".to_string(),
+                process_instance_key: 42,
+                root_process_instance_key: 42,
+                process_definition_key: 99,
+                process_definition_id: "proc".to_string(),
+                process_definition_version: 3,
+                tenant_id: "<default>".to_string(),
+                status: agent_model::AgentInstanceStatus::Thinking,
+                agent_type: "aiAgentTask".to_string(),
+                model: Some("gpt".to_string()),
+                provider: Some("openai".to_string()),
+                system_prompt: Some("be helpful".to_string()),
+                max_tokens: 1000,
+                max_model_calls: 10,
+                max_tool_calls: 10,
+                input_tokens: 1,
+                output_tokens: 2,
+                reasoning_token_count: 0,
+                cache_creation_token_count: 0,
+                cache_read_token_count: 0,
+                model_calls: 1,
+                tool_calls: 0,
+                job_key: 0,
+                tools_json: "[]".to_string(),
+                creation_date_ms: 100,
+                last_updated_date_ms: 200,
+                completion_date_ms: None,
+                process_definition_version_tag: tag.map(str::to_string),
+                element_instance_keys: vec![1011, 2011, 3011],
+            }
+        }
+
+        let tagged = agent_instance_result(&row(Some("v1.2.3")));
+        assert!(
+            matches!(&tagged.process_definition_version_tag, types::Nullable::Present(t) if t == "v1.2.3"),
+            "a projected version tag surfaces in the result, not a hardcoded null"
+        );
+        assert_eq!(
+            tagged.element_instance_keys,
+            vec!["1011".to_string(), "2011".to_string(), "3011".to_string()],
+            "every associated element instance key is reported, not just the owner"
+        );
+
+        let untagged = agent_instance_result(&row(None));
+        assert!(
+            matches!(
+                untagged.process_definition_version_tag,
+                types::Nullable::Null
+            ),
+            "an absent version tag maps to null"
+        );
+    }
+
     /// Runs `search` with a `parentProcessInstanceKey` filter, returning the keys.
     async fn children_of(server: &ServerImpl, parent: Key) -> Vec<String> {
         use apis::process_instance::SearchProcessInstancesResponse as Resp;
@@ -34102,5 +35876,24 @@ mod call_activity_hierarchy_read_model_tests {
                  instance despite a COMPLETED filter (honour_hierarchy={honour_hierarchy:?})"
             );
         }
+    }
+
+    #[test]
+    fn ms_to_datetime_clamps_out_of_range_stamps_to_the_epoch() {
+        // An in-range stamp round-trips.
+        assert_eq!(ms_to_datetime(0), epoch());
+        assert_eq!(ms_to_datetime(1_000).timestamp_millis(), 1_000);
+
+        // A `u64` past `i64::MAX` would wrap to a *negative* instant under an
+        // `as i64` cast — which `from_timestamp_millis` happily accepts, so the
+        // `unwrap_or_else(epoch)` fallback never fires and the mapper silently
+        // emits a pre-epoch timestamp. The checked conversion must clamp instead.
+        let overflow = (i64::MAX as u64) + 1;
+        assert_eq!(
+            ms_to_datetime(overflow),
+            epoch(),
+            "an out-of-i64-range epoch stamp must clamp to the epoch, not wrap negative"
+        );
+        assert_eq!(ms_to_datetime(u64::MAX), epoch());
     }
 }

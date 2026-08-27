@@ -164,6 +164,15 @@ components:
       allOf:
         - $ref: '#/components/schemas/LongKey'
 
+    AgentHistoryKey:
+      description: System-generated key for an agent instance history item.
+      format: AgentHistoryKey
+      x-semantic-type: AgentHistoryKey
+      example: "4503599627370496"
+      type: string
+      allOf:
+        - $ref: '#/components/schemas/LongKey'
+
     AuditLogKey:
       allOf:
         - $ref: '#/components/schemas/LongKey'

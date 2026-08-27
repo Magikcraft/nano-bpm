@@ -501,6 +501,43 @@ pub fn match_element_instance_key_opt(
     }
 }
 
+/// Matches an `AgentInstanceKeyFilterProperty` against a key's decimal string.
+pub fn match_agent_instance_key(
+    filter: &Option<models::AgentInstanceKeyFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::AgentInstanceKeyFilterProperty::AgentInstanceKey(k)) => k.0 == value,
+        Some(models::AgentInstanceKeyFilterProperty::AdvancedAgentInstanceKeyFilter(a)) => {
+            ops!(a, |k: &models::AgentInstanceKey| k.0.clone()).matches(Some(value))
+        }
+    }
+}
+
+/// Matches an `AgentInstanceStatusFilterProperty` (exact enum or advanced
+/// `$eq`/`$neq`/`$exists`/`$in`/`$like`) against a status's wire spelling
+/// (`INITIALIZING`, `IDLE`, …).
+pub fn match_agent_instance_status(
+    filter: &Option<models::AgentInstanceStatusFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::AgentInstanceStatusFilterProperty::AgentInstanceStatusEnum(e)) => {
+            e.to_string() == value
+        }
+        Some(models::AgentInstanceStatusFilterProperty::AdvancedAgentInstanceStatusFilter(a)) => {
+            ops!(
+                a,
+                |e: &models::AgentInstanceStatusEnum| e.to_string(),
+                like_no_notin
+            )
+            .matches(Some(value))
+        }
+    }
+}
+
 /// Matches a `ResourceKeyFilterProperty` against a key's decimal string.
 pub fn match_resource_key(filter: &Option<models::ResourceKeyFilterProperty>, value: &str) -> bool {
     match filter {
