@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -48,7 +48,7 @@ const SCHEMA_VERSION: i64 = 4;
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -5478682060062839751;
+const SCHEMA_FINGERPRINT: i64 = -622031752039098063;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -313,7 +313,9 @@ CREATE TABLE agent_instances (
     tools_json                 TEXT NOT NULL DEFAULT '[]',
     creation_date_ms           INTEGER NOT NULL,
     last_updated_date_ms       INTEGER NOT NULL,
-    completion_date_ms         INTEGER
+    completion_date_ms         INTEGER,
+    process_definition_version_tag TEXT,
+    element_instance_keys_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX idx_agent_instances_process_instance ON agent_instances(process_instance_key);
 CREATE TABLE agent_history (
@@ -5074,7 +5076,7 @@ const AGENT_INSTANCE_COLS: &str = "agent_instance_key, agent_definition_key, ele
      provider, system_prompt, max_tokens, max_model_calls, max_tool_calls, input_tokens, \
      output_tokens, reasoning_token_count, cache_creation_token_count, cache_read_token_count, \
      model_calls, tool_calls, job_key, tools_json, creation_date_ms, last_updated_date_ms, \
-     completion_date_ms";
+     completion_date_ms, process_definition_version_tag, element_instance_keys_json";
 
 /// The `SELECT` column list for [`AgentHistoryRow`], single-sourced.
 const AGENT_HISTORY_COLS: &str = "agent_history_key, agent_instance_key, element_instance_key, \
@@ -5091,6 +5093,8 @@ const AGENT_HISTORY_COLS: &str = "agent_history_key, agent_instance_key, element
 /// a later `UPDATED`/`COMPLETED` event can reuse this same projection unchanged.
 fn project_agent_instance(tx: &rusqlite::Transaction, ai: &AgentInstance) -> rusqlite::Result<()> {
     let tools_json = serde_json::to_string(&ai.tools).unwrap_or_else(|_| "[]".to_string());
+    let element_instance_keys_json =
+        serde_json::to_string(&ai.element_instance_keys).unwrap_or_else(|_| "[]".to_string());
     // `0` in the engine means "not completed yet"; store it as SQL NULL so the
     // completionDate filter/sort distinguishes live from completed instances.
     let completion: Option<i64> = if ai.completed_at == 0 {
@@ -5106,9 +5110,10 @@ fn project_agent_instance(tx: &rusqlite::Transaction, ai: &AgentInstance) -> rus
              model, provider, system_prompt, max_tokens, max_model_calls, max_tool_calls, \
              input_tokens, output_tokens, reasoning_token_count, cache_creation_token_count, \
              cache_read_token_count, model_calls, tool_calls, job_key, tools_json, \
-             creation_date_ms, last_updated_date_ms, completion_date_ms) \
+             creation_date_ms, last_updated_date_ms, completion_date_ms, \
+             process_definition_version_tag, element_instance_keys_json) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30) \
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32) \
          ON CONFLICT(agent_instance_key) DO UPDATE SET \
              status = excluded.status, model = excluded.model, provider = excluded.provider, \
              system_prompt = excluded.system_prompt, max_tokens = excluded.max_tokens, \
@@ -5120,7 +5125,8 @@ fn project_agent_instance(tx: &rusqlite::Transaction, ai: &AgentInstance) -> rus
              model_calls = excluded.model_calls, tool_calls = excluded.tool_calls, \
              job_key = excluded.job_key, tools_json = excluded.tools_json, \
              last_updated_date_ms = excluded.last_updated_date_ms, \
-             completion_date_ms = excluded.completion_date_ms",
+             completion_date_ms = excluded.completion_date_ms, \
+             element_instance_keys_json = excluded.element_instance_keys_json",
         params![
             ai.agent_instance_key as i64,
             ai.agent_definition_key as i64,
@@ -5152,6 +5158,8 @@ fn project_agent_instance(tx: &rusqlite::Transaction, ai: &AgentInstance) -> rus
             ai.created_at as i64,
             ai.last_updated_at as i64,
             completion,
+            ai.process_definition_version_tag.as_ref(),
+            element_instance_keys_json,
         ],
     )?;
     Ok(())
@@ -5464,6 +5472,11 @@ pub struct AgentInstanceRow {
     pub last_updated_date_ms: u64,
     /// The completion instant (ms), `None` until the instance is COMPLETED.
     pub completion_date_ms: Option<u64>,
+    /// The process definition version tag, if any.
+    pub process_definition_version_tag: Option<String>,
+    /// Every element instance associated with this agent instance (the owning
+    /// `element_instance_key` is always the first). Projected as a JSON array.
+    pub element_instance_keys: Vec<Key>,
 }
 
 /// A projected AgentHistory turn row.
@@ -5561,6 +5574,13 @@ fn map_agent_instance(r: &rusqlite::Row) -> rusqlite::Result<AgentInstanceRow> {
         creation_date_ms: r.get::<_, i64>(27)? as u64,
         last_updated_date_ms: r.get::<_, i64>(28)? as u64,
         completion_date_ms: r.get::<_, Option<i64>>(29)?.map(|v| v as u64),
+        process_definition_version_tag: r.get(30)?,
+        element_instance_keys: {
+            let json: String = r.get(31)?;
+            serde_json::from_str::<Vec<i64>>(&json)
+                .map(|v| v.into_iter().map(|k| k as Key).collect())
+                .unwrap_or_default()
+        },
     })
 }
 
@@ -8592,6 +8612,28 @@ mod agent_projection_tests {
         // By-key lookup.
         assert_eq!(store.agent_instance(1).unwrap().element_id, "agent-a");
         assert!(store.agent_instance(999).is_none());
+    }
+
+    #[test]
+    fn projects_version_tag_and_element_instance_keys() {
+        let mut ai = instance(5, "agent-c", AgentInstanceStatus::Idle, 300);
+        ai.process_definition_version_tag = Some("v1.2.3".to_string());
+        ai.element_instance_keys = vec![1005, 2005, 3005];
+        let store = store_with(&[Event::AgentInstanceCreated {
+            instance_key: 42,
+            agent_instance: ai,
+        }]);
+        let row = store.agent_instance(5).expect("instance projects");
+        assert_eq!(
+            row.process_definition_version_tag.as_deref(),
+            Some("v1.2.3"),
+            "the version tag is projected"
+        );
+        assert_eq!(
+            row.element_instance_keys,
+            vec![1005, 2005, 3005],
+            "the full element-instance-key set is projected as a JSON array"
+        );
     }
 
     #[test]

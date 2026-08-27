@@ -11188,18 +11188,14 @@ impl ServerImpl {
         let element_instance_key: Key = match body.element_instance_key.0.parse() {
             Ok(k) => k,
             Err(_) => {
-                return Ok(
-                    Resp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(
-                        problem(
-                            "Element instance not found",
-                            404,
-                            format!(
-                                "Element instance key '{}' is not a valid key.",
-                                body.element_instance_key.0
-                            ),
-                        ),
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid element instance key",
+                    400,
+                    format!(
+                        "Element instance key '{}' is not a valid key.",
+                        body.element_instance_key.0
                     ),
-                );
+                )));
             }
         };
 
@@ -11268,16 +11264,14 @@ impl ServerImpl {
         let key: Key = match path_params.agent_instance_key.parse() {
             Ok(k) => k,
             Err(_) => {
-                return Ok(Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(
-                    problem(
-                        "Agent instance not found",
-                        404,
-                        format!(
-                            "Agent instance key '{}' is not a valid key.",
-                            path_params.agent_instance_key
-                        ),
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid agent instance key",
+                    400,
+                    format!(
+                        "Agent instance key '{}' is not a valid key.",
+                        path_params.agent_instance_key
                     ),
-                ));
+                )));
             }
         };
 
@@ -11310,16 +11304,14 @@ impl ServerImpl {
         let agent_instance_key: Key = match path_params.agent_instance_key.parse() {
             Ok(k) => k,
             Err(_) => {
-                return Ok(Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(
-                    problem(
-                        "Agent instance not found",
-                        404,
-                        format!(
-                            "Agent instance key '{}' is not a valid key.",
-                            path_params.agent_instance_key
-                        ),
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid agent instance key",
+                    400,
+                    format!(
+                        "Agent instance key '{}' is not a valid key.",
+                        path_params.agent_instance_key
                     ),
-                ));
+                )));
             }
         };
         let element_instance_key: Key = match body.element_instance_key.0.parse() {
@@ -11336,25 +11328,48 @@ impl ServerImpl {
             }
         };
 
-        let job_key: Key = body
-            .job_key
-            .as_ref()
-            .and_then(|k| k.0.parse().ok())
-            .unwrap_or(0);
-        let job_lease: u64 = body
-            .job_lease
-            .as_ref()
-            .and_then(|l| l.parse().ok())
-            .unwrap_or(0);
+        // A present-but-unparsable jobKey/jobLease must be rejected rather than
+        // silently coerced to 0: 0 changes ownership/attribution and can defeat
+        // retry de-duplication, so a malformed value is a 400, not a default.
+        let job_key: Key = match body.job_key.as_ref() {
+            None => 0,
+            Some(k) => match k.0.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid job key",
+                        400,
+                        format!("Job key '{}' is not a valid key.", k.0),
+                    )));
+                }
+            },
+        };
+        let job_lease: u64 = match body.job_lease.as_ref() {
+            None => 0,
+            Some(l) => match l.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid job lease",
+                        400,
+                        format!("Job lease '{l}' is not a valid value."),
+                    )));
+                }
+            },
+        };
         let status = body.status.map(agent_update_status);
         let metrics = body
             .metrics
             .as_ref()
             .map(agent_metrics_delta_from)
             .unwrap_or_default();
+        // Distinguish an explicit `tools: null` (clear the tool set) from an
+        // absent field (no change): `Null` maps to an empty replacement set,
+        // mirroring how nullable changesets clear a value elsewhere.
         let tools = match &body.tools {
             Some(types::Nullable::Present(v)) => Some(v.iter().map(agent_tool_from).collect()),
-            _ => None,
+            Some(types::Nullable::Null) => Some(Vec::new()),
+            None => None,
         };
         let history: Vec<agent_model::AgentHistoryTurn> = match &body.history {
             Some(types::Nullable::Present(items)) => items
@@ -11406,33 +11421,42 @@ impl ServerImpl {
                         _ => None,
                     })
                     .collect();
-                let created_history = submitted_ids
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, id)| {
-                        // Prefer the event whose historyItemId matches; fall back to
-                        // positional order for items created without an id.
-                        let ev = created
-                            .iter()
-                            .position(|(eid, _, _)| !id.is_empty() && *eid == id)
-                            .or(if idx < created.len() { Some(idx) } else { None });
-                        match ev {
-                            Some(pos) => {
-                                let (eid, key, dup) = created.remove(pos);
-                                models::AgentInstanceCreatedHistoryItem::new(
-                                    if id.is_empty() { eid } else { id },
-                                    models::AgentInstanceKey(key.to_string()),
-                                    dup,
-                                )
-                            }
-                            None => models::AgentInstanceCreatedHistoryItem::new(
-                                id,
-                                models::AgentInstanceKey("0".to_string()),
-                                false,
-                            ),
+                let mut created_history = Vec::with_capacity(submitted_ids.len());
+                for (idx, id) in submitted_ids.into_iter().enumerate() {
+                    // Prefer the event whose historyItemId matches; fall back to
+                    // positional order for items created without an id.
+                    let ev = created
+                        .iter()
+                        .position(|(eid, _, _)| !id.is_empty() && *eid == id)
+                        .or(if idx < created.len() { Some(idx) } else { None });
+                    match ev {
+                        Some(pos) => {
+                            let (eid, key, dup) = created.remove(pos);
+                            created_history.push(models::AgentInstanceCreatedHistoryItem::new(
+                                if id.is_empty() { eid } else { id },
+                                models::AgentHistoryKey(key.to_string()),
+                                dup,
+                            ));
                         }
-                    })
-                    .collect();
+                        // No emitted event correlates to this submitted item: the
+                        // processor produced fewer AgentHistoryCreated events than
+                        // submitted turns. Returning a synthetic "0" key would 200
+                        // with a meaningless key, so fail the request instead.
+                        None => {
+                            return Ok(
+                                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                    problem(
+                                        "Agent instance update incomplete",
+                                        500,
+                                        "The update emitted fewer history events than submitted \
+                                         turns; no key exists for at least one submitted item."
+                                            .to_string(),
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                }
                 Ok(Resp::Status200_TheAgentInstanceWasUpdatedSuccessfully(
                     models::AgentInstanceUpdateResult::new(created_history),
                 ))
@@ -11519,9 +11543,25 @@ impl ServerImpl {
         };
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let commit_status = filter
-            .and_then(|f| f.commit_status.as_ref())
-            .and_then(agent_commit_status_filter_values);
+        // A commitStatus filter that is present but not expressible as an
+        // inclusion set ($eq/$in) cannot be honoured by the read-model query, so
+        // reject it rather than silently falling back to the COMMITTED-only
+        // default and violating the caller's filter intent.
+        let commit_status = match filter.and_then(|f| f.commit_status.as_ref()) {
+            None => None,
+            Some(cs) => match agent_commit_status_filter_values(cs) {
+                Some(values) => Some(values),
+                None => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Unsupported commitStatus filter",
+                        400,
+                        "The commitStatus filter must be an exact value or an inclusion set \
+                         ($eq/$in); other operators are not supported."
+                            .to_string(),
+                    )));
+                }
+            },
+        };
         let history_filter = readstore::AgentHistoryFilter {
             agent_instance_key: Some(key),
             process_instance_key: None,
@@ -19330,7 +19370,7 @@ fn agent_history_item_result(
         duration_ms: row.duration_ms,
     };
     models::AgentInstanceHistoryItemResult::new(
-        models::AgentInstanceKey(row.agent_history_key.to_string()),
+        models::AgentHistoryKey(row.agent_history_key.to_string()),
         row.history_item_id.clone().unwrap_or_default(),
         models::AgentInstanceKey(row.agent_instance_key.to_string()),
         models::ElementInstanceKey(row.element_instance_key.to_string()),
@@ -19449,6 +19489,36 @@ fn match_agent_instance_filter(
             &f.process_definition_key,
             &row.process_definition_key.to_string(),
         )
+        && query::match_string_opt(&f.tenant_id, Some(&row.tenant_id))
+        && query::match_date_time_ms(&f.creation_date, Some(row.creation_date_ms as i64))
+        && query::match_date_time_ms(&f.last_updated_date, Some(row.last_updated_date_ms as i64))
+        && query::match_date_time_ms(&f.completion_date, row.completion_date_ms.map(|v| v as i64))
+        && query::match_string_opt(&f.process_definition_id, Some(&row.process_definition_id))
+        && query::match_integer(
+            &f.process_definition_version,
+            Some(row.process_definition_version as i64),
+        )
+        && query::match_string_opt(
+            &f.process_definition_version_tag,
+            row.process_definition_version_tag.as_deref(),
+        )
+        && match_agent_instance_element_keys(&f.element_instance_keys, &row.element_instance_keys)
+}
+
+/// Matches the `elementInstanceKeys` filter: every provided key filter must be
+/// satisfied by at least one of the instance's associated element instance keys
+/// (the contract's "associated with all of the provided keys" semantics).
+fn match_agent_instance_element_keys(
+    filters: &Option<Vec<models::ElementInstanceKeyFilterProperty>>,
+    keys: &[Key],
+) -> bool {
+    match filters {
+        None => true,
+        Some(fs) => fs.iter().all(|f| {
+            keys.iter()
+                .any(|k| query::match_element_instance_key(&Some(f.clone()), &k.to_string()))
+        }),
+    }
 }
 
 /// Maps a REST metrics-delta to the engine's delta (the engine carries extra
@@ -34776,6 +34846,218 @@ mod call_activity_hierarchy_read_model_tests {
             items[1].agent_instance_key.0, agent_key,
             "each history item carries its owning agentInstanceKey"
         );
+
+        // --- Validation & filter behaviour (review-convergence coverage) ---
+
+        // Malformed keys are 400 InvalidData (not 404), per the OpenAPI contract.
+        let bad_get = models::GetAgentInstancePathParams {
+            agent_instance_key: "not-a-key".to_string(),
+        };
+        assert!(
+            matches!(
+                srv.get_agent_instance_impl(&bad_get).await.unwrap(),
+                GResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "GET with a malformed agentInstanceKey is 400"
+        );
+        let bad_create = models::AgentInstanceCreationRequest {
+            element_instance_key: models::ElementInstanceKey("not-a-key".to_string()),
+            definition: models::AgentInstanceDefinition::new(
+                "gpt".to_string(),
+                "openai".to_string(),
+                "be helpful".to_string(),
+            ),
+            limits: None,
+        };
+        assert!(
+            matches!(
+                srv.create_agent_instance_impl(&bad_create).await.unwrap(),
+                CResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "POST create with a malformed elementInstanceKey is 400"
+        );
+        let bad_patch_path = models::UpdateAgentInstancePathParams {
+            agent_instance_key: "not-a-key".to_string(),
+        };
+        let patch_body = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
+            element_instance_key.clone(),
+        ));
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&bad_patch_path, &patch_body)
+                    .await
+                    .unwrap(),
+                UResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "PATCH with a malformed agentInstanceKey is 400"
+        );
+        let bad_hist_path = models::SearchAgentInstanceHistoryPathParams {
+            agent_instance_key: "not-a-key".to_string(),
+        };
+        assert!(
+            matches!(
+                srv.search_agent_instance_history_impl(&bad_hist_path, &None)
+                    .await
+                    .unwrap(),
+                HResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "history-search with a malformed agentInstanceKey is 400"
+        );
+
+        // A present-but-unparsable jobKey is rejected (not coerced to 0).
+        let mut bad_job = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
+            element_instance_key.clone(),
+        ));
+        bad_job.job_key = Some(models::JobKey("not-a-number".to_string()));
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &bad_job).await.unwrap(),
+                UResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "PATCH with a malformed jobKey is 400, not a silent 0"
+        );
+
+        // A commitStatus filter that is not an inclusion set ($eq/$in) is 400.
+        let unsupported_commit = models::AgentInstanceHistoryFilter {
+            commit_status: Some(
+                models::AgentInstanceHistoryCommitStatusFilterProperty::AdvancedAgentInstanceHistoryCommitStatusFilter(
+                    models::AdvancedAgentInstanceHistoryCommitStatusFilter {
+                        dollar_eq: None,
+                        dollar_neq: Some(models::AgentInstanceHistoryCommitStatusEnum::Committed),
+                        dollar_exists: None,
+                        dollar_in: None,
+                    },
+                ),
+            ),
+            ..models::AgentInstanceHistoryFilter::new()
+        };
+        let unsupported_query = Some(models::AgentInstanceHistorySearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(unsupported_commit),
+        });
+        assert!(
+            matches!(
+                srv.search_agent_instance_history_impl(&hp, &unsupported_query)
+                    .await
+                    .unwrap(),
+                HResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "an unsupported commitStatus filter shape is 400, not a silent default"
+        );
+
+        // Search now honours the previously-ignored filters: processDefinitionId,
+        // processDefinitionVersion and elementInstanceKeys all narrow to the one
+        // instance, and a non-matching value excludes it.
+        let filter_by_pd_id = models::AgentInstanceFilter {
+            process_definition_id: Some(models::StringFilterProperty::String(
+                "agent-proc".to_string(),
+            )),
+            element_instance_keys: Some(vec![
+                models::ElementInstanceKeyFilterProperty::ElementInstanceKey(
+                    models::ElementInstanceKey(element_instance_key.clone()),
+                ),
+            ]),
+            ..models::AgentInstanceFilter::new()
+        };
+        let SResp::Status200_TheAgentInstanceSearchResult(pd_sr) = srv
+            .search_agent_instances_impl(&Some(models::AgentInstanceSearchQuery {
+                page: None,
+                sort: None,
+                filter: Some(filter_by_pd_id),
+            }))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a 200 search result");
+        };
+        assert_eq!(
+            pd_sr.items.len(),
+            1,
+            "processDefinitionId + elementInstanceKeys filters match the instance"
+        );
+        let filter_no_match = models::AgentInstanceFilter {
+            process_definition_id: Some(models::StringFilterProperty::String(
+                "other-proc".to_string(),
+            )),
+            ..models::AgentInstanceFilter::new()
+        };
+        let SResp::Status200_TheAgentInstanceSearchResult(none_sr) = srv
+            .search_agent_instances_impl(&Some(models::AgentInstanceSearchQuery {
+                page: None,
+                sort: None,
+                filter: Some(filter_no_match),
+            }))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a 200 search result");
+        };
+        assert!(
+            none_sr.items.is_empty(),
+            "a non-matching processDefinitionId excludes the instance (filter is not ignored)"
+        );
+
+        // tools: null clears the stored tool set. First set a tool, then clear it.
+        let mut set_tools = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
+            element_instance_key.clone(),
+        ));
+        set_tools.tools = Some(types::Nullable::Present(vec![models::AgentTool::new(
+            "search".to_string(),
+            types::Nullable::Null,
+            types::Nullable::Null,
+        )]));
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &set_tools)
+                    .await
+                    .expect("set tools"),
+                UResp::Status200_TheAgentInstanceWasUpdatedSuccessfully(_)
+            ),
+            "setting tools succeeds"
+        );
+        let mut has_tool = false;
+        for _ in 0..200 {
+            let GResp::Status200_TheAgentInstanceIsSuccessfullyReturned(g) =
+                srv.get_agent_instance_impl(&gp).await.unwrap()
+            else {
+                panic!("expected 200");
+            };
+            if g.tools.len() == 1 {
+                has_tool = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(has_tool, "the tool set was stored");
+
+        let mut clear_tools = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
+            element_instance_key.clone(),
+        ));
+        clear_tools.tools = Some(types::Nullable::Null);
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &clear_tools)
+                    .await
+                    .expect("clear tools"),
+                UResp::Status200_TheAgentInstanceWasUpdatedSuccessfully(_)
+            ),
+            "clearing tools succeeds"
+        );
+        let mut cleared = false;
+        for _ in 0..200 {
+            let GResp::Status200_TheAgentInstanceIsSuccessfullyReturned(g) =
+                srv.get_agent_instance_impl(&gp).await.unwrap()
+            else {
+                panic!("expected 200");
+            };
+            if g.tools.is_empty() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(cleared, "tools: null clears the stored tool set");
     }
 
     /// Runs `search` with a `parentProcessInstanceKey` filter, returning the keys.

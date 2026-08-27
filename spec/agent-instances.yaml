@@ -699,7 +699,7 @@ components:
             The system-generated key for the history item. When isDuplicate is true, this is
             the key of the original entry, not a new one.
           allOf:
-            - $ref: 'keys.yaml#/components/schemas/AgentInstanceKey'
+            - $ref: 'keys.yaml#/components/schemas/AgentHistoryKey'
         isDuplicate:
           description: |
             True if this item had already been recorded and no new AGENT_HISTORY event was
@@ -913,7 +913,7 @@ components:
         historyItemKey:
           description: The unique key for this history item. Stable and sortable by creation order.
           allOf:
-            - $ref: 'keys.yaml#/components/schemas/AgentInstanceKey'
+            - $ref: 'keys.yaml#/components/schemas/AgentHistoryKey'
         historyItemId:
           type: string
           description: The client-supplied identifier this item was created with. Empty when none.
