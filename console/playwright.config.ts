@@ -33,6 +33,14 @@ const PORT = Number(process.env.E2E_PORT ?? 5177);
  */
 const OBSERVE_PORT = Number(process.env.E2E_OBSERVE_PORT ?? PORT + 1);
 
+// The observe profile needs a SECOND dev server on OBSERVE_PORT. It is on by
+// default so CI and full local runs keep the operator-build home coverage, but
+// Playwright starts every `webServer` entry regardless of `--project`, so a
+// desktop-only run (`--project=chromium`) would otherwise still force
+// OBSERVE_PORT to be free. Set `E2E_WITH_OBSERVE=0` to drop the observe project
+// and its dev server, so such runs need only one port.
+const WITH_OBSERVE = process.env.E2E_WITH_OBSERVE !== "0";
+
 // Match the webServer bind address (127.0.0.1, set below) exactly: on an
 // IPv6-first host `localhost` can resolve to ::1 while the server listens only
 // on 127.0.0.1, reintroducing the poll-until-timeout class the bind avoids.
@@ -80,12 +88,13 @@ export default defineConfig({
     {
       // Only the home guard re-runs against the lean `observe` build: it is the
       // one surface whose card set and landing route differ by profile. The other
-      // mobile guards exercise studio-only routes (/projects, /apps, …).
+      // mobile guards exercise studio-only routes (/projects, /apps, …). Gated on
+      // WITH_OBSERVE so a desktop-only run needn't hold OBSERVE_PORT.
       name: "mobile-observe",
       use: { ...phone, baseURL: OBSERVE_URL },
       testMatch: /mobile\/home\.spec\.ts$/,
     },
-  ],
+  ].filter((p) => WITH_OBSERVE || p.name !== "mobile-observe"),
   // No retries, anywhere. A guard that only passes on a second attempt is
   // reporting a real defect (in the app or in the test), and this repo does not
   // paper over either.
@@ -112,12 +121,13 @@ export default defineConfig({
       // The observe-profile server for the home guard. `VITE_CONSOLE_PROFILE` is
       // read at dev-server start (vite `define`s `__STUDIO__` from it), so a
       // separate process is the only way to serve the operator build alongside
-      // the studio one.
+      // the studio one. Gated on WITH_OBSERVE (see above) so a desktop-only run
+      // needn't start it or hold OBSERVE_PORT.
       command: `npm run dev -- --port ${OBSERVE_PORT} --strictPort --host 127.0.0.1`,
       url: OBSERVE_URL,
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
       env: { VITE_CONSOLE_PROFILE: "observe" },
     },
-  ],
+  ].filter((s) => WITH_OBSERVE || s.url !== OBSERVE_URL),
 });
