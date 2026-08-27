@@ -438,8 +438,9 @@ function makeInstanceTrace(inst: Instance): InstanceTrace {
 }
 
 /**
- * Layer instance content over `stubConsoleApi`: the list endpoint returns
- * `instances`, `/instances/{key}` returns a shaped detail, `/traces/{key}`
+ * Layer instance content over `stubConsoleApi`: the list endpoint returns an
+ * `InstancePage` (`items`, `total`, `page`, `pageSize`, matching
+ * src/gen/types.gen.ts), `/instances/{key}` returns a shaped detail, `/traces/{key}`
  * returns that instance's captured trace (404 for unknown keys, exactly as the
  * real bounded ring would), and the process-definition XML endpoint (which lives
  * OUTSIDE `/console/api`, at `/v2/…`, so the base stub never sees it) returns a
