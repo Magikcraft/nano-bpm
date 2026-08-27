@@ -975,7 +975,10 @@ components:
           items:
             $ref: '#/components/schemas/AgentInstanceToolCall'
         metrics:
-          description: Per-call token and latency metrics. Null when metrics were not provided at creation time.
+          description: >-
+            Per-call token and latency metrics. Present on ASSISTANT items
+            (zeroed when the request omitted metrics at creation time); null for
+            USER, TOOL_RESULT, and CONFIGURATION turns.
           nullable: true
           allOf:
             - $ref: '#/components/schemas/AgentInstanceHistoryItemMetrics'
