@@ -16,7 +16,8 @@
 //
 // The suite never talks to a real gateway. Every test stubs the console API, so a
 // run is deterministic and needs no engine, no Deno, and no scaffolded project —
-// which is what keeps it honest under this repo's no-flaky-tests, no-retries rule.
+// which is what keeps it honest under this repo's no-intermittent-failures,
+// no-retries rule.
 
 import { defineConfig, devices } from "@playwright/test";
 
@@ -32,8 +33,11 @@ const PORT = Number(process.env.E2E_PORT ?? 5177);
  */
 const OBSERVE_PORT = Number(process.env.E2E_OBSERVE_PORT ?? PORT + 1);
 
-const STUDIO_URL = `http://localhost:${PORT}/console/`;
-const OBSERVE_URL = `http://localhost:${OBSERVE_PORT}/console/`;
+// Match the webServer bind address (127.0.0.1, set below) exactly: on an
+// IPv6-first host `localhost` can resolve to ::1 while the server listens only
+// on 127.0.0.1, reintroducing the poll-until-timeout class the bind avoids.
+const STUDIO_URL = `http://127.0.0.1:${PORT}/console/`;
+const OBSERVE_URL = `http://127.0.0.1:${OBSERVE_PORT}/console/`;
 
 /**
  * A phone viewport (375×812, the iPhone-class size unit A7 targets) driven by the
