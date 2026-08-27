@@ -37,6 +37,7 @@ mod raft_net;
 mod readstore;
 mod recovery_throttle;
 mod remote_sink;
+mod response_contract;
 mod runtime_config;
 mod seglog;
 mod sqlite_space;
@@ -21322,7 +21323,16 @@ async fn main() {
             axum::routing::get(system_memory_handler),
         );
 
-    // Prometheus `/metrics` — registered only when enabled (ADR 0035). When
+    // Spec-generated response-contract guard (issue #1011): validate every
+    // implemented `/v2` operation's serialized response against the OpenAPI
+    // schema for its status code, failing loudly with 500 on drift. Layered
+    // here so it wraps the generated REST surface (and the debug/system routes
+    // added above, which it ignores — they carry no operationId in the
+    // contract); the console/metrics/cluster routers merged/added afterwards are
+    // deliberately outside its scope. Off/lenient/strict via
+    // NANOBPM_RESPONSE_VALIDATION (default: strict).
+    app = app.layer(axum::middleware::from_fn(response_contract::guard));
+
     // disabled it 404s, removing the endpoint from the attack surface. Computed
     // on scrape, so it costs nothing at steady state.
     if obs_config.metrics {
