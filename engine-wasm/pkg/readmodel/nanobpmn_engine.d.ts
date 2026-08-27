@@ -251,9 +251,11 @@ export class TestEngine {
     /**
      * The AgentInstances matching an optional filter, as an
      * `AgentInstanceSearchQueryResult` JSON object (`{ items, page }`). The
-     * filter is `{ agentInstanceKey?, processInstanceKey?, status?, elementId? }`
-     * (`status` a REST spelling, e.g. `"INITIALIZING"`); an empty/absent filter
-     * returns every instance. Mirrors `POST /agent-instances/search`.
+     * filter is `{ agentInstanceKey?, agentDefinitionKey?, processInstanceKey?,
+     * rootProcessInstanceKey?, processDefinitionKey?, status?, elementId?,
+     * tenantId? }` (`status` a REST spelling, e.g. `"INITIALIZING"`); an
+     * empty/absent filter returns every instance. Mirrors
+     * `POST /agent-instances/search`.
      */
     searchAgentInstances(filter_json: string): string;
     /**

@@ -1096,9 +1096,11 @@ impl TestEngine {
 
     /// The AgentInstances matching an optional filter, as an
     /// `AgentInstanceSearchQueryResult` JSON object (`{ items, page }`). The
-    /// filter is `{ agentInstanceKey?, processInstanceKey?, status?, elementId? }`
-    /// (`status` a REST spelling, e.g. `"INITIALIZING"`); an empty/absent filter
-    /// returns every instance. Mirrors `POST /agent-instances/search`.
+    /// filter is `{ agentInstanceKey?, agentDefinitionKey?, processInstanceKey?,
+    /// rootProcessInstanceKey?, processDefinitionKey?, status?, elementId?,
+    /// tenantId? }` (`status` a REST spelling, e.g. `"INITIALIZING"`); an
+    /// empty/absent filter returns every instance. Mirrors
+    /// `POST /agent-instances/search`.
     #[wasm_bindgen(js_name = searchAgentInstances)]
     pub fn search_agent_instances(&self, filter_json: &str) -> Result<String, JsValue> {
         let filter = parse_agent_instance_filter(filter_json)?;
