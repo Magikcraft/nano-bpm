@@ -17,9 +17,12 @@ use std::collections::HashMap;
 
 use nanobpmn_engine_core::{
     bpmn::parse_bpmn, form_id_of, ActivateElementInstruction, AdHocActivateElement, AdHocJobResult,
-    BreakCondition, Command, DebugSession, Engine, Event, FormResource, GenericResource,
+    AgentDefinition, AgentHistoryContent, AgentHistoryContentType, AgentHistoryRole,
+    AgentHistoryTurn, AgentInstanceLimits, AgentInstanceMetricsDelta, AgentInstanceStatus,
+    AgentTool, BreakCondition, Command, DebugSession, Engine, Event, FormResource, GenericResource,
     IncidentKind, IncidentState, JobState, MessageSubscriptionKind, MessageSubscriptionState,
     ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState, Value,
+    AGENT_LIMIT_UNLIMITED,
 };
 /// The shared read-model surface, compiled with its in-memory wasm SQLite
 /// backend. Behind the off-by-default `read-model` feature so the baseline engine
@@ -27,7 +30,8 @@ use nanobpmn_engine_core::{
 /// everything it touches is `#[cfg(feature = "read-model")]`.
 #[cfg(feature = "read-model")]
 use nanobpmn_read_model::{
-    FormRow, ProcessInstanceRow, ReadStore, ResourceRow, RootResolver, UserTaskRow, VariableRow,
+    AgentHistoryFilter, AgentHistoryRow, AgentInstanceFilter, AgentInstanceRow, FormRow,
+    ProcessInstanceRow, ReadStore, ResourceRow, RootResolver, UserTaskRow, VariableRow,
     VARIABLE_VALUE_PREVIEW_LEN,
 };
 use serde::Serialize;
@@ -897,6 +901,91 @@ impl TestEngine {
             .collect();
         to_json(&arr)
     }
+
+    // --- Engine-native AgentInstance drivers (Camunda 8.10 parity, Stage 3) ---
+    //
+    // These expose the AgentInstance CREATE/UPDATE/COMPLETE lifecycle commands
+    // through the wasm `TestEngine`. Each accepts a small camelCase JSON request
+    // mirroring the Camunda v2 `/agent-instances` wire shape (status/role are the
+    // REST spellings, e.g. `"INITIALIZING"`, `"ASSISTANT"`), applies the command,
+    // and returns the debug snapshot. The projected instance/history state is read
+    // back through `searchAgentInstances` / `searchAgentInstanceHistory` (the
+    // read-model surface), which serialise the same REST shapes.
+
+    /// Reconcile / create an AgentInstance for an already-activated agent task.
+    /// `request_json` is `{ elementInstanceKey, definition?, limits?, history? }`
+    /// where `definition` is `{ model?, provider?, systemPrompt? }`, `limits` is
+    /// `{ maxTokens?, maxModelCalls?, maxToolCalls? }` (omitted limits default to
+    /// unlimited), and `history` is an initial batch of turns (see the turn shape
+    /// on `updateAgentInstance`). Returns the snapshot.
+    #[wasm_bindgen(js_name = createAgentInstance)]
+    pub fn create_agent_instance(&mut self, request_json: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let req: CreateAgentInstanceReq = serde_json::from_str(request_json)
+            .map_err(|e| js_err(&format!("createAgentInstance: invalid request JSON: {e}")))?;
+        let element_instance_key = parse_key(&req.element_instance_key)?;
+        let history = agent_turns_from(req.history)?;
+        self.apply(Command::CreateAgentInstance {
+            element_instance_key,
+            definition: req.definition.into(),
+            limits: req.limits.map(Into::into),
+            history,
+        })
+        .map_err(|e| js_err(&format!("create agent instance error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Advance an AgentInstance: set its `status` (a REST spelling other than
+    /// `COMPLETED`, which is reachable only through `completeAgentInstance`),
+    /// accumulate `metrics`, optionally replace `tools`, and append a `history`
+    /// batch. `request_json` is `{ agentInstanceKey, elementInstanceKey,
+    /// elementId, processInstanceKey, status?, metrics?, tools?, history? }`. A
+    /// turn is `{ loopIteration?, producedAt?, role?, content?, systemPrompt?,
+    /// historyItemId?, model?, provider? }`; `content` items are
+    /// `{ contentType?, text?, documentReference?, object? }`. Returns the
+    /// snapshot.
+    #[wasm_bindgen(js_name = updateAgentInstance)]
+    pub fn update_agent_instance(&mut self, request_json: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let req: UpdateAgentInstanceReq = serde_json::from_str(request_json)
+            .map_err(|e| js_err(&format!("updateAgentInstance: invalid request JSON: {e}")))?;
+        let agent_instance_key = parse_key(&req.agent_instance_key)?;
+        let element_instance_key = parse_key(&req.element_instance_key)?;
+        let process_instance_key = parse_key(&req.process_instance_key)?;
+        let status = match req.status.as_deref() {
+            Some(s) => Some(parse_agent_status(s)?),
+            None => None,
+        };
+        let tools = req
+            .tools
+            .map(|list| list.into_iter().map(Into::into).collect());
+        let history = agent_turns_from(req.history)?;
+        self.apply(Command::UpdateAgentInstance {
+            agent_instance_key,
+            element_instance_key,
+            element_id: req.element_id,
+            process_instance_key,
+            status,
+            metrics: req.metrics.into(),
+            tools,
+            history,
+        })
+        .map_err(|e| js_err(&format!("update agent instance error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Complete an AgentInstance by its dedicated key, driving it to the terminal
+    /// `COMPLETED` status. Returns the snapshot.
+    #[wasm_bindgen(js_name = completeAgentInstance)]
+    pub fn complete_agent_instance(&mut self, agent_instance_key: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let key = parse_key(agent_instance_key)?;
+        self.apply(Command::CompleteAgentInstance {
+            agent_instance_key: key,
+        })
+        .map_err(|e| js_err(&format!("complete agent instance error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
 }
 
 /// The REST read channel: the gateway's read-side queries served from the SAME
@@ -998,6 +1087,47 @@ impl TestEngine {
             .variables()
             .iter()
             .map(variable_search_result)
+            .collect();
+        to_json(&search_result(items))
+    }
+
+    /// The AgentInstances matching an optional filter, as an
+    /// `AgentInstanceSearchQueryResult` JSON object (`{ items, page }`). The
+    /// filter is `{ agentInstanceKey?, processInstanceKey?, status?, elementId? }`
+    /// (`status` a REST spelling, e.g. `"INITIALIZING"`); an empty/absent filter
+    /// returns every instance. Mirrors `POST /agent-instances/search`.
+    #[wasm_bindgen(js_name = searchAgentInstances)]
+    pub fn search_agent_instances(&self, filter_json: &str) -> Result<String, JsValue> {
+        let filter = parse_agent_instance_filter(filter_json)?;
+        let items: Vec<serde_json::Value> = self
+            .read_model
+            .agent_instances(&filter, None)
+            .iter()
+            .map(agent_instance_result)
+            .collect();
+        to_json(&search_result(items))
+    }
+
+    /// The AgentHistory turns for `agent_instance_key`, as an
+    /// `AgentInstanceHistorySearchQueryResult` JSON object (`{ items, page }`),
+    /// in the engine's canonical `(loopIteration, producedAt, historyItemKey)`
+    /// order. `filter_json` is `{ commitStatus? }` where `commitStatus` is a REST
+    /// spelling or array of them; **omitting it defaults to COMMITTED only**
+    /// (PENDING/DISCARDED surface only when asked for explicitly). Mirrors
+    /// `POST /agent-instances/{agentInstanceKey}/history/search`.
+    #[wasm_bindgen(js_name = searchAgentInstanceHistory)]
+    pub fn search_agent_instance_history(
+        &self,
+        agent_instance_key: &str,
+        filter_json: &str,
+    ) -> Result<String, JsValue> {
+        let key = parse_key(agent_instance_key)?;
+        let filter = parse_agent_history_filter(key, filter_json)?;
+        let items: Vec<serde_json::Value> = self
+            .read_model
+            .agent_history(&filter, None)
+            .iter()
+            .map(agent_history_result)
             .collect();
         to_json(&search_result(items))
     }
@@ -1286,6 +1416,250 @@ fn variable_search_result(v: &VariableRow) -> serde_json::Value {
         "rootProcessInstanceKey": serde_json::Value::Null,
         "value": value,
         "isTruncated": is_truncated,
+    })
+}
+
+/// Parse the `searchAgentInstances` filter body:
+/// `{ agentInstanceKey?, agentDefinitionKey?, processInstanceKey?,
+/// rootProcessInstanceKey?, processDefinitionKey?, status?, elementId?,
+/// tenantId? }`. Empty/whitespace ⇒ an unfiltered search. Keys are decimal
+/// strings; `status` is a REST spelling.
+#[cfg(feature = "read-model")]
+fn parse_agent_instance_filter(filter_json: &str) -> Result<AgentInstanceFilter, JsValue> {
+    let t = filter_json.trim();
+    let mut filter = AgentInstanceFilter::default();
+    if t.is_empty() {
+        return Ok(filter);
+    }
+    let json: serde_json::Value = serde_json::from_str(t)
+        .map_err(|e| js_err(&format!("searchAgentInstances: invalid filter JSON: {e}")))?;
+    let map = match &json {
+        serde_json::Value::Object(m) => m,
+        serde_json::Value::Null => return Ok(filter),
+        _ => return Err(js_err("searchAgentInstances filter must be a JSON object")),
+    };
+    filter.agent_instance_key = agent_filter_key(map, "agentInstanceKey")?;
+    filter.agent_definition_key = agent_filter_key(map, "agentDefinitionKey")?;
+    filter.process_instance_key = agent_filter_key(map, "processInstanceKey")?;
+    filter.root_process_instance_key = agent_filter_key(map, "rootProcessInstanceKey")?;
+    filter.process_definition_key = agent_filter_key(map, "processDefinitionKey")?;
+    if let Some(v) = map.get("status") {
+        if !v.is_null() {
+            let s = v
+                .as_str()
+                .ok_or_else(|| js_err("searchAgentInstances filter `status` must be a string"))?;
+            filter.status = Some(parse_agent_status(s)?);
+        }
+    }
+    filter.element_id = agent_filter_string(map, "elementId");
+    filter.tenant_id = agent_filter_string(map, "tenantId");
+    Ok(filter)
+}
+
+/// Parse the `searchAgentInstanceHistory` filter body: `{ commitStatus? }` where
+/// `commitStatus` is a REST spelling or an array of them. Omitted/empty ⇒ the
+/// COMMITTED default (enforced by the read model). The `agent_instance_key` is
+/// bound from the method argument, not the body.
+#[cfg(feature = "read-model")]
+fn parse_agent_history_filter(
+    agent_instance_key: u64,
+    filter_json: &str,
+) -> Result<AgentHistoryFilter, JsValue> {
+    let mut filter = AgentHistoryFilter {
+        agent_instance_key: Some(agent_instance_key),
+        ..Default::default()
+    };
+    let t = filter_json.trim();
+    if t.is_empty() {
+        return Ok(filter);
+    }
+    let json: serde_json::Value = serde_json::from_str(t).map_err(|e| {
+        js_err(&format!(
+            "searchAgentInstanceHistory: invalid filter JSON: {e}"
+        ))
+    })?;
+    let map = match &json {
+        serde_json::Value::Object(m) => m,
+        serde_json::Value::Null => return Ok(filter),
+        _ => {
+            return Err(js_err(
+                "searchAgentInstanceHistory filter must be a JSON object",
+            ))
+        }
+    };
+    if let Some(v) = map.get("commitStatus") {
+        let spellings: Vec<&str> = match v {
+            serde_json::Value::Null => Vec::new(),
+            serde_json::Value::String(s) => vec![s.as_str()],
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|it| {
+                    it.as_str()
+                        .ok_or_else(|| js_err("`commitStatus` array entries must be strings"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(js_err(
+                    "`commitStatus` must be a string or an array of strings",
+                ))
+            }
+        };
+        if !spellings.is_empty() {
+            let statuses = spellings
+                .into_iter()
+                .map(parse_agent_commit_status)
+                .collect::<Result<Vec<_>, _>>()?;
+            filter.commit_status = Some(statuses);
+        }
+    }
+    Ok(filter)
+}
+
+/// Parse a REST `AgentHistoryItemStateEnum` spelling into the commit status.
+#[cfg(feature = "read-model")]
+fn parse_agent_commit_status(
+    s: &str,
+) -> Result<nanobpmn_engine_core::AgentHistoryCommitStatus, JsValue> {
+    use nanobpmn_engine_core::AgentHistoryCommitStatus as Cs;
+    match s {
+        "COMMITTED" => Ok(Cs::Committed),
+        "PENDING" => Ok(Cs::Pending),
+        "DISCARDED" => Ok(Cs::Discarded),
+        other => Err(js_err(&format!(
+            "invalid agent commit status {other:?}; expected one of COMMITTED, PENDING, DISCARDED"
+        ))),
+    }
+}
+
+/// Read an optional decimal-string key from an agent-search filter object.
+#[cfg(feature = "read-model")]
+fn agent_filter_key(
+    map: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<u64>, JsValue> {
+    match map.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(parse_key(s)?)),
+        Some(_) => Err(js_err(&format!(
+            "agent-search filter `{field}` must be a decimal string key"
+        ))),
+    }
+}
+
+/// Read an optional string field from an agent-search filter object.
+#[cfg(feature = "read-model")]
+fn agent_filter_string(
+    map: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<String> {
+    match map.get(field) {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Serialise an [`AgentInstanceRow`] as the gateway's `AgentInstanceResult` JSON
+/// shape (Camunda v2 `/agent-instances`). Keys are decimal strings; dates are
+/// RFC-3339; `tools` is decoded from the row's projected JSON.
+#[cfg(feature = "read-model")]
+fn agent_instance_result(row: &AgentInstanceRow) -> serde_json::Value {
+    let tools: serde_json::Value =
+        serde_json::from_str(&row.tools_json).unwrap_or(serde_json::Value::Array(Vec::new()));
+    let completion_date = match row.completion_date_ms {
+        Some(ms) => serde_json::Value::String(iso8601_from_ms(ms)),
+        None => serde_json::Value::Null,
+    };
+    let version_tag = match &row.process_definition_version_tag {
+        Some(tag) => serde_json::Value::String(tag.clone()),
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "agentInstanceKey": row.agent_instance_key.to_string(),
+        "agentDefinitionKey": row.agent_definition_key.to_string(),
+        "status": row.status.as_str(),
+        "agentType": row.agent_type,
+        "definition": {
+            "model": row.model,
+            "provider": row.provider,
+            "systemPrompt": row.system_prompt,
+        },
+        "metrics": {
+            "inputTokens": row.input_tokens,
+            "outputTokens": row.output_tokens,
+            "reasoningTokenCount": row.reasoning_token_count,
+            "cacheCreationTokenCount": row.cache_creation_token_count,
+            "cacheReadTokenCount": row.cache_read_token_count,
+            "modelCalls": row.model_calls,
+            "toolCalls": row.tool_calls,
+        },
+        "limits": {
+            "maxTokens": row.max_tokens,
+            "maxModelCalls": row.max_model_calls,
+            "maxToolCalls": row.max_tool_calls,
+        },
+        "tools": tools,
+        "elementId": row.element_id,
+        "elementInstanceKey": row.element_instance_key.to_string(),
+        "processInstanceKey": row.process_instance_key.to_string(),
+        "rootProcessInstanceKey": row.root_process_instance_key.to_string(),
+        "processDefinitionKey": row.process_definition_key.to_string(),
+        "processDefinitionId": row.process_definition_id,
+        "processDefinitionVersion": row.process_definition_version,
+        "processDefinitionVersionTag": version_tag,
+        "tenantId": row.tenant_id,
+        "creationDate": iso8601_from_ms(row.creation_date_ms),
+        "lastUpdatedDate": iso8601_from_ms(row.last_updated_date_ms),
+        "completionDate": completion_date,
+        "elementInstanceKeys": row.element_instance_keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+    })
+}
+
+/// Serialise an [`AgentHistoryRow`] as the gateway's `AgentInstanceHistoryItemResult`
+/// JSON shape. Per-call `metrics` are present on ASSISTANT turns only (null
+/// otherwise, mirroring the REST contract); `content`, `toolCalls` and `tools`
+/// are decoded from the row's projected JSON columns.
+#[cfg(feature = "read-model")]
+fn agent_history_result(row: &AgentHistoryRow) -> serde_json::Value {
+    use nanobpmn_engine_core::AgentHistoryRole;
+    let content: serde_json::Value =
+        serde_json::from_str(&row.content_json).unwrap_or(serde_json::Value::Array(Vec::new()));
+    let tool_calls: serde_json::Value =
+        serde_json::from_str(&row.tool_calls_json).unwrap_or(serde_json::Value::Array(Vec::new()));
+    let tools: serde_json::Value =
+        serde_json::from_str(&row.tools_json).unwrap_or(serde_json::Value::Array(Vec::new()));
+    let metrics = match row.role {
+        AgentHistoryRole::Assistant => serde_json::json!({
+            "inputTokens": row.input_tokens,
+            "outputTokens": row.output_tokens,
+            "reasoningTokenCount": row.reasoning_token_count,
+            "cacheCreationTokenCount": row.cache_creation_token_count,
+            "cacheReadTokenCount": row.cache_read_token_count,
+            "durationMs": row.duration_ms,
+        }),
+        _ => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "historyItemKey": row.agent_history_key.to_string(),
+        "historyItemId": row.history_item_id.clone().unwrap_or_default(),
+        "agentInstanceKey": row.agent_instance_key.to_string(),
+        "elementInstanceKey": row.element_instance_key.to_string(),
+        "processInstanceKey": row.process_instance_key.to_string(),
+        "rootProcessInstanceKey": row.root_process_instance_key.to_string(),
+        "processDefinitionKey": row.process_definition_key.to_string(),
+        "processDefinitionId": row.process_definition_id,
+        "tenantId": row.tenant_id,
+        "jobKey": row.job_key.to_string(),
+        "loopIteration": row.loop_iteration,
+        "role": row.role.as_str(),
+        "content": content,
+        "toolCalls": tool_calls,
+        "metrics": metrics,
+        "commitStatus": row.commit_status.as_str(),
+        "producedAt": iso8601_from_ms(row.produced_at_ms),
+        "tools": tools,
+        "model": row.model,
+        "provider": row.provider,
+        "isDuplicate": row.is_duplicate,
     })
 }
 
@@ -2077,6 +2451,272 @@ fn parse_key(s: &str) -> Result<u64, JsValue> {
     s.trim()
         .parse::<u64>()
         .map_err(|_| js_err(&format!("invalid key: {s}")))
+}
+
+// --- AgentInstance driver request shapes (Camunda 8.10 REST-parity JSON) ------
+//
+// The wasm agent drivers accept camelCase JSON mirroring the Camunda v2
+// `/agent-instances` wire shape, with status/role/commit-status carried as their
+// canonical REST spellings (e.g. `"INITIALIZING"`, `"ASSISTANT"`, `"COMMITTED"`).
+// These request structs deserialize that JSON and convert into the engine-core
+// agent types the lifecycle commands take.
+
+/// `definition` block of a create request: `{ model?, provider?, systemPrompt? }`.
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentDefinitionReq {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+}
+
+impl From<AgentDefinitionReq> for AgentDefinition {
+    fn from(r: AgentDefinitionReq) -> Self {
+        AgentDefinition {
+            model: r.model,
+            provider: r.provider,
+            system_prompt: r.system_prompt,
+        }
+    }
+}
+
+/// `limits` block of a create request. An omitted limit defaults to unlimited
+/// (`-1`), matching the engine's [`AgentInstanceLimits`] default.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentLimitsReq {
+    #[serde(default = "agent_unlimited")]
+    max_tokens: i64,
+    #[serde(default = "agent_unlimited")]
+    max_model_calls: i64,
+    #[serde(default = "agent_unlimited")]
+    max_tool_calls: i64,
+}
+
+fn agent_unlimited() -> i64 {
+    AGENT_LIMIT_UNLIMITED
+}
+
+impl From<AgentLimitsReq> for AgentInstanceLimits {
+    fn from(r: AgentLimitsReq) -> Self {
+        AgentInstanceLimits {
+            max_tokens: r.max_tokens,
+            max_model_calls: r.max_model_calls,
+            max_tool_calls: r.max_tool_calls,
+        }
+    }
+}
+
+/// `metrics` delta of an update request; every counter defaults to zero.
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentMetricsDeltaReq {
+    #[serde(default)]
+    input_tokens: i64,
+    #[serde(default)]
+    output_tokens: i64,
+    #[serde(default)]
+    reasoning_token_count: i64,
+    #[serde(default)]
+    cache_creation_token_count: i64,
+    #[serde(default)]
+    cache_read_token_count: i64,
+    #[serde(default)]
+    model_calls: i64,
+    #[serde(default)]
+    tool_calls: i64,
+}
+
+impl From<AgentMetricsDeltaReq> for AgentInstanceMetricsDelta {
+    fn from(r: AgentMetricsDeltaReq) -> Self {
+        AgentInstanceMetricsDelta {
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+            reasoning_token_count: r.reasoning_token_count,
+            cache_creation_token_count: r.cache_creation_token_count,
+            cache_read_token_count: r.cache_read_token_count,
+            model_calls: r.model_calls,
+            tool_calls: r.tool_calls,
+        }
+    }
+}
+
+/// A `tools[]` entry of an update request: `{ name, description?, elementId? }`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentToolReq {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    element_id: Option<String>,
+}
+
+impl From<AgentToolReq> for AgentTool {
+    fn from(r: AgentToolReq) -> Self {
+        AgentTool {
+            name: r.name,
+            description: r.description,
+            element_id: r.element_id,
+        }
+    }
+}
+
+/// A `content[]` block of a history turn:
+/// `{ contentType?, text?, documentReference?, object? }`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentContentReq {
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    document_reference: Option<String>,
+    #[serde(default)]
+    object: Option<String>,
+}
+
+/// A single history turn of a create/update request. Only the turn-specific
+/// fields are accepted; the instance-derived context and the minted history key
+/// are filled in engine-side.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentTurnReq {
+    #[serde(default)]
+    loop_iteration: i32,
+    #[serde(default)]
+    produced_at: u64,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    content: Vec<AgentContentReq>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    history_item_id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+/// The `createAgentInstance` request body.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAgentInstanceReq {
+    element_instance_key: String,
+    #[serde(default)]
+    definition: AgentDefinitionReq,
+    #[serde(default)]
+    limits: Option<AgentLimitsReq>,
+    #[serde(default)]
+    history: Vec<AgentTurnReq>,
+}
+
+/// The `updateAgentInstance` request body.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateAgentInstanceReq {
+    agent_instance_key: String,
+    element_instance_key: String,
+    element_id: String,
+    process_instance_key: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    metrics: AgentMetricsDeltaReq,
+    #[serde(default)]
+    tools: Option<Vec<AgentToolReq>>,
+    #[serde(default)]
+    history: Vec<AgentTurnReq>,
+}
+
+/// Convert a batch of request turns into engine [`AgentHistoryTurn`]s, resolving
+/// each REST role/content-type spelling.
+fn agent_turns_from(turns: Vec<AgentTurnReq>) -> Result<Vec<AgentHistoryTurn>, JsValue> {
+    turns.into_iter().map(agent_turn_from).collect()
+}
+
+fn agent_turn_from(t: AgentTurnReq) -> Result<AgentHistoryTurn, JsValue> {
+    let role = match t.role.as_deref() {
+        Some(s) => parse_agent_role(s)?,
+        None => AgentHistoryRole::default(),
+    };
+    let content = t
+        .content
+        .into_iter()
+        .map(agent_content_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AgentHistoryTurn {
+        loop_iteration: t.loop_iteration,
+        produced_at: t.produced_at,
+        role,
+        content,
+        system_prompt: t.system_prompt,
+        history_item_id: t.history_item_id,
+        model: t.model,
+        provider: t.provider,
+        ..Default::default()
+    })
+}
+
+fn agent_content_from(c: AgentContentReq) -> Result<AgentHistoryContent, JsValue> {
+    let content_type = match c.content_type.as_deref() {
+        Some(s) => parse_agent_content_type(s)?,
+        None => AgentHistoryContentType::Text,
+    };
+    Ok(AgentHistoryContent {
+        content_type,
+        text: c.text,
+        document_reference: c.document_reference,
+        object: c.object,
+    })
+}
+
+/// Parse a REST `AgentInstanceStatusEnum` spelling into the engine status.
+fn parse_agent_status(s: &str) -> Result<AgentInstanceStatus, JsValue> {
+    match s {
+        "INITIALIZING" => Ok(AgentInstanceStatus::Initializing),
+        "TOOL_DISCOVERY" => Ok(AgentInstanceStatus::ToolDiscovery),
+        "THINKING" => Ok(AgentInstanceStatus::Thinking),
+        "TOOL_CALLING" => Ok(AgentInstanceStatus::ToolCalling),
+        "IDLE" => Ok(AgentInstanceStatus::Idle),
+        "COMPLETED" => Ok(AgentInstanceStatus::Completed),
+        other => Err(js_err(&format!(
+            "invalid agent status {other:?}; expected one of \
+             INITIALIZING, TOOL_DISCOVERY, THINKING, TOOL_CALLING, IDLE, COMPLETED"
+        ))),
+    }
+}
+
+/// Parse a REST `AgentHistoryItemRoleEnum` spelling into the engine role.
+fn parse_agent_role(s: &str) -> Result<AgentHistoryRole, JsValue> {
+    match s {
+        "USER" => Ok(AgentHistoryRole::User),
+        "ASSISTANT" => Ok(AgentHistoryRole::Assistant),
+        "TOOL_RESULT" => Ok(AgentHistoryRole::ToolResult),
+        "CONFIGURATION" => Ok(AgentHistoryRole::Configuration),
+        other => Err(js_err(&format!(
+            "invalid agent history role {other:?}; expected one of \
+             USER, ASSISTANT, TOOL_RESULT, CONFIGURATION"
+        ))),
+    }
+}
+
+/// Parse a REST content-type spelling into the engine content type.
+fn parse_agent_content_type(s: &str) -> Result<AgentHistoryContentType, JsValue> {
+    match s {
+        "TEXT" => Ok(AgentHistoryContentType::Text),
+        "OBJECT" => Ok(AgentHistoryContentType::Object),
+        "DOCUMENT" => Ok(AgentHistoryContentType::Document),
+        other => Err(js_err(&format!(
+            "invalid agent content type {other:?}; expected one of TEXT, OBJECT, DOCUMENT"
+        ))),
+    }
 }
 
 /// Parse the `activate_instructions_json` argument of [`TestEngine::modify`]: a

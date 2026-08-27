@@ -191,6 +191,38 @@ export class TestEngine {
         }
     }
     /**
+     * Complete an AgentInstance by its dedicated key, driving it to the terminal
+     * `COMPLETED` status. Returns the snapshot.
+     * @param {string} agent_instance_key
+     * @returns {string}
+     */
+    completeAgentInstance(agent_instance_key) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(agent_instance_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.testengine_completeAgentInstance(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
      * Complete an ad-hoc sub-process **agent** job — the container's
      * JOB_WORKER job (Camunda's agentic `aiagent-job-worker`) — carrying the
      * agent's activate-element instructions so the engine runs the selected
@@ -357,6 +389,42 @@ export class TestEngine {
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
             wasm.__wbindgen_export3(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
+     * Reconcile / create an AgentInstance for an already-activated agent task.
+     * `request_json` is `{ elementInstanceKey, definition?, limits?, history? }`
+     * where `definition` is `{ model?, provider?, systemPrompt? }`, `limits` is
+     * `{ maxTokens?, maxModelCalls?, maxToolCalls? }` (omitted limits default to
+     * unlimited), and `history` is an initial batch of turns (see the turn shape
+     * on `updateAgentInstance`). Returns the snapshot.
+     * @param {string} request_json
+     * @returns {string}
+     */
+    createAgentInstance(request_json) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.testengine_createAgentInstance(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred3_0, deferred3_1, 1);
         }
     }
     /**
@@ -1012,6 +1080,45 @@ export class TestEngine {
             const ptr0 = passStringToWasm0(user_task_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len0 = WASM_VECTOR_LEN;
             wasm.testengine_unassignUserTask(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Advance an AgentInstance: set its `status` (a REST spelling other than
+     * `COMPLETED`, which is reachable only through `completeAgentInstance`),
+     * accumulate `metrics`, optionally replace `tools`, and append a `history`
+     * batch. `request_json` is `{ agentInstanceKey, elementInstanceKey,
+     * elementId, processInstanceKey, status?, metrics?, tools?, history? }`. A
+     * turn is `{ loopIteration?, producedAt?, role?, content?, systemPrompt?,
+     * historyItemId?, model?, provider? }`; `content` items are
+     * `{ contentType?, text?, documentReference?, object? }`. Returns the
+     * snapshot.
+     * @param {string} request_json
+     * @returns {string}
+     */
+    updateAgentInstance(request_json) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.testengine_updateAgentInstance(retptr, this.__wbg_ptr, ptr0, len0);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
             var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
