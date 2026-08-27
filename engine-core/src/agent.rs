@@ -685,7 +685,8 @@ impl AgentHistoryTurn {
             + opt_str_bytes(&self.provider)
     }
 }
-/// Camunda stable/8.10). One is produced per [`AgentHistoryTurn`] appended.
+/// A single materialised turn in the AgentHistory turn log (Camunda
+/// stable/8.10). One is produced per [`AgentHistoryTurn`] appended.
 ///
 /// Records are held append-only in
 /// [`crate::state::ProcessInstance::agent_history`], keyed by
