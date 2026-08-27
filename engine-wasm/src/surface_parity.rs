@@ -177,19 +177,17 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
                  drives ad-hoc tools through the agent-job path, not this direct command",
         },
         // AgentInstance write commands (engine-native AgentInstance parity). The
-        // CREATE/UPDATE/COMPLETE lifecycle processors land in S3 (this slice),
-        // but no `#[wasm_bindgen]` TestEngine driver exposes them through the wasm
-        // surface yet — that driver (and the JSON wire contract) is a later slice
-        // (S6, alongside the regenerated `pkg/` artifact). Classified
-        // `NotSurfaced` until that driver exists.
-        Command::CreateAgentInstance { .. } => Surface::NotSurfaced {
-            reason: "AgentInstance CREATE processor landed (S3); its TestEngine driver arrives in agent-instance-parity S6",
+        // CREATE/UPDATE/COMPLETE lifecycle processors landed in S3; their
+        // `#[wasm_bindgen]` TestEngine drivers land here in S6 alongside the
+        // regenerated `pkg/` artifact, so each is now `Surfaced`.
+        Command::CreateAgentInstance { .. } => Surface::Surfaced {
+            js_method: "createAgentInstance",
         },
-        Command::UpdateAgentInstance { .. } => Surface::NotSurfaced {
-            reason: "AgentInstance UPDATE processor landed (S3); its TestEngine driver arrives in agent-instance-parity S6",
+        Command::UpdateAgentInstance { .. } => Surface::Surfaced {
+            js_method: "updateAgentInstance",
         },
-        Command::CompleteAgentInstance { .. } => Surface::NotSurfaced {
-            reason: "AgentInstance COMPLETE processor landed (S3); its TestEngine driver arrives in agent-instance-parity S6",
+        Command::CompleteAgentInstance { .. } => Surface::Surfaced {
+            js_method: "completeAgentInstance",
         },
     }
 }

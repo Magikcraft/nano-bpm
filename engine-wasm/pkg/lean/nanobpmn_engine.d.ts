@@ -39,6 +39,11 @@ export class TestEngine {
      */
     cancelInstance(instance_key: string): string;
     /**
+     * Complete an AgentInstance by its dedicated key, driving it to the terminal
+     * `COMPLETED` status. Returns the snapshot.
+     */
+    completeAgentInstance(agent_instance_key: string): string;
+    /**
      * Complete an ad-hoc sub-process **agent** job — the container's
      * JOB_WORKER job (Camunda's agentic `aiagent-job-worker`) — carrying the
      * agent's activate-element instructions so the engine runs the selected
@@ -81,6 +86,15 @@ export class TestEngine {
      * in-browser equivalent of an app publishing a message. Returns the snapshot.
      */
     correlateMessage(message_name: string, correlation_key: string, variables_json: string): string;
+    /**
+     * Reconcile / create an AgentInstance for an already-activated agent task.
+     * `request_json` is `{ elementInstanceKey, definition?, limits?, history? }`
+     * where `definition` is `{ model?, provider?, systemPrompt? }`, `limits` is
+     * `{ maxTokens?, maxModelCalls?, maxToolCalls? }` (omitted limits default to
+     * unlimited), and `history` is an initial batch of turns (see the turn shape
+     * on `updateAgentInstance`). Returns the snapshot.
+     */
+    createAgentInstance(request_json: string): string;
     /**
      * Start a new instance of `process_id`, seeding it with the given variables
      * (a JSON object string; pass `"{}"` or `""` for none). `version` selects a
@@ -244,6 +258,24 @@ export class TestEngine {
      */
     unassignUserTask(user_task_key: string): string;
     /**
+     * Advance an AgentInstance: set its `status` (a REST spelling other than
+     * `COMPLETED`, which is reachable only through `completeAgentInstance` and is
+     * rejected here with a targeted error), accumulate `metrics`, optionally
+     * replace `tools`, and append a `history` batch. `request_json` is
+     * `{ agentInstanceKey, elementInstanceKey, elementId, processInstanceKey,
+     * status?, metrics?, tools?, jobKey?, jobLease?, history? }`. `tools` is a
+     * nullable changeset: omit it to leave the stored set unchanged, pass `null`
+     * to clear it, or an array to replace it. `jobKey`/`jobLease` are the
+     * activation's job attribution, stamped onto every appended turn (as the
+     * gateway does). A turn is `{ loopIteration?, producedAt?, role?, content?,
+     * systemPrompt?, historyItemId?, model?, provider? }`, where `producedAt` is
+     * an RFC-3339 `date-time` string (the REST spelling; a bare epoch-millis
+     * number is also accepted); `content` items are `{ contentType?, text?,
+     * documentReference?, object? }`, where `object` is arbitrary JSON (the REST
+     * wire shape). Returns the snapshot.
+     */
+    updateAgentInstance(request_json: string): string;
+    /**
      * Set a job's remaining retries by key. Used to recover a job parked on a
      * no-retries incident before resolving that incident; does not by itself
      * unblock the job. Returns the snapshot.
@@ -277,10 +309,12 @@ export interface InitOutput {
     readonly testengine_assignUserTask: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly testengine_broadcastSignal: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_cancelInstance: (a: number, b: number, c: number, d: number) => void;
+    readonly testengine_completeAgentInstance: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_completeAgentJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_completeJob: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_completeUserTask: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_correlateMessage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly testengine_createAgentInstance: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_createInstance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly testengine_debugClear: (a: number) => void;
     readonly testengine_debugCreateInstance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
@@ -303,6 +337,7 @@ export interface InitOutput {
     readonly testengine_throwError: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_tickNow: (a: number, b: number, c: number) => void;
     readonly testengine_unassignUserTask: (a: number, b: number, c: number, d: number) => void;
+    readonly testengine_updateAgentInstance: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_updateRetries: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly testengine_updateUserTask: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
