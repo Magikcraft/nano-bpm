@@ -1,10 +1,13 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   cancelInstance,
   getInstance,
+  getTrace,
   resolveIncident,
   setInstanceVariables,
+  type InstanceTrace,
 } from "../gen";
 import { fetchProcessXml } from "../lib/api";
 import { isCancellable, cancelConfirmMessage } from "../lib/instanceActions";
@@ -13,17 +16,35 @@ import { usePaneResize } from "../lib/usePaneResize";
 import { ResizeHandle } from "../components/ResizeHandle";
 import BpmnViewer from "../components/BpmnViewer";
 import { IncidentReason } from "../components/IncidentReason";
-import { fmtClock, fmtDuration } from "../components/TraceTimeline";
-import { Badge, Button, Input, SectionLabel } from "../components/ui";
+import {
+  TraceTimeline,
+  fmtClock,
+  fmtDuration,
+} from "../components/TraceTimeline";
+import {
+  Badge,
+  Button,
+  CardGrid,
+  Input,
+  NavCard,
+  SectionLabel,
+  useIsNarrow,
+} from "../components/ui";
 
 export default function InstanceDetail({
   instanceKey,
 }: {
   instanceKey: string;
 }) {
-  // Detail refetches on the same live signal as the list.
-  useLiveInvalidation(["instance"]);
+  // Detail refetches on the same live signal as the list; the trace is folded
+  // from the same event stream, so refresh it on the same signal too.
+  useLiveInvalidation(["instance", "trace"]);
   const qc = useQueryClient();
+  const narrow = useIsNarrow();
+  // Which drill-down is open full-screen on mobile (Model / Variables / Trace).
+  const [panel, setPanel] = useState<null | "model" | "variables" | "trace">(
+    null,
+  );
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -56,10 +77,33 @@ export default function InstanceDetail({
     staleTime: Infinity,
   });
 
-  // Both operator actions refresh the same detail query so the diagram overlay,
-  // the incident list and the variables all reflect the new engine state.
-  const refresh = () =>
+  // The execution trace is folded from a bounded in-memory ring, so it may be
+  // absent (never traced, or evicted). Only a 404 means "no trace" — surfaced as
+  // an explicit empty state. Any other failure (network, 5xx) is a real error we
+  // throw so the section can render an error state instead of hiding it.
+  const {
+    data: trace,
+    isLoading: traceLoading,
+    error: traceError,
+  } = useQuery({
+    queryKey: ["trace", instanceKey],
+    queryFn: async () => {
+      const result = await getTrace({ path: { key: instanceKey } });
+      if (result.response?.status === 404) return undefined;
+      if (result.error) throw result.error;
+      return result.data;
+    },
+    enabled: !!instanceKey,
+    retry: false,
+  });
+
+  // Operator actions refresh both detail queries so the diagram overlay, the
+  // incident list, the variables and the Process Trace section all reflect the
+  // new engine state right away rather than waiting for the next SSE signal.
+  const refresh = () => {
     qc.invalidateQueries({ queryKey: ["instance", instanceKey] });
+    qc.invalidateQueries({ queryKey: ["trace", instanceKey] });
+  };
 
   const onResolve = (incidentKey: string) => {
     setBusy(true);
@@ -122,35 +166,210 @@ export default function InstanceDetail({
     .filter((i) => i.state === "Active")
     .map((i) => i.element_id);
 
+  const header = (
+    <header className="border-b border-edge px-4 py-4 sm:px-8">
+      <div className="flex items-center gap-3">
+        <h1 className="min-w-0 truncate text-xl font-semibold text-fg">
+          {instance.process_id}
+        </h1>
+        <Badge tone="neutral">{instance.state}</Badge>
+        {instance.has_incident && <Badge tone="danger">Incident</Badge>}
+        {isCancellable(instance.state) && (
+          <Button
+            size="sm"
+            variant="danger"
+            disabled={busy}
+            className="ml-auto shrink-0"
+            onClick={() => onCancelInstance(instance.process_id)}
+          >
+            Cancel instance
+          </Button>
+        )}
+      </div>
+      <div className="mt-1 font-mono text-xs break-all text-fg-faint">
+        instance {instance.key} · definition {instance.process_definition_key} ·
+        v{instance.version}
+      </div>
+    </header>
+  );
+
+  const actionBanner = actionError && (
+    <p className="mb-4 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
+      {actionError}
+    </p>
+  );
+
+  // bg-white is intentional: the BPMN diagram canvas is a physical white
+  // "sheet" regardless of theme — and keeping it white is what keeps the
+  // fixed-light `.nano-active` / `.nano-incident` overlay colours legible on a
+  // phone (they are deliberately not theme-driven).
+  const modelBody = (
+    <div className="h-full w-full bg-white">
+      <BpmnViewer
+        xml={xml ?? null}
+        activeElementIds={activeEls}
+        incidentElementIds={incidentEls}
+        fitOnResize
+      />
+    </div>
+  );
+
+  const variablesBody =
+    variables.length === 0 ? (
+      <Empty>No variables.</Empty>
+    ) : (
+      <ScrollX>
+        <Table head={["Name", "Value", "Scope", ""]}>
+          {variables.map((v) => (
+            <VariableRow
+              key={`${v.scope_key}:${v.name}`}
+              name={v.name}
+              value={v.value}
+              scopeKey={v.scope_key}
+              busy={busy}
+              onSave={(parsed) => onSetVariable(v.scope_key, v.name, parsed)}
+            />
+          ))}
+        </Table>
+      </ScrollX>
+    );
+
+  const traceBody = (
+    <TraceContent trace={trace} isLoading={traceLoading} error={traceError} />
+  );
+
+  const incidentsSection = incidents.length > 0 && (
+    <Section title="Incidents">
+      <ScrollX>
+        <Table head={["Element", "Kind", "State", "Reason", ""]}>
+          {incidents.map((i) => (
+            <tr key={i.key} className="border-b border-edge">
+              <Td>{i.element_id}</Td>
+              <Td>{i.kind}</Td>
+              <Td>{i.state}</Td>
+              <Td className="align-top" title={i.reason}>
+                <IncidentReason reason={i.reason} />
+              </Td>
+              <Td className="text-right">
+                {i.state === "Active" && (
+                  <Button
+                    size="sm"
+                    disabled={busy}
+                    onClick={() => onResolve(i.key)}
+                  >
+                    Resolve
+                  </Button>
+                )}
+              </Td>
+            </tr>
+          ))}
+        </Table>
+      </ScrollX>
+    </Section>
+  );
+
+  const jobsSection = (
+    <Section title="Jobs">
+      {jobs.length === 0 ? (
+        <Empty>No jobs.</Empty>
+      ) : (
+        <ScrollX>
+          <Table
+            head={[
+              "Element",
+              "Type",
+              "State",
+              "Retries",
+              "Worker",
+              "Job key",
+              "Activated",
+              "Timeout",
+            ]}
+          >
+            {jobs.map((j) => (
+              <tr key={j.key} className="border-b border-edge">
+                <Td>{j.element_id}</Td>
+                <Td className="font-mono">{j.job_type}</Td>
+                <Td>{j.state}</Td>
+                <Td>{j.retries}</Td>
+                <Td className="text-fg-faint">{j.worker ?? "—"}</Td>
+                <Td className="font-mono text-fg-faint">{j.key}</Td>
+                <Td className="text-fg-faint">
+                  {j.activated_at_ms != null
+                    ? fmtClock(j.activated_at_ms)
+                    : "—"}
+                </Td>
+                <Td className="text-fg-faint">
+                  {j.timeout_ms != null ? fmtDuration(j.timeout_ms) : "—"}
+                </Td>
+              </tr>
+            ))}
+          </Table>
+        </ScrollX>
+      )}
+    </Section>
+  );
+
+  // Mobile: Model / Variables / Process Trace are drill-in cards that open a
+  // full-screen panel (the diagram needs the whole viewport to be usable, and
+  // the wide variables/timeline tables would otherwise force horizontal page
+  // scroll at 375px). Incidents and Jobs stay inline as sections.
+  if (narrow) {
+    const panels = {
+      model: { title: `${instance.process_id} · Model`, body: modelBody },
+      variables: { title: "Variables", body: variablesBody },
+      trace: { title: "Process Trace", body: traceBody },
+    } as const;
+    const openPanel = panel ? panels[panel] : null;
+
+    return (
+      <div className="flex h-full flex-col">
+        {header}
+        <div className="nano-safe-x min-h-0 flex-1 overflow-auto p-4">
+          {actionBanner}
+          <CardGrid className="mb-6">
+            <NavCard
+              label="Model"
+              description="BPMN diagram"
+              onClick={() => setPanel("model")}
+            />
+            <NavCard
+              label="Variables"
+              description={`${variables.length} variable${
+                variables.length === 1 ? "" : "s"
+              }`}
+              onClick={() => setPanel("variables")}
+            />
+            <NavCard
+              label="Process Trace"
+              description="Execution timeline"
+              onClick={() => setPanel("trace")}
+            />
+          </CardGrid>
+          {incidentsSection}
+          {jobsSection}
+        </div>
+        {openPanel && (
+          <FullScreenPanel
+            title={openPanel.title}
+            onClose={() => setPanel(null)}
+            bodyClassName={
+              panel === "model"
+                ? "min-h-0 flex-1 overflow-hidden bg-white"
+                : "min-h-0 flex-1 overflow-auto p-4"
+            }
+          >
+            {openPanel.body}
+          </FullScreenPanel>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full flex-col">
-      <header className="border-b border-edge px-8 py-4">
-        <div className="flex items-center gap-3">
-          <h1 className="text-xl font-semibold text-fg">
-            {instance.process_id}
-          </h1>
-          <Badge tone="neutral">{instance.state}</Badge>
-          {instance.has_incident && <Badge tone="danger">Incident</Badge>}
-          {isCancellable(instance.state) && (
-            <Button
-              size="sm"
-              variant="danger"
-              disabled={busy}
-              className="ml-auto"
-              onClick={() => onCancelInstance(instance.process_id)}
-            >
-              Cancel instance
-            </Button>
-          )}
-        </div>
-        <div className="mt-1 font-mono text-xs text-fg-faint">
-          instance {instance.key} · definition {instance.process_definition_key}{" "}
-          · v{instance.version}
-        </div>
-      </header>
+      {header}
 
-      {/* bg-white is intentional: the BPMN diagram canvas is a physical white
-          "sheet" regardless of theme. */}
       <div style={{ height: modelResize.size }} className="shrink-0 bg-white">
         <BpmnViewer
           xml={xml ?? null}
@@ -171,100 +390,105 @@ export default function InstanceDetail({
       />
 
       <div className="min-h-0 flex-1 overflow-auto p-8">
-        {actionError && (
-          <p className="mb-4 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
-            {actionError}
-          </p>
-        )}
-
-        {incidents.length > 0 && (
-          <Section title="Incidents">
-            <Table head={["Element", "Kind", "State", "Reason", ""]}>
-              {incidents.map((i) => (
-                <tr key={i.key} className="border-b border-edge">
-                  <Td>{i.element_id}</Td>
-                  <Td>{i.kind}</Td>
-                  <Td>{i.state}</Td>
-                  <Td className="align-top" title={i.reason}>
-                    <IncidentReason reason={i.reason} />
-                  </Td>
-                  <Td className="text-right">
-                    {i.state === "Active" && (
-                      <Button
-                        size="sm"
-                        disabled={busy}
-                        onClick={() => onResolve(i.key)}
-                      >
-                        Resolve
-                      </Button>
-                    )}
-                  </Td>
-                </tr>
-              ))}
-            </Table>
-          </Section>
-        )}
-
-        <Section title="Variables">
-          {variables.length === 0 ? (
-            <Empty>No variables.</Empty>
-          ) : (
-            <Table head={["Name", "Value", "Scope", ""]}>
-              {variables.map((v) => (
-                <VariableRow
-                  key={`${v.scope_key}:${v.name}`}
-                  name={v.name}
-                  value={v.value}
-                  scopeKey={v.scope_key}
-                  busy={busy}
-                  onSave={(parsed) =>
-                    onSetVariable(v.scope_key, v.name, parsed)
-                  }
-                />
-              ))}
-            </Table>
-          )}
-        </Section>
-
-        <Section title="Jobs">
-          {jobs.length === 0 ? (
-            <Empty>No jobs.</Empty>
-          ) : (
-            <Table
-              head={[
-                "Element",
-                "Type",
-                "State",
-                "Retries",
-                "Worker",
-                "Job key",
-                "Activated",
-                "Timeout",
-              ]}
-            >
-              {jobs.map((j) => (
-                <tr key={j.key} className="border-b border-edge">
-                  <Td>{j.element_id}</Td>
-                  <Td className="font-mono">{j.job_type}</Td>
-                  <Td>{j.state}</Td>
-                  <Td>{j.retries}</Td>
-                  <Td className="text-fg-faint">{j.worker ?? "—"}</Td>
-                  <Td className="font-mono text-fg-faint">{j.key}</Td>
-                  <Td className="text-fg-faint">
-                    {j.activated_at_ms != null
-                      ? fmtClock(j.activated_at_ms)
-                      : "—"}
-                  </Td>
-                  <Td className="text-fg-faint">
-                    {j.timeout_ms != null ? fmtDuration(j.timeout_ms) : "—"}
-                  </Td>
-                </tr>
-              ))}
-            </Table>
-          )}
-        </Section>
+        {actionBanner}
+        {incidentsSection}
+        <Section title="Variables">{variablesBody}</Section>
+        {jobsSection}
+        <Section title="Process Trace">{traceBody}</Section>
       </div>
     </div>
+  );
+}
+
+/** A horizontally-scrollable wrapper so a wide table (jobs, variables) scrolls
+ * within its own box instead of forcing the whole page to scroll sideways on a
+ * phone. Inert on desktop, where the table already fits. */
+function ScrollX({ children }: { children: ReactNode }) {
+  return <div className="overflow-x-auto">{children}</div>;
+}
+
+/** Renders the shared trace timeline for an instance, an explicit empty state
+ * when no trace was captured (the trace ring is bounded and evicts), or an error
+ * state when the trace fetch failed for a non-404 reason. */
+function TraceContent({
+  trace,
+  isLoading,
+  error,
+}: {
+  trace: InstanceTrace | undefined;
+  isLoading: boolean;
+  error?: Error | null;
+}) {
+  if (isLoading) return <p className="text-sm text-fg-muted">Loading…</p>;
+  if (error)
+    return (
+      <Empty>
+        Failed to load the trace for this instance. Please try again.
+      </Empty>
+    );
+  if (!trace)
+    return (
+      <Empty>
+        No trace captured for this instance. Traces are held in a bounded
+        in-memory ring and are not persisted.
+      </Empty>
+    );
+  return <TraceTimeline trace={trace} />;
+}
+
+/** A full-screen overlay for a mobile drill-in (Model / Variables / Trace).
+ * Portals to the document body, closes on Escape or the ✕, and clears the notch
+ * with the shared safe-area helper. */
+function FullScreenPanel({
+  title,
+  onClose,
+  bodyClassName = "min-h-0 flex-1 overflow-auto p-4",
+  children,
+}: {
+  title: ReactNode;
+  onClose: () => void;
+  bodyClassName?: string;
+  children: ReactNode;
+}) {
+  const titleId = useId();
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={titleId}
+      className="fixed inset-0 z-50 flex flex-col bg-app"
+    >
+      <header className="nano-safe-top nano-safe-x flex shrink-0 items-center gap-2 border-b border-edge px-4 py-3">
+        <h2
+          id={titleId}
+          className="min-w-0 flex-1 truncate text-sm font-semibold text-fg"
+        >
+          {title}
+        </h2>
+        <button
+          type="button"
+          className="nano-touch -mr-2 rounded p-2 text-fg-muted hover:bg-hover hover:text-fg"
+          aria-label="Close"
+          onClick={onClose}
+        >
+          ✕
+        </button>
+      </header>
+      <div className={`nano-safe-bottom nano-safe-x ${bodyClassName}`}>
+        {children}
+      </div>
+    </div>,
+    document.body,
   );
 }
 

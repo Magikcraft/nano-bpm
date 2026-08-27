@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { getInstance, listInstances, type Instance } from "../gen";
@@ -6,13 +6,16 @@ import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import { usePaneResize } from "../lib/usePaneResize";
 import { ResizeHandle } from "../components/ResizeHandle";
 import InstanceDetail from "./InstanceDetail";
-import { Badge, Button } from "../components/ui";
+import { Badge, Button, useIsNarrow } from "../components/ui";
 import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
 import {
   applyFilterChange,
+  explorerStackView,
   filtersQueryKey,
+  INSTANCE_DEEP_LINK_PARAM,
   INSTANCE_STATE_FILTERS,
   parseExplorerFilters,
+  readInstanceParam,
   toInstanceQuery,
   type InstanceStateFilter,
 } from "./explorerFilters";
@@ -43,11 +46,13 @@ function stateTone(
 }
 
 /**
- * One instance row in the left list. `rowRef` is forwarded only for the selected
+ * One instance row in the list. `rowRef` is forwarded only for the selected
  * row so the list can scroll it into view (e.g. after a deep-link preselects an
  * instance that would otherwise be below the fold). `pinnedLabel` renders the
  * small "Linked" tag on the pinned deep-link row that sits above the page when
- * the selected instance isn't on the current page.
+ * the selected instance isn't on the current page. When `card` is set (narrow /
+ * mobile viewports) the row renders as a standalone tappable card with a
+ * comfortable touch target instead of a flush list row.
  */
 function InstanceRow({
   inst,
@@ -55,21 +60,30 @@ function InstanceRow({
   onSelect,
   rowRef,
   pinnedLabel,
+  card = false,
 }: {
   inst: Instance;
   selected: boolean;
   onSelect: (key: string) => void;
   rowRef?: (node: HTMLButtonElement | null) => void;
   pinnedLabel?: boolean;
+  card?: boolean;
 }) {
+  const className = card
+    ? `nano-touch flex w-full flex-col gap-1 rounded-xl border p-4 text-left shadow-sm transition-colors ${
+        selected
+          ? "border-accent/60 bg-accent/10"
+          : "border-edge bg-raised hover:border-edge-strong hover:bg-hover"
+      }`
+    : `flex w-full flex-col gap-1 border-b border-edge px-5 py-3 text-left hover:bg-hover ${
+        selected ? "bg-accent/10" : ""
+      }`;
   return (
     <button
       type="button"
       ref={rowRef}
       onClick={() => onSelect(inst.key)}
-      className={`flex w-full flex-col gap-1 border-b border-edge px-5 py-3 text-left hover:bg-hover ${
-        selected ? "bg-accent/10" : ""
-      }`}
+      className={className}
     >
       <div className="flex items-center justify-between">
         <span className="flex items-center gap-2 font-medium text-fg">
@@ -91,10 +105,41 @@ function InstanceRow({
   );
 }
 
+/**
+ * A pill filter chip for the mobile, horizontally-scrollable filter row. Toggle
+ * semantics are exposed via `aria-pressed`; the chip carries a 44px touch
+ * target (`.nano-touch`) so it is comfortably tappable on a phone.
+ */
+function FilterChip({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      className={`nano-touch inline-flex shrink-0 items-center justify-center whitespace-nowrap rounded-full border px-4 text-sm transition-colors ${
+        active
+          ? "border-accent bg-accent text-on-accent"
+          : "border-edge bg-panel text-fg-muted hover:bg-hover"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
 export default function Explorer() {
   const [selected, setSelected] = useState<string | null>(null);
   const [page, setPage] = useState(0);
   const [searchParams, setSearchParams] = useSearchParams();
+  const isNarrow = useIsNarrow();
 
   // Resizable, reload-persistent process list (the left column). The user can
   // drag it narrower to give the model/detail pane more room; the width is
@@ -112,14 +157,24 @@ export default function Explorer() {
   });
 
   // Allow deep-linking to a specific instance (e.g. from the modeler's "Start
-  // instance" success link): ?instance=<key> preselects it, then the param is
-  // cleared so it doesn't pin the selection on later navigation.
+  // instance" success link, or Urban's `?instance=` landing): ?instance=<key>
+  // selects it, then the param is cleared so it doesn't pin the selection on
+  // later navigation. On a narrow (mobile) viewport a set selection resolves to
+  // the *detail* view (see `explorerStackView`), so the deep link genuinely
+  // navigates to the detail rather than preselecting a row in an off-screen
+  // pane — the contract unit A6's standalone landing depends on.
   useEffect(() => {
-    const key = searchParams.get("instance");
+    const key = readInstanceParam(searchParams);
     if (key) {
       setSelected(key);
-      searchParams.delete("instance");
-      setSearchParams(searchParams, { replace: true });
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete(INSTANCE_DEEP_LINK_PARAM);
+          return next;
+        },
+        { replace: true },
+      );
     }
   }, [searchParams, setSearchParams]);
 
@@ -228,6 +283,201 @@ export default function Explorer() {
     if (page > 0 && page >= pageCount) setPage(pageCount - 1);
   }, [page, pageCount]);
 
+  const countText = data
+    ? total === 0
+      ? "0 instances"
+      : `${rangeStart}–${rangeEnd} of ${total} instance(s)`
+    : "Live view";
+
+  // Desktop filter controls: the segmented state group + the incident checkbox.
+  const filterBar = (
+    <div className="mt-3 flex flex-wrap items-center gap-2">
+      <div
+        role="group"
+        aria-label="Filter by state"
+        className="inline-flex overflow-hidden rounded-md border border-edge"
+      >
+        <button
+          type="button"
+          aria-pressed={filters.state === undefined}
+          onClick={() => setStateFilter(undefined)}
+          className={`px-2.5 py-1 text-xs ${
+            filters.state === undefined
+              ? "bg-accent text-on-accent"
+              : "bg-panel text-fg-muted hover:bg-hover"
+          }`}
+        >
+          All
+        </button>
+        {INSTANCE_STATE_FILTERS.map((s) => (
+          <button
+            key={s}
+            type="button"
+            aria-pressed={filters.state === s}
+            onClick={() => setStateFilter(s)}
+            className={`border-l border-edge px-2.5 py-1 text-xs ${
+              filters.state === s
+                ? "bg-accent text-on-accent"
+                : "bg-panel text-fg-muted hover:bg-hover"
+            }`}
+          >
+            {s}
+          </button>
+        ))}
+      </div>
+      <label className="inline-flex items-center gap-1.5 text-xs text-fg-muted">
+        <input
+          type="checkbox"
+          checked={filters.hasIncident}
+          onChange={(e) => setHasIncident(e.target.checked)}
+        />
+        Has incident
+      </label>
+    </div>
+  );
+
+  // Mobile filter controls: a horizontally-scrollable chip row. The row bleeds
+  // to the header's padding edges (`-mx-4 px-4`) and scrolls on its own
+  // (`overflow-x-auto`), so the filters stay reachable without ever forcing the
+  // page itself to scroll horizontally at 375px.
+  const filterChips = (
+    <div
+      role="group"
+      aria-label="Filter instances"
+      className="-mx-4 mt-3 flex gap-2 overflow-x-auto px-4 pb-1"
+    >
+      <FilterChip
+        active={filters.state === undefined}
+        onClick={() => setStateFilter(undefined)}
+      >
+        All
+      </FilterChip>
+      {INSTANCE_STATE_FILTERS.map((s) => (
+        <FilterChip
+          key={s}
+          active={filters.state === s}
+          onClick={() => setStateFilter(s)}
+        >
+          {s}
+        </FilterChip>
+      ))}
+      <FilterChip
+        active={filters.hasIncident}
+        onClick={() => setHasIncident(!filters.hasIncident)}
+      >
+        Incident
+      </FilterChip>
+    </div>
+  );
+
+  // The instance list body — shared by the desktop left pane and the mobile
+  // stacked list. On mobile each row renders as a spaced, tappable card.
+  const listBody = (
+    <div className="min-h-0 flex-1 overflow-auto">
+      {isLoading && <p className="p-5 text-fg-muted">Loading…</p>}
+      {error && (
+        <p className="p-5 text-danger">Failed to load: {String(error)}</p>
+      )}
+      {data && data.items.length === 0 && (
+        <p className="p-5 text-fg-faint">
+          {filters.state !== undefined || filters.hasIncident
+            ? "No instances match the current filters."
+            : "No instances yet. Deploy a process and create one."}
+        </p>
+      )}
+      <ul className={isNarrow ? "flex flex-col gap-2 p-3" : ""}>
+        {pinned && (
+          <li key={`pinned-${pinned.key}`}>
+            <InstanceRow
+              inst={pinned}
+              selected
+              onSelect={setSelected}
+              rowRef={(node) => (selectedRowRef.current = node)}
+              pinnedLabel
+              card={isNarrow}
+            />
+          </li>
+        )}
+        {items.map((inst: Instance) => (
+          <li key={inst.key}>
+            <InstanceRow
+              inst={inst}
+              selected={selected === inst.key}
+              onSelect={setSelected}
+              rowRef={
+                selected === inst.key
+                  ? (node) => (selectedRowRef.current = node)
+                  : undefined
+              }
+              card={isNarrow}
+            />
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+
+  const pager =
+    total > PAGE_SIZE ? (
+      <footer className="flex shrink-0 items-center justify-between border-t border-edge px-5 py-3 text-xs">
+        <Button
+          size="sm"
+          onClick={() => setPage((p) => Math.max(0, p - 1))}
+          disabled={page === 0}
+        >
+          ← Prev
+        </Button>
+        <span className="text-fg-faint">
+          Page {page + 1} of {pageCount}
+        </span>
+        <Button
+          size="sm"
+          onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
+          disabled={page >= pageCount - 1}
+        >
+          Next →
+        </Button>
+      </footer>
+    ) : null;
+
+  // Mobile: a stacked list → detail navigation flow instead of the resizable
+  // master/detail split. Selecting a card sets `selected`, which resolves to the
+  // detail view (`explorerStackView`); "Instances" navigates back to the list.
+  // A `?instance=<key>` deep link sets `selected` on mount, so it lands directly
+  // on the detail here rather than in an off-screen pane.
+  if (isNarrow) {
+    if (explorerStackView(selected) === "detail" && selected) {
+      return (
+        <div className="flex h-full min-w-0 flex-col">
+          <header className="flex shrink-0 items-center gap-2 border-b border-edge px-4 py-3">
+            <Button size="sm" onClick={() => setSelected(null)}>
+              ← Instances
+            </Button>
+          </header>
+          <div className="min-h-0 flex-1 overflow-auto">
+            <InstanceDetail instanceKey={selected} />
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div className="flex h-full min-w-0 flex-col">
+        <header
+          data-tour={TOUR_ANCHOR.explorerInspect}
+          className="shrink-0 border-b border-edge px-4 py-4"
+        >
+          <h1 className="text-xl font-semibold text-fg">Process instances</h1>
+          <p className="text-xs text-fg-faint">{countText}</p>
+          {filterChips}
+          <BaseUrlAffordance />
+        </header>
+        {listBody}
+        {pager}
+      </div>
+    );
+  }
+
+  // Desktop: the resizable master/detail split (the left list + the detail pane).
   return (
     <div className="flex h-full">
       <div
@@ -239,119 +489,12 @@ export default function Explorer() {
           className="border-b border-edge px-5 py-4"
         >
           <h1 className="text-xl font-semibold text-fg">Process instances</h1>
-          <p className="text-xs text-fg-faint">
-            {data
-              ? total === 0
-                ? "0 instances"
-                : `${rangeStart}–${rangeEnd} of ${total} instance(s)`
-              : "Live view"}
-          </p>
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <div
-              role="group"
-              aria-label="Filter by state"
-              className="inline-flex overflow-hidden rounded-md border border-edge"
-            >
-              <button
-                type="button"
-                aria-pressed={filters.state === undefined}
-                onClick={() => setStateFilter(undefined)}
-                className={`px-2.5 py-1 text-xs ${
-                  filters.state === undefined
-                    ? "bg-accent text-on-accent"
-                    : "bg-panel text-fg-muted hover:bg-hover"
-                }`}
-              >
-                All
-              </button>
-              {INSTANCE_STATE_FILTERS.map((s) => (
-                <button
-                  key={s}
-                  type="button"
-                  aria-pressed={filters.state === s}
-                  onClick={() => setStateFilter(s)}
-                  className={`border-l border-edge px-2.5 py-1 text-xs ${
-                    filters.state === s
-                      ? "bg-accent text-on-accent"
-                      : "bg-panel text-fg-muted hover:bg-hover"
-                  }`}
-                >
-                  {s}
-                </button>
-              ))}
-            </div>
-            <label className="inline-flex items-center gap-1.5 text-xs text-fg-muted">
-              <input
-                type="checkbox"
-                checked={filters.hasIncident}
-                onChange={(e) => setHasIncident(e.target.checked)}
-              />
-              Has incident
-            </label>
-          </div>
+          <p className="text-xs text-fg-faint">{countText}</p>
+          {filterBar}
           <BaseUrlAffordance />
         </header>
-        <div className="min-h-0 flex-1 overflow-auto">
-          {isLoading && <p className="p-5 text-fg-muted">Loading…</p>}
-          {error && (
-            <p className="p-5 text-danger">Failed to load: {String(error)}</p>
-          )}
-          {data && data.items.length === 0 && (
-            <p className="p-5 text-fg-faint">
-              {filters.state !== undefined || filters.hasIncident
-                ? "No instances match the current filters."
-                : "No instances yet. Deploy a process and create one."}
-            </p>
-          )}
-          <ul>
-            {pinned && (
-              <li key={`pinned-${pinned.key}`}>
-                <InstanceRow
-                  inst={pinned}
-                  selected
-                  onSelect={setSelected}
-                  rowRef={(node) => (selectedRowRef.current = node)}
-                  pinnedLabel
-                />
-              </li>
-            )}
-            {items.map((inst: Instance) => (
-              <li key={inst.key}>
-                <InstanceRow
-                  inst={inst}
-                  selected={selected === inst.key}
-                  onSelect={setSelected}
-                  rowRef={
-                    selected === inst.key
-                      ? (node) => (selectedRowRef.current = node)
-                      : undefined
-                  }
-                />
-              </li>
-            ))}
-          </ul>
-        </div>
-        {total > PAGE_SIZE && (
-          <footer className="flex items-center justify-between border-t border-edge px-5 py-3 text-xs">
-            <Button
-              size="sm"
-              onClick={() => setPage((p) => Math.max(0, p - 1))}
-              disabled={page === 0}
-            >
-              ← Prev
-            </Button>
-            <span className="text-fg-faint">
-              Page {page + 1} of {pageCount}
-            </span>
-            <Button
-              size="sm"
-              onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
-              disabled={page >= pageCount - 1}
-            >
-              Next →
-            </Button>
-          </footer>
-        )}
+        {listBody}
+        {pager}
       </div>
 
       <ResizeHandle

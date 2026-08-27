@@ -456,6 +456,142 @@ export type PageNodeType = (typeof PAGE_NODE_TYPES)[number];
 /** Narrowing guard: is `value` a known page node type? */
 export declare function isPageNodeType(value: unknown): value is PageNodeType;
 /**
+ * The single canonical mobile breakpoint: pages render their mobile presentation
+ * at or below this viewport width. This is the ONE breakpoint constant in the
+ * system — consumers (the console's `useIsNarrow`, the Urban runtime's
+ * `isNarrow()`) MUST import it rather than restating a literal `640px`/`640`, so
+ * the breakpoint can never fork.
+ */
+export declare const MOBILE_MAX_WIDTH: "640px";
+/** The type of {@link MOBILE_MAX_WIDTH} — the canonical breakpoint literal. */
+export type MobileMaxWidth = typeof MOBILE_MAX_WIDTH;
+/**
+ * How a grid column is presented on mobile (`column.mobile.priority`):
+ *   - `"primary"` — shown as the card's primary line;
+ *   - `"chip"` — shown as a secondary chip/badge on the card;
+ *   - `"hidden"` — dropped from the mobile card entirely.
+ */
+export declare const COLUMN_MOBILE_PRIORITIES: readonly [
+	"primary",
+	"chip",
+	"hidden"
+];
+/** A column's mobile priority — one of {@link COLUMN_MOBILE_PRIORITIES}. */
+export type ColumnMobilePriority = (typeof COLUMN_MOBILE_PRIORITIES)[number];
+/**
+ * The mobile presentation hints on a grid column (`column.mobile`) — the shape
+ * the Urban runtime already reads (`column.mobile.priority`,
+ * `column.mobile.label`).
+ */
+export interface ColumnMobile {
+	/** How this column is surfaced on the mobile card. */
+	priority: ColumnMobilePriority;
+	/** An optional short label to use in place of the column header on mobile. */
+	label?: string;
+}
+/** Narrowing guard: is `value` a known column mobile priority? */
+export declare function isColumnMobilePriority(value: unknown): value is ColumnMobilePriority;
+/**
+ * A `nav` node's layout variant (`nav.props.variant`):
+ *   - `"bar"` — a horizontal top bar;
+ *   - `"rail"` — a vertical side rail;
+ *   - `"cards"` — a launcher grid of cards (the mobile-first home).
+ */
+export declare const NAV_VARIANTS: readonly [
+	"bar",
+	"rail",
+	"cards"
+];
+/** A nav variant — one of {@link NAV_VARIANTS}. */
+export type NavVariant = (typeof NAV_VARIANTS)[number];
+/** Narrowing guard: is `value` a known nav variant? */
+export declare function isNavVariant(value: unknown): value is NavVariant;
+/**
+ * How a `nav` node collapses items that do not fit (`nav.props.overflow`):
+ *   - `"menu"` — overflowing items move into a hamburger/overflow menu.
+ * Omitting `overflow` keeps the default (no collapse; items wrap/scroll).
+ */
+export declare const NAV_OVERFLOW_MODES: readonly [
+	"menu"
+];
+/** A nav overflow mode — one of {@link NAV_OVERFLOW_MODES}. */
+export type NavOverflow = (typeof NAV_OVERFLOW_MODES)[number];
+/** Narrowing guard: is `value` a known nav overflow mode? */
+export declare function isNavOverflow(value: unknown): value is NavOverflow;
+/**
+ * Which group a nav item belongs to (`nav.items[].group`):
+ *   - `"primary"` — rendered as a first-class card / top-level item;
+ *   - `"secondary"` — demoted (e.g. into the overflow menu).
+ */
+export declare const NAV_ITEM_GROUPS: readonly [
+	"primary",
+	"secondary"
+];
+/** A nav item group — one of {@link NAV_ITEM_GROUPS}. */
+export type NavItemGroup = (typeof NAV_ITEM_GROUPS)[number];
+/**
+ * The default nav item group. An item that annotates no `group` is `"primary"`,
+ * so an app that annotates nothing gets every item rendered as a card.
+ */
+export declare const NAV_ITEM_GROUP_DEFAULT: NavItemGroup;
+/** Narrowing guard: is `value` a known nav item group? */
+export declare function isNavItemGroup(value: unknown): value is NavItemGroup;
+/**
+ * How a `dataGrid` presents itself on mobile
+ * (`dataGrid.props.mobile.presentation`):
+ *   - `"cards"` — one card per row (the mobile-first default);
+ *   - `"table"` — stay tabular (escape hatch for a grid that must be a table).
+ */
+export declare const DATA_GRID_MOBILE_PRESENTATIONS: readonly [
+	"cards",
+	"table"
+];
+/** A grid's mobile presentation — one of {@link DATA_GRID_MOBILE_PRESENTATIONS}. */
+export type DataGridMobilePresentation = (typeof DATA_GRID_MOBILE_PRESENTATIONS)[number];
+/**
+ * The default grid mobile presentation. A grid that annotates no
+ * `mobile.presentation` renders as `"cards"` on mobile.
+ */
+export declare const DATA_GRID_MOBILE_PRESENTATION_DEFAULT: DataGridMobilePresentation;
+/** The mobile presentation hints on a grid (`dataGrid.props.mobile`). */
+export interface DataGridMobile {
+	/**
+	 * How the grid renders below {@link MOBILE_MAX_WIDTH}. Omitting it defaults to
+	 * {@link DATA_GRID_MOBILE_PRESENTATION_DEFAULT} (`"cards"`).
+	 */
+	presentation?: DataGridMobilePresentation;
+}
+/** Narrowing guard: is `value` a known grid mobile presentation? */
+export declare function isDataGridMobilePresentation(value: unknown): value is DataGridMobilePresentation;
+/**
+ * The page-level mobile layout variant (`layout.mobile`) — the Tier-2 switch the
+ * runtime's `isNarrow()` anticipates (Tier-1 is the pure CSS reflow at
+ * {@link MOBILE_MAX_WIDTH}; Tier-2 is this explicit, authored variant):
+ *   - `"stack"` — the natural vertical stack of the page's nodes;
+ *   - `"cards"` — a launcher/card mobile layout.
+ */
+export declare const LAYOUT_MOBILE_VARIANTS: readonly [
+	"stack",
+	"cards"
+];
+/** A page-level mobile layout variant — one of {@link LAYOUT_MOBILE_VARIANTS}. */
+export type LayoutMobileVariant = (typeof LAYOUT_MOBILE_VARIANTS)[number];
+/**
+ * The default page mobile layout variant. A page that declares `layout` but no
+ * `layout.mobile` reflows as `"stack"`.
+ */
+export declare const LAYOUT_MOBILE_VARIANT_DEFAULT: LayoutMobileVariant;
+/** Narrowing guard: is `value` a known page mobile layout variant? */
+export declare function isLayoutMobileVariant(value: unknown): value is LayoutMobileVariant;
+/**
+ * The page-level layout hints (`page.layout`). Its `mobile` field is the Tier-2
+ * variant hook; omitting it leaves the runtime on the Tier-1 CSS reflow.
+ */
+export interface PageLayout {
+	/** The Tier-2 mobile layout variant (see {@link LAYOUT_MOBILE_VARIANTS}). */
+	mobile?: LayoutMobileVariant;
+}
+/**
  * GENERATED — do not edit by hand.
  *
  * TypeScript types for the Urban App manifest (nano.app.json), generated from
