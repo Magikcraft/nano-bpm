@@ -700,6 +700,7 @@ components:
         historyItemId:
           description: The historyItemId of the corresponding request item, echoed back for correlation.
           type: string
+          minLength: 1
         historyItemKey:
           description: |
             The system-generated key for the history item. When isDuplicate is true, this is
