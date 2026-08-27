@@ -19369,13 +19369,21 @@ fn agent_history_item_result(
         serde_json::from_str(&row.tool_calls_json).unwrap_or_default();
     let tools: Vec<agent_model::AgentTool> =
         serde_json::from_str(&row.tools_json).unwrap_or_default();
-    let metrics = agent_model::AgentHistoryMetrics {
-        input_tokens: row.input_tokens,
-        output_tokens: row.output_tokens,
-        reasoning_token_count: row.reasoning_token_count,
-        cache_creation_token_count: row.cache_creation_token_count,
-        cache_read_token_count: row.cache_read_token_count,
-        duration_ms: row.duration_ms,
+    // Per the contract, per-call `metrics` are present on ASSISTANT items only;
+    // for USER/TOOL_RESULT/CONFIGURATION turns the field is required-but-nullable
+    // and must be null rather than leaking meaningless zero metrics.
+    let metrics = match row.role {
+        agent_model::AgentHistoryRole::Assistant => types::Nullable::Present(
+            agent_history_metrics_result(&agent_model::AgentHistoryMetrics {
+                input_tokens: row.input_tokens,
+                output_tokens: row.output_tokens,
+                reasoning_token_count: row.reasoning_token_count,
+                cache_creation_token_count: row.cache_creation_token_count,
+                cache_read_token_count: row.cache_read_token_count,
+                duration_ms: row.duration_ms,
+            }),
+        ),
+        _ => types::Nullable::Null,
     };
     models::AgentInstanceHistoryItemResult::new(
         models::AgentHistoryKey(row.agent_history_key.to_string()),
@@ -19392,7 +19400,7 @@ fn agent_history_item_result(
         agent_history_role_enum(row.role),
         content.iter().map(agent_message_content).collect(),
         tool_calls.iter().map(agent_tool_call_result).collect(),
-        types::Nullable::Present(agent_history_metrics_result(&metrics)),
+        metrics,
         agent_commit_status_enum(row.commit_status),
         ms_to_datetime(row.produced_at_ms),
         tools.iter().map(agent_tool_result).collect(),
@@ -34838,6 +34846,17 @@ mod call_activity_hierarchy_read_model_tests {
         );
         assert_eq!(items[0].history_item_id, "h1");
         assert_eq!(items[0].role, models::AgentInstanceHistoryRoleEnum::User);
+        assert!(
+            matches!(items[0].metrics, types::Nullable::Null),
+            "non-ASSISTANT (USER) history items carry null metrics, not zeroed metrics"
+        );
+        assert!(
+            matches!(
+                items[1].role,
+                models::AgentInstanceHistoryRoleEnum::Assistant
+            ) && matches!(items[1].metrics, types::Nullable::Present(_)),
+            "ASSISTANT history items carry present per-call metrics"
+        );
         assert_eq!(
             items[0].commit_status,
             models::AgentInstanceHistoryCommitStatusEnum::Committed,
