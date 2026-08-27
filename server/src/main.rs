@@ -11588,6 +11588,10 @@ impl ServerImpl {
                         .role
                         .as_ref()
                         .is_none_or(|rf| match_agent_history_role(rf, row.role))
+                        && query::match_date_time_ms(
+                            &f.produced_at,
+                            Some(row.produced_at_ms as i64),
+                        )
                 }
             })
             .collect();
@@ -35020,6 +35024,68 @@ mod call_activity_hierarchy_read_model_tests {
         assert!(
             empty_in_result.items.is_empty(),
             "commitStatus $in: [] must match nothing, not fall back to the COMMITTED default"
+        );
+
+        // producedAt filter is honoured, not silently ignored (defect class:
+        // a filter declared in the contract must narrow results). A $gt far in
+        // the future matches nothing; a $lte far in the future matches every
+        // committed turn. If producedAt were a no-op, the $gt query would still
+        // return the two committed rows and fail this assertion.
+        let far_future = chrono::DateTime::from_timestamp_millis(32_503_680_000_000).unwrap();
+        let produced_after_future = models::AgentInstanceHistoryFilter {
+            produced_at: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                models::AdvancedDateTimeFilter {
+                    dollar_gt: Some(far_future),
+                    ..models::AdvancedDateTimeFilter::new()
+                },
+            )),
+            ..models::AgentInstanceHistoryFilter::new()
+        };
+        let HResp::Status200_TheAgentInstanceHistorySearchResult(produced_future_result) = srv
+            .search_agent_instance_history_impl(
+                &hp,
+                &Some(models::AgentInstanceHistorySearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(produced_after_future),
+                }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected a 200 history search result");
+        };
+        assert!(
+            produced_future_result.items.is_empty(),
+            "producedAt $gt (far future) matches nothing — the filter must not be ignored"
+        );
+        let produced_before_future = models::AgentInstanceHistoryFilter {
+            produced_at: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                models::AdvancedDateTimeFilter {
+                    dollar_lte: Some(far_future),
+                    ..models::AdvancedDateTimeFilter::new()
+                },
+            )),
+            ..models::AgentInstanceHistoryFilter::new()
+        };
+        let HResp::Status200_TheAgentInstanceHistorySearchResult(produced_all_result) = srv
+            .search_agent_instance_history_impl(
+                &hp,
+                &Some(models::AgentInstanceHistorySearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(produced_before_future),
+                }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected a 200 history search result");
+        };
+        assert_eq!(
+            produced_all_result.items.len(),
+            2,
+            "producedAt $lte (far future) matches every committed turn"
         );
 
         // Search now honours the previously-ignored filters: processDefinitionId,
