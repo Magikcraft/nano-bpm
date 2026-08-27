@@ -182,6 +182,10 @@ $(RESPONSE_CONTRACT): scripts/gen-response-contract.py scripts/gen-stub-server.p
 	elif [ scripts/gen-response-contract.py -nt "$(RESPONSE_CONTRACT)" ]; then need=1; \
 	elif [ scripts/gen-stub-server.py -nt "$(RESPONSE_CONTRACT)" ]; then need=1; \
 	elif [ "$(GENERATED_DIR)/Cargo.toml" -nt "$(RESPONSE_CONTRACT)" ]; then need=1; \
+	else \
+		for spec in $(REST_SPEC_SRCS); do \
+			if [ "$$spec" -nt "$(RESPONSE_CONTRACT)" ]; then need=1; break; fi; \
+		done; \
 	fi; \
 	if [ $$need -eq 1 ]; then \
 		if [ -d "$(PROJECT_ROOT)/build/spec" ]; then \

@@ -486,10 +486,12 @@ fn is_null_type_schema(schema: &Value) -> bool {
 
 fn compact(value: &Value) -> String {
     let s = value.to_string();
-    if s.len() > 80 {
-        format!("{}…", &s[..80])
-    } else {
-        s
+    // Truncate on a char boundary: `&s[..80]` would panic if byte 80 landed in
+    // the middle of a multi-byte UTF-8 codepoint (turning a contract violation
+    // into a 500 + panic instead of a structured error).
+    match s.char_indices().nth(80) {
+        Some((idx, _)) => format!("{}…", &s[..idx]),
+        None => s,
     }
 }
 
@@ -603,7 +605,20 @@ async fn guard_with_mode(req: Request, next: Next, current_mode: Mode) -> Respon
     let (parts, body) = resp.into_parts();
     let bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
-        Err(_) => return Response::from_parts(parts, Body::empty()),
+        Err(err) => {
+            // The body stream is now partially consumed and unrecoverable, so we
+            // cannot pass the original response through. Returning `parts` with an
+            // empty body would ship a corrupt response (e.g. a stale
+            // Content-Length that no longer matches the empty body) and bury the
+            // I/O error. Fail loudly with a structured 500 instead.
+            tracing::error!(
+                target: "response_contract",
+                operation = %op.operation_id,
+                status,
+                "failed to buffer response body for contract validation: {err}"
+            );
+            return buffer_failure_response(&op.operation_id, status);
+        }
     };
 
     let violations = match serde_json::from_slice::<Value>(&bytes) {
@@ -666,6 +681,30 @@ fn violation_response(operation_id: &str, status: u16, violations: &[Violation])
         })
 }
 
+/// Structured 500 for when the response body could not be buffered for
+/// validation. The body stream is unrecoverable at that point, so we cannot pass
+/// the original response through without risking a corrupt (mismatched
+/// Content-Length) reply; fail loudly instead.
+fn buffer_failure_response(operation_id: &str, status: u16) -> Response {
+    let body = serde_json::json!({
+        "error": "response_contract_buffer_failed",
+        "message": "The gateway could not buffer its own response body to validate it \
+                    against its OpenAPI contract; failing loudly rather than shipping a \
+                    possibly-corrupt response (see Magikcraft/nano-bpm#1011).",
+        "operationId": operation_id,
+        "status": status,
+    });
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|_| {
+            let mut fallback = Response::new(Body::from("response_contract_buffer_failed"));
+            *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            fallback
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -698,6 +737,22 @@ mod tests {
         assert_eq!(normalize_path("/v2/foo/{barKey}"), "/v2/foo/{}");
         assert_eq!(normalize_path("/v2/a/{x}/b/{y}"), "/v2/a/{}/b/{}");
         assert_eq!(normalize_path("/v2/plain"), "/v2/plain");
+    }
+
+    #[test]
+    fn compact_truncates_non_ascii_without_panicking() {
+        // Byte 80 lands mid-codepoint for a multi-byte string; `&s[..80]` would
+        // panic. compact() must truncate on a char boundary instead, so a
+        // contract violation on a non-ASCII value surfaces as a structured error
+        // rather than a 500 + panic.
+        let long_unicode = "é".repeat(200);
+        let out = compact(&Value::String(long_unicode));
+        assert!(out.ends_with('…'));
+        assert!(out.is_char_boundary(out.len()));
+
+        // Short values pass through untouched (no ellipsis).
+        let short = compact(&Value::String("héllo".to_string()));
+        assert_eq!(short, "\"héllo\"");
     }
 
     #[test]
