@@ -5002,6 +5002,17 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             project_agent_instance(tx, agent_instance)?;
         }
 
+        Event::AgentInstanceUpdated {
+            instance_key: _,
+            agent_instance,
+        }
+        | Event::AgentInstanceCompleted {
+            instance_key: _,
+            agent_instance,
+        } => {
+            project_agent_instance(tx, agent_instance)?;
+        }
+
         Event::AgentHistoryCreated {
             instance_key: _,
             record,
@@ -8856,6 +8867,47 @@ mod agent_projection_tests {
         assert!(
             still.is_empty(),
             "a committed turn must not become discarded"
+        );
+    }
+
+    #[test]
+    fn update_and_completed_events_reproject_the_mutable_state() {
+        // The read model must reflect a PATCH's status advance and a COMPLETE's
+        // terminal status + completion date (both events reuse the CREATE upsert),
+        // else GET-after-PATCH on the REST channel (S5) reports stale INITIALIZING.
+        let created = Event::AgentInstanceCreated {
+            instance_key: 42,
+            agent_instance: instance(1, "agent-a", AgentInstanceStatus::Initializing, 100),
+        };
+        let store = store_with(&[created]);
+        assert_eq!(
+            store.agent_instance(1).unwrap().status,
+            AgentInstanceStatus::Initializing
+        );
+
+        // UPDATED advances the projected status.
+        let updated = Event::AgentInstanceUpdated {
+            instance_key: 42,
+            agent_instance: instance(1, "agent-a", AgentInstanceStatus::Thinking, 100),
+        };
+        store.export(&[&updated]).unwrap();
+        assert_eq!(
+            store.agent_instance(1).unwrap().status,
+            AgentInstanceStatus::Thinking,
+            "an AgentInstanceUpdated event reprojects the advanced status"
+        );
+
+        // COMPLETED drives to the terminal status and records the completion date.
+        let completed = Event::AgentInstanceCompleted {
+            instance_key: 42,
+            agent_instance: instance(1, "agent-a", AgentInstanceStatus::Completed, 100),
+        };
+        store.export(&[&completed]).unwrap();
+        let row = store.agent_instance(1).unwrap();
+        assert_eq!(row.status, AgentInstanceStatus::Completed);
+        assert!(
+            row.completion_date_ms.is_some(),
+            "a completed instance carries its completion date"
         );
     }
 }

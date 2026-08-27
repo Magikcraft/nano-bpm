@@ -1816,6 +1816,18 @@ impl Journal {
         Ok((events, commit))
     }
 
+    /// The authoritative ownership tuple `(element_id, process_instance_key)` of
+    /// the agent instance identified by `agent_instance_key`, resolved on the
+    /// engine thread against primary state. The REST `PATCH` handler uses it to
+    /// fill the ownership assertion [`Command::UpdateAgentInstance`] requires but
+    /// the 8.10 request body omits, without racing the read-model projection.
+    pub fn agent_instance_ownership(
+        &self,
+        agent_instance_key: Key,
+    ) -> Option<(nanobpmn_engine_core::ElementId, Key)> {
+        self.engine.agent_instance_ownership(agent_instance_key)
+    }
+
     /// Applies a durable command using the engine's current clock, journaling its
     /// events on success. Mirrors [`Engine::apply_command`].
     pub fn apply_command(
