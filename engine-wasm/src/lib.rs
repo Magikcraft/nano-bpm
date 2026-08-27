@@ -1266,7 +1266,7 @@ fn rest_filter_target(
     match obj.get("filter") {
         None | Some(serde_json::Value::Null) => Ok(obj),
         Some(serde_json::Value::Object(nested)) => Ok(nested),
-        Some(_) => Err("filter `filter` must be a JSON object".to_string()),
+        Some(_) => Err("the `filter` field must be a JSON object".to_string()),
     }
 }
 
@@ -4474,7 +4474,7 @@ mod read_channel_tests {
         ] {
             let err = parse_state_filter_inner(bad, "state").unwrap_err();
             assert!(
-                err.contains("`filter` must be a JSON object"),
+                err.contains("`filter` field must be a JSON object"),
                 "body {bad:?} should be rejected as non-object filter, got {err:?}"
             );
         }
