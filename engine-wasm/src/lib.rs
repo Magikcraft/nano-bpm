@@ -936,14 +936,16 @@ impl TestEngine {
     }
 
     /// Advance an AgentInstance: set its `status` (a REST spelling other than
-    /// `COMPLETED`, which is reachable only through `completeAgentInstance`),
-    /// accumulate `metrics`, optionally replace `tools`, and append a `history`
-    /// batch. `request_json` is `{ agentInstanceKey, elementInstanceKey,
-    /// elementId, processInstanceKey, status?, metrics?, tools?, history? }`. A
-    /// turn is `{ loopIteration?, producedAt?, role?, content?, systemPrompt?,
-    /// historyItemId?, model?, provider? }`; `content` items are
-    /// `{ contentType?, text?, documentReference?, object? }`. Returns the
-    /// snapshot.
+    /// `COMPLETED`, which is reachable only through `completeAgentInstance` and is
+    /// rejected here with a targeted error), accumulate `metrics`, optionally
+    /// replace `tools`, and append a `history` batch. `request_json` is
+    /// `{ agentInstanceKey, elementInstanceKey, elementId, processInstanceKey,
+    /// status?, metrics?, tools?, history? }`. A turn is `{ loopIteration?,
+    /// producedAt?, role?, content?, systemPrompt?, historyItemId?, model?,
+    /// provider? }`, where `producedAt` is an RFC-3339 `date-time` string (the
+    /// REST spelling; a bare epoch-millis number is also accepted); `content`
+    /// items are `{ contentType?, text?, documentReference?, object? }`, where
+    /// `object` is arbitrary JSON (the REST wire shape). Returns the snapshot.
     #[wasm_bindgen(js_name = updateAgentInstance)]
     pub fn update_agent_instance(&mut self, request_json: &str) -> Result<String, JsValue> {
         self.guard_paused()?;
@@ -952,6 +954,7 @@ impl TestEngine {
         let agent_instance_key = parse_key(&req.agent_instance_key)?;
         let element_instance_key = parse_key(&req.element_instance_key)?;
         let process_instance_key = parse_key(&req.process_instance_key)?;
+        reject_non_updatable_status(req.status.as_deref()).map_err(|m| js_err(&m))?;
         let status = match req.status.as_deref() {
             Some(s) => Some(parse_agent_status(s)?),
             None => None,
@@ -1614,19 +1617,28 @@ fn agent_instance_result(row: &AgentInstanceRow) -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "read-model")]
+use nanobpmn_engine_core::AgentHistoryToolCall;
+
 /// Serialise an [`AgentHistoryRow`] as the gateway's `AgentInstanceHistoryItemResult`
 /// JSON shape. Per-call `metrics` are present on ASSISTANT turns only (null
 /// otherwise, mirroring the REST contract); `content`, `toolCalls` and `tools`
-/// are decoded from the row's projected JSON columns.
+/// are decoded from the row's projected JSON columns and re-serialised into the
+/// REST wire shape (camelCase keys, REST enum spellings, and the opaque
+/// `object`/`arguments` JSON strings re-parsed to structured JSON) exactly as the
+/// gateway does — never dumped in the engine's internal snake_case layout.
 #[cfg(feature = "read-model")]
 fn agent_history_result(row: &AgentHistoryRow) -> serde_json::Value {
     use nanobpmn_engine_core::AgentHistoryRole;
-    let content: serde_json::Value =
-        serde_json::from_str(&row.content_json).unwrap_or(serde_json::Value::Array(Vec::new()));
-    let tool_calls: serde_json::Value =
-        serde_json::from_str(&row.tool_calls_json).unwrap_or(serde_json::Value::Array(Vec::new()));
-    let tools: serde_json::Value =
-        serde_json::from_str(&row.tools_json).unwrap_or(serde_json::Value::Array(Vec::new()));
+    let content = serde_json::from_str::<Vec<AgentHistoryContent>>(&row.content_json)
+        .map(|items| serde_json::Value::Array(items.iter().map(agent_content_result).collect()))
+        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+    let tool_calls = serde_json::from_str::<Vec<AgentHistoryToolCall>>(&row.tool_calls_json)
+        .map(|items| serde_json::Value::Array(items.iter().map(agent_tool_call_result).collect()))
+        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+    let tools = serde_json::from_str::<Vec<AgentTool>>(&row.tools_json)
+        .map(|items| serde_json::Value::Array(items.iter().map(agent_tool_result).collect()))
+        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
     let metrics = match row.role {
         AgentHistoryRole::Assistant => serde_json::json!({
             "inputTokens": row.input_tokens,
@@ -1663,6 +1675,56 @@ fn agent_history_result(row: &AgentHistoryRow) -> serde_json::Value {
     })
 }
 
+/// Map an engine [`AgentHistoryContent`] block to the gateway's
+/// `AgentInstanceMessageContent` JSON shape (camelCase keys, REST `contentType`
+/// enum spelling). The engine stores `object` as an opaque JSON string; it is
+/// re-parsed into structured JSON so the wire carries JSON, not a JSON-in-a-string
+/// — mirroring the server's `agent_message_content`. An `object` string that is
+/// not valid JSON falls back to a JSON string, never an error.
+#[cfg(feature = "read-model")]
+fn agent_content_result(c: &AgentHistoryContent) -> serde_json::Value {
+    let object = c.object.as_ref().map(|s| {
+        serde_json::from_str::<serde_json::Value>(s)
+            .unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+    });
+    serde_json::json!({
+        "contentType": c.content_type.as_str(),
+        "text": c.text,
+        "documentReference": c.document_reference,
+        "object": object,
+    })
+}
+
+/// Map an engine [`AgentHistoryToolCall`] to the gateway's
+/// `AgentInstanceToolCall` JSON shape (camelCase keys). `arguments` is stored as
+/// an opaque JSON string and re-parsed into structured JSON (mirroring the
+/// server's `agent_tool_call_result`); an unparseable string falls back to a JSON
+/// string, and an absent one to `null`.
+#[cfg(feature = "read-model")]
+fn agent_tool_call_result(c: &AgentHistoryToolCall) -> serde_json::Value {
+    let arguments = c.arguments.as_ref().map(|s| {
+        serde_json::from_str::<serde_json::Value>(s)
+            .unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+    });
+    serde_json::json!({
+        "toolCallId": c.tool_call_id,
+        "toolName": c.tool_name,
+        "elementId": c.element_id,
+        "arguments": arguments,
+    })
+}
+
+/// Map an engine [`AgentTool`] to the gateway's `AgentTool` JSON shape (camelCase
+/// keys), mirroring the server's `agent_tool_result`.
+#[cfg(feature = "read-model")]
+fn agent_tool_result(t: &AgentTool) -> serde_json::Value {
+    serde_json::json!({
+        "name": t.name,
+        "description": t.description,
+        "elementId": t.element_id,
+    })
+}
+
 /// Coerce an optional user-task date (`followUpDate` / `dueDate`) to the JSON the
 /// gateway would emit: the string when it is a valid RFC-3339 `date-time`, else
 /// JSON `null`. Mirrors the gateway's `parse_date`, which parses these as
@@ -1680,7 +1742,6 @@ fn rfc3339_or_null(value: &Option<String>) -> serde_json::Value {
 /// leap-year rule chrono uses (divisible by 4, except centuries not divisible by
 /// 400). Callers must pass a `month` already validated into `1..=12`; any other
 /// value falls through to 31 and is rejected by the surrounding range check.
-#[cfg(feature = "read-model")]
 fn days_in_month(year: u32, month: u32) -> u32 {
     match month {
         2 => {
@@ -2565,6 +2626,165 @@ impl From<AgentToolReq> for AgentTool {
     }
 }
 
+/// The `producedAt` field of a history turn. REST/OpenAPI types it as an
+/// RFC-3339 `date-time` string, so that is the parity spelling accepted here; a
+/// bare numeric epoch-millis is additionally tolerated as a convenience for
+/// programmatic TestEngine callers. Absent ⇒ epoch 0.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ProducedAt {
+    /// Epoch milliseconds (the convenience form).
+    Ms(u64),
+    /// An RFC-3339 `date-time` string (the REST wire spelling).
+    Iso(String),
+}
+
+impl Default for ProducedAt {
+    fn default() -> Self {
+        ProducedAt::Ms(0)
+    }
+}
+
+impl ProducedAt {
+    /// Resolve to epoch milliseconds, parsing the RFC-3339 spelling if given.
+    fn to_ms(&self) -> Result<u64, JsValue> {
+        match self {
+            ProducedAt::Ms(ms) => Ok(*ms),
+            ProducedAt::Iso(s) => ms_from_rfc3339(s).map_err(|m| js_err(&m)),
+        }
+    }
+}
+
+/// Parse an RFC-3339 `date-time` string into epoch milliseconds, mirroring the
+/// grammar `is_rfc3339_date_time` validates (and the gateway's chrono parse):
+/// `YYYY-MM-DDThh:mm:ss`, optional `.fraction` (rounded down to millis), and a
+/// mandatory `Z`/`±hh:mm` offset. Computed without `chrono` to keep the wasm
+/// engine date-crate-free. A leap second (`:60`) is clamped to `:59` for the
+/// epoch arithmetic, matching how chrono normalises it. Returns the error message
+/// as a `String` — kept pure so it is unit-testable on the host, where `JsValue`
+/// errors cannot be constructed.
+fn ms_from_rfc3339(s: &str) -> Result<u64, String> {
+    let err = || {
+        format!(
+            "invalid producedAt {s:?}; expected epoch millis or an RFC-3339 \
+             date-time string (e.g. \"2026-01-02T03:04:05Z\")"
+        )
+    };
+    let b = s.as_bytes();
+    // Shortest valid form "1970-01-01T00:00:00Z" is 20 bytes.
+    if b.len() < 20 {
+        return Err(err());
+    }
+    let digit = |c: u8| c.is_ascii_digit();
+    let ok_fixed = digit(b[0])
+        && digit(b[1])
+        && digit(b[2])
+        && digit(b[3])
+        && b[4] == b'-'
+        && digit(b[5])
+        && digit(b[6])
+        && b[7] == b'-'
+        && digit(b[8])
+        && digit(b[9])
+        && (b[10] == b'T' || b[10] == b't')
+        && digit(b[11])
+        && digit(b[12])
+        && b[13] == b':'
+        && digit(b[14])
+        && digit(b[15])
+        && b[16] == b':'
+        && digit(b[17])
+        && digit(b[18]);
+    if !ok_fixed {
+        return Err(err());
+    }
+    let num = |slice: &[u8]| -> i64 {
+        slice
+            .iter()
+            .fold(0i64, |a, &c| a * 10 + i64::from(c - b'0'))
+    };
+    let year = num(&b[0..4]);
+    let month = num(&b[5..7]);
+    let day = num(&b[8..10]);
+    let hour = num(&b[11..13]);
+    let min = num(&b[14..16]);
+    let sec = num(&b[17..19]);
+    if !(1..=12).contains(&month)
+        || day < 1
+        || day > i64::from(days_in_month(year as u32, month as u32))
+        || hour > 23
+        || min > 59
+        || sec > 60
+    {
+        return Err(err());
+    }
+    let mut i = 19usize;
+    let mut millis = 0i64;
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        let start = i;
+        let mut scale = 0;
+        while i < b.len() && digit(b[i]) {
+            if scale < 3 {
+                millis = millis * 10 + i64::from(b[i] - b'0');
+                scale += 1;
+            }
+            i += 1;
+        }
+        if i == start {
+            return Err(err());
+        }
+        while scale < 3 {
+            millis *= 10;
+            scale += 1;
+        }
+    }
+    let (offset_min, consumed) = match b.get(i) {
+        Some(&c) if c == b'Z' || c == b'z' => (0i64, i + 1),
+        Some(&c)
+            if (c == b'+' || c == b'-')
+                && i + 6 <= b.len()
+                && digit(b[i + 1])
+                && digit(b[i + 2])
+                && b[i + 3] == b':'
+                && digit(b[i + 4])
+                && digit(b[i + 5]) =>
+        {
+            let oh = num(&b[i + 1..i + 3]);
+            let om = num(&b[i + 4..i + 6]);
+            if oh > 23 || om > 59 {
+                return Err(err());
+            }
+            let mag = oh * 60 + om;
+            (if c == b'-' { -mag } else { mag }, i + 6)
+        }
+        _ => return Err(err()),
+    };
+    if consumed != b.len() {
+        return Err(err());
+    }
+    let sec = sec.min(59);
+    let days = days_from_civil(year, month, day);
+    let total_secs = days * 86_400 + hour * 3600 + min * 60 + sec - offset_min * 60;
+    let total_ms = total_secs * 1000 + millis;
+    if total_ms < 0 {
+        return Err(err());
+    }
+    Ok(total_ms as u64)
+}
+
+/// Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian civil date,
+/// via Howard Hinnant's `days_from_civil`. Inverse of the civil-from-days
+/// algorithm `iso8601_from_ms` uses; callers pass an already-validated date.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// A `content[]` block of a history turn:
 /// `{ contentType?, text?, documentReference?, object? }`.
 #[derive(serde::Deserialize)]
@@ -2577,7 +2797,7 @@ struct AgentContentReq {
     #[serde(default)]
     document_reference: Option<String>,
     #[serde(default)]
-    object: Option<String>,
+    object: Option<serde_json::Value>,
 }
 
 /// A single history turn of a create/update request. Only the turn-specific
@@ -2589,7 +2809,7 @@ struct AgentTurnReq {
     #[serde(default)]
     loop_iteration: i32,
     #[serde(default)]
-    produced_at: u64,
+    produced_at: ProducedAt,
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
@@ -2653,7 +2873,7 @@ fn agent_turn_from(t: AgentTurnReq) -> Result<AgentHistoryTurn, JsValue> {
         .collect::<Result<Vec<_>, _>>()?;
     Ok(AgentHistoryTurn {
         loop_iteration: t.loop_iteration,
-        produced_at: t.produced_at,
+        produced_at: t.produced_at.to_ms()?,
         role,
         content,
         system_prompt: t.system_prompt,
@@ -2673,8 +2893,26 @@ fn agent_content_from(c: AgentContentReq) -> Result<AgentHistoryContent, JsValue
         content_type,
         text: c.text,
         document_reference: c.document_reference,
-        object: c.object,
+        object: c.object.map(|v| v.to_string()),
     })
+}
+
+/// Reject a `status` that `updateAgentInstance` must not set. `COMPLETED` is the
+/// terminal status and is reachable only through `completeAgentInstance`; the
+/// driver rejects it up-front with a targeted message rather than forwarding it
+/// to the engine (which would yield a less-specific error, or an invalid
+/// transition if engine validation ever loosens). Returns the rejection message
+/// as a `String` — kept pure so it is unit-testable on the host, where `JsValue`
+/// errors cannot be inspected.
+fn reject_non_updatable_status(status: Option<&str>) -> Result<(), String> {
+    if status == Some("COMPLETED") {
+        return Err(
+            "updateAgentInstance: status COMPLETED is not settable via UPDATE; \
+                    drive the instance to COMPLETED with completeAgentInstance"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Parse a REST `AgentInstanceStatusEnum` spelling into the engine status.
@@ -3673,6 +3911,92 @@ mod tests {
             "a real mutator succeeds once unblocked"
         );
     }
+
+    // `updateAgentInstance` must reject `status: "COMPLETED"` — the terminal
+    // status is reachable only through the dedicated `completeAgentInstance`
+    // command, and the driver must not forward it to yield a less-specific engine
+    // error (or, if engine validation ever loosens, an invalid transition). The
+    // rejection message is asserted at the pure layer (`JsValue` errors cannot be
+    // constructed or inspected on the host target); the driver wrapper's
+    // end-to-end rejection is covered by the wasm agent-instance-e2e probe.
+    #[test]
+    fn update_agent_instance_rejects_completed_status() {
+        let msg = reject_non_updatable_status(Some("COMPLETED"))
+            .expect_err("status COMPLETED must be rejected");
+        assert!(
+            msg.contains("COMPLETED") && msg.contains("completeAgentInstance"),
+            "the rejection names the terminal status and points at the dedicated \
+             completeAgentInstance command: {msg}"
+        );
+        // Non-terminal statuses (and absence) are settable via UPDATE.
+        assert!(reject_non_updatable_status(Some("THINKING")).is_ok());
+        assert!(reject_non_updatable_status(None).is_ok());
+    }
+
+    // `producedAt` accepts the REST RFC-3339 `date-time` spelling and parses it to
+    // epoch millis; a bare numeric epoch-millis is also tolerated. `object`
+    // content accepts arbitrary JSON (the REST wire shape), stored as the engine's
+    // opaque JSON string.
+    #[test]
+    fn agent_turn_from_parses_rest_produced_at_and_json_object() {
+        let iso = agent_turn_from(
+            serde_json::from_str::<AgentTurnReq>(
+                r#"{"producedAt":"2026-01-02T03:04:05.250Z","role":"USER",
+                    "content":[{"contentType":"OBJECT","object":{"a":1,"b":[2,3]}}]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            iso.produced_at, 1_767_323_045_250,
+            "RFC-3339 producedAt parses to epoch millis (incl. fractional seconds)"
+        );
+        assert_eq!(
+            iso.content[0].object.as_deref(),
+            Some(r#"{"a":1,"b":[2,3]}"#),
+            "a JSON object is stored as the engine's opaque JSON string"
+        );
+
+        let numeric = agent_turn_from(
+            serde_json::from_str::<AgentTurnReq>(r#"{"producedAt":100,"role":"USER"}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            numeric.produced_at, 100,
+            "a bare numeric epoch-millis is still accepted"
+        );
+    }
+
+    #[test]
+    fn ms_from_rfc3339_handles_offsets_fractions_and_rejects_garbage() {
+        assert_eq!(ms_from_rfc3339("1970-01-01T00:00:00Z").unwrap(), 0);
+        assert_eq!(
+            ms_from_rfc3339("2026-01-02T03:04:05Z").unwrap(),
+            1_767_323_045_000
+        );
+        // A +02:00 offset is subtracted to reach UTC.
+        assert_eq!(
+            ms_from_rfc3339("2026-01-02T05:04:05+02:00").unwrap(),
+            1_767_323_045_000
+        );
+        // Fractional seconds are truncated to millisecond precision.
+        assert_eq!(
+            ms_from_rfc3339("2026-01-02T03:04:05.2509Z").unwrap(),
+            1_767_323_045_250
+        );
+        for bad in [
+            "not-a-date",
+            "2026-13-01T00:00:00Z",
+            "2026-02-30T00:00:00Z",
+            "2026-01-02T03:04:05",
+            "2026-01-02 03:04:05Z",
+        ] {
+            assert!(
+                ms_from_rfc3339(bad).is_err(),
+                "an invalid RFC-3339 string is rejected: {bad}"
+            );
+        }
+    }
 }
 
 /// Acceptance tests for the feature-gated REST read channel: proves the shared
@@ -4265,5 +4589,89 @@ mod read_channel_tests {
         }
         // Absent dates are null.
         assert_eq!(rfc3339_or_null(&None), serde_json::Value::Null);
+    }
+
+    const AGENT_TASK_XML: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="agent">
+            <bpmn:extensionElements>
+              <zeebe:agentDefinition agentType="aiAgentTask" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="b" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    // The read-model history output must mirror the gateway's
+    // `AgentInstanceHistoryItemResult` wire shape, not dump the engine's internal
+    // snake_case layout: content blocks use camelCase keys + REST `contentType`
+    // spellings, an `object` payload round-trips as structured JSON (never a
+    // JSON-in-a-string), and `producedAt` is an RFC-3339 string round-tripped from
+    // the string the driver parsed to millis. Guards the S6 parity fix for the
+    // regenerated engine-wasm AgentInstance surface.
+    #[test]
+    fn agent_history_output_is_rest_shaped_and_round_trips_json_object() {
+        let mut eng = TestEngine::new();
+        eng.deploy(AGENT_TASK_XML).unwrap();
+        eng.create_instance("p", "{}", None).unwrap();
+        let minted = parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone();
+        let req = serde_json::json!({
+            "agentInstanceKey": minted["agentInstanceKey"],
+            "elementInstanceKey": minted["elementInstanceKey"],
+            "elementId": minted["elementId"],
+            "processInstanceKey": minted["processInstanceKey"],
+            "status": "THINKING",
+            "history": [{
+                "loopIteration": 1,
+                "producedAt": "2026-01-02T03:04:05.250Z",
+                "role": "ASSISTANT",
+                "content": [
+                    { "contentType": "OBJECT", "object": { "a": 1, "b": [2, 3] } },
+                    { "contentType": "TEXT", "text": "hello" },
+                ],
+            }],
+        });
+        eng.update_agent_instance(&req.to_string()).unwrap();
+
+        let history = parse(
+            &eng.search_agent_instance_history(minted["agentInstanceKey"].as_str().unwrap(), "{}")
+                .unwrap(),
+        );
+        let turn = history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["role"] == "ASSISTANT")
+            .expect("the pushed ASSISTANT turn");
+
+        // producedAt is the RFC-3339 string the gateway emits.
+        assert_eq!(turn["producedAt"], "2026-01-02T03:04:05.250Z");
+
+        let content = turn["content"].as_array().unwrap();
+        let obj_block = &content[0];
+        // camelCase keys + REST enum spelling, never the engine's snake_case layout.
+        assert_eq!(obj_block["contentType"], "OBJECT");
+        assert!(
+            obj_block.get("content_type").is_none(),
+            "no snake_case content_type leaks: {obj_block}"
+        );
+        assert!(
+            obj_block.get("documentReference").is_some()
+                && obj_block.get("document_reference").is_none(),
+            "documentReference is camelCase, not snake_case: {obj_block}"
+        );
+        // The `object` payload round-trips as structured JSON, not a JSON string.
+        assert_eq!(
+            obj_block["object"],
+            serde_json::json!({ "a": 1, "b": [2, 3] })
+        );
+
+        // toolCalls / tools are present as arrays in the REST shape.
+        assert!(turn["toolCalls"].is_array() && turn["tools"].is_array());
     }
 }

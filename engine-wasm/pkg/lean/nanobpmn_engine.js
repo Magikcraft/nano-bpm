@@ -1100,14 +1100,16 @@ export class TestEngine {
     }
     /**
      * Advance an AgentInstance: set its `status` (a REST spelling other than
-     * `COMPLETED`, which is reachable only through `completeAgentInstance`),
-     * accumulate `metrics`, optionally replace `tools`, and append a `history`
-     * batch. `request_json` is `{ agentInstanceKey, elementInstanceKey,
-     * elementId, processInstanceKey, status?, metrics?, tools?, history? }`. A
-     * turn is `{ loopIteration?, producedAt?, role?, content?, systemPrompt?,
-     * historyItemId?, model?, provider? }`; `content` items are
-     * `{ contentType?, text?, documentReference?, object? }`. Returns the
-     * snapshot.
+     * `COMPLETED`, which is reachable only through `completeAgentInstance` and is
+     * rejected here with a targeted error), accumulate `metrics`, optionally
+     * replace `tools`, and append a `history` batch. `request_json` is
+     * `{ agentInstanceKey, elementInstanceKey, elementId, processInstanceKey,
+     * status?, metrics?, tools?, history? }`. A turn is `{ loopIteration?,
+     * producedAt?, role?, content?, systemPrompt?, historyItemId?, model?,
+     * provider? }`, where `producedAt` is an RFC-3339 `date-time` string (the
+     * REST spelling; a bare epoch-millis number is also accepted); `content`
+     * items are `{ contentType?, text?, documentReference?, object? }`, where
+     * `object` is arbitrary JSON (the REST wire shape). Returns the snapshot.
      * @param {string} request_json
      * @returns {string}
      */

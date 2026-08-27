@@ -111,7 +111,9 @@ assert(
 );
 
 // 4. UPDATE advances the status to THINKING, accumulates metrics, and pushes an
-//    ASSISTANT turn.
+//    ASSISTANT turn. Exercise the REST parity surface deliberately: a `producedAt`
+//    as an RFC-3339 string (not epoch millis), and an OBJECT content item whose
+//    `object` is a real JSON object (not a JSON-encoded string).
 engine.updateAgentInstance(
   JSON.stringify({
     agentInstanceKey,
@@ -123,9 +125,12 @@ engine.updateAgentInstance(
     history: [
       {
         loopIteration: 1,
-        producedAt: 100,
+        producedAt: "2026-01-02T03:04:05.250Z",
         role: "ASSISTANT",
-        content: [{ contentType: "TEXT", text: "hello from the agent" }],
+        content: [
+          { contentType: "TEXT", text: "hello from the agent" },
+          { contentType: "OBJECT", object: { answer: 42, nested: { ok: true } } },
+        ],
       },
     ],
   }),
@@ -138,6 +143,37 @@ assert(
 assert(
   advanced.metrics.inputTokens === 100 && advanced.metrics.modelCalls === 1,
   "UPDATE accumulates metrics onto the instance",
+);
+
+// 4a. UPDATE must reject the terminal `status: "COMPLETED"` — it is reachable
+//     only through the dedicated completeAgentInstance command. The driver
+//     rejects it up front, before any engine dispatch.
+let rejectedCompleted = false;
+try {
+  engine.updateAgentInstance(
+    JSON.stringify({
+      agentInstanceKey,
+      elementInstanceKey,
+      elementId,
+      processInstanceKey,
+      status: "COMPLETED",
+    }),
+  );
+} catch (e) {
+  rejectedCompleted = true;
+  assert(
+    String(e).includes("completeAgentInstance"),
+    `the COMPLETED rejection points at completeAgentInstance (got ${String(e)})`,
+  );
+}
+assert(
+  rejectedCompleted,
+  "updateAgentInstance rejects status COMPLETED",
+);
+// The rejected UPDATE left the instance untouched (still THINKING).
+assert(
+  JSON.parse(engine.searchAgentInstances("{}")).items[0].status === "THINKING",
+  "the rejected COMPLETED update did not mutate the instance",
 );
 
 // 5. History-search returns the appended turn(s), defaulting to COMMITTED.
@@ -166,6 +202,33 @@ assert(
   Array.isArray(assistantTurn?.content) &&
     assistantTurn.content.some((c) => c.text === "hello from the agent"),
   "the ASSISTANT turn round-trips its text content",
+);
+// REST parity of the history output shape (matches the gateway JSON):
+//  - `producedAt` comes back as an RFC-3339 string, not epoch millis;
+//  - content is camelCase with the REST `contentType` enum spelling;
+//  - an OBJECT item's `object` round-trips as a real JSON object, not a string.
+assert(
+  typeof assistantTurn?.producedAt === "string" &&
+    assistantTurn.producedAt === "2026-01-02T03:04:05.250Z",
+  `producedAt round-trips as an RFC-3339 string (got ${JSON.stringify(
+    assistantTurn?.producedAt,
+  )})`,
+);
+const objectItem = assistantTurn?.content?.find(
+  (c) => c.contentType === "OBJECT",
+);
+assert(
+  objectItem !== undefined,
+  "the OBJECT content item survives with its REST contentType spelling",
+);
+assert(
+  objectItem?.object &&
+    typeof objectItem.object === "object" &&
+    objectItem.object.answer === 42 &&
+    objectItem.object.nested?.ok === true,
+  `the OBJECT item's object round-trips as a JSON object (got ${JSON.stringify(
+    objectItem?.object,
+  )})`,
 );
 
 // 6. COMPLETE drives the instance to the terminal COMPLETED status. Advance the

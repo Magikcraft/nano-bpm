@@ -14,8 +14,14 @@ stable/8.10 parity, Stage 3) is reachable end-to-end through the
 3. **`createAgentInstance`** reconciles that record with a CREATE-time
    definition/limits (still `INITIALIZING`, same key — no duplicate);
 4. **`updateAgentInstance`** advances the status (`THINKING`) and pushes a turn;
+   it also **rejects the terminal `status: "COMPLETED"`** (reachable only through
+   `completeAgentInstance`), and accepts a `producedAt` as an **RFC-3339 string**
+   (as well as epoch millis) plus an **`OBJECT` content item** whose `object` is a
+   real JSON object;
 5. **`searchAgentInstanceHistory`** returns that turn (defaulting to
-   `COMMITTED`);
+   `COMMITTED`) in the gateway's REST JSON shape — camelCase keys, the REST
+   `contentType` enum spelling, `producedAt` as an RFC-3339 string, and an
+   `OBJECT` item's `object` round-tripped as a JSON object (not a string);
 6. **`completeAgentInstance`** drives the instance to `COMPLETED`.
 
 Run:
@@ -27,4 +33,6 @@ npm test
 
 The probe consumes the committed/regenerated `engine-wasm/pkg/` artifact, so it
 also guards that `make console-wasm` shipped the AgentInstance driver + read
-methods onto the exported wasm surface.
+methods onto the exported wasm surface. It runs in CI as part of
+`make engine-wasm-ffi-dist` (the `engine-wasm-ffi (dist + verify)` job), so a
+regression in the AgentInstance/AgentHistory surface fails the build.
