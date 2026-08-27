@@ -407,8 +407,8 @@ function makeInstanceTrace(inst: Instance): InstanceTrace {
     businessId: null,
     tags: [],
     startedAt: 1000,
-    endedAt: 1500,
-    durationMs: 500,
+    endedAt: null,
+    durationMs: null,
     outcome: "active",
     elements: [
       {
@@ -570,7 +570,10 @@ export async function stubApp(
         status: 200,
         contentType: "text/event-stream",
         headers: { "cache-control": "no-cache" },
-        body: "",
+        // Emit a long `retry:` directive so the browser EventSource stays quiet
+        // for the life of the test instead of hitting EOF and auto-reconnecting
+        // every ~3s (each reconnect would trigger a needless getProject refresh).
+        body: "retry: 86400000\n\n",
       });
     }
     if (url.endsWith(`/console/api/projects/${encodeURIComponent(name)}`)) {
