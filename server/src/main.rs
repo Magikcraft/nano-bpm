@@ -11567,7 +11567,15 @@ impl ServerImpl {
             process_instance_key: None,
             commit_status,
         };
-        let rows = self.store.agent_history(&history_filter);
+        // An explicit empty inclusion set (`commitStatus: { $in: [] }`) matches
+        // nothing. The read-model collapses `Some(vec![])` to the COMMITTED-only
+        // default (see `AgentHistoryFilter`), so honour "match nothing" here by
+        // skipping the query rather than silently returning committed rows.
+        let rows = if matches!(&history_filter.commit_status, Some(v) if v.is_empty()) {
+            Vec::new()
+        } else {
+            self.store.agent_history(&history_filter)
+        };
 
         let mut matched: Vec<&readstore::AgentHistoryRow> = rows
             .iter()
@@ -19064,11 +19072,13 @@ fn ms_to_datetime(ms: u64) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64).unwrap_or_else(epoch)
 }
 
-/// A row's tenant id, mapping the engine's empty-string "no tenant" to the
-/// canonical `<default>` the REST surface reports elsewhere.
+/// A row's tenant id, defensively mapping an unset/empty tenant to the engine's
+/// canonical default tenant ([`nanobpmn_engine_core::DEFAULT_TENANT`], the literal
+/// `<default>`) the REST surface reports elsewhere. Engine rows normally already
+/// carry `DEFAULT_TENANT`; this only backfills a row that somehow lacks one.
 fn tenant_or_default(tenant_id: &str) -> String {
     if tenant_id.is_empty() {
-        "<default>".to_string()
+        nanobpmn_engine_core::DEFAULT_TENANT.to_string()
     } else {
         tenant_id.to_string()
     }
@@ -34971,6 +34981,38 @@ mod call_activity_hierarchy_read_model_tests {
                 HResp::Status400_TheProvidedDataIsNotValid(_)
             ),
             "an unsupported commitStatus filter shape is 400, not a silent default"
+        );
+
+        // An explicit empty inclusion set (`$in: []`) matches nothing — it must
+        // NOT silently fall back to the COMMITTED-only default and return rows.
+        let empty_in_commit = models::AgentInstanceHistoryFilter {
+            commit_status: Some(
+                models::AgentInstanceHistoryCommitStatusFilterProperty::AdvancedAgentInstanceHistoryCommitStatusFilter(
+                    models::AdvancedAgentInstanceHistoryCommitStatusFilter {
+                        dollar_eq: None,
+                        dollar_neq: None,
+                        dollar_exists: None,
+                        dollar_in: Some(vec![]),
+                    },
+                ),
+            ),
+            ..models::AgentInstanceHistoryFilter::new()
+        };
+        let empty_in_query = Some(models::AgentInstanceHistorySearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(empty_in_commit),
+        });
+        let HResp::Status200_TheAgentInstanceHistorySearchResult(empty_in_result) = srv
+            .search_agent_instance_history_impl(&hp, &empty_in_query)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a 200 history search result");
+        };
+        assert!(
+            empty_in_result.items.is_empty(),
+            "commitStatus $in: [] must match nothing, not fall back to the COMMITTED default"
         );
 
         // Search now honours the previously-ignored filters: processDefinitionId,
