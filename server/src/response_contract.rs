@@ -87,8 +87,11 @@ fn parse_max_bytes(raw: Option<&str>) -> usize {
 
 /// Maximum response body size (bytes) the guard will buffer for validation,
 /// from `NANOBPM_RESPONSE_VALIDATION_MAX_BYTES` (default 8 MiB). A response that
-/// declares (via `Content-Length`) or streams past this limit is passed through
-/// unvalidated rather than buffered, so validation can never exhaust memory.
+/// declares a larger body via `Content-Length` is passed through unvalidated
+/// (never buffered). A response with a missing or dishonest length that streams
+/// past this cap cannot be passed through (its body is already partly consumed),
+/// so the guard fails loudly with a structured 500 instead. Either way,
+/// validation can never buffer more than this and exhaust memory.
 fn max_buffer_bytes() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {
