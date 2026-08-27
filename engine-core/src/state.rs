@@ -2010,6 +2010,10 @@ pub fn apply(state: &mut State, event: &Event) {
             }
         }
 
+        // Dedup outcome only — the append-only log is intentionally left
+        // untouched (no record is created for an idempotent retry).
+        Event::AgentHistoryDeduplicated { .. } => {}
+
         Event::ExecutionListenerJobCreated {
             job_key,
             instance_key,

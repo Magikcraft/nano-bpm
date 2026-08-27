@@ -11418,6 +11418,17 @@ impl ServerImpl {
                             record.agent_history_key.to_string(),
                             record.is_duplicate,
                         )),
+                        // An idempotent retry created no new record; echo the
+                        // original turn's key back with isDuplicate=true.
+                        Event::AgentHistoryDeduplicated {
+                            history_item_id,
+                            original_agent_history_key,
+                            ..
+                        } => Some((
+                            history_item_id.clone(),
+                            original_agent_history_key.to_string(),
+                            true,
+                        )),
                         _ => None,
                     })
                     .collect();
@@ -34880,6 +34891,40 @@ mod call_activity_hierarchy_read_model_tests {
         );
         assert_eq!(updated.created_history[0].history_item_id, "h1");
         assert!(!updated.created_history[0].is_duplicate);
+        let h1_key = updated.created_history[0].history_item_key.0.clone();
+
+        // Idempotent retry: re-submitting "h1" (same historyItemId) must NOT
+        // create a second AGENT_HISTORY record; the response echoes
+        // isDuplicate=true with the ORIGINAL turn's key.
+        let mut retry = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
+            element_instance_key.clone(),
+        ));
+        retry.history = Some(types::Nullable::Present(vec![
+            models::AgentInstanceHistoryItem::new(
+                "h1".to_string(),
+                0,
+                models::AgentInstanceHistoryRoleEnum::User,
+                vec![text_content("hello")],
+                epoch(),
+            ),
+        ]));
+        let UResp::Status200_TheAgentInstanceWasUpdatedSuccessfully(retried) = srv
+            .update_agent_instance_impl(&up, &retry)
+            .await
+            .expect("retry update agent instance")
+        else {
+            panic!("expected a 200 retry update result");
+        };
+        assert_eq!(retried.created_history.len(), 1);
+        assert_eq!(retried.created_history[0].history_item_id, "h1");
+        assert!(
+            retried.created_history[0].is_duplicate,
+            "a resubmitted historyItemId is reported as a duplicate"
+        );
+        assert_eq!(
+            retried.created_history[0].history_item_key.0, h1_key,
+            "the duplicate echoes the original turn's key, not a new one"
+        );
 
         // GET now reports THINKING (poll: the read model projects asynchronously).
         let mut thinking = false;

@@ -17550,6 +17550,153 @@ fn agent_history_append_to_unknown_instance_is_a_noop() {
     assert!(engine.discard_agent_history(bogus).is_empty());
 }
 
+/// A history turn carrying a stable `historyItemId`, used to exercise the
+/// idempotent-retry dedup path.
+fn history_turn_with_id(
+    loop_iteration: i32,
+    produced_at: u64,
+    role: crate::agent::AgentHistoryRole,
+    history_item_id: &str,
+) -> crate::agent::AgentHistoryTurn {
+    crate::agent::AgentHistoryTurn {
+        loop_iteration,
+        produced_at,
+        role,
+        history_item_id: Some(history_item_id.to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn agent_history_dedups_repeated_history_item_id_within_a_batch() {
+    use crate::agent::AgentHistoryRole;
+    let (mut engine, instance_key, aik) = agent_instance_for_history();
+
+    // Two turns share `historyItemId` "h1"; the second is an idempotent retry
+    // of the first and must NOT materialise a second record.
+    let events = engine.append_agent_history(
+        aik,
+        vec![
+            history_turn_with_id(0, 10, AgentHistoryRole::User, "h1"),
+            history_turn_with_id(0, 20, AgentHistoryRole::Assistant, "h1"),
+        ],
+    );
+
+    let created_key = match &events[0] {
+        Event::AgentHistoryCreated { record, .. } => {
+            assert_eq!(record.history_item_id.as_deref(), Some("h1"));
+            record.agent_history_key
+        }
+        other => panic!("expected AgentHistoryCreated first, got {other:?}"),
+    };
+    match &events[1] {
+        Event::AgentHistoryDeduplicated {
+            instance_key: ik,
+            agent_instance_key,
+            history_item_id,
+            original_agent_history_key,
+        } => {
+            assert_eq!(*ik, instance_key);
+            assert_eq!(*agent_instance_key, aik);
+            assert_eq!(history_item_id, "h1");
+            assert_eq!(
+                *original_agent_history_key, created_key,
+                "the duplicate resolves to the original turn's key"
+            );
+        }
+        other => panic!("expected AgentHistoryDeduplicated second, got {other:?}"),
+    }
+    assert_eq!(events.len(), 2);
+
+    // Only one record is materialised in the append-only log.
+    let stored = stored_history(&engine, instance_key, aik);
+    assert_eq!(stored.len(), 1, "the duplicate created no new record");
+    assert_eq!(stored[0].agent_history_key, created_key);
+}
+
+#[test]
+fn agent_history_dedups_history_item_id_against_a_prior_committed_batch() {
+    use crate::agent::AgentHistoryRole;
+    let (mut engine, instance_key, aik) = agent_instance_for_history();
+
+    // First batch records "h1" and commits it.
+    engine.append_agent_history(
+        aik,
+        vec![history_turn_with_id(0, 10, AgentHistoryRole::User, "h1")],
+    );
+    engine.commit_agent_history(aik);
+    let original_key = stored_history(&engine, instance_key, aik)[0].agent_history_key;
+
+    // A retry re-submits "h1": no new record, dedup resolves to the original.
+    let events = engine.append_agent_history(
+        aik,
+        vec![history_turn_with_id(1, 20, AgentHistoryRole::User, "h1")],
+    );
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        Event::AgentHistoryDeduplicated {
+            history_item_id,
+            original_agent_history_key,
+            ..
+        } => {
+            assert_eq!(history_item_id, "h1");
+            assert_eq!(*original_agent_history_key, original_key);
+        }
+        other => panic!("expected AgentHistoryDeduplicated, got {other:?}"),
+    }
+    let stored = stored_history(&engine, instance_key, aik);
+    assert_eq!(stored.len(), 1, "the retry created no new record");
+}
+
+#[test]
+fn agent_history_absent_history_item_id_never_dedups() {
+    use crate::agent::AgentHistoryRole;
+    let (mut engine, instance_key, aik) = agent_instance_for_history();
+
+    // Two id-less turns are indistinguishable for correlation, so both must
+    // materialise fresh records — dedup applies only to carried ids.
+    let events = engine.append_agent_history(
+        aik,
+        vec![
+            history_turn(0, 10, AgentHistoryRole::User),
+            history_turn(0, 20, AgentHistoryRole::Assistant),
+        ],
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| matches!(e, Event::AgentHistoryCreated { .. })),
+        "id-less turns never dedup"
+    );
+    assert_eq!(stored_history(&engine, instance_key, aik).len(), 2);
+}
+
+#[test]
+fn agent_history_discarded_history_item_id_is_re_recordable() {
+    use crate::agent::AgentHistoryRole;
+    let (mut engine, instance_key, aik) = agent_instance_for_history();
+
+    // "h1" is appended then discarded (rejected) — it is not "already
+    // recorded", so re-submitting it must create a fresh record, not dedup.
+    engine.append_agent_history(
+        aik,
+        vec![history_turn_with_id(0, 10, AgentHistoryRole::User, "h1")],
+    );
+    engine.discard_agent_history(aik);
+
+    let events = engine.append_agent_history(
+        aik,
+        vec![history_turn_with_id(1, 20, AgentHistoryRole::User, "h1")],
+    );
+    assert_eq!(events.len(), 1);
+    assert!(
+        matches!(&events[0], Event::AgentHistoryCreated { .. }),
+        "a discarded id is re-recordable, not deduped"
+    );
+    // One discarded + one fresh pending record.
+    assert_eq!(stored_history(&engine, instance_key, aik).len(), 2);
+}
+
 // --- AgentInstance lifecycle processors (Camunda 8.10 parity, slice S3) ------
 //
 // CREATE/UPDATE/COMPLETE processors with the stable/8.10 validation rules and

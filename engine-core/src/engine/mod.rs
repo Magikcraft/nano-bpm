@@ -906,6 +906,16 @@ impl Engine {
     /// process id, process-definition key, tenant) is copied from the owning
     /// AgentInstance; an unknown `agent_instance_key` yields no events.
     ///
+    /// **Idempotent retry dedup.** A turn carrying a `historyItemId` that
+    /// matches an already-recorded, non-discarded turn for this agent instance
+    /// — whether recorded by a prior batch or earlier in *this* batch — is an
+    /// idempotent retry: no new record is materialised and instead an
+    /// [`Event::AgentHistoryDeduplicated`] naming the original turn's
+    /// `agent_history_key` is emitted. Turns without a `historyItemId` (or with
+    /// an empty one) cannot be correlated and always materialise a fresh record.
+    /// This is what lets the API echo back `isDuplicate=true` with the original
+    /// key while creating no duplicate AGENT_HISTORY record.
+    ///
     /// This is the internal behavior the S3 CREATE/UPDATE processors invoke to
     /// apply a `history[]` batch. It emits (and applies) the events and returns
     /// them so the caller folds them into its command result.
@@ -929,7 +939,52 @@ impl Engine {
             },
             None => return log,
         };
+        // Seed the dedup index from already-recorded turns: a turn whose
+        // `historyItemId` matches an existing non-discarded record is an
+        // idempotent retry (Camunda 8.10) and must resolve to that original
+        // record rather than materialise a second one. Discarded turns were
+        // rejected, so a resubmission of their id is allowed to create a fresh
+        // record — they are excluded from the index.
+        let mut seen_by_item_id: HashMap<String, Key> = self
+            .state
+            .instances
+            .get(&base.instance_key)
+            .and_then(|inst| inst.agent_history.get(&agent_instance_key))
+            .map(|records| {
+                records
+                    .iter()
+                    .filter(|r| {
+                        r.commit_status != crate::agent::AgentHistoryCommitStatus::Discarded
+                    })
+                    .filter_map(|r| {
+                        r.history_item_id
+                            .clone()
+                            .filter(|id| !id.is_empty())
+                            .map(|id| (id, r.agent_history_key))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         for turn in turns {
+            // Idempotent dedup by `historyItemId`. An absent/empty id cannot be
+            // correlated to a prior turn, so it always materialises a fresh
+            // record. A matching id (against prior state or an earlier turn in
+            // this same batch) resolves to the original key and creates no new
+            // AGENT_HISTORY record.
+            if let Some(id) = turn.history_item_id.as_deref().filter(|id| !id.is_empty()) {
+                if let Some(&original_agent_history_key) = seen_by_item_id.get(id) {
+                    self.emit(
+                        &mut log,
+                        Event::AgentHistoryDeduplicated {
+                            instance_key: base.instance_key,
+                            agent_instance_key,
+                            history_item_id: id.to_string(),
+                            original_agent_history_key,
+                        },
+                    );
+                    continue;
+                }
+            }
             let agent_history_key = self.mint_key();
             let record = crate::agent::AgentHistoryRecord {
                 agent_history_key,
@@ -957,6 +1012,11 @@ impl Engine {
                 is_duplicate: turn.is_duplicate,
                 commit_status: crate::agent::AgentHistoryCommitStatus::Pending,
             };
+            // Index this freshly-minted record so a later turn in the same batch
+            // carrying the same id dedups against it.
+            if let Some(id) = record.history_item_id.clone().filter(|id| !id.is_empty()) {
+                seen_by_item_id.insert(id, agent_history_key);
+            }
             self.emit(
                 &mut log,
                 Event::AgentHistoryCreated {

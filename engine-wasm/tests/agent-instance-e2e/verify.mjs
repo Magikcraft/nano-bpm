@@ -231,6 +231,52 @@ assert(
   )})`,
 );
 
+// 5a. Idempotent retry dedup (server-side, historyItemId): pushing a turn with a
+//     stable historyItemId, then re-submitting the SAME historyItemId, must NOT
+//     create a second AGENT_HISTORY record — the retry dedups against the
+//     original. Verified through the wasm surface for engine parity.
+const beforeRetry = JSON.parse(
+  engine.searchAgentInstanceHistory(agentInstanceKey, "{}"),
+).items.length;
+const dedupUpdate = JSON.stringify({
+  agentInstanceKey,
+  elementInstanceKey,
+  elementId,
+  processInstanceKey,
+  history: [
+    {
+      loopIteration: 2,
+      producedAt: "2026-01-02T03:04:06.000Z",
+      role: "USER",
+      historyItemId: "retry-1",
+      content: [{ contentType: "TEXT", text: "please retry" }],
+    },
+  ],
+});
+engine.updateAgentInstance(dedupUpdate);
+const afterFirst = JSON.parse(
+  engine.searchAgentInstanceHistory(agentInstanceKey, "{}"),
+).items;
+assert(
+  afterFirst.length === beforeRetry + 1,
+  `a new historyItemId records one turn (got ${afterFirst.length - beforeRetry})`,
+);
+// Re-submit the identical historyItemId: it is an idempotent retry.
+engine.updateAgentInstance(dedupUpdate);
+const afterRetry = JSON.parse(
+  engine.searchAgentInstanceHistory(agentInstanceKey, "{}"),
+).items;
+assert(
+  afterRetry.length === afterFirst.length,
+  `re-submitting the same historyItemId creates no new record (got ${
+    afterRetry.length - afterFirst.length
+  } extra)`,
+);
+assert(
+  afterRetry.filter((t) => t.historyItemId === "retry-1").length === 1,
+  "the deduped turn appears exactly once in history",
+);
+
 // 6. COMPLETE drives the instance to the terminal COMPLETED status. Advance the
 //    host clock first so the completion instant is a real (non-zero) timestamp.
 engine.advanceTime(700);

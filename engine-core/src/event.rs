@@ -1061,6 +1061,25 @@ pub enum Event {
         /// The keys of the turns that transitioned to DISCARDED.
         agent_history_keys: Vec<Key>,
     },
+
+    /// A submitted AgentHistory turn was detected as an idempotent retry of an
+    /// already-recorded turn (same `historyItemId`) for the agent instance and
+    /// was therefore **not** materialised into a new record (Camunda 8.10
+    /// AgentHistory dedup, slice S2). No new AGENT_HISTORY record is created —
+    /// this event only records the dedup outcome so the API can echo back
+    /// `isDuplicate=true` with the original turn's `agent_history_key`. It is a
+    /// state and read-model no-op (the append-only log is left untouched).
+    AgentHistoryDeduplicated {
+        /// The owning process instance key.
+        instance_key: Key,
+        /// The agent instance the duplicate turn targeted.
+        agent_instance_key: Key,
+        /// The `historyItemId` that matched an already-recorded turn.
+        history_item_id: String,
+        /// The `agent_history_key` of the original (already-recorded) turn the
+        /// duplicate resolves to.
+        original_agent_history_key: Key,
+    },
 }
 
 impl Event {
@@ -1156,7 +1175,8 @@ impl Event {
             | Event::AgentInstanceCompleted { instance_key, .. } => Some(*instance_key),
             Event::AgentHistoryCreated { instance_key, .. }
             | Event::AgentHistoryCommitted { instance_key, .. }
-            | Event::AgentHistoryDiscarded { instance_key, .. } => Some(*instance_key),
+            | Event::AgentHistoryDiscarded { instance_key, .. }
+            | Event::AgentHistoryDeduplicated { instance_key, .. } => Some(*instance_key),
             Event::ProcessDeployed { .. }
             | Event::DecisionRequirementsDeployed { .. }
             | Event::DecisionDeployed { .. }
@@ -1480,6 +1500,13 @@ impl Event {
                 if let Some(max_key) = agent_history_keys.iter().copied().max() {
                     m = m.max(max_key);
                 }
+            }
+            Event::AgentHistoryDeduplicated {
+                agent_instance_key,
+                original_agent_history_key,
+                ..
+            } => {
+                m = m.max(*agent_instance_key).max(*original_agent_history_key);
             }
             _ => {}
         }
