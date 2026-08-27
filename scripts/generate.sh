@@ -100,6 +100,17 @@ echo "Generating stub trait implementations for the server"
   "${PROJECT_ROOT}/${OUTPUT_REL}/src/apis" \
   "${PROJECT_ROOT}/server/src/stub_impls.rs"
 
+# Spec-generated response-contract bundle (issue #1011): per-(operationId,status)
+# response-body schemas the gateway validates its own responses against. Derived
+# from the SAME sanitized spec the generator consumes, so it never drifts; the
+# implemented-operation set is imported from gen-stub-server.py's OVERRIDES. Like
+# stub_impls.rs it is git-ignored and regenerated here.
+echo "Generating spec-derived response contract for the server"
+"${PY[@]}" "${SCRIPT_DIR}/gen-response-contract.py" \
+  "${PROJECT_ROOT}/${SANITIZED_SPEC_DIR_REL}" \
+  "${SPEC_ENTRYPOINT}" \
+  "${PROJECT_ROOT}/server/src/response_contract_schema.json"
+
 # Format the generated artifacts with the host toolchain. Only generated files
 # are formatted: the whole generated/ crate, and the single generated
 # server/src/stub_impls.rs. The server's hand-written sources are left untouched
