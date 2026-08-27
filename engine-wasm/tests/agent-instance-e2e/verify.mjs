@@ -74,14 +74,25 @@ assert(
 );
 
 // 3. CREATE reconciles the auto-minted record (same key), applying a CREATE-time
-//    definition + limits + a configuration turn — still INITIALIZING.
+//    definition + limits + a configuration turn — still INITIALIZING. The turn
+//    uses the canonical REST history-item shape (a non-blank `historyItemId`, an
+//    RFC-3339 `producedAt`, and a `content` array) so the probe guards against
+//    contract drift on the CREATE surface too, not just UPDATE.
 engine.createAgentInstance(
   JSON.stringify({
     elementInstanceKey,
     definition: { model: "gpt-4o", provider: "openai" },
     limits: { maxTokens: 1000, maxModelCalls: 10, maxToolCalls: 5 },
     history: [
-      { loopIteration: 0, producedAt: 10, role: "CONFIGURATION" },
+      {
+        historyItemId: "cfg-0",
+        loopIteration: 0,
+        producedAt: "2026-01-02T03:04:04.000Z",
+        role: "CONFIGURATION",
+        content: [
+          { contentType: "TEXT", text: "agent configured" },
+        ],
+      },
     ],
   }),
 );
