@@ -727,9 +727,14 @@ export type AgentInstanceUpdateRequest = {
      */
     metrics?: AgentInstanceMetricsDelta;
     /**
-     * The complete list of tools available to the agent, replacing any previously
-     * stored tools. When provided, the engine replaces the existing tool list with
-     * this value.
+     * The complete list of tools available to the agent. Interpreted as a nullable
+     * changeset with three distinct cases:
+     * * omitted (field absent) — no change; the stored tool list is left untouched.
+     * * null — clears the tool set, replacing any previously stored tools with an
+     * empty list.
+     * * array — replaces the existing tool list with exactly this value.
+     * Note that null and an empty array are equivalent (both clear the set); omitting
+     * the field is the only way to leave the existing tools unchanged.
      *
      */
     tools?: Array<AgentTool> | null;
