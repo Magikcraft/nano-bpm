@@ -29055,12 +29055,28 @@ mod clustered_startup_tests {
         let new_leader = new_leader.expect("survivors must re-elect a leader for partition 0");
 
         // Data survived the failover: the parked instance exists on the new leader's
-        // engine handle for partition 0 (which it only replicated before).
-        let survived = new_leader
+        // engine handle for partition 0 (which it only replicated before). Winning
+        // the election only makes the node leader in the raft metrics; it does not
+        // guarantee the committed create entry has been *applied* to this node's
+        // engine state machine yet. Raft only marks prior-term entries committed
+        // (and thus applies them) once the new leader commits its own no-op for the
+        // current term, so there is a bounded apply lag between the metrics
+        // reporting a new leader and the instance materializing on its handle.
+        // Poll for it, like every other convergence check in this test.
+        let handle = new_leader
             .engine_handle_for(0)
-            .expect("new leader materializes partition 0")
-            .with(move |journal| journal.engine().instance(instance_key).is_some())
-            .await;
+            .expect("new leader materializes partition 0");
+        let mut survived = false;
+        for _ in 0..500 {
+            if handle
+                .with(move |journal| journal.engine().instance(instance_key).is_some())
+                .await
+            {
+                survived = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert!(
             survived,
             "the committed instance must survive the leader loss"
