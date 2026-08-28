@@ -621,13 +621,13 @@ fn run_path(
         for (job_key, job_type, element_id, needs_activation) in pending {
             if needs_activation {
                 let _ = engine.apply_command_at(
-                    Command::ActivateJobs {
-                        job_type: job_type.clone(),
-                        worker: "corpus".to_string(),
-                        max_jobs: 100_000,
-                        timeout: u64::MAX / 4,
-                        now: clock,
-                    },
+                    Command::activate_jobs(
+                        job_type.clone(),
+                        "corpus".to_string(),
+                        100_000,
+                        u64::MAX / 4,
+                        clock,
+                    ),
                     clock,
                 );
             }

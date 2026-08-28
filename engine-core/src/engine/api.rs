@@ -113,9 +113,33 @@ impl Engine {
         timeout: u64,
         now: u64,
     ) -> Vec<ActivatedJob> {
+        self.activate_jobs_with_fetch(job_type, worker, max_jobs, timeout, now, Vec::new())
+    }
+
+    /// Like [`Engine::activate_jobs`] but records the declared read-set
+    /// (`fetchVariables`) on each resulting [`Event::JobActivated`] — the
+    /// engine-native read provenance for reification. An empty `fetch_variables`
+    /// is exactly [`Engine::activate_jobs`] (fetch-all / undeclared reads), and
+    /// keeps the activation event byte-identical.
+    pub fn activate_jobs_with_fetch(
+        &mut self,
+        job_type: impl Into<String>,
+        worker: impl Into<String>,
+        max_jobs: usize,
+        timeout: u64,
+        now: u64,
+        fetch_variables: Vec<String>,
+    ) -> Vec<ActivatedJob> {
         let events = self
             .apply_command_at(
-                Command::activate_jobs(job_type, worker, max_jobs, timeout, now),
+                Command::activate_jobs_with_fetch(
+                    job_type,
+                    worker,
+                    max_jobs,
+                    timeout,
+                    now,
+                    fetch_variables,
+                ),
                 now,
             )
             .expect("ActivateJobs never fails");

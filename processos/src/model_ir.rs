@@ -141,6 +141,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
     match kind {
         ElementKind::StartEvent => "startEvent",
         ElementKind::EndEvent => "endEvent",
+        ElementKind::TerminateEndEvent => "terminateEndEvent",
         ElementKind::ServiceTask { .. } => "serviceTask",
         ElementKind::BusinessRuleTask { .. } => "businessRuleTask",
         ElementKind::UserTask(_) => "userTask",
@@ -177,6 +178,7 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
     match kind {
         ElementKind::StartEvent
         | ElementKind::EndEvent
+        | ElementKind::TerminateEndEvent
         | ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
         | ElementKind::EventBasedGateway
@@ -1111,6 +1113,7 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
     let kind = match keyword {
         "startEvent" => ElementKind::StartEvent,
         "endEvent" => ElementKind::EndEvent,
+        "terminateEndEvent" => ElementKind::TerminateEndEvent,
         "exclusiveGateway" => ElementKind::ExclusiveGateway,
         "parallelGateway" => ElementKind::ParallelGateway,
         "eventBasedGateway" => ElementKind::EventBasedGateway,
@@ -1246,6 +1249,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::CompensationBoundaryEvent { attached_to, .. } => Some(attached_to),
         ElementKind::StartEvent
         | ElementKind::EndEvent
+        | ElementKind::TerminateEndEvent
         | ElementKind::ServiceTask { .. }
         | ElementKind::BusinessRuleTask { .. }
         | ElementKind::UserTask(_)

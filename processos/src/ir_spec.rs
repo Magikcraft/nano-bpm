@@ -83,6 +83,11 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
         attrs: &[],
     },
     KindSpec {
+        keyword: "terminateEndEvent",
+        doc: "Terminate end event. Kills every other token in its enclosing scope, then completes that scope.",
+        attrs: &[],
+    },
+    KindSpec {
         keyword: "serviceTask",
         doc: "Job-based task. Creates a job of `jobType` and rests until completion.",
         attrs: &[
@@ -832,6 +837,7 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
     match k {
         StartEvent => "startEvent",
         EndEvent => "endEvent",
+        TerminateEndEvent => "terminateEndEvent",
         ServiceTask { .. } => "serviceTask",
         BusinessRuleTask { .. } => "businessRuleTask",
         UserTask(_) => "userTask",
@@ -869,6 +875,7 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
     vec![
         ("startEvent", ElementKind::StartEvent),
         ("endEvent", ElementKind::EndEvent),
+        ("terminateEndEvent", ElementKind::TerminateEndEvent),
         (
             "serviceTask",
             ElementKind::ServiceTask {

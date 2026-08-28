@@ -37,6 +37,7 @@ mod raft_net;
 mod readstore;
 mod recovery_throttle;
 mod remote_sink;
+mod response_contract;
 mod runtime_config;
 mod seglog;
 mod sqlite_space;
@@ -15749,7 +15750,7 @@ impl ServerImpl {
                 let p = led[(start + off) % ln];
                 if self.replicate_activation_for(p) {
                     futures.push(
-                        self.activate_on_raft(p, job_type, worker, want, timeout)
+                        self.activate_on_raft(p, job_type, worker, want, timeout, fetch_variable)
                             .boxed(),
                     );
                 } else {
@@ -15763,8 +15764,15 @@ impl ServerImpl {
                         continue;
                     };
                     futures.push(
-                        self.activate_on_local(handle, job_type, worker, want, timeout)
-                            .boxed(),
+                        self.activate_on_local(
+                            handle,
+                            job_type,
+                            worker,
+                            want,
+                            timeout,
+                            fetch_variable,
+                        )
+                        .boxed(),
                     );
                 }
             }
@@ -15779,8 +15787,15 @@ impl ServerImpl {
                 .collect();
         }
         let activated: Vec<ActivatedJobWithIdentity> = if n == 1 {
-            self.activate_on(&handles[0], job_type, worker, max_jobs, timeout)
-                .await
+            self.activate_on(
+                &handles[0],
+                job_type,
+                worker,
+                max_jobs,
+                timeout,
+                fetch_variable,
+            )
+            .await
         } else {
             // Fan out across partitions CONCURRENTLY so every partition's engine
             // thread runs its activation pass in parallel, instead of one
@@ -15807,7 +15822,14 @@ impl ServerImpl {
                     continue;
                 }
                 let handle = &handles[(start + off) % n];
-                futures.push(self.activate_on(handle, job_type, worker, want, timeout));
+                futures.push(self.activate_on(
+                    handle,
+                    job_type,
+                    worker,
+                    want,
+                    timeout,
+                    fetch_variable,
+                ));
             }
             futures_util::future::join_all(futures)
                 .await
@@ -15834,9 +15856,17 @@ impl ServerImpl {
         worker: &str,
         want: usize,
         timeout: u64,
+        fetch_variable: Option<&[String]>,
     ) -> Vec<ActivatedJobWithIdentity> {
         let job_type = job_type.to_string();
         let worker = worker.to_string();
+        // Declared read-set (`fetchVariables`) threaded into the activation so the
+        // engine stamps it onto `JobActivated` (#986). Leader-local activation
+        // discards the event (never journaled), so this is durable only where the
+        // event is exported, but is threaded uniformly for a consistent surface.
+        let fetch_variables: Vec<String> = fetch_variable
+            .map(|names| names.to_vec())
+            .unwrap_or_default();
         #[cfg(feature = "console")]
         let worker_for_trace = worker.clone();
         let activated: Vec<ActivatedJobWithIdentity> = handle
@@ -15846,7 +15876,14 @@ impl ServerImpl {
                 let timer = cmd_profile::start();
                 let now = now_millis();
                 let out: Vec<ActivatedJobWithIdentity> = engine
-                    .activate_jobs(&job_type, &worker, want, timeout, now)
+                    .activate_jobs_with_fetch(
+                        &job_type,
+                        &worker,
+                        want,
+                        timeout,
+                        now,
+                        fetch_variables,
+                    )
                     .into_iter()
                     .map(|job| {
                         let (process_id, version, process_definition_key) = engine
@@ -15888,8 +15925,9 @@ impl ServerImpl {
         worker: &str,
         want: usize,
         timeout: u64,
+        fetch_variable: Option<&[String]>,
     ) -> Vec<ActivatedJobWithIdentity> {
-        self.activate_on(&handle, job_type, worker, want, timeout)
+        self.activate_on(&handle, job_type, worker, want, timeout, fetch_variable)
             .await
     }
 
@@ -15906,6 +15944,7 @@ impl ServerImpl {
         worker: &str,
         want: usize,
         timeout: u64,
+        fetch_variable: Option<&[String]>,
     ) -> Vec<ActivatedJobWithIdentity> {
         let Some(part) = self.raft.get(p) else {
             return Vec::new();
@@ -15917,13 +15956,22 @@ impl ServerImpl {
         // A single logical instant drives both the command (job-lock deadlines)
         // and the journal apply, so leader and followers mint identical state.
         let now = now_millis();
-        let response = match part
-            .propose_result(
-                Command::activate_jobs(job_type, worker, want, timeout, now),
+        // Replicated activation journals `JobActivated`, so the declared read-set
+        // (`fetchVariables`) rides the command into the durable event as
+        // engine-native read provenance for reification (#986). Empty ⇒ fetch-all
+        // (undeclared), keeping the command/event byte-identical.
+        let command = match fetch_variable {
+            Some(names) if !names.is_empty() => Command::activate_jobs_with_fetch(
+                job_type,
+                worker,
+                want,
+                timeout,
                 now,
-            )
-            .await
-        {
+                names.to_vec(),
+            ),
+            _ => Command::activate_jobs(job_type, worker, want, timeout, now),
+        };
+        let response = match part.propose_result(command, now).await {
             Ok(r) if r.error.is_none() => r,
             _ => return Vec::new(),
         };
@@ -19822,7 +19870,7 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
 
     let (job_kind_enum, job_listener_event_type_enum) = job_kind_enums(&job.kind);
 
-    models::JobSearchResult::new(
+    let mut result = models::JobSearchResult::new(
         std::collections::HashMap::new(),
         deadline,
         types::Nullable::Null,
@@ -19848,7 +19896,14 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
         types::Nullable::Null,
         types::Nullable::Null,
         0,
-    )
+    );
+    // nano extension (#986): surface the declared read-set recorded on the durable
+    // `JobActivated`. Omitted (`Null`) when the activation declared none, so a
+    // fetch-all / undeclared activation reads as `null` rather than "[]".
+    if !job.read_set.is_empty() {
+        result.fetched_variables = Some(types::Nullable::Present(job.read_set.clone()));
+    }
+    result
 }
 
 /// Maps an engine [`nanobpmn_engine_core::UserTaskState`] to the REST user-task
@@ -22419,7 +22474,16 @@ async fn main() {
             axum::routing::get(system_memory_handler),
         );
 
-    // Prometheus `/metrics` — registered only when enabled (ADR 0035). When
+    // Spec-generated response-contract guard (issue #1011): validate every
+    // implemented `/v2` operation's serialized response against the OpenAPI
+    // schema for its status code, failing loudly with 500 on drift. Layered
+    // here so it wraps the generated REST surface (and the debug/system routes
+    // added above, which it ignores — they carry no operationId in the
+    // contract); the console/metrics/cluster routers merged/added afterwards are
+    // deliberately outside its scope. Off/lenient/strict via
+    // NANOBPM_RESPONSE_VALIDATION (default: strict).
+    app = app.layer(axum::middleware::from_fn(response_contract::guard));
+
     // disabled it 404s, removing the endpoint from the attack surface. Computed
     // on scrape, so it costs nothing at steady state.
     if obs_config.metrics {
@@ -25129,6 +25193,13 @@ mod clustered_startup_tests {
         assert_eq!(jd.job_kind, models::JobKindEnum::BpmnElement);
         // An ordinary element job has no listener event type.
         assert_eq!(jd.listener_event_type, types::Nullable::Null);
+        // Camunda 8 marks `retries` required on JobWaitStateDetails, so it must be
+        // present (never null) for a live activatable job (#1010).
+        assert!(
+            matches!(jd.retries, types::Nullable::Present(r) if r > 0),
+            "JOB wait state carries a present, positive retries count, got {:?}",
+            jd.retries
+        );
         assert!(matches!(job.message_details, types::Nullable::Null));
 
         // MESSAGE wait state: the message catch parked on its open subscription.
@@ -25197,6 +25268,88 @@ mod clustered_startup_tests {
         };
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].element_id, "charge");
+    }
+
+    #[tokio::test]
+    async fn wait_state_job_details_survive_activation() {
+        // #1010 regression guard: a JOB wait state parked on an *activated* (locked)
+        // job — the shape a worker-driven deployment like nano-workforce sits in,
+        // where an agent service task is picked up and held by a worker — must still
+        // carry the Camunda-8-required `jobType`/`jobKind`/`retries`. The read model
+        // materialises `job_type` on `JobCreated`; `JobActivated` only rewrites
+        // state/worker/deadline, so this pins that activation does not drop the type.
+        let server = ServerImpl::default();
+
+        let charger = ProcessBuilder::new("charger")
+            .start_event("s")
+            .service_task("charge", "pay")
+            .end_event("e")
+            .connect("s", "charge")
+            .connect("charge", "e")
+            .build()
+            .expect("valid service-task process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("charger".to_string(), "charger.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![charger],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let (charger_key, _) = server
+            .create_for_stream(
+                Some("charger".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create charger");
+
+        // Park the job (Created), then activate it (Activated) as a worker would.
+        let _ = loop_until_wait_states(&server, None, 1).await;
+        let mut req = models::JobActivationRequest::new("pay".into(), 60_000, 10);
+        req.request_timeout = Some(-1);
+        let resp = server.activate_jobs_impl(&req).await.expect("activate ok");
+        use apis::job::ActivateJobsResponse as ActR;
+        let jobs = match resp {
+            ActR::Status200_TheListOfActivatedJobs(r) => r.jobs,
+            other => panic!("expected 200 list, got {other:?}"),
+        };
+        assert_eq!(jobs.len(), 1, "the 'pay' job activates");
+
+        // The still-parked, now-activated job remains a JOB wait state with its
+        // required contract fields intact.
+        let items = loop_until_wait_states(&server, None, 1).await;
+        let job = items
+            .iter()
+            .find(|w| {
+                w.wait_state_type == models::WaitStateTypeEnum::Job
+                    && w.process_instance_key.0 == charger_key.to_string()
+            })
+            .expect("the activated service-task job is still a JOB wait state");
+        let jd = match &job.job_details {
+            types::Nullable::Present(d) => d,
+            types::Nullable::Null => panic!("JOB wait state carries job details"),
+        };
+        assert_eq!(
+            jd.job_type, "pay",
+            "activation must not drop the required jobType"
+        );
+        assert!(
+            !jd.job_type.is_empty(),
+            "jobType is required (Zeebe parity) and must never be empty"
+        );
+        assert_eq!(jd.job_kind, models::JobKindEnum::BpmnElement);
+        assert!(
+            matches!(jd.retries, types::Nullable::Present(r) if r > 0),
+            "retries is required and stays present across activation, got {:?}",
+            jd.retries
+        );
     }
 
     #[tokio::test]

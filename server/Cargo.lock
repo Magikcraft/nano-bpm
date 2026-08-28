@@ -1476,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "nanobpm-gateway-rest-server"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1514,6 +1514,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-tungstenite",
+ "tower",
  "tower-http 0.7.0",
  "tracing",
  "tracing-appender",

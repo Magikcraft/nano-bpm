@@ -2,8 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   applyFilterChange,
+  explorerStackView,
   filtersQueryKey,
+  INSTANCE_DEEP_LINK_PARAM,
   parseExplorerFilters,
+  readInstanceParam,
   shouldResetPageOnFilterChange,
   toInstanceQuery,
 } from "./explorerFilters.ts";
@@ -106,4 +109,37 @@ test("applyFilterChange preserves unrelated params (e.g. instance deep-link)", (
 
 test("a filter change always resets the pager to the first page", () => {
   assert.equal(shouldResetPageOnFilterChange(), true);
+});
+
+test("INSTANCE_DEEP_LINK_PARAM is the stable `instance` wire name", () => {
+  assert.equal(INSTANCE_DEEP_LINK_PARAM, "instance");
+});
+
+test("readInstanceParam returns null when the param is absent", () => {
+  assert.equal(readInstanceParam(new URLSearchParams()), null);
+});
+
+test("readInstanceParam returns the trimmed key when present", () => {
+  assert.equal(
+    readInstanceParam(new URLSearchParams("instance=abc-123")),
+    "abc-123",
+  );
+  assert.equal(
+    readInstanceParam(new URLSearchParams("instance=%20abc%20")),
+    "abc",
+  );
+});
+
+test("readInstanceParam treats a blank/whitespace-only value as absent", () => {
+  assert.equal(readInstanceParam(new URLSearchParams("instance=")), null);
+  assert.equal(readInstanceParam(new URLSearchParams("instance=%20%20")), null);
+});
+
+test("explorerStackView shows the list when nothing is selected", () => {
+  assert.equal(explorerStackView(null), "list");
+  assert.equal(explorerStackView(""), "list");
+});
+
+test("explorerStackView shows the detail once an instance is selected — this is the ?instance= mobile deep-link contract", () => {
+  assert.equal(explorerStackView("inst-1"), "detail");
 });

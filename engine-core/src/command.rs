@@ -136,6 +136,16 @@ pub enum Command {
         max_jobs: usize,
         timeout: u64,
         now: u64,
+        /// The declared read-set (`fetchVariables`) the worker asked for. Carried
+        /// from the activate request into the durable [`Event::JobActivated`] as
+        /// engine-native read provenance for reification. Empty for a fetch-all
+        /// (undeclared) activation, which keeps the declaration-free activation
+        /// command byte-identical (`skip_serializing_if`).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        fetch_variables: Vec<String>,
     },
     /// Release the activation lock of every job whose `deadline` is at or before
     /// `now`, making it activatable again. A periodic "tick" the host drives;
@@ -962,6 +972,29 @@ impl Command {
             max_jobs,
             timeout,
             now,
+            fetch_variables: Vec::new(),
+        }
+    }
+
+    /// `ActivateJobs` carrying a declared read-set (`fetchVariables`). The names
+    /// are stamped onto each resulting [`Event::JobActivated`] as engine-native
+    /// read provenance. An empty `fetch_variables` is equivalent to
+    /// [`Command::activate_jobs`] (fetch-all, undeclared reads).
+    pub fn activate_jobs_with_fetch(
+        job_type: impl Into<String>,
+        worker: impl Into<String>,
+        max_jobs: usize,
+        timeout: u64,
+        now: u64,
+        fetch_variables: Vec<String>,
+    ) -> Self {
+        Command::ActivateJobs {
+            job_type: job_type.into(),
+            worker: worker.into(),
+            max_jobs,
+            timeout,
+            now,
+            fetch_variables,
         }
     }
 
@@ -1047,7 +1080,8 @@ mod kind_tests {
                 worker: "w".into(),
                 max_jobs: 1,
                 timeout: 0,
-                now: 0
+                now: 0,
+                fetch_variables: Vec::new(),
             }
             .kind(),
             "activate_jobs"

@@ -583,7 +583,7 @@ element_families! {
 fn element_kind_family(kind: &ElementKind) -> ElementFamily {
     match kind {
         ElementKind::StartEvent => ElementFamily::StartEvent,
-        ElementKind::EndEvent => ElementFamily::EndEvent,
+        ElementKind::EndEvent | ElementKind::TerminateEndEvent => ElementFamily::EndEvent,
         ElementKind::ServiceTask { .. }
         | ElementKind::BusinessRuleTask { .. }
         | ElementKind::UserTask(_)

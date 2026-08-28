@@ -370,15 +370,17 @@ mod tests {
         );
     }
 
-    /// A `<terminateEventDefinition>` is a *documented* "parsed-not-executed"
-    /// element (`docs/camunda-compatibility.md`): Zeebe accepts terminate end
-    /// events at deploy, so Nano does too — degrading to a plain end event rather
-    /// than rejecting. This is a KNOWN, documented limitation, not the silent
-    /// accept-and-mis-execute of an *unknown* construct that this rule guards
-    /// against, so a terminate end event must deploy clean. (Real corpus models —
-    /// e.g. the `cdd-refresh` sanctions gate — rely on this.)
+    /// A `<terminateEventDefinition>` on an `<endEvent>` is an **executed**
+    /// terminate end event (`docs/camunda-compatibility.md`): it parses to
+    /// [`ElementKind::TerminateEndEvent`](crate::model::ElementKind::TerminateEndEvent)
+    /// via an explicit parse arm and drives real "kill the enclosing scope's
+    /// remaining tokens" semantics at runtime. It must therefore deploy clean —
+    /// it is a recognised, supported construct, not the silent
+    /// accept-and-mis-execute of an *unknown* element that this rule guards
+    /// against. (Real corpus models — e.g. the `cdd-refresh` sanctions gate —
+    /// rely on this.)
     #[test]
-    fn a_terminate_end_event_is_accepted_as_a_documented_parsed_not_executed_element() {
+    fn a_terminate_end_event_deploys_clean_and_is_not_rejected_as_unsupported() {
         let terminate_end = defs_xml(
             r#"<bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
                <bpmn:endEvent id="e">
@@ -389,8 +391,8 @@ mod tests {
         );
         assert!(
             parse_bpmn(&terminate_end).is_ok(),
-            "a terminate end event is a documented parsed-not-executed element, not \
-             an unsupported one: {:?}",
+            "a terminate end event is an executed, supported element, not an \
+             unsupported one: {:?}",
             parse_bpmn(&terminate_end).err(),
         );
     }

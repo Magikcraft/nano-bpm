@@ -12,7 +12,7 @@
 root      ::= ws "process" sp string sp "{" nl indent "start" sp id nl elements flows "}" ws
 elements  ::= element*
 flows     ::= flow*
-element   ::= elem-startEvent | elem-endEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent | elem-agentTask
+element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent | elem-agentTask
 
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
@@ -23,6 +23,11 @@ attr-line-startEvent  ::= attr-parent | attr-retries | attr-timer | attr-input |
 elem-endEvent  ::= indent "endEvent" sp id (sp string)? (sp attrs-endEvent)? nl
 attrs-endEvent   ::= "{" nl (indent2 attr-line-endEvent nl)+ indent "}"
 attr-line-endEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+
+# terminateEndEvent — Terminate end event. Kills every other token in its enclosing scope, then completes that scope.
+elem-terminateEndEvent  ::= indent "terminateEndEvent" sp id (sp string)? (sp attrs-terminateEndEvent)? nl
+attrs-terminateEndEvent   ::= "{" nl (indent2 attr-line-terminateEndEvent nl)+ indent "}"
+attr-line-terminateEndEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
 
 # serviceTask — Job-based task. Creates a job of `jobType` and rests until completion.
 elem-serviceTask  ::= indent "serviceTask" sp id (sp string)? (sp attrs-serviceTask)? nl

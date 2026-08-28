@@ -174,15 +174,15 @@ merges it:
   "waitForChecks": true,
   "land": { "method": "mergify-queue", "comment": "@mergifyio queue" },
   "requiredChecks": [
-    { "name": "rustfmt (pinned nightly)", "acceptedConclusions": ["success"] },
-    { "name": "engine-core (clippy + test)", "acceptedConclusions": ["success"] },
-    { "name": "engine-wasm-ffi (dist + verify)", "acceptedConclusions": ["success"] },
-    { "name": "server (clippy + test)", "acceptedConclusions": ["success"] },
-    { "name": "@nanobpm/nano-bernd (build + test)", "acceptedConclusions": ["success"] },
-    { "name": "io.github.jwulf:nano-bernd (JVM, Chicory)", "acceptedConclusions": ["success"] },
+    { "name": "rustfmt (pinned nightly)", "acceptedConclusions": ["success", "skipped"] },
+    { "name": "engine-core (clippy + test)", "acceptedConclusions": ["success", "skipped"] },
+    { "name": "engine-wasm-ffi (dist + verify)", "acceptedConclusions": ["success", "skipped"] },
+    { "name": "server (clippy + test)", "acceptedConclusions": ["success", "skipped"] },
+    { "name": "@nanobpm/nano-bernd (build + test)", "acceptedConclusions": ["success", "skipped"] },
+    { "name": "io.github.jwulf:nano-bernd (JVM, Chicory)", "acceptedConclusions": ["success", "skipped"] },
     { "name": "processos (clippy + test)", "acceptedConclusions": ["success", "skipped"] }
   ],
-  "checksSemantics": "Every entry in requiredChecks gates the merge and must reach one of its acceptedConclusions. 'processos (clippy + test)' is change-gated in ci.yml and skipped for PRs that don't touch its inputs; a skipped check never reports success, so it accepts 'skipped' too (required-when-run, skip-tolerant). This mirrors .mergify.yml success_conditions (check-success OR check-skipped for processos).",
+  "checksSemantics": "Every entry in requiredChecks gates the merge and must reach one of its acceptedConclusions. All seven checks are change-gated in ci.yml: the six code checks share the `code` filter (`*code_gate`) and 'processos (clippy + test)' has its own `processos` filter, so each is SKIPPED for PRs that don't touch its inputs (e.g. console/spec-app-only PRs skip every code check) and RUNS on the merge_group queue build. A skipped check never reports success, so each accepts 'skipped' too (required-when-run, skip-tolerant). Without this, a merge orchestrator that treats a skipped required check as unsatisfied blocks console-only PRs that GitHub itself reports as CLEAN.",
   "doc": "AGENTS.md#merging-prs"
 }
 ```

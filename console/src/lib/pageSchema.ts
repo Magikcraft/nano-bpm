@@ -10,7 +10,70 @@
 import {
   PAGE_NODE_TYPES as SHARED_PAGE_NODE_TYPES,
   type PageNodeType,
+  // The C1 responsive-presentation vocabulary (issue #1005). These are the single
+  // source of truth for the mobile props the Urban runtime renders; the composer's
+  // local prop types below bind to them and the parity lock at the bottom of this
+  // file proves they can never silently drift (the same guard `PAGE_NODE_TYPES`
+  // gives node *types*, now extended to node *props*).
+  MOBILE_MAX_WIDTH,
+  COLUMN_MOBILE_PRIORITIES,
+  NAV_VARIANTS,
+  NAV_OVERFLOW_MODES,
+  NAV_ITEM_GROUPS,
+  NAV_ITEM_GROUP_DEFAULT,
+  DATA_GRID_MOBILE_PRESENTATIONS,
+  DATA_GRID_MOBILE_PRESENTATION_DEFAULT,
+  LAYOUT_MOBILE_VARIANTS,
+  LAYOUT_MOBILE_VARIANT_DEFAULT,
+  isColumnMobilePriority,
+  isNavVariant,
+  isNavOverflow,
+  isNavItemGroup,
+  isDataGridMobilePresentation,
+  isLayoutMobileVariant,
+  type ColumnMobile,
+  type ColumnMobilePriority,
+  type NavVariant,
+  type NavOverflow,
+  type NavItemGroup,
+  type DataGridMobile,
+  type DataGridMobilePresentation,
+  type LayoutMobileVariant,
+  type PageLayout,
 } from "@nanobpm/nano-app-schema";
+
+// Re-export the C1 vocabulary from the console's schema module so every console
+// surface (the PageComposer, its editors, the parity lock) has one import site,
+// exactly as `PAGE_NODE_TYPES` is re-exported below. `MOBILE_MAX_WIDTH` is the ONE
+// canonical breakpoint — consumers import it rather than restating a literal.
+export {
+  MOBILE_MAX_WIDTH,
+  COLUMN_MOBILE_PRIORITIES,
+  NAV_VARIANTS,
+  NAV_OVERFLOW_MODES,
+  NAV_ITEM_GROUPS,
+  NAV_ITEM_GROUP_DEFAULT,
+  DATA_GRID_MOBILE_PRESENTATIONS,
+  DATA_GRID_MOBILE_PRESENTATION_DEFAULT,
+  LAYOUT_MOBILE_VARIANTS,
+  LAYOUT_MOBILE_VARIANT_DEFAULT,
+  isColumnMobilePriority,
+  isNavVariant,
+  isNavOverflow,
+  isNavItemGroup,
+  isDataGridMobilePresentation,
+  isLayoutMobileVariant,
+};
+export type {
+  ColumnMobile,
+  ColumnMobilePriority,
+  NavOverflow,
+  NavItemGroup,
+  DataGridMobile,
+  DataGridMobilePresentation,
+  LayoutMobileVariant,
+  PageLayout,
+};
 
 export const PAGE_SCHEMA_VERSION = "1.0" as const;
 
@@ -101,10 +164,14 @@ export interface GridColumn {
   header: string;
   /** An optional structured link the cell value becomes (e.g. a process-explorer
    * deep link). This is the only per-column link mechanism the parser preserves
-   * — `parseColumns` keeps `field`, `header`, and `link` and drops anything
-   * else. (Not to be confused with `DetailSpec.linkField`, which is a
+   * — `parseColumns` keeps `field`, `header`, `link`, and `mobile` and drops
+   * anything else. (Not to be confused with `DetailSpec.linkField`, which is a
    * detail-panel concern, unrelated to grid columns.) */
   link?: GridColumnLink;
+  /** How this column is presented on mobile (`column.mobile`). The Urban runtime
+   * reads `column.mobile.priority` (primary line / chip / hidden) and an optional
+   * `column.mobile.label` used in place of the header on the card. */
+  mobile?: ColumnMobile;
 }
 
 /** A tab over a single grid — selecting it swaps the active row filter
@@ -216,9 +283,17 @@ export interface NavItem {
   href?: string;
   /** Optional leading icon/glyph. */
   icon?: string;
+  /** Which group the item belongs to on mobile (`nav.items[].group`). Omitting it
+   *  means {@link NAV_ITEM_GROUP_DEFAULT} (`"primary"`), so an app that annotates
+   *  nothing gets every item rendered as a first-class card. */
+  group?: NavItemGroup;
 }
 
-export type NavVariant = "bar" | "rail";
+// The nav layout variant is the C1 vocabulary (`"bar" | "rail" | "cards"`, where
+// `"cards"` is the mobile-first launcher grid). Aliased to the shared type so the
+// composer can never carry a variant the runtime doesn't render (see the parity
+// lock below).
+export type { NavVariant };
 
 /** A navigation node: a top `bar` or side `rail` linking the app's pages. `items`
  *  is either the literal string `"auto"` (enumerate every page at render time) or an
@@ -233,6 +308,9 @@ export interface NavNode {
     title?: string;
     /** `"auto"` = link every page; otherwise an explicit ordered list. */
     items: "auto" | NavItem[];
+    /** How the nav collapses items that do not fit (`nav.props.overflow`).
+     *  Omitting it keeps the default (no collapse). */
+    overflow?: NavOverflow;
   };
 }
 
@@ -264,6 +342,9 @@ export interface DataGridNode {
     detail?: DetailSpec;
     /** Auto-refresh interval in ms (0/omitted disables). */
     refreshMs?: number;
+    /** How the grid presents itself on mobile (`dataGrid.props.mobile`). Omitting
+     *  it means {@link DATA_GRID_MOBILE_PRESENTATION_DEFAULT} (`"cards"`). */
+    mobile?: DataGridMobile;
   };
 }
 
@@ -288,6 +369,57 @@ const _pageNodeTypeParity: [
   AssertUnionCoversRegistry,
 ] = [true, true];
 void _pageNodeTypeParity;
+
+// ── prop-level parity lock (issue #1005) ─────────────────────────────────────
+// The node-*type* parity above proves the composer's node union stays in lockstep
+// with the shared registry. The C1 responsive vocabulary moved the drift risk from
+// node types into node *props*: the composer now authors nav.props.variant/overflow,
+// nav.items[].group, column.mobile.priority, dataGrid.props.mobile.presentation and
+// the page-level layout.mobile — each an enum the Urban runtime also renders. Bind
+// every one to its C1 constant (`NAV_VARIANTS`-style exports) so a value added there
+// but unhandled here — or a local prop enum hand-narrowed away from the schema —
+// fails to compile, exactly as node-type drift does today.
+//
+// `MutuallyExtends<A, B>` is `true` only when the two unions are identical; assigning
+// it to a `true` literal turns any drift into a type error at build time.
+type MutuallyExtends<A, B> = [A] extends [B]
+  ? [B] extends [A]
+    ? true
+    : never
+  : never;
+
+const _navVariantParity: MutuallyExtends<
+  NavNode["props"]["variant"],
+  (typeof NAV_VARIANTS)[number]
+> = true;
+const _navOverflowParity: MutuallyExtends<
+  NonNullable<NavNode["props"]["overflow"]>,
+  (typeof NAV_OVERFLOW_MODES)[number]
+> = true;
+const _navItemGroupParity: MutuallyExtends<
+  NonNullable<NavItem["group"]>,
+  (typeof NAV_ITEM_GROUPS)[number]
+> = true;
+const _columnMobilePriorityParity: MutuallyExtends<
+  NonNullable<GridColumn["mobile"]>["priority"],
+  (typeof COLUMN_MOBILE_PRIORITIES)[number]
+> = true;
+const _dataGridMobilePresentationParity: MutuallyExtends<
+  NonNullable<NonNullable<DataGridNode["props"]["mobile"]>["presentation"]>,
+  (typeof DATA_GRID_MOBILE_PRESENTATIONS)[number]
+> = true;
+const _layoutMobileParity: MutuallyExtends<
+  NonNullable<NonNullable<PageDoc["layout"]>["mobile"]>,
+  (typeof LAYOUT_MOBILE_VARIANTS)[number]
+> = true;
+void [
+  _navVariantParity,
+  _navOverflowParity,
+  _navItemGroupParity,
+  _columnMobilePriorityParity,
+  _dataGridMobilePresentationParity,
+  _layoutMobileParity,
+];
 
 /** A data-bound prose/markdown list (#274). Binds a datasource like `dataGrid`,
  * but renders each row as a stacked prose block — a header template over one body
@@ -344,6 +476,10 @@ export interface PageDoc {
   schemaVersion: typeof PAGE_SCHEMA_VERSION;
   title: string;
   nodes: PageNode[];
+  /** Page-level layout hints (`page.layout`). Its `mobile` field is the C1 Tier-2
+   *  variant hook (`layout.mobile`) the runtime's `isNarrow()` anticipates; omitting
+   *  it leaves the page on the Tier-1 CSS reflow at {@link MOBILE_MAX_WIDTH}. */
+  layout?: PageLayout;
 }
 
 /** A fresh, empty page. */
@@ -409,13 +545,26 @@ function parseColumnLink(raw: unknown): GridColumnLink | undefined {
   return undefined;
 }
 
+function parseColumnMobile(raw: unknown): ColumnMobile | undefined {
+  if (!isRecord(raw) || !isColumnMobilePriority(raw.priority)) return undefined;
+  return {
+    priority: raw.priority,
+    ...(typeof raw.label === "string" && raw.label ? { label: raw.label } : {}),
+  };
+}
+
 function parseColumns(raw: unknown): GridColumn[] {
   return (Array.isArray(raw) ? raw : [])
     .filter(isRecord)
     .map((c) => {
       const link = parseColumnLink(c.link);
+      const mobile = parseColumnMobile(c.mobile);
       const col: GridColumn = { field: str(c.field), header: str(c.header) };
-      return link ? { ...col, link } : col;
+      return {
+        ...col,
+        ...(link ? { link } : {}),
+        ...(mobile ? { mobile } : {}),
+      };
     })
     .filter((c) => c.field !== "");
 }
@@ -649,7 +798,10 @@ export function parsePageDoc(
         });
         break;
       case "nav": {
-        const variant = props.variant === "rail" ? "rail" : "bar";
+        const variant = isNavVariant(props.variant) ? props.variant : "bar";
+        const overflow = isNavOverflow(props.overflow)
+          ? props.overflow
+          : undefined;
         const rawItems = props.items;
         let items: "auto" | NavItem[];
         if (rawItems === "auto" || rawItems === undefined) {
@@ -668,11 +820,13 @@ export function parsePageDoc(
                   : "";
               const label = typeof it.label === "string" ? it.label : "";
               const icon = typeof it.icon === "string" ? it.icon : "";
+              const group = isNavItemGroup(it.group) ? it.group : undefined;
               return {
                 label,
                 // `page` wins over `href` (mirrors urban's navLink precedence).
                 ...(page ? { page } : href ? { href } : {}),
                 ...(icon ? { icon } : {}),
+                ...(group ? { group } : {}),
               };
             })
             // Drop fully-empty items (no label and no target): they render as
@@ -690,6 +844,7 @@ export function parsePageDoc(
             variant,
             ...(typeof props.title === "string" ? { title: props.title } : {}),
             items,
+            ...(overflow ? { overflow } : {}),
           },
         });
         break;
@@ -742,6 +897,11 @@ export function parsePageDoc(
           typeof props.refreshMs === "number" && props.refreshMs > 0
             ? props.refreshMs
             : undefined;
+        const mobile =
+          isRecord(props.mobile) &&
+          isDataGridMobilePresentation(props.mobile.presentation)
+            ? { presentation: props.mobile.presentation }
+            : undefined;
         nodes.push({
           type: "dataGrid",
           id,
@@ -762,6 +922,7 @@ export function parsePageDoc(
             ...(rowActions.length ? { rowActions } : {}),
             ...(detail ? { detail } : {}),
             ...(refreshMs ? { refreshMs } : {}),
+            ...(mobile ? { mobile } : {}),
           },
         });
         break;
@@ -838,9 +999,22 @@ export function parsePageDoc(
     }
   }
 
+  // The page-level layout hint (`page.layout.mobile`) is the C1 Tier-2 variant
+  // hook. Preserve it when it names a known layout variant; an absent/unknown
+  // value leaves the page on the Tier-1 CSS reflow (no `layout` key persisted).
+  const layoutMobile =
+    isRecord(value.layout) && isLayoutMobileVariant(value.layout.mobile)
+      ? value.layout.mobile
+      : undefined;
+
   if (errors.length) return { ok: false, errors };
   return {
     ok: true,
-    doc: { schemaVersion: PAGE_SCHEMA_VERSION, title, nodes },
+    doc: {
+      schemaVersion: PAGE_SCHEMA_VERSION,
+      title,
+      nodes,
+      ...(layoutMobile ? { layout: { mobile: layoutMobile } } : {}),
+    },
   };
 }

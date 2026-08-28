@@ -258,6 +258,7 @@ fn field_node_dims(el: &nanobpmn_engine_core::Element) -> (f64, f64) {
     match el.kind {
         StartEvent
         | EndEvent
+        | TerminateEndEvent
         | IntermediateThrowEvent
         | TimerIntermediateCatchEvent { .. }
         | MessageIntermediateCatchEvent { .. }

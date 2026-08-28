@@ -579,13 +579,13 @@ impl TestEngine {
             30_000
         };
         let events = self
-            .apply(Command::ActivateJobs {
-                job_type: job_type.to_string(),
-                worker: worker.to_string(),
-                max_jobs: (max_jobs.max(1)) as usize,
+            .apply(Command::activate_jobs(
+                job_type.to_string(),
+                worker.to_string(),
+                (max_jobs.max(1)) as usize,
                 timeout,
                 now,
-            })
+            ))
             .map_err(|e| js_err(&format!("activate error: {e}")))?;
         // Derive the returned job keys from the `JobActivated` events *this*
         // call emitted — not by scanning all `Activated` jobs, which would also
@@ -2086,13 +2086,13 @@ impl TestEngine {
             return Ok(());
         }
         let now = self.now;
-        self.apply(Command::ActivateJobs {
-            job_type: job_type.0,
-            worker: "modeler".to_string(),
-            max_jobs: 1024,
-            timeout: u64::MAX / 4,
+        self.apply(Command::activate_jobs(
+            job_type.0,
+            "modeler".to_string(),
+            1024,
+            u64::MAX / 4,
             now,
-        })
+        ))
         .map_err(|e| js_err(&format!("activate error: {e}")))?;
         Ok(())
     }

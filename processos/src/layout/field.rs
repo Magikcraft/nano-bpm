@@ -905,6 +905,7 @@ fn node_shape(el: &Element) -> NodeShape {
         ExclusiveGateway | ParallelGateway => NodeShape::Diamond,
         StartEvent
         | EndEvent
+        | TerminateEndEvent
         | IntermediateThrowEvent
         | TimerIntermediateCatchEvent { .. }
         | MessageIntermediateCatchEvent { .. }

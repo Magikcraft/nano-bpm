@@ -16,15 +16,25 @@
 // makes a crash report itself instead of masquerading as anchor rot.
 
 import { expect, type Page } from "@playwright/test";
+import type {
+  AppUi,
+  Instance,
+  InstanceDetail,
+  InstanceTrace,
+  ProjectConfig,
+  ProjectDetail,
+  RunState,
+} from "../src/gen";
 
 export interface StubOptions {
   /** Both false ⇒ `hasJsRuntime` resolves to "repair". */
   denoAvailable?: boolean;
   nodeAvailable?: boolean;
+  urbanAvailable?: boolean;
   /** 0 ⇒ `hasTraces` resolves to "skip". */
   traceCount?: number;
   /** Empty ⇒ `hasProject` resolves to "skip", and the picker's empty state shows. */
-  projects?: { name: string; lang?: string }[];
+  projects?: { name: string; lang?: string; running?: boolean }[];
   /** >1 ⇒ `hasCluster` resolves to "ok". */
   nodeCount?: number;
 }
@@ -87,6 +97,7 @@ export async function stubConsoleApi(
   const {
     denoAvailable = true,
     nodeAvailable = true,
+    urbanAvailable = true,
     traceCount = 0,
     nodeCount = 1,
     projects = [{ name: "demo", lang: "deno" }],
@@ -102,12 +113,13 @@ export async function stubConsoleApi(
       decisions: 0,
       forms: 0,
       workers: 0,
-      running: false,
+      running: p.running ?? false,
       source: "workspace",
       lang: p.lang ?? "deno",
     })),
     denoAvailable,
     nodeAvailable,
+    urbanAvailable,
     platforms: [],
     templates: [
       template("starter", "Starter app"),
@@ -150,7 +162,18 @@ export async function stubConsoleApi(
         replication_factor: 1,
         raft_enabled: nodeCount > 1,
         gateway_version: "e2e",
+        // The Topology view maps over these; the real endpoint always includes
+        // them, so an empty-cluster stub must too or the view crashes on
+        // `nodes.map`. (The observe build lands here as its home route.)
+        nodes: [],
+        partitions: [],
       });
+    }
+    if (url.endsWith("/console/api/cluster/health")) {
+      // Match the generated `ClusterHealth` contract (types.gen.ts): the real
+      // endpoint always includes `checkedAtMs`, so the stub must too or a view
+      // reading the timestamp diverges from production shape.
+      return json({ checkedAtMs: 0, nodes: [] });
     }
     if (url.endsWith("/console/api/metrics")) return json(metricsSnapshot());
     if (url.endsWith("/console/api/cluster/metrics")) {
@@ -277,4 +300,302 @@ export function assertNoPageCrash(page: Page): () => void {
       errors,
       "a view threw during render, which unmounts the whole SPA — the missing anchor below is a symptom, not the cause",
     ).toEqual([]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Mobile-first fixtures (issue #1005, unit A7)
+//
+// The desktop journey stubs above drive the tour; the mobile guards need a few
+// more shaped payloads so a phone-sized run can reach real content — an instance
+// list to tap into, an instance detail with a trace and a diagram, and a running
+// app to embed. These are LAYERED ON TOP of `stubConsoleApi`: each registers a
+// `**/console/api/**` route that handles only its own paths and `route.fallback()`s
+// the rest, so the base stubs keep answering metrics/topology/projects. Register
+// them AFTER `stubConsoleApi` (Playwright tries the most-recently-added first).
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * The smallest valid, laid-out BPMN 2.0 document — a start event wired to one
+ * task — with the diagram interchange (DI) bpmn-js needs to render shapes. The
+ * instance-detail Model card feeds this to `BpmnViewer`; without the `BPMNShape`
+ * DI, bpmn-js imports the semantics but paints nothing, so the "diagram rendered"
+ * assertion would pass on an empty canvas. The `Task_1` id matches the active /
+ * incident element ids the instance factory emits so the token overlay lands.
+ */
+export const MINIMAL_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+  id="Definitions_1" targetNamespace="http://nano/e2e">
+  <bpmn:process id="demo" isExecutable="true">
+    <bpmn:startEvent id="Start_1">
+      <bpmn:outgoing>Flow_1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:task id="Task_1" name="Do the thing">
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+    </bpmn:task>
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Task_1" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="Diagram_1">
+    <bpmndi:BPMNPlane id="Plane_1" bpmnElement="demo">
+      <bpmndi:BPMNShape id="Start_1_di" bpmnElement="Start_1">
+        <dc:Bounds x="150" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_1_di" bpmnElement="Task_1">
+        <dc:Bounds x="240" y="78" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1">
+        <di:waypoint x="186" y="118" />
+        <di:waypoint x="240" y="118" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>`;
+
+/** Build a list-shaped `Instance` with sensible defaults; override per test. */
+export function makeInstance(overrides: Partial<Instance> = {}): Instance {
+  return {
+    key: "2251799813685250",
+    process_id: "order-fulfilment",
+    process_definition_key: "2251799813685249",
+    version: 1,
+    state: "Active",
+    start_date_ms: 0,
+    has_incident: false,
+    business_id: null,
+    tags: [],
+    ...overrides,
+  };
+}
+
+/** A full `InstanceDetail` around a list instance, with one trace-linked task. */
+function makeInstanceDetail(inst: Instance): InstanceDetail {
+  return {
+    instance: inst,
+    variables: [
+      { name: "orderId", value: '"A-1001"', scope_key: inst.key },
+      { name: "amount", value: "42", scope_key: inst.key },
+    ],
+    jobs: [],
+    incidents: inst.has_incident
+      ? [
+          {
+            key: `${inst.key}-inc`,
+            element_id: "Task_1",
+            kind: "JOB_NO_RETRIES",
+            state: "CREATED",
+            reason: "worker failed",
+            created_at_ms: 0,
+          },
+        ]
+      : [],
+    active_elements: [
+      {
+        element_id: "Task_1",
+        element_type: "TASK",
+        element_name: "Do the thing",
+      },
+    ],
+  };
+}
+
+/** A captured `InstanceTrace` (start → Task_1) so the Process Trace card renders
+ * the shared `TraceTimeline` instead of the empty state. */
+function makeInstanceTrace(inst: Instance): InstanceTrace {
+  return {
+    instanceKey: inst.key,
+    processId: inst.process_id,
+    version: inst.version,
+    businessId: null,
+    tags: [],
+    startedAt: 1000,
+    endedAt: null,
+    durationMs: null,
+    outcome: "active",
+    elements: [
+      {
+        elementId: "Start_1",
+        elementInstanceKey: `${inst.key}-s`,
+        scope: inst.key,
+        enteredAt: 1000,
+        exitedAt: 1005,
+        durationMs: 5,
+        incidents: 0,
+        job: null,
+      },
+      {
+        elementId: "Task_1",
+        elementInstanceKey: `${inst.key}-t`,
+        scope: inst.key,
+        enteredAt: 1005,
+        exitedAt: null,
+        durationMs: null,
+        incidents: 0,
+        job: null,
+      },
+    ],
+    incidents: [],
+    path: ["Start_1", "Task_1"],
+  };
+}
+
+/**
+ * Layer instance content over `stubConsoleApi`: the list endpoint returns an
+ * `InstancePage` (`items`, `total`, `page`, `pageSize`, matching
+ * src/gen/types.gen.ts), `/instances/{key}` returns a shaped detail, `/traces/{key}`
+ * returns that instance's captured trace (404 for unknown keys, exactly as the
+ * real bounded ring would), and the process-definition XML endpoint (which lives
+ * OUTSIDE `/console/api`, at `/v2/…`, so the base stub never sees it) returns a
+ * laid-out diagram. Everything else falls through to the base stubs.
+ */
+export async function stubInstances(
+  page: Page,
+  instances: Instance[],
+): Promise<void> {
+  const byKey = new Map(instances.map((i) => [i.key, i]));
+
+  await page.route("**/console/api/**", async (route) => {
+    const url = new URL(route.request().url()).pathname;
+    const json = (body: unknown) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(body),
+      });
+
+    const detailMatch = url.match(/\/console\/api\/instances\/([^/]+)$/);
+    if (detailMatch) {
+      const inst = byKey.get(decodeURIComponent(detailMatch[1]));
+      if (!inst)
+        return route.fulfill({ status: 404, body: "no such instance" });
+      return json(makeInstanceDetail(inst));
+    }
+    if (url.endsWith("/console/api/instances")) {
+      return json({
+        items: instances,
+        total: instances.length,
+        page: 0,
+        pageSize: 50,
+      });
+    }
+    const traceMatch = url.match(/\/console\/api\/traces\/([^/]+)$/);
+    if (traceMatch) {
+      const inst = byKey.get(decodeURIComponent(traceMatch[1]));
+      if (!inst) return route.fulfill({ status: 404, body: "no trace" });
+      return json(makeInstanceTrace(inst));
+    }
+    return route.fallback();
+  });
+
+  // The BPMN XML is fetched from the gateway's v2 endpoint, not `/console/api`.
+  await page.route("**/v2/process-definitions/*/xml", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/xml",
+      body: MINIMAL_BPMN,
+    }),
+  );
+}
+
+/** A minimal running-app `ProjectDetail`, UI or headless, for the AppView guard. */
+function makeProjectDetail(
+  name: string,
+  opts: { headless?: boolean; label?: string } = {},
+): ProjectDetail {
+  const config: ProjectConfig = {
+    name,
+    displayName: opts.label ?? name,
+    description: "",
+    deployTarget: "http://localhost:8080",
+    main: "main.ts",
+    platforms: [],
+    lang: "deno",
+    app: "urban",
+    createdMs: 0,
+    updatedMs: 0,
+  };
+  const runState: RunState = {
+    status: "running",
+    pid: 1234,
+    startedAtMs: 0,
+    lastError: null,
+    compiling: false,
+  };
+  const appUi: AppUi = opts.headless
+    ? { enabled: false, port: null, label: opts.label ?? name }
+    : { enabled: true, port: 4321, path: "/", label: opts.label ?? name };
+  return {
+    config,
+    files: [],
+    runState,
+    appUi,
+    rootPath: `/tmp/${name}`,
+    denoAvailable: true,
+    nodeAvailable: true,
+    urbanAvailable: true,
+    runnable: true,
+    platforms: [],
+  };
+}
+
+/** Default HTML served for an embedded app iframe: enough to load cleanly so the
+ * theme bridge (`onLoad`) fires. A test may pass its own body (e.g. one that
+ * posts `nano-navigate`) to drive the embedded deep-link bridge. */
+const APP_VIEW_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>app</title></head><body><main id="app">embedded app</main></body></html>`;
+
+/**
+ * Stub a single running app for the AppView guard: `/console/api/projects/{name}`
+ * returns a running detail (UI or headless), the per-project log SSE returns an
+ * empty (but well-formed) event stream so the live-log effect connects without a
+ * real gateway, and the same-origin app-view iframe route returns a small HTML
+ * document. Layered over `stubConsoleApi` — the projects LIST and everything else
+ * still come from the base stub.
+ */
+export async function stubApp(
+  page: Page,
+  opts: {
+    name: string;
+    headless?: boolean;
+    label?: string;
+    appViewHtml?: string;
+  },
+): Promise<void> {
+  const { name, headless, label } = opts;
+  const detail = makeProjectDetail(name, { headless, label });
+
+  await page.route("**/console/api/**", async (route) => {
+    const url = new URL(route.request().url()).pathname;
+    if (
+      url.endsWith(`/console/api/projects/${encodeURIComponent(name)}/logs`)
+    ) {
+      return route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        headers: { "cache-control": "no-cache" },
+        // Emit a long `retry:` directive so the browser EventSource stays quiet
+        // for the life of the test instead of hitting EOF and auto-reconnecting
+        // every ~3s (each reconnect would trigger a needless getProject refresh).
+        body: "retry: 86400000\n\n",
+      });
+    }
+    if (url.endsWith(`/console/api/projects/${encodeURIComponent(name)}`)) {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(detail),
+      });
+    }
+    return route.fallback();
+  });
+
+  await page.route(
+    `**/console/app-view/${encodeURIComponent(name)}/**`,
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "text/html",
+        body: opts.appViewHtml ?? APP_VIEW_HTML,
+      }),
+  );
 }

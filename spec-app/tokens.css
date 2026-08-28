@@ -1,0 +1,59 @@
+/*
+ * GENERATED from src/tokens.ts — do not edit by hand.
+ *
+ * The canonical --nano-* colour palette (issue #1005), as CSS custom properties.
+ * Regenerate with `npm run build` (from spec-app/). The single source of truth is
+ * NANO_PALETTE in src/tokens.ts; this file and the ./tokens map cannot drift (the
+ * package build regenerates this file and a test locks it to the map).
+ *
+ * A theme is switched by `data-appearance` on <html>: dark is the default :root,
+ * light applies under [data-appearance="light"]. Theme packs override the same
+ * properties inline on <html>.
+ */
+
+:root,
+:root[data-appearance="dark"] {
+  color-scheme: dark;
+
+  --nano-app: #0b0b10;
+  --nano-panel: #10101a;
+  --nano-raised: #16161f;
+  --nano-inset: #08080c;
+  --nano-hover: #1e1e2a;
+  --nano-edge: #24242f;
+  --nano-edge-strong: #383848;
+  --nano-text: #f2f2f7;
+  --nano-text-muted: #a3a3b2;
+  --nano-text-faint: #6e6e80;
+  --nano-accent: #8b5cf6;
+  --nano-accent-strong: #a78bfa;
+  --nano-accent-2: #22d3ee;
+  --nano-on-accent: #ffffff;
+  --nano-ok: #34d399;
+  --nano-warn: #fbbf24;
+  --nano-danger: #fb7185;
+  --nano-info: #38bdf8;
+}
+
+:root[data-appearance="light"] {
+  color-scheme: light;
+
+  --nano-app: #f5f5f9;
+  --nano-panel: #fdfdfe;
+  --nano-raised: #ffffff;
+  --nano-inset: #ededf3;
+  --nano-hover: #e8e8f0;
+  --nano-edge: #e2e2ea;
+  --nano-edge-strong: #c5c5d4;
+  --nano-text: #1a1a22;
+  --nano-text-muted: #565664;
+  --nano-text-faint: #8c8c9c;
+  --nano-accent: #7c3aed;
+  --nano-accent-strong: #6d28d9;
+  --nano-accent-2: #0891b2;
+  --nano-on-accent: #ffffff;
+  --nano-ok: #059669;
+  --nano-warn: #b45309;
+  --nano-danger: #e11d48;
+  --nano-info: #0369a1;
+}

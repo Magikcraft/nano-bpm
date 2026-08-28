@@ -321,6 +321,32 @@ pub enum Event {
         /// replayed historical activation yields no (bogus epoch-0) timestamp.
         #[cfg_attr(feature = "serde", serde(default))]
         activated_at: Option<u64>,
+        /// The **declared read-set**: the `fetchVariables` names the worker asked
+        /// for on this activation (Zeebe `ACTIVATED`-record parity — the variable
+        /// set the worker was handed). This is the engine-native provenance signal
+        /// for post-hoc reification / data-dependency analysis: reconstructing
+        /// "which step read a variable a prior step wrote" from the log alone,
+        /// with no application instrumentation (values are recoverable by folding
+        /// `ScopedVariablesUpdated`/`VariablesUpdated` writes, so the lean names
+        /// alone reconstruct the DAG at minimal log cost).
+        ///
+        /// **Empty** when the activation declared no `fetchVariables` (fetch-all):
+        /// the read-set is then "all in-scope / undeclared", which a reader must
+        /// treat as *unknown reads* rather than "reads everything". Serialized
+        /// only when non-empty (`skip_serializing_if`), so declaration-free
+        /// activations stay byte-identical in the journal.
+        ///
+        /// This is the enabler for engine-native reification: it lets the reifier
+        /// in `camunda/web-demo-framework` (PR #101) move off its sandbox
+        /// read-set proxy and onto the engine trace, since writes are already
+        /// log-native (`ScopedVariablesUpdated`/`VariablesUpdated`, `JobCompleted`
+        /// outputs) — this closes the missing read side on the generic
+        /// service-task job path.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        fetch_variables: Vec<String>,
     },
     /// A job's activation lock expired (its `deadline` passed); it becomes
     /// activatable again. Emitted by an `ExpireJobs` tick.
@@ -812,6 +838,15 @@ pub enum Event {
         throw_element_instance_key: Key,
         handler_element_id: ElementId,
     },
+    /// A sub-process scope was torn down (by a scoped terminate end or an
+    /// interrupting boundary), so the compensation state scoped to it must be
+    /// dropped. `scopes` is the terminated scope element instance plus every
+    /// descendant scope; the reducer removes each `compensable` subscription and
+    /// `compensation_waits` entry whose `scope` is in this set. Carries the scope
+    /// set explicitly (rather than recomputing it) because the descendant tokens
+    /// are torn down in the same batch, so the scope tree no longer exists by
+    /// replay. Emitted only when the scope actually holds compensation state.
+    ScopedCompensationCleared { instance_key: Key, scopes: Vec<Key> },
     /// A multi-instance body activated: its `input_collection` was evaluated to
     /// `items` and one child of `element_id` will run per item (all at once when
     /// `sequential` is `false`, one after another when `true`). Carries the
@@ -1153,6 +1188,7 @@ impl Event {
             | Event::CompensationSubscriptionCreated { instance_key, .. }
             | Event::CompensationTriggered { instance_key, .. }
             | Event::CompensationHandlerCompleted { instance_key, .. }
+            | Event::ScopedCompensationCleared { instance_key, .. }
             | Event::MultiInstanceActivated { instance_key, .. }
             | Event::MultiInstanceChildActivated { instance_key, .. }
             | Event::MultiInstanceChildCompleted { instance_key, .. }
@@ -1507,6 +1543,11 @@ impl Event {
                 ..
             } => {
                 m = m.max(*agent_instance_key).max(*original_agent_history_key);
+            }
+            Event::ScopedCompensationCleared { scopes, .. } => {
+                if let Some(max_scope) = scopes.iter().copied().max() {
+                    m = m.max(max_scope);
+                }
             }
             _ => {}
         }

@@ -21,6 +21,9 @@ PROJECT_ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 GENERATED_DIR := $(PROJECT_ROOT)/generated
 CONSOLE_GENERATED_DIR := $(PROJECT_ROOT)/generated-console
 STUB_IMPLS := $(PROJECT_ROOT)/server/src/stub_impls.rs
+# Spec-generated response-contract bundle (issue #1011); git-ignored like the
+# stub, regenerated from spec/ by scripts/gen-response-contract.py.
+RESPONSE_CONTRACT := $(PROJECT_ROOT)/server/src/response_contract_schema.json
 ENGINE_DIR := $(PROJECT_ROOT)/engine-core
 CONSOLE_DIR := $(PROJECT_ROOT)/console
 PROCESSOS_DIR := $(PROJECT_ROOT)/processos
@@ -83,7 +86,7 @@ check-deps: ## Check that the required toolchain is installed (rust, uv, java) a
 	fi
 
 .PHONY: all
-all: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build nano top-to-bottom: generate REST stubs, then compile the gateway (nano) and ProcessOS
+all: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Build nano top-to-bottom: generate REST stubs, then compile the gateway (nano) and ProcessOS
 	cd $(GENERATED_DIR) && cargo build
 	cd $(PROJECT_ROOT)/server && cargo build
 	cd $(PROCESSOS_DIR) && cargo build
@@ -91,7 +94,7 @@ all: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build nano top-to-bottom: gene
 	@echo "Built nano top-to-bottom: generated REST crate + gateway (server) + ProcessOS."
 
 .PHONY: all-release
-all-release: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build optimized release binaries of nano (gateway) and ProcessOS top-to-bottom
+all-release: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Build optimized release binaries of nano (gateway) and ProcessOS top-to-bottom
 	cd $(GENERATED_DIR) && cargo build --release
 	cd $(PROJECT_ROOT)/server && cargo build --release
 	cd $(PROCESSOS_DIR) && cargo build --release
@@ -166,13 +169,44 @@ $(STUB_IMPLS): scripts/gen-stub-server.py $(GENERATED_DIR)/Cargo.toml FORCE-stub
 .PHONY: FORCE-stub-check
 FORCE-stub-check:
 
+# The response-contract bundle (issue #1011) is derived from the sanitized spec
+# under build/spec/ and from gen-stub-server.py's OVERRIDES (the implemented-op
+# set). Regenerate when either generator script, the spec, or the generated
+# crate is newer — or when the bundle is missing. When build/spec/ isn't present
+# yet (never generated) fall back to a full `make generate`, which produces it.
+# Uses the FORCE idiom (like $(STUB_IMPLS)) so a missing target always
+# regenerates even if a stale mtime would otherwise mark it up to date.
+$(RESPONSE_CONTRACT): scripts/gen-response-contract.py scripts/gen-stub-server.py $(REST_SPEC_SRCS) $(GENERATED_DIR)/Cargo.toml FORCE-contract-check
+	@need=0; \
+	if [ ! -f "$(RESPONSE_CONTRACT)" ]; then need=1; \
+	elif [ scripts/gen-response-contract.py -nt "$(RESPONSE_CONTRACT)" ]; then need=1; \
+	elif [ scripts/gen-stub-server.py -nt "$(RESPONSE_CONTRACT)" ]; then need=1; \
+	elif [ "$(GENERATED_DIR)/Cargo.toml" -nt "$(RESPONSE_CONTRACT)" ]; then need=1; \
+	else \
+		for spec in $(REST_SPEC_SRCS); do \
+			if [ "$$spec" -nt "$(RESPONSE_CONTRACT)" ]; then need=1; break; fi; \
+		done; \
+	fi; \
+	if [ $$need -eq 1 ]; then \
+		if [ -d "$(PROJECT_ROOT)/build/spec" ]; then \
+			echo "Regenerating $(RESPONSE_CONTRACT) from build/spec"; \
+			$(UV) run --project "$(PROJECT_ROOT)" python scripts/gen-response-contract.py \
+				"$(PROJECT_ROOT)/build/spec" rest-api.yaml "$(RESPONSE_CONTRACT)"; \
+		else \
+			$(MAKE) generate; \
+		fi; \
+	fi
+
+.PHONY: FORCE-contract-check
+FORCE-contract-check:
+
 .PHONY: build
-build: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Compile the generated crate and the stub server
+build: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Compile the generated crate and the stub server
 	cd $(GENERATED_DIR) && cargo build
 	cd $(PROJECT_ROOT)/server && cargo build
 
 .PHONY: release
-release: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) console-frontend ## Build the optimized self-contained distribution (gateway + embedded console + Swagger)
+release: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) console-frontend ## Build the optimized self-contained distribution (gateway + embedded console + Swagger)
 	@# Force the RustEmbed derive to re-run so the just-built console/dist (which
 	@# release builds bake in at compile time) is embedded, even if the gateway
 	@# sources are otherwise unchanged.
@@ -182,7 +216,7 @@ release: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_
 	@echo "  landing /  ·  console /console  ·  API docs /swagger  ·  REST /v2"
 
 .PHONY: debug
-debug: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) console-frontend ## Full self-contained stack (gateway + embedded console + Swagger) as an UNOPTIMIZED debug build — same as `release` but far faster to compile, for a tight local loop
+debug: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) console-frontend ## Full self-contained stack (gateway + embedded console + Swagger) as an UNOPTIMIZED debug build — same as `release` but far faster to compile, for a tight local loop
 	@# Force the RustEmbed derive to re-run so the just-built console/dist is
 	@# embedded, even if the gateway sources are otherwise unchanged (mirrors
 	@# `release`; the embed is a compile-time bake regardless of profile).
@@ -192,7 +226,7 @@ debug: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IM
 	@echo "  landing /  ·  console /console  ·  API docs /swagger  ·  REST /v2"
 
 .PHONY: release-gateway
-release-gateway: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build the optimized API-only gateway (no web console)
+release-gateway: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Build the optimized API-only gateway (no web console)
 	cd $(PROJECT_ROOT)/server && cargo build --release
 	@echo "Built API-only gateway: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
 
@@ -222,7 +256,7 @@ CROSS_ARGS ?=
 # needed for the default `--features console` build. When CROSS_ARGS opts out
 # with --no-console, drop them so an API-only cross-build doesn't build the SPA.
 CROSS_CONSOLE_PREREQS := $(CONSOLE_GENERATED_DIR)/Cargo.toml console-frontend
-CROSS_PREREQS := $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) \
+CROSS_PREREQS := $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) \
 	$(if $(filter --no-console,$(CROSS_ARGS)),,$(CROSS_CONSOLE_PREREQS))
 
 .PHONY: cross
@@ -302,15 +336,15 @@ console-dev: ## Run the console frontend dev server (Vite); proxies /console/api
 	cd $(CONSOLE_DIR) && npm run dev
 
 .PHONY: run
-run: $(STUB_IMPLS) ## Run the stub server (PORT overrides the default 8080)
+run: $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Run the stub server (PORT overrides the default 8080)
 	cd $(PROJECT_ROOT)/server && cargo run
 
 .PHONY: server-test
-server-test: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Test the stub server (incl. journal-replay e2e tests)
+server-test: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Test the stub server (incl. journal-replay e2e tests)
 	cd $(PROJECT_ROOT)/server && cargo test
 
 .PHONY: server-test-release
-server-test-release: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Test the stub server with release optimizations (uses the release-test profile to avoid the panic=abort double-compile)
+server-test-release: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Test the stub server with release optimizations (uses the release-test profile to avoid the panic=abort double-compile)
 	cd $(PROJECT_ROOT)/server && cargo test --profile release-test --features console
 
 .PHONY: engine-build
@@ -428,7 +462,7 @@ clippy: $(GENERATED_DIR)/Cargo.toml ## Lint the generated crate, the stub server
 
 .PHONY: clean
 clean: ## Remove all generated artifacts
-	rm -rf $(PROJECT_ROOT)/build $(GENERATED_DIR) $(STUB_IMPLS) $(PROJECT_ROOT)/server/target $(ENGINE_DIR)/target
+	rm -rf $(PROJECT_ROOT)/build $(GENERATED_DIR) $(STUB_IMPLS) $(RESPONSE_CONTRACT) $(PROJECT_ROOT)/server/target $(ENGINE_DIR)/target
 
 .PHONY: help
 help: ## Show this help
