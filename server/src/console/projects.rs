@@ -3529,9 +3529,10 @@ async fn ensure_urban_boot_ready(name: &str) -> Vec<(&'static str, String)> {
         BootGenPath::Fresh => {}
         BootGenPath::Regen => match gen_via_urban(name).await {
             Ok(()) => logs.push(("info", "urban gen complete".into())),
-            // `e` from `gen_via_urban`/`gen_with_urban` already begins with
-            // "urban gen failed …", so don't re-prefix it — just add the
-            // operator-facing consequence.
+            // Surface `e` as-is: it is usually an "urban gen failed …" message
+            // (from `gen_with_urban`) but can also be a lookup error like
+            // "urban CLI not available" (from `gen_via_urban`), so don't assume a
+            // prefix — just append it after the operator-facing consequence.
             Err(e) => logs.push((
                 "err",
                 format!("OpenAPI endpoints will 500 until `urban gen` runs: {e}"),
@@ -5175,11 +5176,14 @@ pub async fn finalize_after_update(name: &str) -> PostUpdateOutcome {
     if is_urban_app(name) {
         match gen_via_urban(name).await {
             Ok(()) => outcome.generated = true,
-            // `e` already begins with "urban gen failed …" (see `gen_with_urban`),
-            // so surface only the remedial hint to avoid duplicating the phrase.
+            // Surface `e` as-is: it is usually an "urban gen failed …" message
+            // (from `gen_with_urban`) but can also be a lookup error like
+            // "urban CLI not available" (from `gen_via_urban`), for which a
+            // "run `urban gen` manually" hint would be impossible. Report the
+            // consequence and the reason without prescribing a specific remedy.
             Err(e) => outcome
                 .warnings
-                .push(format!("{e} — run `urban gen` manually")),
+                .push(format!("OpenAPI endpoints may 500 until derived types regenerate: {e}")),
         }
     }
 
