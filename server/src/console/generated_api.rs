@@ -983,14 +983,21 @@ impl apis::projects::Projects for ServerImpl {
                 // so a brand-new project opens with a rendered model. Fire-and-
                 // forget — it needs a Deno round-trip (npm fetch) we must not block
                 // the create response on; best-effort, failures are logged only.
+                //
+                // Both post-create refresh paths key off the created config's
+                // *slug* (`v["name"]`), never `body.name`: a display name like
+                // "Home Heating" is scaffolded on disk under its slug
+                // ("home-heating"), and `project_dir`/`generate_models` reject the
+                // spaced display name with "invalid project name" — so using
+                // `body.name` here would silently skip the regen for spaced names.
+                let created_slug = v.get("name").and_then(|n| n.as_str()).map(str::to_string);
                 if template == "workflow-starter" {
-                    let project = body.name.clone();
-                    tokio::spawn(async move {
-                        super::regenerate_workflow_models(&project).await;
-                    });
-                } else if let Some(project) =
-                    v.get("name").and_then(|n| n.as_str()).map(str::to_string)
-                {
+                    if let Some(project) = created_slug {
+                        tokio::spawn(async move {
+                            super::regenerate_workflow_models(&project).await;
+                        });
+                    }
+                } else if let Some(project) = created_slug {
                     // Post-create refresh (#1036): a pack-template / Urban app
                     // ships neither `node_modules/` nor the derived
                     // `nano-generated/` facade, so without this its first Run's
