@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import {
   getProject,
   runProject,
@@ -21,6 +21,12 @@ import { decideAppViewMessage } from "../lib/appViewMessage";
 // sandboxed iframe over the same-origin reverse proxy at
 // `/console/app-view/<name>/…` (posture A — the app self-authenticates; the
 // console injects no credentials and never proxies its WebSocket stream).
+//
+// Rendered by PersistentAppViews (issue #1040), which keeps ONE instance per
+// visited app mounted for the console session and hides the inactive ones, so
+// the iframe below survives navigation away and back. `name` is therefore fixed
+// per instance, and `active` is the visibility signal for effects that must not
+// run from a hidden view.
 
 function statusTone(status: RunState["status"]): {
   label: string;
@@ -51,8 +57,16 @@ function streamTone(stream: ProjectLogLine["stream"]): string {
 // capped buffer can trim its front without reshuffling existing rows' keys.
 type KeyedLogLine = ProjectLogLine & { _key: number };
 
-export default function AppView() {
-  const { name = "" } = useParams<{ name: string }>();
+export default function AppView({
+  name,
+  active,
+}: {
+  name: string;
+  /** Whether this instance is the active route. PersistentAppViews keeps one
+   * instance per visited app mounted (hidden, not unmounted) across navigation,
+   * so effects that must not act from a hidden view gate on this. */
+  active: boolean;
+}) {
   const navigate = useNavigate();
   const [runState, setRunState] = useState<RunState | null>(null);
   const [appUi, setAppUi] = useState<AppUi | null>(null);
@@ -65,8 +79,9 @@ export default function AppView() {
   // On a phone the App/Logs tab strip is presented as drill-in cards that open
   // a view full-screen; `drilled` tracks whether one is open (false = show the
   // card chooser). The desktop presentation ignores this and keeps the tab
-  // strip. Reset to the chooser whenever the routed app changes, since AppView
-  // stays mounted across `/apps/a` → `/apps/b`.
+  // strip. Each visited app gets its own kept-alive instance (see
+  // PersistentAppViews), so `name` never changes within an instance — the reset
+  // below fires once on mount, leaving the chooser as the initial mobile view.
   const [drilled, setDrilled] = useState(false);
   const isNarrow = useIsNarrow();
   // Hide the header icon when the server 404s a missing/oversized/wrong-type
@@ -127,11 +142,9 @@ export default function AppView() {
       void refresh();
     }, 150);
   }, [refresh]);
-  // Cancel any pending debounce not just on unmount, but whenever `refresh`
-  // changes — i.e. when the routed app (`name`) changes. React Router keeps
-  // `AppView` mounted across `/apps/a` → `/apps/b`, so a timer armed for the
-  // previous app would otherwise fire and overwrite state with the wrong
-  // project's `getProject` result via the stale closure.
+  // Cancel any pending debounce on unmount (or if `refresh` ever changed). With
+  // the keep-alive host an instance lives for the whole session, so this
+  // cleanup effectively only runs when the console session ends.
   useEffect(
     () => () => {
       if (refreshTimer.current != null) {
@@ -142,12 +155,33 @@ export default function AppView() {
     [refresh],
   );
 
-  // Initial load whenever the routed app changes.
+  // Initial load on mount (each visited app gets its own instance).
   useEffect(() => {
     setLogs([]);
     setError(null);
     void refresh();
   }, [refresh]);
+
+  // Re-read the authoritative run state whenever this instance becomes the
+  // active route again. Before the keep-alive host, returning to an app REMOUNTED
+  // the view — a full refresh. Now the instance survives (hidden), and its live
+  // SSE keeps state current while hidden, but a re-activation refresh restores
+  // the old freshness guarantee for the paths the stream can't see (e.g. a
+  // deleted-then-recreated same-name app, which clears a stale notFound).
+  const didMountRef = useRef(false);
+  // Mirror `active` into a ref, updated during render so it is current on the
+  // very next commit. The message handler below reads the ref instead of the
+  // closed-over `active`, so a just-hidden iframe can't slip a navigation
+  // through on a stale `active=true` closure before the effect re-runs.
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  useEffect(() => {
+    if (!didMountRef.current) {
+      didMountRef.current = true;
+      return;
+    }
+    if (active) void refresh();
+  }, [active, refresh]);
 
   // Live logs for the life of this view (history replays first, then tail).
   // The same per-project SSE doubles as our lifecycle *notification* channel:
@@ -213,7 +247,11 @@ export default function AppView() {
   // navigate). Guard on the framing iframe's own window and our own origin so a
   // message from any other frame can't drive a post or a navigation; the routing
   // decision (incl. target whitelist + host-side path construction) lives in the
-  // pure `decideAppViewMessage` helper.
+  // pure `decideAppViewMessage` helper. Navigate actions additionally require
+  // `active`: the keep-alive host keeps a hidden instance's iframe alive and
+  // posting, and a background app must not yank the console off the route the
+  // user is actually on (theme replies stay allowed — they're side-effect-free
+  // and keep the hidden frame correctly themed for when it's shown again).
   useEffect(() => {
     const onMessage = (ev: MessageEvent) => {
       if (
@@ -226,6 +264,7 @@ export default function AppView() {
       if (!action) return;
       if (action.kind === "theme") postTheme();
       else {
+        if (!activeRef.current) return;
         if ("stash" in action && action.stash) {
           try {
             sessionStorage.setItem(action.stash.key, action.stash.value);

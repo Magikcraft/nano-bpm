@@ -47,6 +47,7 @@ import type { ChangelogDoc } from "./lib/changelog";
 import { hasUnseenSince, gatewayLabel } from "./lib/changelog";
 import { RouteErrorBoundary } from "./components/RouteErrorBoundary";
 import { lazyImport } from "./lib/lazyWithReload";
+import { PersistentAppViews } from "./views/PersistentAppViews";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
 // panel, monaco) stay out of the initial bundle and load on navigation.
@@ -68,7 +69,8 @@ const ProjectWorkspace = __STUDIO__
 const Extensions = __STUDIO__
   ? lazyImport(() => import("./views/Extensions"))
   : null;
-const AppView = __STUDIO__ ? lazyImport(() => import("./views/AppView")) : null;
+// AppView is anchored in ./views/PersistentAppViews (the keep-alive host renders
+// it outside <Routes>) so this import stays tree-shakeable with the profile.
 // Operator surface — always present in both profiles.
 const Workers = lazyImport(() => import("./views/Workers"));
 const Metrics = lazyImport(() => import("./views/Metrics"));
@@ -1151,7 +1153,12 @@ export default function App() {
                 {Extensions && (
                   <Route path="/extensions" element={<Extensions />} />
                 )}
-                {AppView && <Route path="/apps/:name" element={<AppView />} />}
+                {/* Stub: keeps `/apps/:name` matched so the catch-all redirect
+                    below doesn't fire. The kept-alive view itself is rendered by
+                    PersistentAppViews OUTSIDE <Routes> (issue #1040) — mounting
+                    it here would unmount the embedded app's iframe on every
+                    navigation away. */}
+                {IS_STUDIO && <Route path="/apps/:name" element={null} />}
                 <Route path="/config" element={<Config />} />
                 <Route path="/credits" element={<Credits />} />
                 <Route path="/topology" element={<Topology />} />
@@ -1169,6 +1176,30 @@ export default function App() {
                 />
               </Routes>
             </RouteErrorBoundary>
+            {/* Keep-alive host for the embedded app views (issue #1040): mounts
+                one AppView per visited app for the session and hides the
+                inactive ones, so leaving `/apps/:name` no longer destroys the
+                app's iframe.
+
+                Own <Suspense> boundary: PersistentAppViews lazily imports the
+                AppView chunk, and a *hidden* kept-alive view can suspend in the
+                background (e.g. its chunk is still loading when you navigate
+                away). Sharing the outer boundary would raise the global
+                "Loading…" over whatever route is actually visible (Topology,
+                etc.). Isolating it here keeps that background suspend invisible,
+                while still showing a fallback when `/apps/:name` is the active
+                route (where the AppView *is* the visible content). */}
+            <Suspense
+              fallback={
+                location.pathname.startsWith("/apps/") ? (
+                  <div className="flex h-full items-center justify-center text-sm text-fg-faint">
+                    Loading…
+                  </div>
+                ) : null
+              }
+            >
+              <PersistentAppViews />
+            </Suspense>
           </Suspense>
         </main>
       </div>
