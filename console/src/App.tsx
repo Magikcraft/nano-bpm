@@ -1179,8 +1179,27 @@ export default function App() {
             {/* Keep-alive host for the embedded app views (issue #1040): mounts
                 one AppView per visited app for the session and hides the
                 inactive ones, so leaving `/apps/:name` no longer destroys the
-                app's iframe. */}
-            <PersistentAppViews />
+                app's iframe.
+
+                Own <Suspense> boundary: PersistentAppViews lazily imports the
+                AppView chunk, and a *hidden* kept-alive view can suspend in the
+                background (e.g. its chunk is still loading when you navigate
+                away). Sharing the outer boundary would raise the global
+                "Loading…" over whatever route is actually visible (Topology,
+                etc.). Isolating it here keeps that background suspend invisible,
+                while still showing a fallback when `/apps/:name` is the active
+                route (where the AppView *is* the visible content). */}
+            <Suspense
+              fallback={
+                location.pathname.startsWith("/apps/") ? (
+                  <div className="flex h-full items-center justify-center text-sm text-fg-faint">
+                    Loading…
+                  </div>
+                ) : null
+              }
+            >
+              <PersistentAppViews />
+            </Suspense>
           </Suspense>
         </main>
       </div>
