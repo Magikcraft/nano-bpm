@@ -3529,11 +3529,12 @@ async fn ensure_urban_boot_ready(name: &str) -> Vec<(&'static str, String)> {
         BootGenPath::Fresh => {}
         BootGenPath::Regen => match gen_via_urban(name).await {
             Ok(()) => logs.push(("info", "urban gen complete".into())),
+            // `e` from `gen_via_urban`/`gen_with_urban` already begins with
+            // "urban gen failed …", so don't re-prefix it — just add the
+            // operator-facing consequence.
             Err(e) => logs.push((
                 "err",
-                format!(
-                    "urban gen failed — OpenAPI endpoints will 500 until `urban gen` runs: {e}"
-                ),
+                format!("OpenAPI endpoints will 500 until `urban gen` runs: {e}"),
             )),
         },
         BootGenPath::UrbanUnavailable => logs.push((
@@ -5174,9 +5175,11 @@ pub async fn finalize_after_update(name: &str) -> PostUpdateOutcome {
     if is_urban_app(name) {
         match gen_via_urban(name).await {
             Ok(()) => outcome.generated = true,
+            // `e` already begins with "urban gen failed …" (see `gen_with_urban`),
+            // so surface only the remedial hint to avoid duplicating the phrase.
             Err(e) => outcome
                 .warnings
-                .push(format!("urban gen failed — run it manually: {e}")),
+                .push(format!("{e} — run `urban gen` manually")),
         }
     }
 
