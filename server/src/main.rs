@@ -9572,10 +9572,13 @@ impl ServerImpl {
     }
 
     /// Searches element-instance wait states: element instances currently parked
-    /// waiting on an external interaction. Two sources feed it — active jobs
-    /// (`JOB`, waiting for a worker) from the jobs read model, and open message
+    /// waiting on an external interaction. Three sources feed it — active jobs
+    /// (`JOB`, waiting for a worker) from the jobs read model, open message
     /// subscriptions (`MESSAGE`, waiting for a correlated message) from the
-    /// message-subscription read model. `rootProcessInstanceKey` resolves to the
+    /// message-subscription read model, and open native user tasks (`USER_TASK`,
+    /// waiting for a human) from the user-task read model. A concrete
+    /// `waitStateType` filter skips the sources it excludes (see `wants` below).
+    /// `rootProcessInstanceKey` resolves to the
     /// top-level ancestor by walking the `parentProcessInstanceKey` chain (issue
     /// #977) — a top-level instance roots to its own key, a call-activity child
     /// (issue #808) to the true top-level instance; see `element_instance_result`.
@@ -9630,9 +9633,27 @@ impl ServerImpl {
 
         let mut states: Vec<WaitState> = Vec::new();
 
+        // Whether a wait-state source can contribute any row under the current
+        // `waitStateType` filter. This endpoint is polled, and each source below
+        // performs a full cross-shard read-model scan, so a concrete
+        // `waitStateType` (e.g. `MESSAGE`) would otherwise still scan the jobs and
+        // user-task stores only to discard every row post-collection. The guard
+        // reuses `match_wait_state_type` — the same predicate the post-collection
+        // filter applies — so type matching stays a single source of truth (no
+        // duplicated enum logic to drift), and it short-circuits every source
+        // uniformly rather than special-casing one.
+        let wants = |t: models::WaitStateTypeEnum| {
+            filter.is_none_or(|f| query::match_wait_state_type(&f.wait_state_type, &t.to_string()))
+        };
+
         // JOB wait states: an element instance parked on an activatable/locked
         // job (`Created`/`Activated`). Failed/terminal jobs are not wait states.
-        for job in self.store.jobs() {
+        let jobs = if wants(models::WaitStateTypeEnum::Job) {
+            self.store.jobs()
+        } else {
+            Vec::new()
+        };
+        for job in jobs {
             use nanobpmn_engine_core::JobState;
             if !matches!(job.state, JobState::Created | JobState::Activated) {
                 continue;
@@ -9668,7 +9689,12 @@ impl ServerImpl {
         // MESSAGE wait states: an element instance parked on an open message
         // subscription. Correlation key is null for start events (never tracked
         // here) so an empty stored key projects as null.
-        for sub in self.store.message_subscriptions() {
+        let message_subscriptions = if wants(models::WaitStateTypeEnum::Message) {
+            self.store.message_subscriptions()
+        } else {
+            Vec::new()
+        };
+        for sub in message_subscriptions {
             let (element_type, tenant_id, element_id) =
                 resolve(sub.element_instance_key, &sub.element_id);
             let correlation_key = if sub.correlation_key.is_empty() {
@@ -9693,13 +9719,23 @@ impl ServerImpl {
         }
 
         // USER_TASK wait states: an element instance parked on an open (native)
-        // user task. Canonical Camunda lifecycle — the task is added to this read
-        // model on `UserTaskCreated` and removed on `COMPLETED`/`CANCELED`; the
-        // read-model row keeps its terminal state after that, so an *open* park is
-        // exactly a row still in `Created`. The park carries the user-task element
-        // instance's own `elementId`/`elementType: USER_TASK`, plus `taskKey` (and
-        // `dueDate` when the task declared one).
-        for task in self.store.user_tasks() {
+        // user task. Two distinct things share the word "task" here, so keep them
+        // separate: the underlying `user_tasks` read-model *row* and the derived
+        // wait-state *view* projected from it. Canonical Camunda lifecycle — the
+        // row is inserted on `UserTaskCreated` and transitions to a terminal state
+        // (`COMPLETED`/`CANCELED`) on completion/cancellation; the row is retained
+        // with that terminal state, it is not deleted. The derived wait-state view
+        // exists only while the row is still `Created`, so an *open* park is
+        // exactly a row in `Created` and terminal rows contribute nothing. The
+        // park carries the user-task element instance's own
+        // `elementId`/`elementType: USER_TASK`, plus `taskKey` (and `dueDate` when
+        // the task declared one).
+        let user_tasks = if wants(models::WaitStateTypeEnum::UserTask) {
+            self.store.user_tasks()
+        } else {
+            Vec::new()
+        };
+        for task in user_tasks {
             use nanobpmn_engine_core::UserTaskState;
             if task.state != UserTaskState::Created {
                 continue;
@@ -25395,6 +25431,38 @@ mod clustered_startup_tests {
         );
         assert!(matches!(park.job_details, types::Nullable::Null));
         assert!(matches!(park.message_details, types::Nullable::Null));
+
+        // Short-circuit guard (suppressed advisory, main.rs:9704): a concrete
+        // `waitStateType` filter skips the read-model scans it excludes. Filtering
+        // by `MESSAGE` must therefore surface *no* USER_TASK park for this instance
+        // — the derived skip must never drop a matching row into the wrong bucket
+        // nor leak an excluded source's rows past the filter.
+        let message_filter = models::ElementInstanceWaitStateFilter {
+            wait_state_type: Some(models::WaitStateTypeFilterProperty::WaitStateTypeEnum(
+                models::WaitStateTypeEnum::Message,
+            )),
+            ..models::ElementInstanceWaitStateFilter::new()
+        };
+        let message_resp = server
+            .search_element_instance_wait_states_impl(&Some(
+                models::ElementInstanceWaitStateQuery {
+                    page: None,
+                    filter: Some(message_filter),
+                },
+            ))
+            .await
+            .expect("wait-state search returns");
+        let Resp::Status200_TheElementInstanceWaitStateSearchResult(message_result) = message_resp
+        else {
+            panic!("expected a 200 result");
+        };
+        assert!(
+            message_result
+                .items
+                .iter()
+                .all(|w| w.wait_state_type == models::WaitStateTypeEnum::Message),
+            "a MESSAGE filter surfaces only MESSAGE wait states — no USER_TASK leak"
+        );
 
         // Complete the user task; the park must disappear from the read model.
         let complete = server
