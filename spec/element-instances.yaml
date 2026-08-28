@@ -888,6 +888,7 @@ components:
       type: object
       required:
         - taskKey
+        - dueDate
       properties:
         taskKey:
           allOf:

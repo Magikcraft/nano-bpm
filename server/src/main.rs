@@ -9710,11 +9710,12 @@ impl ServerImpl {
                 .due_date
                 .as_deref()
                 .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
-                .map(types::Nullable::Present);
-            let mut details = models::UserTaskWaitStateDetails::new(models::UserTaskKey(
-                task.key.to_string(),
-            ));
-            details.due_date = due_date;
+                .map(types::Nullable::Present)
+                .unwrap_or(types::Nullable::Null);
+            let details = models::UserTaskWaitStateDetails::new(
+                models::UserTaskKey(task.key.to_string()),
+                due_date,
+            );
             states.push(WaitState {
                 element_instance_key: task.element_instance_key,
                 process_instance_key: task.instance_key,
@@ -25386,6 +25387,12 @@ mod clustered_startup_tests {
         };
         let task_key: u64 = ud.task_key.0.parse().expect("numeric task key");
         assert!(task_key > 0, "taskKey is a real user-task key");
+        // dueDate is required+nullable: a task without a due date surfaces it as
+        // present-but-null (never omitted), keeping the response shape stable.
+        assert!(
+            matches!(ud.due_date, types::Nullable::Null),
+            "dueDate is present-but-null for a task without a due date"
+        );
         assert!(matches!(park.job_details, types::Nullable::Null));
         assert!(matches!(park.message_details, types::Nullable::Null));
 

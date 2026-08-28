@@ -3876,7 +3876,7 @@ export type UserTaskWaitStateDetails = {
     /**
      * The due date of the user task, if set.
      */
-    dueDate?: string | null;
+    dueDate: string | null;
 };
 
 /**
