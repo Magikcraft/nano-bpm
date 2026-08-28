@@ -946,7 +946,8 @@ mod tests {
                     "listenerEventType": null,
                     "retries": 3
                 },
-                "messageDetails": null
+                "messageDetails": null,
+                "userTaskDetails": null
             }]
         });
         assert!(
@@ -1041,7 +1042,8 @@ mod middleware_tests {
                     "listenerEventType": null,
                     "retries": 3
                 },
-                "messageDetails": null
+                "messageDetails": null,
+                "userTaskDetails": null
             }]
         })
     }

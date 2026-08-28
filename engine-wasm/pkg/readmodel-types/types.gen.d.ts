@@ -3828,6 +3828,10 @@ export type ElementInstanceWaitStateResult = {
      * Message details, present when waitStateType is MESSAGE.
      */
     messageDetails: MessageWaitStateDetails | null;
+    /**
+     * User task details, present when waitStateType is USER_TASK.
+     */
+    userTaskDetails: UserTaskWaitStateDetails | null;
 };
 
 export type JobWaitStateDetails = {
@@ -3864,6 +3868,17 @@ export type MessageWaitStateDetails = {
     correlationKey: string | null;
 };
 
+export type UserTaskWaitStateDetails = {
+    /**
+     * The key of the user task.
+     */
+    taskKey: UserTaskKey;
+    /**
+     * The due date of the user task, if set.
+     */
+    dueDate?: string | null;
+};
+
 /**
  * The BPMN element type of a waiting element instance.
  */
@@ -3877,7 +3892,7 @@ export type WaitStateElementTypeFilterProperty = WaitStateElementTypeEnum | Adva
 /**
  * The type of waiting state an element instance is in.
  */
-export type WaitStateTypeEnum = 'JOB' | 'MESSAGE';
+export type WaitStateTypeEnum = 'JOB' | 'MESSAGE' | 'USER_TASK';
 
 /**
  * Wait state type property with full advanced search capabilities.

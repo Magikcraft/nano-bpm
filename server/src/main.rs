@@ -9625,6 +9625,7 @@ impl ServerImpl {
             wait_state_type: models::WaitStateTypeEnum,
             job: Option<models::JobWaitStateDetails>,
             message: Option<models::MessageWaitStateDetails>,
+            user_task: Option<models::UserTaskWaitStateDetails>,
         }
 
         let mut states: Vec<WaitState> = Vec::new();
@@ -9660,6 +9661,7 @@ impl ServerImpl {
                     types::Nullable::Present(job.retries),
                 )),
                 message: None,
+                user_task: None,
             });
         }
 
@@ -9686,6 +9688,43 @@ impl ServerImpl {
                     sub.message_name.clone(),
                     correlation_key,
                 )),
+                user_task: None,
+            });
+        }
+
+        // USER_TASK wait states: an element instance parked on an open (native)
+        // user task. Canonical Camunda lifecycle — the task is added to this read
+        // model on `UserTaskCreated` and removed on `COMPLETED`/`CANCELED`; the
+        // read-model row keeps its terminal state after that, so an *open* park is
+        // exactly a row still in `Created`. The park carries the user-task element
+        // instance's own `elementId`/`elementType: USER_TASK`, plus `taskKey` (and
+        // `dueDate` when the task declared one).
+        for task in self.store.user_tasks() {
+            use nanobpmn_engine_core::UserTaskState;
+            if task.state != UserTaskState::Created {
+                continue;
+            }
+            let (element_type, tenant_id, element_id) =
+                resolve(task.element_instance_key, &task.element_id);
+            let due_date = task
+                .due_date
+                .as_deref()
+                .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                .map(types::Nullable::Present);
+            let mut details = models::UserTaskWaitStateDetails::new(models::UserTaskKey(
+                task.key.to_string(),
+            ));
+            details.due_date = due_date;
+            states.push(WaitState {
+                element_instance_key: task.element_instance_key,
+                process_instance_key: task.instance_key,
+                element_id,
+                element_type,
+                tenant_id,
+                wait_state_type: models::WaitStateTypeEnum::UserTask,
+                job: None,
+                message: None,
+                user_task: Some(details),
             });
         }
 
@@ -9758,6 +9797,10 @@ impl ServerImpl {
                         None => types::Nullable::Null,
                     },
                     match ws.message {
+                        Some(d) => types::Nullable::Present(d),
+                        None => types::Nullable::Null,
+                    },
+                    match ws.user_task {
                         Some(d) => types::Nullable::Present(d),
                         None => types::Nullable::Null,
                     },
@@ -25268,6 +25311,127 @@ mod clustered_startup_tests {
         };
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].element_id, "charge");
+    }
+
+    #[tokio::test]
+    async fn wait_states_surface_open_user_tasks() {
+        // Zeebe parity (#1042): an element instance parked on an open (native)
+        // user task is a USER_TASK wait state — the canonical contract this
+        // endpoint exists to surface. The row carries the user-task element
+        // instance's own `elementId`, `elementType: USER_TASK`, and
+        // `userTaskDetails` with the `taskKey`. The park disappears when the task
+        // completes.
+        use apis::element_instance::SearchElementInstanceWaitStatesResponse as Resp;
+        let server = ServerImpl::default();
+
+        let proc = ProcessBuilder::new("approval")
+            .start_event("s")
+            .user_task("review")
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .expect("valid user-task process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("approval".to_string(), "approval.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let (instance_key, _) = server
+            .create_for_stream(
+                Some("approval".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create approval");
+
+        // Filtering by the canonical USER_TASK type must return 200 (not 422) with
+        // the parked user task.
+        let user_task_filter = models::ElementInstanceWaitStateFilter {
+            wait_state_type: Some(models::WaitStateTypeFilterProperty::WaitStateTypeEnum(
+                models::WaitStateTypeEnum::UserTask,
+            )),
+            ..models::ElementInstanceWaitStateFilter::new()
+        };
+        let items = loop_until_wait_states(&server, Some(user_task_filter.clone()), 1).await;
+        let park = items
+            .iter()
+            .find(|w| w.wait_state_type == models::WaitStateTypeEnum::UserTask)
+            .expect("a USER_TASK wait state");
+        assert_eq!(park.element_id, "review");
+        assert_eq!(
+            park.element_type,
+            models::WaitStateElementTypeEnum::UserTask
+        );
+        assert_eq!(park.process_instance_key.0, instance_key.to_string());
+        // rootProcessInstanceKey is populated and equals the process instance key.
+        assert_eq!(
+            park.root_process_instance_key,
+            types::Nullable::Present(models::ProcessInstanceKey(instance_key.to_string()))
+        );
+        // The park carries userTaskDetails with a present taskKey (and no job or
+        // message details).
+        let ud = match &park.user_task_details {
+            types::Nullable::Present(d) => d,
+            types::Nullable::Null => panic!("USER_TASK wait state carries user task details"),
+        };
+        let task_key: u64 = ud.task_key.0.parse().expect("numeric task key");
+        assert!(task_key > 0, "taskKey is a real user-task key");
+        assert!(matches!(park.job_details, types::Nullable::Null));
+        assert!(matches!(park.message_details, types::Nullable::Null));
+
+        // Complete the user task; the park must disappear from the read model.
+        let complete = server
+            .complete_user_task_impl(
+                &models::CompleteUserTaskPathParams {
+                    user_task_key: task_key.to_string(),
+                },
+                &None,
+            )
+            .await
+            .expect("complete the review task");
+        assert!(
+            matches!(
+                complete,
+                apis::user_task::CompleteUserTaskResponse::Status204_TheUserTaskWasCompletedSuccessfully
+            ),
+            "completing the review task succeeds"
+        );
+
+        // Poll until no USER_TASK parks remain for this instance.
+        let mut gone = false;
+        for _ in 0..200 {
+            let resp = server
+                .search_element_instance_wait_states_impl(&Some(
+                    models::ElementInstanceWaitStateQuery {
+                        page: None,
+                        filter: Some(user_task_filter.clone()),
+                    },
+                ))
+                .await
+                .expect("wait-state search returns");
+            let Resp::Status200_TheElementInstanceWaitStateSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            if result.items.is_empty() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            gone,
+            "the USER_TASK wait state disappears once the task completes"
+        );
     }
 
     #[tokio::test]
