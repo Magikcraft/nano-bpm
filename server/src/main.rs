@@ -9572,10 +9572,13 @@ impl ServerImpl {
     }
 
     /// Searches element-instance wait states: element instances currently parked
-    /// waiting on an external interaction. Two sources feed it — active jobs
-    /// (`JOB`, waiting for a worker) from the jobs read model, and open message
+    /// waiting on an external interaction. Three sources feed it — active jobs
+    /// (`JOB`, waiting for a worker) from the jobs read model, open message
     /// subscriptions (`MESSAGE`, waiting for a correlated message) from the
-    /// message-subscription read model. `rootProcessInstanceKey` resolves to the
+    /// message-subscription read model, and open native user tasks (`USER_TASK`,
+    /// waiting for a human) from the user-task read model. A concrete
+    /// `waitStateType` filter skips the sources it excludes (see `wants` below).
+    /// `rootProcessInstanceKey` resolves to the
     /// top-level ancestor by walking the `parentProcessInstanceKey` chain (issue
     /// #977) — a top-level instance roots to its own key, a call-activity child
     /// (issue #808) to the true top-level instance; see `element_instance_result`.
@@ -9625,13 +9628,32 @@ impl ServerImpl {
             wait_state_type: models::WaitStateTypeEnum,
             job: Option<models::JobWaitStateDetails>,
             message: Option<models::MessageWaitStateDetails>,
+            user_task: Option<models::UserTaskWaitStateDetails>,
         }
 
         let mut states: Vec<WaitState> = Vec::new();
 
+        // Whether a wait-state source can contribute any row under the current
+        // `waitStateType` filter. This endpoint is polled, and each source below
+        // performs a full cross-shard read-model scan, so a concrete
+        // `waitStateType` (e.g. `MESSAGE`) would otherwise still scan the jobs and
+        // user-task stores only to discard every row post-collection. The guard
+        // reuses `match_wait_state_type` — the same predicate the post-collection
+        // filter applies — so type matching stays a single source of truth (no
+        // duplicated enum logic to drift), and it short-circuits every source
+        // uniformly rather than special-casing one.
+        let wants = |t: models::WaitStateTypeEnum| {
+            filter.is_none_or(|f| query::match_wait_state_type(&f.wait_state_type, &t.to_string()))
+        };
+
         // JOB wait states: an element instance parked on an activatable/locked
         // job (`Created`/`Activated`). Failed/terminal jobs are not wait states.
-        for job in self.store.jobs() {
+        let jobs = if wants(models::WaitStateTypeEnum::Job) {
+            self.store.jobs()
+        } else {
+            Vec::new()
+        };
+        for job in jobs {
             use nanobpmn_engine_core::JobState;
             if !matches!(job.state, JobState::Created | JobState::Activated) {
                 continue;
@@ -9660,13 +9682,19 @@ impl ServerImpl {
                     types::Nullable::Present(job.retries),
                 )),
                 message: None,
+                user_task: None,
             });
         }
 
         // MESSAGE wait states: an element instance parked on an open message
         // subscription. Correlation key is null for start events (never tracked
         // here) so an empty stored key projects as null.
-        for sub in self.store.message_subscriptions() {
+        let message_subscriptions = if wants(models::WaitStateTypeEnum::Message) {
+            self.store.message_subscriptions()
+        } else {
+            Vec::new()
+        };
+        for sub in message_subscriptions {
             let (element_type, tenant_id, element_id) =
                 resolve(sub.element_instance_key, &sub.element_id);
             let correlation_key = if sub.correlation_key.is_empty() {
@@ -9686,6 +9714,54 @@ impl ServerImpl {
                     sub.message_name.clone(),
                     correlation_key,
                 )),
+                user_task: None,
+            });
+        }
+
+        // USER_TASK wait states: an element instance parked on an open (native)
+        // user task. Two distinct things share the word "task" here, so keep them
+        // separate: the underlying `user_tasks` read-model *row* and the derived
+        // wait-state *view* projected from it. Canonical Camunda lifecycle — the
+        // row is inserted on `UserTaskCreated` and transitions to a terminal state
+        // (`COMPLETED`/`CANCELED`) on completion/cancellation; the row is retained
+        // with that terminal state, it is not deleted. The derived wait-state view
+        // exists only while the row is still `Created`, so an *open* park is
+        // exactly a row in `Created` and terminal rows contribute nothing. The
+        // park carries the user-task element instance's own
+        // `elementId`/`elementType: USER_TASK`, plus `taskKey` (and `dueDate` when
+        // the task declared one).
+        let user_tasks = if wants(models::WaitStateTypeEnum::UserTask) {
+            self.store.user_tasks()
+        } else {
+            Vec::new()
+        };
+        for task in user_tasks {
+            use nanobpmn_engine_core::UserTaskState;
+            if task.state != UserTaskState::Created {
+                continue;
+            }
+            let (element_type, tenant_id, element_id) =
+                resolve(task.element_instance_key, &task.element_id);
+            let due_date = task
+                .due_date
+                .as_deref()
+                .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                .map(types::Nullable::Present)
+                .unwrap_or(types::Nullable::Null);
+            let details = models::UserTaskWaitStateDetails::new(
+                models::UserTaskKey(task.key.to_string()),
+                due_date,
+            );
+            states.push(WaitState {
+                element_instance_key: task.element_instance_key,
+                process_instance_key: task.instance_key,
+                element_id,
+                element_type,
+                tenant_id,
+                wait_state_type: models::WaitStateTypeEnum::UserTask,
+                job: None,
+                message: None,
+                user_task: Some(details),
             });
         }
 
@@ -9758,6 +9834,10 @@ impl ServerImpl {
                         None => types::Nullable::Null,
                     },
                     match ws.message {
+                        Some(d) => types::Nullable::Present(d),
+                        None => types::Nullable::Null,
+                    },
+                    match ws.user_task {
                         Some(d) => types::Nullable::Present(d),
                         None => types::Nullable::Null,
                     },
@@ -25268,6 +25348,165 @@ mod clustered_startup_tests {
         };
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].element_id, "charge");
+    }
+
+    #[tokio::test]
+    async fn wait_states_surface_open_user_tasks() {
+        // Zeebe parity (#1042): an element instance parked on an open (native)
+        // user task is a USER_TASK wait state — the canonical contract this
+        // endpoint exists to surface. The row carries the user-task element
+        // instance's own `elementId`, `elementType: USER_TASK`, and
+        // `userTaskDetails` with the `taskKey`. The park disappears when the task
+        // completes.
+        use apis::element_instance::SearchElementInstanceWaitStatesResponse as Resp;
+        let server = ServerImpl::default();
+
+        let proc = ProcessBuilder::new("approval")
+            .start_event("s")
+            .user_task("review")
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .expect("valid user-task process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("approval".to_string(), "approval.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let (instance_key, _) = server
+            .create_for_stream(
+                Some("approval".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create approval");
+
+        // Filtering by the canonical USER_TASK type must return 200 (not 422) with
+        // the parked user task.
+        let user_task_filter = models::ElementInstanceWaitStateFilter {
+            wait_state_type: Some(models::WaitStateTypeFilterProperty::WaitStateTypeEnum(
+                models::WaitStateTypeEnum::UserTask,
+            )),
+            ..models::ElementInstanceWaitStateFilter::new()
+        };
+        let items = loop_until_wait_states(&server, Some(user_task_filter.clone()), 1).await;
+        let park = items
+            .iter()
+            .find(|w| w.wait_state_type == models::WaitStateTypeEnum::UserTask)
+            .expect("a USER_TASK wait state");
+        assert_eq!(park.element_id, "review");
+        assert_eq!(
+            park.element_type,
+            models::WaitStateElementTypeEnum::UserTask
+        );
+        assert_eq!(park.process_instance_key.0, instance_key.to_string());
+        // rootProcessInstanceKey is populated and equals the process instance key.
+        assert_eq!(
+            park.root_process_instance_key,
+            types::Nullable::Present(models::ProcessInstanceKey(instance_key.to_string()))
+        );
+        // The park carries userTaskDetails with a present taskKey (and no job or
+        // message details).
+        let ud = match &park.user_task_details {
+            types::Nullable::Present(d) => d,
+            types::Nullable::Null => panic!("USER_TASK wait state carries user task details"),
+        };
+        let task_key: u64 = ud.task_key.0.parse().expect("numeric task key");
+        assert!(task_key > 0, "taskKey is a real user-task key");
+        // dueDate is required+nullable: a task without a due date surfaces it as
+        // present-but-null (never omitted), keeping the response shape stable.
+        assert!(
+            matches!(ud.due_date, types::Nullable::Null),
+            "dueDate is present-but-null for a task without a due date"
+        );
+        assert!(matches!(park.job_details, types::Nullable::Null));
+        assert!(matches!(park.message_details, types::Nullable::Null));
+
+        // Short-circuit guard (suppressed advisory, main.rs:9704): a concrete
+        // `waitStateType` filter skips the read-model scans it excludes. Filtering
+        // by `MESSAGE` must therefore surface *no* USER_TASK park for this instance
+        // — the derived skip must never drop a matching row into the wrong bucket
+        // nor leak an excluded source's rows past the filter.
+        let message_filter = models::ElementInstanceWaitStateFilter {
+            wait_state_type: Some(models::WaitStateTypeFilterProperty::WaitStateTypeEnum(
+                models::WaitStateTypeEnum::Message,
+            )),
+            ..models::ElementInstanceWaitStateFilter::new()
+        };
+        let message_resp = server
+            .search_element_instance_wait_states_impl(&Some(
+                models::ElementInstanceWaitStateQuery {
+                    page: None,
+                    filter: Some(message_filter),
+                },
+            ))
+            .await
+            .expect("wait-state search returns");
+        let Resp::Status200_TheElementInstanceWaitStateSearchResult(message_result) = message_resp
+        else {
+            panic!("expected a 200 result");
+        };
+        assert!(
+            message_result
+                .items
+                .iter()
+                .all(|w| w.wait_state_type == models::WaitStateTypeEnum::Message),
+            "a MESSAGE filter surfaces only MESSAGE wait states — no USER_TASK leak"
+        );
+
+        // Complete the user task; the park must disappear from the read model.
+        let complete = server
+            .complete_user_task_impl(
+                &models::CompleteUserTaskPathParams {
+                    user_task_key: task_key.to_string(),
+                },
+                &None,
+            )
+            .await
+            .expect("complete the review task");
+        assert!(
+            matches!(
+                complete,
+                apis::user_task::CompleteUserTaskResponse::Status204_TheUserTaskWasCompletedSuccessfully
+            ),
+            "completing the review task succeeds"
+        );
+
+        // Poll until no USER_TASK parks remain for this instance.
+        let mut gone = false;
+        for _ in 0..200 {
+            let resp = server
+                .search_element_instance_wait_states_impl(&Some(
+                    models::ElementInstanceWaitStateQuery {
+                        page: None,
+                        filter: Some(user_task_filter.clone()),
+                    },
+                ))
+                .await
+                .expect("wait-state search returns");
+            let Resp::Status200_TheElementInstanceWaitStateSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            if result.items.is_empty() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            gone,
+            "the USER_TASK wait state disappears once the task completes"
+        );
     }
 
     #[tokio::test]
