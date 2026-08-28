@@ -11,30 +11,25 @@ repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
 # rustfmt must resolve the server crate's module tree, which includes the
-# gitignored codegen module `stub_impls`. In a built tree the real file exists;
-# if it does not (e.g. a fresh clone before the first build) drop a throwaway
-# one-line stub for the parse-only check and remove it afterwards, exactly as
-# the CI fmt job does — never clobbering a real generated file.
+# gitignored codegen module `stub_impls`, and (since ADR 0064 made server/ a
+# cargo workspace) the generated/ + generated-console/ path-dep manifests. In a
+# built tree the real files exist; if they do not (e.g. a fresh clone before
+# the first build) `scripts/fmt-stub-codegen.sh` drops throwaway stubs for the
+# parse-only check — the same ones the CI fmt job uses — never clobbering a real
+# generated file.
 #
 # The cleanup runs from a `trap` so an interrupt (Ctrl-C during fmt-check) or any
-# early exit still removes a stub we created. Without it, a leaked placeholder is
+# early exit still removes stubs we created. Without it, a leaked placeholder is
 # left behind with a fresh mtime, which defeats the Makefile's timestamp-based
 # regeneration of stub_impls.rs and makes the next build compile the placeholder
 # (the FORCE-stub-check guard on the $(STUB_IMPLS) rule is the Makefile-side
 # backstop that re-checks the content and regenerates regardless of mtime).
-stub="server/src/stub_impls.rs"
-created_stub=0
 cleanup() {
-	if [ "$created_stub" -eq 1 ]; then
-		rm -f "$stub"
-	fi
+	./scripts/fmt-stub-codegen.sh --cleanup
 	return 0
 }
 trap cleanup EXIT INT TERM
-if [ ! -f "$stub" ]; then
-	printf '// fmt stub\n' > "$stub"
-	created_stub=1
-fi
+./scripts/fmt-stub-codegen.sh
 
 status=0
 make fmt-check || status=$?

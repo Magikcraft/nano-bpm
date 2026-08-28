@@ -5,6 +5,14 @@ edition = "2024"
 publish = false
 description = "NanoBPM gateway: stub server for the generated Camunda 8 Orchestration Cluster v2 REST layer, wired to the embedded nanobpmn engine."
 
+# Workspace rooted here (ADR 0064) so `server/target`, `server/Cargo.lock`,
+# `server/.config/nextest.toml`, the `[patch.crates-io]` section and the
+# profiles below all stay exactly where the Makefile, scripts and CI expect
+# them. The storage layer lives in the member crate
+# `crates/nano-server-storage`; this package stays the binary.
+[workspace]
+members = ["crates/*"]
+
 [dependencies]
 nanobpm-gateway-rest = { path = "../generated" }
 # Generated console API layer (models + axum router + per-tag Api traits) from
@@ -15,6 +23,11 @@ nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
 # projection + read queries compile both here (native/bundled C SQLite) and for
 # the in-browser WASM test engine. The gateway consumes the `native` backend.
 nanobpmn-read-model = { path = "../read-model", features = ["native"] }
+# The storage layer (metrics, memory/allocator, journal, seglog, var stores,
+# read-model facade, remote export sink), extracted under ADR 0064 Phase 1.
+# `main.rs` re-exports its modules at the crate root so existing
+# `crate::journal::…` paths keep resolving.
+nano-server-storage = { path = "crates/nano-server-storage" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
@@ -27,8 +40,6 @@ http = "1"
 # path on Windows that Node's ESM loader and some CLI tools reject; `dunce`
 # strips it when possible and is a transparent passthrough to std on Unix.
 dunce = "1"
-prometheus = { version = "0.13", default-features = false }
-rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # YAML for the optional runtime config file (ADR 0035). Chosen over TOML to match
@@ -92,16 +103,13 @@ tower-http = { version = "0.7.0", features = ["cors"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# jemalloc as the global allocator. Unlike the system allocator (macOS libmalloc,
-# Linux glibc), it returns freed memory to the OS on a decay schedule and exposes
-# a portable `mallctl` purge knob, so an idle server's resident footprint falls
-# back down after a load burst instead of pinning the peak (see `memory.rs` and
-# the idle-purge tick). It is vendored and built from source, so the binary stays
-# self-contained. Not available on MSVC; the system allocator is used there.
+# jemalloc mallctl access for `cmd_profile.rs` (per-thread allocation
+# profiling). The global allocator itself — and the purge/resident-stats knobs
+# — lives in `nano-server-storage`'s `memory` module (see that crate's
+# manifest for the vendored-allocator rationale). Not available on MSVC; the
+# system allocator is used there.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats"] }
-tikv-jemalloc-sys = "0.6"
 
 [dev-dependencies]
 serde_json = "1"
@@ -110,13 +118,18 @@ serde_json = "1"
 # middleware's routing (MatchedPath), status/schema lookup, and 500-on-violation
 # rewrite are exercised exactly as in production.
 tower = { version = "0.5", features = ["util"] }
+# Test builds link the storage crate as a normal (non-test) library, so the
+# `#[cfg(test)]` hooks this binary's inline tests used to call in-crate (e.g.
+# `Journal::cold_spill_configured`) would vanish. `test-hooks` recompiles them
+# in for test builds only; production builds never see the feature.
+nano-server-storage = { path = "crates/nano-server-storage", features = ["test-hooks"] }
 
 # The self-contained single-node distribution: bundle the web console (cluster
 # console, BPMN modeler, process-instance explorer, embedded workers) into the
 # gateway binary. Off by default — the production gateway build is unaffected and
 # does not require a built frontend under ../console/dist.
 [features]
-console = ["dep:nanobpm-console-api", "dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:portable-pty", "dep:url", "tokio/process", "tokio/io-util"]
+console = ["dep:nanobpm-console-api", "dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:portable-pty", "dep:url", "tokio/process", "tokio/io-util", "nano-server-storage/console"]
 # ADR 0034: build the console with the lean "observe" operator profile instead of
 # the full "studio" IDE. Additive over `console` — it only swaps the embedded
 # bundle from `console/dist` to `console/dist-observe` (~158KB gzip vs ~4.7MB),
@@ -126,7 +139,8 @@ console-observe = ["console"]
 # on sampled allocation-backtrace capture at startup. Adds per-allocation
 # sampling overhead, so it is NEVER enabled in a production build — it exists to
 # pin the structure behind a live-heap growth via `/debug/heap/prof` + jeprof.
-heapprof = ["tikv-jemallocator/profiling", "tikv-jemalloc-sys/profiling"]
+# The allocator lives in the storage crate, so this forwards there.
+heapprof = ["nano-server-storage/heapprof"]
 
 # Optimized for a small production binary. `strip` removes ~8 MB of symbols;
 # fat LTO + a single codegen unit let the linker drop dead code across crate
