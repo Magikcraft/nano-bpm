@@ -3407,6 +3407,148 @@ async fn gen_with_urban(name: &str, urban: &Path, no_models: bool) -> Result<(),
     Ok(())
 }
 
+/// Which boot-readiness action an Urban-shaped app's derived `nano-generated/`
+/// facade needs before its Run spawns, decided purely from the project shape,
+/// toolkit availability and gen freshness so the run-path self-heal invariant is
+/// unit-testable in isolation (mirrors [`super::RegenPath`] / [`DataGatewayPath`]).
+///
+/// This is the #1036 class fix: a fresh Urban app ships neither `node_modules/`
+/// nor `nano-generated/`, so its first OpenAPI request 500s with "delegate failed
+/// to load" until `urban gen` materialises the facade. The run path heals that
+/// before the spawn instead of leaving the maker to `npm i && urban gen` by hand.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum BootGenPath {
+    /// `urban gen --check` exited 0: the facade is fresh — skip regen so a
+    /// steady-state Run stays cheap.
+    Fresh,
+    /// `urban gen --check` was non-zero, absent, or the toolkit predates the
+    /// flag: the facade is missing/stale — run `urban gen` before the spawn so
+    /// the first OpenAPI request finds its delegate.
+    Regen,
+    /// No `urban` resolved for the project: warn and proceed, the same
+    /// `SkipUrbanUnavailable` semantics as [`super::regenerate_domain_types`] —
+    /// a missing toolkit must never block Run (ADR 0053: no embedded fallback).
+    UrbanUnavailable,
+    /// Not an Urban-shaped app: no boot gen — the legacy run path is unchanged.
+    NotUrban,
+}
+
+/// The #1036 run-path boot-readiness rule, factored out as a pure function so the
+/// invariant is unit-testable in isolation: only an Urban-shaped app self-heals;
+/// with no resolvable toolkit it warns and proceeds (never blocks Run); with one,
+/// it regenerates the facade only when `urban gen --check` reports it stale.
+fn boot_gen_path(is_urban: bool, urban_resolved: bool, gen_fresh: bool) -> BootGenPath {
+    match (is_urban, urban_resolved, gen_fresh) {
+        (false, _, _) => BootGenPath::NotUrban,
+        (true, false, _) => BootGenPath::UrbanUnavailable,
+        (true, true, true) => BootGenPath::Fresh,
+        (true, true, false) => BootGenPath::Regen,
+    }
+}
+
+/// Probe whether an Urban app's derived `nano-generated/` facade is fresh by
+/// running `urban gen --check` in the project dir. Exit 0 ⇒ fresh (skip regen);
+/// any non-zero exit, spawn failure, or an older toolkit that doesn't recognise
+/// `--check` (errors out) ⇒ `false`, so the caller regenerates. Treating an
+/// unrecognised flag as "stale" is the safe, non-regressing default: the worst
+/// case is a redundant `urban gen`, never a skipped one that leaves the facade
+/// absent. `dir` is canonicalized so the CWD urban resolves relative paths
+/// against matches the project (mirrors [`gen_with_urban`]).
+async fn urban_gen_is_fresh(urban: &Path, dir: &Path) -> bool {
+    let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    matches!(
+        Command::new(urban)
+            .current_dir(&dir)
+            .arg("gen")
+            .arg("--check")
+            .env("NO_COLOR", "1")
+            .kill_on_drop(true)
+            .output()
+            .await,
+        Ok(out) if out.status.success()
+    )
+}
+
+/// Best-effort boot-readiness for an Urban-shaped app, run just before its Run
+/// spawn (#1036). Two halves, both best-effort — a flaky npm/network or an
+/// unreachable toolkit must never block Run:
+///
+/// 1. **Deps** — materialise any declared dependency missing from `node_modules`
+///    (or out of its declared range), *regardless of the eventual spawn runtime*.
+///    Unlike the legacy non-Urban lazy install (Node arm only), this fires on the
+///    Deno arm too, because `urban` itself resolves from the app's own
+///    `node_modules/.bin/urban` (#776) — without deps there is no toolkit to gen
+///    with.
+/// 2. **Gen** — probe the derived facade with `urban gen --check` and, when it is
+///    missing/stale, delegate to [`gen_via_urban`] (the one deriver, ADR 0053).
+///    An unresolvable toolkit warns and proceeds; a fresh facade is skipped so a
+///    steady-state Run stays cheap.
+///
+/// Returns the `(stream, text)` log lines the caller streams onto the project's
+/// log, so a skipped/failed gen surfaces an explicit "endpoints may 500 until
+/// `urban gen` runs" hint rather than the runtime's opaque "delegate failed to
+/// load". A non-Urban project returns no lines and takes no action.
+async fn ensure_urban_boot_ready(name: &str) -> Vec<(&'static str, String)> {
+    let mut logs: Vec<(&'static str, String)> = Vec::new();
+    if !is_urban_app(name) {
+        return logs;
+    }
+    let Some(dir) = project_dir(name) else {
+        return logs;
+    };
+
+    // 1. Deps — for either runtime (see the doc comment).
+    let needing = node_modules_needing_install(&dir);
+    if !needing.is_empty() {
+        logs.push((
+            "info",
+            format!(
+                "installing {} npm dependenc{} ({})…",
+                needing.len(),
+                if needing.len() == 1 { "y" } else { "ies" },
+                needing.join(", "),
+            ),
+        ));
+        let install_dir = dir.clone();
+        match tokio::task::spawn_blocking(move || install_project_node_modules(&install_dir)).await
+        {
+            Ok(Ok(())) => logs.push(("info", "npm install complete".into())),
+            Ok(Err(e)) => logs.push(("err", format!("npm install: {e}"))),
+            Err(e) => logs.push(("err", format!("npm install task: {e}"))),
+        }
+    }
+
+    // 2. Gen freshness. Resolve the toolkit project-scoped (#776) so the app's
+    //    own `node_modules/.bin/urban` — just materialised above — is honoured.
+    let urban = super::urban::find_urban_for(&dir);
+    let gen_fresh = match &urban {
+        Some(u) => urban_gen_is_fresh(u, &dir).await,
+        None => false,
+    };
+    match boot_gen_path(true, urban.is_some(), gen_fresh) {
+        BootGenPath::Fresh => {}
+        BootGenPath::Regen => match gen_via_urban(name).await {
+            Ok(()) => logs.push(("info", "urban gen complete".into())),
+            // Surface `e` as-is: it is usually an "urban gen failed …" message
+            // (from `gen_with_urban`) but can also be a lookup error like
+            // "urban CLI not available" (from `gen_via_urban`), so don't assume a
+            // prefix — just append it after the operator-facing consequence.
+            Err(e) => logs.push((
+                "err",
+                format!("OpenAPI endpoints may 500 until `urban gen` runs: {e}"),
+            )),
+        },
+        BootGenPath::UrbanUnavailable => logs.push((
+            "err",
+            "urban CLI unavailable — OpenAPI endpoints may 500 until `urban gen` runs".into(),
+        )),
+        // Unreachable (guarded by `is_urban_app` above) but kept exhaustive so a
+        // future caller can't route a legacy project into a gen attempt.
+        BootGenPath::NotUrban => {}
+    }
+    logs
+}
+
 /// Which gateway a datasource op is routed to, decided purely from the project
 /// shape and toolkit availability so the routing invariant is unit-testable in
 /// isolation (mirrors [`super::RegenPath`] for `urban gen`).
@@ -5034,9 +5176,14 @@ pub async fn finalize_after_update(name: &str) -> PostUpdateOutcome {
     if is_urban_app(name) {
         match gen_via_urban(name).await {
             Ok(()) => outcome.generated = true,
-            Err(e) => outcome
-                .warnings
-                .push(format!("urban gen failed — run it manually: {e}")),
+            // Surface `e` as-is: it is usually an "urban gen failed …" message
+            // (from `gen_with_urban`) but can also be a lookup error like
+            // "urban CLI not available" (from `gen_via_urban`), for which a
+            // "run `urban gen` manually" hint would be impossible. Report the
+            // consequence and the reason without prescribing a specific remedy.
+            Err(e) => outcome.warnings.push(format!(
+                "OpenAPI endpoints may 500 until derived types regenerate: {e}"
+            )),
         }
     }
 
@@ -7069,18 +7216,27 @@ impl ProjectSupervisor {
 
         Self::auto_deploy_resources(&cfg, &dir, &base_url, &inner).await;
 
-        // Node resolves the project's real npm `dependencies` (e.g. `@nanobpm/urban`,
-        // a published Urban app's toolkit) as bare specifiers from `node_modules`.
-        // Unlike Deno — which fetches `npm:` on demand — the host never populates
-        // it, so a project created from such an app fails with ERR_MODULE_NOT_FOUND.
-        // Lazily materialise any declared dep that is missing from `node_modules`
-        // OR present but out of its declared version range (e.g. an extension
-        // update bumped the range while preserving node_modules) with a guarded,
-        // best-effort `npm install` (no dev deps, no lifecycle scripts) before
-        // the Node spawn. A failure is logged, not fatal: the spawn then
-        // surfaces the underlying resolution error, so the run is never silently
-        // blocked on a flaky install.
-        if let RunRuntime::Node(_) = &runtime {
+        // Boot-readiness before the spawn. Two shapes:
+        //
+        // * **Urban-shaped app** (#1036): a fresh marketplace install ships
+        //   neither `node_modules/` nor the derived `nano-generated/` facade, so
+        //   the first OpenAPI request 500s with "delegate failed to load" until
+        //   `npm i && urban gen` run by hand. `ensure_urban_boot_ready` heals the
+        //   whole class here — deps (on *either* runtime, since `urban` itself
+        //   resolves from `node_modules/.bin/urban`) plus a `urban gen --check`
+        //   guarded regen — so the first endpoint hit works. Best-effort: every
+        //   step warns rather than blocks Run.
+        // * **Legacy Node project**: Node resolves npm `dependencies` as bare
+        //   specifiers from `node_modules`; unlike Deno (which fetches `npm:` on
+        //   demand) the host never populates it, so a missing/out-of-range dep
+        //   fails with ERR_MODULE_NOT_FOUND. Lazily materialise them before the
+        //   Node spawn (Node arm only — Deno needs no local install). A failure
+        //   is logged, not fatal: the spawn then surfaces the underlying error.
+        if is_urban_app(name) {
+            for (stream, text) in ensure_urban_boot_ready(name).await {
+                inner.push_log(stream, text).await;
+            }
+        } else if let RunRuntime::Node(_) = &runtime {
             let needing = node_modules_needing_install(&dir);
             if !needing.is_empty() {
                 inner
@@ -11071,6 +11227,235 @@ mod tests {
         assert!(!outcome.installed_deps);
         assert!(!outcome.generated, "legacy app is not Urban-shaped");
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    }
+
+    /// The #1036 run-path boot-readiness rule is a pure function: only an
+    /// Urban-shaped app self-heals; with no resolvable toolkit it warns and
+    /// proceeds (never blocks Run); with one, it regenerates only when
+    /// `urban gen --check` reports the facade stale, and skips when it is fresh.
+    #[test]
+    fn boot_gen_path_routes_by_shape_toolkit_and_freshness() {
+        // Not Urban-shaped ⇒ never a gen attempt, whatever the toolkit/freshness.
+        assert_eq!(boot_gen_path(false, false, false), BootGenPath::NotUrban);
+        assert_eq!(boot_gen_path(false, true, true), BootGenPath::NotUrban);
+        // Urban but no toolkit ⇒ warn + proceed (never the embedded path).
+        assert_eq!(
+            boot_gen_path(true, false, false),
+            BootGenPath::UrbanUnavailable
+        );
+        assert_eq!(
+            boot_gen_path(true, false, true),
+            BootGenPath::UrbanUnavailable
+        );
+        // Urban + toolkit: freshness decides regen vs skip.
+        assert_eq!(boot_gen_path(true, true, false), BootGenPath::Regen);
+        assert_eq!(boot_gen_path(true, true, true), BootGenPath::Fresh);
+    }
+
+    /// `urban gen --check` is the freshness gate: exit 0 ⇒ fresh (skip regen);
+    /// any non-zero exit (missing/stale facade, or an older toolkit that doesn't
+    /// recognise the flag) ⇒ not fresh, so the caller regenerates.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn urban_gen_is_fresh_reads_the_check_exit_code() {
+        let _g = lock();
+        let root = temp_root();
+        let dir = root.join("freshcheck");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fresh = root.join("urban-fresh.sh");
+        write_urban_stub(&fresh, "exit 0");
+        assert!(
+            urban_gen_is_fresh(&fresh, &dir).await,
+            "exit 0 ⇒ facade fresh"
+        );
+
+        let stale = root.join("urban-stale.sh");
+        write_urban_stub(&stale, "exit 1");
+        assert!(
+            !urban_gen_is_fresh(&stale, &dir).await,
+            "non-zero exit ⇒ facade stale"
+        );
+
+        // The probe records `gen --check`, not a bare `gen` — a `--check` run
+        // must never write artifacts.
+        let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap();
+        assert_eq!(
+            sentinel.lines().next(),
+            Some("gen --check"),
+            "freshness probe must run `gen --check`: {sentinel:?}"
+        );
+    }
+
+    /// End-to-end run-path self-heal for an Urban app with a stale facade
+    /// (`urban gen --check` non-zero): boot readiness delegates to `urban gen`
+    /// before the spawn so the first OpenAPI request finds its delegate (#1036).
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn ensure_urban_boot_ready_gens_when_facade_is_stale() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "boot-stale";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"boot-stale"}"#,
+        )
+        .unwrap();
+        // No deps ⇒ the install step is a hermetic no-op (no real npm needed).
+        std::fs::write(dir.join("package.json"), r#"{"name":"boot-stale"}"#).unwrap();
+
+        // A stub that fails `gen --check` (stale) but succeeds a bare `gen`. It
+        // must NOT advertise `--no-models`/`derive` in --help, so `gen_via_urban`
+        // takes the bare-`gen` path and the recorded first line stays `gen`.
+        let stub = root.join("urban-boot.sh");
+        write_urban_stub(
+            &stub,
+            "case \"$1\" in gen) case \"$2\" in --check) exit 1;; esac;; esac",
+        );
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+
+        let logs = ensure_urban_boot_ready(name).await;
+
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+
+        let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap();
+        assert_eq!(
+            sentinel.lines().next(),
+            Some("gen"),
+            "stale facade must trigger `urban gen`: {sentinel:?}"
+        );
+        assert!(
+            logs.iter().any(|(_, t)| t.contains("urban gen complete")),
+            "expected a gen-complete log line: {logs:?}"
+        );
+    }
+
+    /// When `urban gen --check` reports the facade fresh, boot readiness skips
+    /// regen entirely — a steady-state Run stays cheap (no `urban gen` spawn).
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn ensure_urban_boot_ready_skips_gen_when_fresh() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "boot-fresh";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"boot-fresh"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"name":"boot-fresh"}"#).unwrap();
+
+        // `gen --check` exits 0 (fresh); a bare `gen` would also record, so if the
+        // facade is (incorrectly) regenerated the sentinel's first line becomes
+        // `gen` — the assertion below catches that.
+        let stub = root.join("urban-fresh-boot.sh");
+        write_urban_stub(&stub, "");
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+
+        let logs = ensure_urban_boot_ready(name).await;
+
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+
+        let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap();
+        assert_eq!(
+            sentinel.lines().next(),
+            Some("gen --check"),
+            "fresh facade must stop at `gen --check`, never run a bare `gen`: {sentinel:?}"
+        );
+        assert!(
+            !logs.iter().any(|(_, t)| t.contains("urban gen complete")),
+            "fresh facade must not log a gen: {logs:?}"
+        );
+    }
+
+    /// A legacy-shaped project (no `nano.app.json`) is never routed into the
+    /// Urban boot-readiness path: no toolkit is spawned and no logs are produced.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn ensure_urban_boot_ready_is_a_noop_for_legacy_projects() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "boot-legacy";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("nanobpm.project.json"), "{}").unwrap();
+
+        // A stub that would record if (wrongly) invoked; the assertion is that it
+        // is not.
+        let stub = root.join("urban-legacy-boot.sh");
+        write_urban_stub(&stub, "");
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+
+        let logs = ensure_urban_boot_ready(name).await;
+
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+
+        assert!(
+            logs.is_empty(),
+            "legacy project ⇒ no boot-readiness: {logs:?}"
+        );
+        assert!(
+            !dir.join("urban-ran.txt").exists(),
+            "legacy project must not spawn `urban`"
+        );
+    }
+
+    /// An Urban app whose toolkit does not resolve warns and proceeds — the
+    /// `SkipUrbanUnavailable` semantics: Run is never blocked on a missing
+    /// toolkit, and the log makes the coming 500s explicit rather than opaque.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn ensure_urban_boot_ready_warns_when_toolkit_unresolved() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "boot-notoolkit";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"boot-notoolkit"}"#,
+        )
+        .unwrap();
+        // Make resolution hermetic across all four `find_urban_for` seams
+        // (override → pack → project-local → PATH) so the test yields `None`
+        // regardless of the host: the override points at a non-existent path,
+        // the project has no `node_modules/.bin/urban`, `NANOBPMN_EXTENSIONS_DIR`
+        // is isolated to an empty dir (no marketplace pack), and `PATH` is
+        // cleared for the duration (no ambient `urban`). Without the last two, a
+        // dev machine with the pack installed or an `urban` on `PATH` would
+        // resolve a real toolkit and the test would fail or spawn it.
+        let prev_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("NANOBPMN_URBAN_BIN", root.join("does-not-exist-urban"));
+            std::env::set_var("NANOBPMN_EXTENSIONS_DIR", root.join("empty-extensions"));
+            std::env::remove_var("PATH");
+        }
+
+        let logs = ensure_urban_boot_ready(name).await;
+
+        unsafe {
+            std::env::remove_var("NANOBPMN_URBAN_BIN");
+            std::env::remove_var("NANOBPMN_EXTENSIONS_DIR");
+            match prev_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            logs.iter()
+                .any(|(s, t)| *s == "err" && t.contains("urban CLI unavailable")),
+            "expected an unavailable-toolkit warning: {logs:?}"
+        );
     }
 
     /// A unique, env-free temp directory for tests that pass explicit paths and
