@@ -1427,6 +1427,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-server-storage"
+version = "0.0.16"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "nanobpmn-engine-core",
+ "nanobpmn-read-model",
+ "prometheus",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tikv-jemalloc-ctl",
+ "tikv-jemalloc-sys",
+ "tikv-jemallocator",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nanobpm-console-api"
 version = "0.1.0"
 dependencies = [
@@ -1496,22 +1516,19 @@ dependencies = [
  "hyper-util",
  "libc",
  "mime_guess",
+ "nano-server-storage",
  "nanobpm-console-api",
  "nanobpm-gateway-rest",
  "nanobpmn-engine-core",
  "nanobpmn-read-model",
  "openraft",
  "portable-pty",
- "prometheus",
  "reqwest",
- "rusqlite",
  "rust-embed",
  "serde",
  "serde_json",
  "serde_yaml",
  "tikv-jemalloc-ctl",
- "tikv-jemalloc-sys",
- "tikv-jemallocator",
  "tokio",
  "tokio-tungstenite",
  "tower",

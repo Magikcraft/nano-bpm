@@ -1,6 +1,9 @@
 # The heavy server integration tests each spin up a multi-node Raft cluster on a
 # `worker_threads = 4` runtime (the `cluster_e2e` binary) or drive snapshot+tail
-# journal recovery (`seglog::tests`). They are timing sensitive: their fixed
+# journal recovery (`seglog::tests`, which live in the `nano-server-storage`
+# crate's lib test binary since the ADR 0064 Phase 1 extraction — the `test()`
+# predicate below matches them by name regardless of which test binary they are
+# in). They are timing sensitive: their fixed
 # replication/failover readiness budgets (e.g. "the create ships to node 1"
 # within 8s) assume the tokio runtime makes steady progress, which only holds if
 # the process isn't starved of CPU.

@@ -156,7 +156,10 @@ impl ColdIndex {
     }
 
     /// How many instances are currently cold.
-    pub fn len(&self) -> usize {
+    // `pub(crate)`: consumed only by `journal` (same crate); keeping it off the
+    // public API also avoids the `len_without_is_empty` clippy lint without
+    // growing an `is_empty` this index never needs.
+    pub(crate) fn len(&self) -> usize {
         self.instances.len()
     }
 

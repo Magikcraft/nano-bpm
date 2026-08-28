@@ -341,11 +341,11 @@ run: $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Run the stub server (PORT overrides t
 
 .PHONY: server-test
 server-test: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Test the stub server (incl. journal-replay e2e tests)
-	cd $(PROJECT_ROOT)/server && cargo test
+	cd $(PROJECT_ROOT)/server && cargo test --workspace
 
 .PHONY: server-test-release
 server-test-release: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) $(RESPONSE_CONTRACT) ## Test the stub server with release optimizations (uses the release-test profile to avoid the panic=abort double-compile)
-	cd $(PROJECT_ROOT)/server && cargo test --profile release-test --features console
+	cd $(PROJECT_ROOT)/server && cargo test --workspace --profile release-test --features nanobpm-gateway-rest-server/console
 
 .PHONY: engine-build
 engine-build: ## Build the embeddable BPMN engine-core crate (no Docker, no codegen)
@@ -457,7 +457,7 @@ install-hooks: ## Activate the tracked git hooks (.githooks) — adds a pre-push
 .PHONY: clippy
 clippy: $(GENERATED_DIR)/Cargo.toml ## Lint the generated crate, the stub server and engine-core
 	cd $(GENERATED_DIR) && cargo clippy
-	cd $(PROJECT_ROOT)/server && cargo clippy
+	cd $(PROJECT_ROOT)/server && cargo clippy --workspace
 	cd $(ENGINE_DIR) && cargo clippy --all-targets -- -D warnings
 
 .PHONY: clean
