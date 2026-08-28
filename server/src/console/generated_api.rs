@@ -1005,7 +1005,7 @@ impl apis::projects::Projects for ServerImpl {
                     // it never fails the create the maker already succeeded at.
                     let outcome = super::projects::finalize_after_update(&project).await;
                     for warning in &outcome.warnings {
-                        tracing::debug!(project = %project, warning = %warning, "post-create refresh");
+                        tracing::warn!(project = %project, warning = %warning, "post-create refresh");
                     }
                 }
                 Ok(apis::projects::CreateProjectResponse::Status201_ProjectCreated(from_val(v)))
