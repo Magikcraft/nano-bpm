@@ -630,21 +630,25 @@ jobs:
         run: mkdir -p console/dist && printf '<!doctype html>\n' > console/dist/index.html
       - name: Clippy
         working-directory: server
-        run: cargo clippy --all-targets --features console -- -D warnings
+        # `--workspace` covers the extracted member crates (ADR 0064: e.g.
+        # crates/nano-server-storage); `console` is a feature of the bin
+        # package, so with `--workspace` it must be package-scoped.
+        run: cargo clippy --workspace --all-targets --features nanobpm-gateway-rest-server/console -- -D warnings
       - name: Test
         working-directory: server
         # Run with nextest so the heavy, timing-sensitive integration tests
         # (`clustered_startup_tests` spin up multi-node Raft clusters on a
-        # worker_threads=4 runtime; `seglog::tests` drive snapshot+tail recovery)
+        # worker_threads=4 runtime; `seglog::tests` — now in the
+        # nano-server-storage lib test binary — drive snapshot+tail recovery)
         # run in a single-threaded group that reserves the whole test-thread
         # pool — see .config/nextest.toml. This eliminates the cross-test CPU
         # oversubscription that starved these timing-sensitive tests, so they run
         # under the same uncontended conditions as locally. No retries: tests
         # must pass on the first run; the whole suite stays strict and, apart
         # from these serial-heavy tests, parallel.
-        # (The server crate is a binary with no lib target, so there are no
-        # doctests to run separately.)
-        run: cargo nextest run --features console
+        # (The moved modules carry no doctests, so nextest — which cannot run
+        # doctests — covers the whole workspace suite.)
+        run: cargo nextest run --workspace --features nanobpm-gateway-rest-server/console
   console:
     name: console (typecheck + test)
     runs-on: ubuntu-24.04

@@ -12,7 +12,6 @@
 mod backpressure;
 mod cluster;
 mod cmd_profile;
-mod coldspill;
 #[cfg(feature = "console")]
 mod console;
 #[cfg(feature = "console")]
@@ -20,9 +19,6 @@ mod consumers;
 mod deepthi;
 mod drain_guard;
 mod falcon;
-mod journal;
-mod memory;
-mod metrics;
 // Intra-cluster peer uplink (falcon client to peers). The forwarding
 // seam that drives it (create-forward, by-key forward, broadcast) lands in the
 // following increments; the transport is integration-tested now.
@@ -34,16 +30,10 @@ mod query;
 mod raft;
 mod raft_logstore;
 mod raft_net;
-mod readstore;
 mod recovery_throttle;
-mod remote_sink;
 mod response_contract;
 mod runtime_config;
-mod seglog;
-mod sqlite_space;
 mod stub_impls;
-mod varspill;
-mod varstore;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -56,6 +46,19 @@ use axum::body::Body;
 use axum::extract::Multipart;
 use axum::response::Response;
 use http::StatusCode;
+// The storage layer was extracted into the `nano-server-storage` library crate
+// (ADR 0064, Phase 1). Re-export its modules at this crate's root so every
+// existing `crate::journal::…` / `crate::metrics::…` path in this binary keeps
+// resolving unchanged. (`coldspill` and `sqlite_space` are used only inside
+// the storage crate itself, so they are not re-exported here.)
+pub(crate) use nano_server_storage::journal;
+pub(crate) use nano_server_storage::memory;
+pub(crate) use nano_server_storage::metrics;
+pub(crate) use nano_server_storage::readstore;
+pub(crate) use nano_server_storage::remote_sink;
+pub(crate) use nano_server_storage::seglog;
+pub(crate) use nano_server_storage::varspill;
+pub(crate) use nano_server_storage::varstore;
 use nanobpm_gateway_rest::{apis, models, types};
 use nanobpmn_engine_core as agent_model;
 use nanobpmn_engine_core::bpmn::parse_bpmn;

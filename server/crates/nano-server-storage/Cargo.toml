@@ -1,0 +1,62 @@
+[package]
+name = "nano-server-storage"
+version = "0.0.16"
+edition = "2024"
+publish = false
+description = "Storage layer of the nanobpm gateway server (ADR 0064 Phase 1): metrics, memory/allocator, SQLite space accounting, variable stores, cold spill, segmented journal log, read-model facade, remote export sink."
+
+[dependencies]
+nanobpmn-engine-core = { path = "../../../engine-core", features = ["serde"] }
+# The shared SQLite read model (CQRS query side); this crate's `readstore`
+# module is the server-side facade over it and consumes the `native` backend.
+nanobpmn-read-model = { path = "../../../read-model", features = ["native"] }
+prometheus = { version = "0.13", default-features = false }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "rt", "time"] }
+tracing = "0.1"
+anyhow = "1.0.102"
+# Journal frame compression in `seglog` (best-effort deflate framing; the
+# reader tolerates mixed framed/plaintext records).
+flate2 = "1.1.9"
+# Async HTTP client for `remote_sink`'s remote read-model export sink. rustls
+# matches the gateway bin's reqwest build (feature unification makes the union
+# in the full workspace build; declared here so this crate is correct when
+# built standalone — `Client::new()` panics with no TLS backend compiled in).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# jemalloc as the global allocator (see `memory.rs`): returns freed memory to
+# the OS on a decay schedule and exposes the portable `mallctl` purge knob.
+# Not available on MSVC; the system allocator is used there.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats"] }
+tikv-jemalloc-sys = "0.6"
+
+[dev-dependencies]
+# Test-only tokio extras: `remote_sink`'s mock HTTP server binds a TcpListener
+# and reads/writes streams.
+tokio = { version = "1", features = ["net", "io-util"] }
+
+[features]
+# Cfg marker only: the console-only metric surface in `metrics.rs`
+# (`MetricsSnapshot`, `snapshot()`) is plain registry reads, so nothing needs
+# activating — but the feature must exist for the `cfg(feature = "console")`
+# gates to be known cfgs. The gateway bin's `console` feature forwards here.
+console = []
+# Diagnostic-only: builds jemalloc with heap profiling (--enable-prof) so
+# `memory::prof_dump` can capture sampled allocation backtraces. NEVER enabled
+# in a production build; the bin's `heapprof` feature forwards here.
+heapprof = ["tikv-jemallocator/profiling", "tikv-jemalloc-sys/profiling"]
+# Compiles the `#[cfg(any(test, feature = "test-hooks"))]` hooks (e.g.
+# `Journal::cold_spill_configured`) into the library. Enabled ONLY by the
+# gateway bin's dev-dependencies so its inline tests — which link this crate
+# as a non-test library — keep the access they had when everything was one
+# crate. Production builds never enable it.
+test-hooks = []
+
+[lints.rust]
+# Project policy: warnings are banned. `cargo build`/`check` fail on any rustc
+# warning (unused code, deprecations, future-incompat lints, etc.).
+warnings = "deny"

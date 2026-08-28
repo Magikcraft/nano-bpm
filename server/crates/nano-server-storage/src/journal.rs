@@ -122,7 +122,7 @@ enum CommitInner {
 }
 
 impl Commit {
-    pub(crate) fn ready() -> Self {
+    pub fn ready() -> Self {
         Commit(CommitInner::Ready)
     }
 
@@ -1533,7 +1533,10 @@ impl Journal {
     /// Test hook: whether cold-spill is configured (a cold store is wired). Used
     /// to assert that lazily-created Raft replica engines inherit the same spill
     /// tiers as owned engines, so a follower can reclaim hot RAM.
-    #[cfg(test)]
+    // Also compiled under `test-hooks` (enabled by the gateway bin's
+    // dev-dependencies) so the bin's own inline tests — which link this crate as
+    // a non-test library since the ADR 0064 extraction — keep seeing the hook.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn cold_spill_configured(&self) -> bool {
         self.cold.is_some()
     }
