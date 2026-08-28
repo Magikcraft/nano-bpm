@@ -980,9 +980,12 @@ impl apis::projects::Projects for ServerImpl {
             Ok(v) => {
                 // Code-first projects (ADR 0048): generate the initial laid-out
                 // `resources/processes/*.bpmn` from the scaffolded `workflows/*.ts`
-                // so a brand-new project opens with a rendered model. Fire-and-
-                // forget — it needs a Deno round-trip (npm fetch) we must not block
-                // the create response on; best-effort, failures are logged only.
+                // so a brand-new project opens with a rendered model. It needs a
+                // Deno round-trip (npm fetch); both paths below are best-effort and
+                // only log on failure — they never fail the create. How they run
+                // differs per template: the `workflow-starter` path is fire-and-
+                // forget (spawned, so the create response isn't blocked on the Deno
+                // round-trip), while the pack-template path awaits (see below).
                 //
                 // Both post-create refresh paths key off the created config's
                 // *slug* (`v["name"]`), never `body.name`: a display name like

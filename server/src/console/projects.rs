@@ -3485,7 +3485,7 @@ async fn urban_gen_is_fresh(urban: &Path, dir: &Path) -> bool {
 ///    steady-state Run stays cheap.
 ///
 /// Returns the `(stream, text)` log lines the caller streams onto the project's
-/// log, so a skipped/failed gen surfaces an explicit "endpoints will 500 until
+/// log, so a skipped/failed gen surfaces an explicit "endpoints may 500 until
 /// `urban gen` runs" hint rather than the runtime's opaque "delegate failed to
 /// load". A non-Urban project returns no lines and takes no action.
 async fn ensure_urban_boot_ready(name: &str) -> Vec<(&'static str, String)> {
@@ -3535,12 +3535,12 @@ async fn ensure_urban_boot_ready(name: &str) -> Vec<(&'static str, String)> {
             // prefix — just append it after the operator-facing consequence.
             Err(e) => logs.push((
                 "err",
-                format!("OpenAPI endpoints will 500 until `urban gen` runs: {e}"),
+                format!("OpenAPI endpoints may 500 until `urban gen` runs: {e}"),
             )),
         },
         BootGenPath::UrbanUnavailable => logs.push((
             "err",
-            "urban CLI unavailable — OpenAPI endpoints will 500 until `urban gen` runs".into(),
+            "urban CLI unavailable — OpenAPI endpoints may 500 until `urban gen` runs".into(),
         )),
         // Unreachable (guarded by `is_urban_app` above) but kept exhaustive so a
         // future caller can't route a legacy project into a gen attempt.
