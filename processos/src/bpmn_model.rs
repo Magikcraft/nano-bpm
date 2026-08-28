@@ -67,6 +67,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::ConditionalBoundaryEvent { .. } => "conditionalBoundaryEvent",
         ElementKind::CompensationBoundaryEvent { .. } => "compensationBoundaryEvent",
         ElementKind::CompensationThrowEvent => "compensationThrowEvent",
+        ElementKind::AgentTask { .. } => "agentTask",
     }
 }
 
@@ -2477,6 +2478,22 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             }
             out.push_str("    </bpmn:subProcess>\n");
         }
+        ElementKind::AgentTask { agent_type, .. } => {
+            // An engine-native agent task round-trips as a serviceTask carrying a
+            // `zeebe:agentDefinition` marker. The runtime definition/limits are
+            // agent config supplied at CREATE (slice S3), not model structure, so
+            // only the structural `agentType` marker is emitted here.
+            out.push_str(&format!("    <bpmn:serviceTask id=\"{eid}\"{na}>\n"));
+            out.push_str("      <bpmn:extensionElements>\n");
+            out.push_str(&format!(
+                "        <zeebe:agentDefinition agentType=\"{}\"/>\n",
+                xml_escape(agent_type.as_str())
+            ));
+            emit_io_mapping(el, out);
+            out.push_str("      </bpmn:extensionElements>\n");
+            emit_multi_instance(el, out);
+            out.push_str("    </bpmn:serviceTask>\n");
+        }
     }
 }
 
@@ -4116,6 +4133,69 @@ mod tests {
     /// Serialize with no operator label overrides (humanized fallbacks only).
     fn definition_to_xml(def: &ProcessDefinition) -> String {
         definition_to_xml_labeled(def, &HashMap::new())
+    }
+
+    #[test]
+    fn agent_task_emission_round_trips_io_mapping_and_multi_instance() {
+        // An `agentTask` emits as a `bpmn:serviceTask`; like every other activity
+        // kind it must carry its `zeebe:ioMapping` and multi-instance loop
+        // characteristics through emission, or they are silently dropped on a
+        // round trip.
+        const AGENT_MI_BPMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="agent-mi" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Agent">
+      <bpmn:extensionElements>
+        <zeebe:agentDefinition agentType="aiAgentTask"/>
+        <zeebe:ioMapping>
+          <zeebe:input source="= item" target="in"/>
+          <zeebe:output source="= result" target="out"/>
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics>
+        <bpmn:extensionElements>
+          <zeebe:loopCharacteristics inputCollection="= items" inputElement="item" outputCollection="results" outputElement="= result"/>
+        </bpmn:extensionElements>
+      </bpmn:multiInstanceLoopCharacteristics>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Agent"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="Agent" targetRef="End"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let (orig, _) = first_def(AGENT_MI_BPMN).expect("parse agent multi-instance model");
+        assert!(matches!(
+            orig.elements["Agent"].kind,
+            ElementKind::AgentTask { .. }
+        ));
+        let xml = definition_to_xml(&orig);
+        assert!(
+            xml.contains("<zeebe:agentDefinition agentType=\"aiAgentTask\"/>"),
+            "agent marker must survive, got:\n{xml}"
+        );
+        assert!(
+            xml.contains("<zeebe:ioMapping>")
+                && xml.contains("<zeebe:input source=\"= item\" target=\"in\"/>")
+                && xml.contains("<zeebe:output source=\"= result\" target=\"out\"/>"),
+            "ioMapping must survive agentTask emission, got:\n{xml}"
+        );
+        assert!(
+            xml.contains("<bpmn:multiInstanceLoopCharacteristics>")
+                && xml.contains("inputCollection=\"= items\""),
+            "multi-instance loop characteristics must survive agentTask emission, got:\n{xml}"
+        );
+        // And the emitted model re-parses to the same structure.
+        let reparsed = parse_bpmn(&xml).expect("emitted agent model re-parses");
+        assert_same_structure(&orig, &reparsed[0]);
     }
 
     #[test]

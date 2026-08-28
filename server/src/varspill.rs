@@ -663,6 +663,8 @@ mod tests {
                 scope_variables: HashMap::new(),
                 compensable: Vec::new(),
                 compensation_waits: HashMap::new(),
+                agent_instances: HashMap::new(),
+                agent_history: HashMap::new(),
             },
             jobs: Vec::new(),
             timers: Vec::new(),

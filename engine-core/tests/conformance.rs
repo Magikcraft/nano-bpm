@@ -127,6 +127,11 @@ const NANO_ZEEBE_MAPPING: &[Mapping] = &[
         zeebe: "INVALID_ARGUMENT (ZeebeElementValidator hasNonEmptyAttribute)",
         origin: "#856",
     },
+    Mapping {
+        nano: "InvalidAgentDefinition",
+        zeebe: "INVALID_ARGUMENT (AgentDefinitionValidator agentType placement)",
+        origin: "agent-instance-parity S1",
+    },
 ];
 
 /// Maps a [`ParseError`] to its stable category key. The match is **exhaustive
@@ -150,6 +155,7 @@ fn nano_category(err: &ParseError) -> &'static str {
         ParseError::InvalidEndEvent { .. } => "InvalidEndEvent",
         ParseError::DuplicateStartEvent { .. } => "DuplicateStartEvent",
         ParseError::InvalidTaskDefinition { .. } => "InvalidTaskDefinition",
+        ParseError::InvalidAgentDefinition { .. } => "InvalidAgentDefinition",
     }
 }
 
@@ -472,6 +478,11 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             attribute: String::new(),
             reason: String::new(),
         },
+        ParseError::InvalidAgentDefinition {
+            process_id: String::new(),
+            element_id: String::new(),
+            reason: String::new(),
+        },
     ];
     // Compile-time completeness ratchet: this exhaustive, wildcard-free match
     // will not compile if a `ParseError` variant is added without a witness
@@ -494,6 +505,7 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             | ParseError::InvalidEndEvent { .. }
             | ParseError::DuplicateStartEvent { .. }
             | ParseError::InvalidTaskDefinition { .. } => {}
+            ParseError::InvalidAgentDefinition { .. } => {}
         }
     }
     witnesses
@@ -576,6 +588,7 @@ fn element_kind_family(kind: &ElementKind) -> ElementFamily {
         | ElementKind::BusinessRuleTask { .. }
         | ElementKind::UserTask(_)
         | ElementKind::ScriptTask { .. }
+        | ElementKind::AgentTask { .. }
         | ElementKind::Task => ElementFamily::Task,
         ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway

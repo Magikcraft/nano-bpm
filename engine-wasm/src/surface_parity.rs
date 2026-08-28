@@ -176,6 +176,19 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
                 "external ad-hoc activity activation is a server/REST seam; the studio wasm engine \
                  drives ad-hoc tools through the agent-job path, not this direct command",
         },
+        // AgentInstance write commands (engine-native AgentInstance parity). The
+        // CREATE/UPDATE/COMPLETE lifecycle processors landed in S3; their
+        // `#[wasm_bindgen]` TestEngine drivers land here in S6 alongside the
+        // regenerated `pkg/` artifact, so each is now `Surfaced`.
+        Command::CreateAgentInstance { .. } => Surface::Surfaced {
+            js_method: "createAgentInstance",
+        },
+        Command::UpdateAgentInstance { .. } => Surface::Surfaced {
+            js_method: "updateAgentInstance",
+        },
+        Command::CompleteAgentInstance { .. } => Surface::Surfaced {
+            js_method: "completeAgentInstance",
+        },
     }
 }
 
@@ -311,6 +324,18 @@ pub(crate) fn classify_read(query: &ReadQuery) -> Surface {
         },
         ReadQuery::GetDecisionRequirementsXml => Surface::NotSurfaced {
             reason: "DMN requirements-graph XML; the in-browser test engine exercises BPMN only",
+        },
+
+        // ---- AgentInstance / AgentHistory reads (Camunda 8.10 parity). The two
+        // search surfaces are surfaced through the read-model build so the wasm
+        // read-model TestEngine can query the projected agent state; the
+        // single-key get mirrors the other single-lookup gets (GetProcessInstance)
+        // and stays out — the modeler enumerates via searchAgentInstances. ----
+        ReadQuery::SearchAgentInstances => read_model_read("searchAgentInstances"),
+        ReadQuery::SearchAgentHistory => read_model_read("searchAgentInstanceHistory"),
+        ReadQuery::GetAgentInstance => Surface::NotSurfaced {
+            reason: "single AgentInstance lookup by key; the modeler enumerates via \
+                     searchAgentInstances (mirrors GetProcessInstance/GetUserTask)",
         },
     }
 }

@@ -195,6 +195,19 @@ pub(crate) struct IoMappingFailure {
     pub(crate) reason: String,
 }
 
+/// The instance-derived context copied off an [`AgentInstance`](crate::agent::AgentInstance)
+/// when materialising a batch of AgentHistory turns, so the borrow is released
+/// before keys are minted / events emitted.
+struct AgentHistoryBase {
+    instance_key: Key,
+    element_instance_key: Key,
+    process_instance_key: Key,
+    root_process_instance_key: Key,
+    bpmn_process_id: String,
+    process_definition_key: Key,
+    tenant_id: String,
+}
+
 /// A unit of internal work in the processing loop — one transition of the BPMN
 /// element lifecycle.
 enum Step {
@@ -518,10 +531,583 @@ impl Engine {
         state::compose_key(self.partition_id, self.next_local)
     }
 
-    /// Installs an already-minted deployment (a slice of [`Event`]s produced by
-    /// another partition's [`Command::Deploy`]) into this partition's state
-    /// **without minting new keys**, so every partition registers the identical
-    /// process definition under the identical `processDefinitionKey`.
+    /// The root (top-level ancestor) process instance key for `instance_key`:
+    /// walks up the call-activity parent chain, returning `instance_key` itself
+    /// for a top-level instance. Bounded against a pathological cycle.
+    fn root_process_instance_key(&self, instance_key: Key) -> Key {
+        let mut current = instance_key;
+        // A legal parent chain is bounded by the same call-activity nesting
+        // limit that guards deployment, so reuse it (plus one to reach the root
+        // from the deepest legal instance) rather than a separate magic number.
+        for _ in 0..=MAX_CALL_ACTIVITY_DEPTH {
+            match self
+                .state
+                .instances
+                .get(&current)
+                .and_then(|i| i.parent_process_instance_key)
+            {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        current
+    }
+
+    /// Locate the AgentInstance identified by `agent_instance_key`, returning a
+    /// reference. Agent instances live inside their owning
+    /// [`crate::state::ProcessInstance::agent_instances`], so this scans the
+    /// live instances; the S3 processors call it once per command and the live
+    /// set is small relative to a turn's cost.
+    fn find_agent_instance(&self, agent_instance_key: Key) -> Option<&crate::agent::AgentInstance> {
+        self.state
+            .instances
+            .values()
+            .find_map(|inst| inst.agent_instances.get(&agent_instance_key))
+    }
+
+    /// The authoritative ownership tuple `(element_id, process_instance_key)` of
+    /// the agent instance identified by `agent_instance_key`, or `None` when no
+    /// such instance is live. The 8.10 `PATCH /agent-instances/{key}` REST
+    /// request carries neither field, yet [`Command::UpdateAgentInstance`]
+    /// asserts them for its ownership guard; the gateway resolves them here — on
+    /// the engine thread, against the primary state — so the update is never
+    /// built from an eventually-consistent read-model row.
+    pub fn agent_instance_ownership(
+        &self,
+        agent_instance_key: Key,
+    ) -> Option<(crate::model::ElementId, Key)> {
+        self.find_agent_instance(agent_instance_key)
+            .map(|inst| (inst.element_id.clone(), inst.process_instance_key))
+    }
+
+    /// Resolve an `element_instance_key` to its owning process-instance key and
+    /// element id **only when it is active** (present in that instance's `active`
+    /// map). Returns `None` for an unknown or already-completed element instance.
+    /// The AgentInstance CREATE/UPDATE processors use this to enforce the
+    /// "active element instance" precondition.
+    fn resolve_active_element_instance(
+        &self,
+        element_instance_key: Key,
+    ) -> Option<(Key, crate::model::ElementId)> {
+        self.state.instances.iter().find_map(|(pi_key, inst)| {
+            inst.active
+                .get(&element_instance_key)
+                .map(|element_id| (*pi_key, element_id.clone()))
+        })
+    }
+
+    /// The agent instance (if any) that already owns `element_instance_key` —
+    /// i.e. lists it in `element_instance_keys`. Used by the UPDATE processor to
+    /// detect a *conflicting* instance before it links a re-entry key.
+    fn owning_agent_instance(&self, element_instance_key: Key) -> Option<Key> {
+        self.state.instances.values().find_map(|inst| {
+            inst.agent_instances.values().find_map(|ai| {
+                ai.element_instance_keys
+                    .contains(&element_instance_key)
+                    .then_some(ai.agent_instance_key)
+            })
+        })
+    }
+
+    /// Process a `Command::CreateAgentInstance` (Camunda `AgentInstanceIntent.CREATE`,
+    /// stable/8.10). The referenced `element_instance_key` must be an **active**
+    /// element instance modelled as an [`ElementKind::AgentTask`](crate::model::ElementKind::AgentTask)
+    /// — a `serviceTask` bearing a `zeebe:agentDefinition` (`aiAgentTask` or
+    /// `external`). A plain `SERVICE_TASK` without that marker is rejected as
+    /// missing an agentDefinition, and any other element kind is not eligible.
+    /// The engine already mints an
+    /// AgentInstance when such an element activates (slice S1); this processor
+    /// **reconciles** with that record — configuring its definition/limits and
+    /// applying any initial `history[]` batch — rather than minting a duplicate,
+    /// so there is one source of truth per element instance. It (re-)emits
+    /// `AgentInstanceCreated` (status `INITIALIZING`, an idempotent upsert).
+    /// Limits come from the explicit `limits`, else the last `limits` carried by
+    /// a history turn (a CONFIGURATION item), else default to unlimited.
+    fn process_create_agent_instance(
+        &mut self,
+        log: &mut Vec<Event>,
+        element_instance_key: Key,
+        definition: crate::agent::AgentDefinition,
+        limits: Option<crate::agent::AgentInstanceLimits>,
+        history: Vec<crate::agent::AgentHistoryTurn>,
+    ) -> Result<(), EngineError> {
+        // 1. The element instance must be active.
+        let (process_instance_key, element_id) = self
+            .resolve_active_element_instance(element_instance_key)
+            .ok_or(EngineError::AgentInstanceElementInstanceInactive {
+                element_instance_key,
+            })?;
+        // 2. Its element must be agent-eligible and carry an agentDefinition.
+        let agent_type = match self.element_kind(process_instance_key, &element_id) {
+            Some(crate::model::ElementKind::AgentTask { agent_type, .. }) => agent_type,
+            Some(crate::model::ElementKind::ServiceTask { .. }) => {
+                return Err(EngineError::AgentInstanceMissingAgentDefinition {
+                    element_instance_key,
+                });
+            }
+            _ => {
+                return Err(EngineError::AgentInstanceElementNotEligible {
+                    element_instance_key,
+                });
+            }
+        };
+        // 3. Reconcile with the auto-created instance (slice S1), if any.
+        let existing = self
+            .state
+            .instances
+            .get(&process_instance_key)
+            .and_then(|inst| {
+                inst.agent_instances
+                    .values()
+                    .find(|ai| ai.element_instance_keys.contains(&element_instance_key))
+                    .cloned()
+            });
+        // Limits: explicit wins, else the last CONFIGURATION history item, else
+        // the existing record's limits, else unlimited default. Only a
+        // CONFIGURATION turn may seed limits — a non-CONFIGURATION turn (e.g.
+        // ASSISTANT) carrying `limits` must not silently override them, per the
+        // stable/8.10 semantics documented above.
+        let resolved_limits = limits
+            .or_else(|| {
+                history.iter().rev().find_map(|turn| {
+                    turn.limits
+                        .filter(|_| turn.role == crate::agent::AgentHistoryRole::Configuration)
+                })
+            })
+            .or_else(|| existing.as_ref().map(|ai| ai.limits))
+            .unwrap_or_default();
+        let agent_instance_key = existing
+            .as_ref()
+            .map(|ai| ai.agent_instance_key)
+            .unwrap_or_else(|| self.mint_key());
+        let root_process_instance_key = self.root_process_instance_key(process_instance_key);
+        let (bpmn_process_id, process_definition_key, process_definition_version) = self
+            .state
+            .instances
+            .get(&process_instance_key)
+            .map(|inst| {
+                let version = self
+                    .state
+                    .process_versions
+                    .get(&inst.process_definition_key)
+                    .map(|d| d.version)
+                    .unwrap_or(0);
+                (
+                    inst.process_id.clone(),
+                    inst.process_definition_key,
+                    version,
+                )
+            })
+            .unwrap_or_default();
+        let agent_instance = crate::agent::AgentInstance {
+            agent_instance_key,
+            agent_definition_key: existing
+                .as_ref()
+                .map(|ai| ai.agent_definition_key)
+                .unwrap_or(0),
+            element_instance_key,
+            element_instance_keys: existing
+                .as_ref()
+                .map(|ai| ai.element_instance_keys.clone())
+                .unwrap_or_else(|| vec![element_instance_key]),
+            element_id: element_id.clone(),
+            process_instance_key,
+            root_process_instance_key,
+            bpmn_process_id,
+            process_definition_key,
+            process_definition_version,
+            process_definition_version_tag: existing
+                .as_ref()
+                .and_then(|ai| ai.process_definition_version_tag.clone()),
+            tenant_id: existing
+                .as_ref()
+                .map(|ai| ai.tenant_id.clone())
+                .unwrap_or_else(|| crate::DEFAULT_TENANT.to_string()),
+            agent_type,
+            status: crate::agent::AgentInstanceStatus::Initializing,
+            definition,
+            limits: resolved_limits,
+            metrics: existing.as_ref().map(|ai| ai.metrics).unwrap_or_default(),
+            tools: existing
+                .as_ref()
+                .map(|ai| ai.tools.clone())
+                .unwrap_or_default(),
+            job_key: existing.as_ref().map(|ai| ai.job_key).unwrap_or(0),
+            job_lease: existing.as_ref().map(|ai| ai.job_lease).unwrap_or(0),
+            created_at: existing
+                .as_ref()
+                .map(|ai| ai.created_at)
+                .unwrap_or(self.now),
+            last_updated_at: self.now,
+            completed_at: 0,
+        };
+        self.emit(
+            log,
+            Event::AgentInstanceCreated {
+                instance_key: process_instance_key,
+                agent_instance,
+            },
+        );
+        // 4. Apply the initial history batch (append + commit), slice S2.
+        if !history.is_empty() {
+            let created = self.append_agent_history(agent_instance_key, history);
+            log.extend(created);
+            let committed = self.commit_agent_history(agent_instance_key);
+            log.extend(committed);
+        }
+        Ok(())
+    }
+
+    /// Process a `Command::UpdateAgentInstance` (Camunda `AgentInstanceIntent.UPDATE`,
+    /// stable/8.10). Validates that the instance exists, the asserted
+    /// element/process instance matches, the referenced element instance is
+    /// active and not owned by a *different* agent instance, and that the target
+    /// `status` (if any) is an **active** state (`COMPLETED` is not settable via
+    /// UPDATE). Accumulates the metric deltas — rejecting the batch if the new
+    /// totals would breach a configured limit — replaces the tool set when
+    /// given, appends the history batch (slice S2), and emits `AgentInstanceUpdated`.
+    #[allow(clippy::too_many_arguments)]
+    fn process_update_agent_instance(
+        &mut self,
+        log: &mut Vec<Event>,
+        agent_instance_key: Key,
+        element_instance_key: Key,
+        element_id: crate::model::ElementId,
+        process_instance_key: Key,
+        status: Option<crate::agent::AgentInstanceStatus>,
+        metrics: crate::agent::AgentInstanceMetricsDelta,
+        tools: Option<Vec<crate::agent::AgentTool>>,
+        history: Vec<crate::agent::AgentHistoryTurn>,
+    ) -> Result<(), EngineError> {
+        // 1. The instance must exist.
+        let mut updated = self
+            .find_agent_instance(agent_instance_key)
+            .cloned()
+            .ok_or(EngineError::AgentInstanceNotFound { agent_instance_key })?;
+        // 2. The asserted ownership (element id + process instance) must match.
+        if updated.element_id != element_id || updated.process_instance_key != process_instance_key
+        {
+            return Err(EngineError::AgentInstanceOwnershipMismatch { agent_instance_key });
+        }
+        // 3. The referenced element instance must be active and belong to the
+        //    same logical element (so a re-entry key is a fresh activation of the
+        //    same element, not a foreign one). It may live in another process
+        //    instance only when this same agent instance *already* owns it —
+        //    a fresh (unowned) re-entry key must belong to the agent instance's
+        //    own process instance (step 4a); cross-owner references are rejected
+        //    as a conflict in step 4.
+        let (active_pi, active_element_id) = self
+            .resolve_active_element_instance(element_instance_key)
+            .ok_or(EngineError::AgentInstanceElementInstanceInactive {
+                element_instance_key,
+            })?;
+        if active_element_id != updated.element_id {
+            return Err(EngineError::AgentInstanceOwnershipMismatch { agent_instance_key });
+        }
+        // 4. No conflicting instance: the element instance may only be owned by
+        //    this agent instance (or be a fresh re-entry key owned by none).
+        if let Some(owner) = self.owning_agent_instance(element_instance_key) {
+            if owner != agent_instance_key {
+                return Err(EngineError::AgentInstanceConflict {
+                    agent_instance_key,
+                    element_instance_key,
+                    conflicting_agent_instance_key: owner,
+                });
+            }
+        }
+        // 4a. A fresh (not already owned by this agent instance) re-entry key must
+        //     live in this agent instance's own process instance. An element
+        //     instance in a *foreign* process instance that merely shares the
+        //     element id — and is not agent-eligible, so no owner minted it —
+        //     would otherwise be linkable and corrupt ownership/re-entry tracking.
+        if !updated
+            .element_instance_keys
+            .contains(&element_instance_key)
+            && active_pi != process_instance_key
+        {
+            return Err(EngineError::AgentInstanceOwnershipMismatch { agent_instance_key });
+        }
+        // 5. The target status (if any) must be an active state.
+        if let Some(target) = status {
+            if !target.is_active() {
+                return Err(EngineError::AgentInstanceStatusNotSettable {
+                    agent_instance_key,
+                    status: target,
+                });
+            }
+        }
+        // 6. Accumulate metrics and enforce limits (reject before applying).
+        let new_metrics = updated.metrics.with_delta(&metrics);
+        if let Some(limit) = updated.limits.first_breach(&new_metrics) {
+            return Err(EngineError::AgentInstanceLimitExceeded {
+                agent_instance_key,
+                limit,
+            });
+        }
+        // 7. Apply: status, metrics, tools, re-entry link, timestamp.
+        if let Some(target) = status {
+            updated.status = target;
+        }
+        updated.metrics = new_metrics;
+        if let Some(new_tools) = tools {
+            updated.tools = new_tools;
+        }
+        if !updated
+            .element_instance_keys
+            .contains(&element_instance_key)
+        {
+            updated.element_instance_keys.push(element_instance_key);
+        }
+        updated.element_instance_key = element_instance_key;
+        updated.last_updated_at = self.now;
+        let instance_key = updated.process_instance_key;
+        self.emit(
+            log,
+            Event::AgentInstanceUpdated {
+                instance_key,
+                agent_instance: updated,
+            },
+        );
+        // 8. Apply the history batch (append + commit), slice S2.
+        if !history.is_empty() {
+            let created = self.append_agent_history(agent_instance_key, history);
+            log.extend(created);
+            let committed = self.commit_agent_history(agent_instance_key);
+            log.extend(committed);
+        }
+        Ok(())
+    }
+
+    /// Process a `Command::CompleteAgentInstance` (Camunda `AgentInstanceIntent.COMPLETE`,
+    /// stable/8.10). Drives one agent instance to the terminal `COMPLETED` status
+    /// — the only path to it. Rejects an unknown instance and a re-completion of
+    /// an already-terminal one. Commits any still-pending history, then emits
+    /// `AgentInstanceCompleted`. A caller drains a process instance's agents by
+    /// re-issuing COMPLETE (by key) until none remain active.
+    fn process_complete_agent_instance(
+        &mut self,
+        log: &mut Vec<Event>,
+        agent_instance_key: Key,
+    ) -> Result<(), EngineError> {
+        let mut completed = self
+            .find_agent_instance(agent_instance_key)
+            .cloned()
+            .ok_or(EngineError::AgentInstanceNotFound { agent_instance_key })?;
+        if !completed.status.is_active() {
+            return Err(EngineError::AgentInstanceAlreadyCompleted { agent_instance_key });
+        }
+        // Commit any pending history before the record turns terminal.
+        let committed = self.commit_agent_history(agent_instance_key);
+        log.extend(committed);
+        completed.status = crate::agent::AgentInstanceStatus::Completed;
+        completed.completed_at = self.now;
+        completed.last_updated_at = self.now;
+        let instance_key = completed.process_instance_key;
+        self.emit(
+            log,
+            Event::AgentInstanceCompleted {
+                instance_key,
+                agent_instance: completed,
+            },
+        );
+        Ok(())
+    }
+
+    /// Append a batch of AgentHistory turns to `agent_instance_key`'s
+    /// append-only turn log (Camunda 8.10 AgentHistory, slice S2). Each turn is
+    /// materialised into its own [`crate::agent::AgentHistoryRecord`] with a
+    /// freshly-minted, monotonic `agent_history_key` and `commit_status`
+    /// PENDING, emitted as an [`Event::AgentHistoryCreated`]. The
+    /// instance-derived context (element/process/root instance keys, bpmn
+    /// process id, process-definition key, tenant) is copied from the owning
+    /// AgentInstance; an unknown `agent_instance_key` yields no events.
+    ///
+    /// **Idempotent retry dedup.** A turn carrying a `historyItemId` that
+    /// matches an already-recorded, non-discarded turn for this agent instance
+    /// — whether recorded by a prior batch or earlier in *this* batch — is an
+    /// idempotent retry: no new record is materialised and instead an
+    /// [`Event::AgentHistoryDeduplicated`] naming the original turn's
+    /// `agent_history_key` is emitted. Turns without a `historyItemId` (or with
+    /// an empty one) cannot be correlated and always materialise a fresh record.
+    /// This is what lets the API echo back `isDuplicate=true` with the original
+    /// key while creating no duplicate AGENT_HISTORY record.
+    ///
+    /// This is the internal behavior the S3 CREATE/UPDATE processors invoke to
+    /// apply a `history[]` batch. It emits (and applies) the events and returns
+    /// them so the caller folds them into its command result.
+    pub(crate) fn append_agent_history(
+        &mut self,
+        agent_instance_key: Key,
+        turns: Vec<crate::agent::AgentHistoryTurn>,
+    ) -> Vec<Event> {
+        let mut log = Vec::new();
+        // Copy the instance-derived context up front, releasing the immutable
+        // borrow before we mint keys / emit (both need `&mut self`).
+        let base = match self.find_agent_instance(agent_instance_key) {
+            Some(ai) => AgentHistoryBase {
+                instance_key: ai.process_instance_key,
+                element_instance_key: ai.element_instance_key,
+                process_instance_key: ai.process_instance_key,
+                root_process_instance_key: ai.root_process_instance_key,
+                bpmn_process_id: ai.bpmn_process_id.clone(),
+                process_definition_key: ai.process_definition_key,
+                tenant_id: ai.tenant_id.clone(),
+            },
+            None => return log,
+        };
+        // Seed the dedup index from already-recorded turns: a turn whose
+        // `historyItemId` matches an existing non-discarded record is an
+        // idempotent retry (Camunda 8.10) and must resolve to that original
+        // record rather than materialise a second one. Discarded turns were
+        // rejected, so a resubmission of their id is allowed to create a fresh
+        // record — they are excluded from the index.
+        let mut seen_by_item_id: HashMap<String, Key> = self
+            .state
+            .instances
+            .get(&base.instance_key)
+            .and_then(|inst| inst.agent_history.get(&agent_instance_key))
+            .map(|records| {
+                records
+                    .iter()
+                    .filter(|r| {
+                        r.commit_status != crate::agent::AgentHistoryCommitStatus::Discarded
+                    })
+                    .filter_map(|r| {
+                        r.history_item_id
+                            .clone()
+                            .filter(|id| !id.is_empty())
+                            .map(|id| (id, r.agent_history_key))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for turn in turns {
+            // Idempotent dedup by `historyItemId`. An absent/empty id cannot be
+            // correlated to a prior turn, so it always materialises a fresh
+            // record. A matching id (against prior state or an earlier turn in
+            // this same batch) resolves to the original key and creates no new
+            // AGENT_HISTORY record.
+            if let Some(id) = turn.history_item_id.as_deref().filter(|id| !id.is_empty()) {
+                if let Some(&original_agent_history_key) = seen_by_item_id.get(id) {
+                    self.emit(
+                        &mut log,
+                        Event::AgentHistoryDeduplicated {
+                            instance_key: base.instance_key,
+                            agent_instance_key,
+                            history_item_id: id.to_string(),
+                            original_agent_history_key,
+                        },
+                    );
+                    continue;
+                }
+            }
+            let agent_history_key = self.mint_key();
+            let record = crate::agent::AgentHistoryRecord {
+                agent_history_key,
+                agent_instance_key,
+                element_instance_key: base.element_instance_key,
+                process_instance_key: base.process_instance_key,
+                root_process_instance_key: base.root_process_instance_key,
+                bpmn_process_id: base.bpmn_process_id.clone(),
+                process_definition_key: base.process_definition_key,
+                tenant_id: base.tenant_id.clone(),
+                job_key: turn.job_key,
+                job_lease: turn.job_lease,
+                loop_iteration: turn.loop_iteration,
+                role: turn.role,
+                produced_at: turn.produced_at,
+                content: turn.content,
+                system_prompt: turn.system_prompt,
+                tool_calls: turn.tool_calls,
+                metrics: turn.metrics,
+                history_item_id: turn.history_item_id,
+                tools: turn.tools,
+                model: turn.model,
+                provider: turn.provider,
+                limits: turn.limits,
+                is_duplicate: turn.is_duplicate,
+                commit_status: crate::agent::AgentHistoryCommitStatus::Pending,
+            };
+            // Index this freshly-minted record so a later turn in the same batch
+            // carrying the same id dedups against it.
+            if let Some(id) = record.history_item_id.clone().filter(|id| !id.is_empty()) {
+                seen_by_item_id.insert(id, agent_history_key);
+            }
+            self.emit(
+                &mut log,
+                Event::AgentHistoryCreated {
+                    instance_key: base.instance_key,
+                    record,
+                },
+            );
+        }
+        log
+    }
+
+    /// Commit `agent_instance_key`'s pending AgentHistory turns (PENDING ->
+    /// COMMITTED). Emits a single [`Event::AgentHistoryCommitted`] naming the
+    /// affected turns, or nothing when there are no pending turns / the instance
+    /// is unknown. Internal behavior the S3 processors call on turn accept.
+    pub(crate) fn commit_agent_history(&mut self, agent_instance_key: Key) -> Vec<Event> {
+        self.transition_pending_agent_history(agent_instance_key, true)
+    }
+
+    /// Discard `agent_instance_key`'s pending AgentHistory turns (PENDING ->
+    /// DISCARDED). Emits a single [`Event::AgentHistoryDiscarded`] naming the
+    /// affected turns, or nothing when there are no pending turns / the instance
+    /// is unknown. Internal behavior the S3 processors call on turn reject.
+    #[allow(dead_code)] // AgentHistory (S2) behavior; S3 processors wire the callers.
+    pub(crate) fn discard_agent_history(&mut self, agent_instance_key: Key) -> Vec<Event> {
+        self.transition_pending_agent_history(agent_instance_key, false)
+    }
+
+    /// Shared body of [`Self::commit_agent_history`] / [`Self::discard_agent_history`]:
+    /// collect the currently-PENDING turn keys and emit the single lifecycle
+    /// event (`commit` selects COMMITTED vs DISCARDED). Only PENDING turns are
+    /// named, so committed/discarded turns stay immutable.
+    fn transition_pending_agent_history(
+        &mut self,
+        agent_instance_key: Key,
+        commit: bool,
+    ) -> Vec<Event> {
+        let mut log = Vec::new();
+        let instance_key = match self.find_agent_instance(agent_instance_key) {
+            Some(ai) => ai.process_instance_key,
+            None => return log,
+        };
+        let pending: Vec<Key> = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|inst| inst.agent_history.get(&agent_instance_key))
+            .map(|records| {
+                records
+                    .iter()
+                    .filter(|r| r.commit_status == crate::agent::AgentHistoryCommitStatus::Pending)
+                    .map(|r| r.agent_history_key)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return log;
+        }
+        let event = if commit {
+            Event::AgentHistoryCommitted {
+                instance_key,
+                agent_instance_key,
+                agent_history_keys: pending,
+            }
+        } else {
+            Event::AgentHistoryDiscarded {
+                instance_key,
+                agent_instance_key,
+                agent_history_keys: pending,
+            }
+        };
+        self.emit(&mut log, event);
+        log
+    }
+
     ///
     /// Only [`Event::ProcessDeployed`] events are applied: message-start
     /// subscriptions and timer-start arming are intentionally skipped so those
@@ -3375,6 +3961,50 @@ impl Engine {
                     cancel_remaining,
                 );
             }
+            // AgentInstance lifecycle commands (slice S3). Each processor
+            // validates against the stable/8.10 rules, applies any history batch
+            // via the S2 append/commit behavior, enforces the configured limits,
+            // and emits the CREATED/UPDATED/COMPLETED record event. Validation
+            // failures return an `EngineError` and apply nothing.
+            Command::CreateAgentInstance {
+                element_instance_key,
+                definition,
+                limits,
+                history,
+            } => {
+                self.process_create_agent_instance(
+                    &mut log,
+                    element_instance_key,
+                    definition,
+                    limits,
+                    history,
+                )?;
+            }
+            Command::UpdateAgentInstance {
+                agent_instance_key,
+                element_instance_key,
+                element_id,
+                process_instance_key,
+                status,
+                metrics,
+                tools,
+                history,
+            } => {
+                self.process_update_agent_instance(
+                    &mut log,
+                    agent_instance_key,
+                    element_instance_key,
+                    element_id,
+                    process_instance_key,
+                    status,
+                    metrics,
+                    tools,
+                    history,
+                )?;
+            }
+            Command::CompleteAgentInstance { agent_instance_key } => {
+                self.process_complete_agent_instance(&mut log, agent_instance_key)?;
+            }
         }
 
         Ok((log, queue))
@@ -5092,6 +5722,76 @@ impl Engine {
                         });
                     }
                 }
+            }
+            // An AI agent element (Camunda `zeebe:agentDefinition`). The engine
+            // is the system-of-record for agent state: on activation create a
+            // first-class AgentInstance (status INITIALIZING) keyed by its own
+            // dedicated key and linked to this element instance. LLM calls /
+            // prompt assembly / tool dispatch stay in the worker layer; the
+            // token parks on the element (no completion follow-up) while the
+            // agent runs, exactly like a job-bearing service task.
+            Some(ElementKind::AgentTask {
+                agent_type,
+                definition,
+                limits,
+            }) => {
+                // Only mint an AgentInstance when the owning ProcessInstance is
+                // present: defaulting a missing/corrupt instance would silently
+                // record an agent with an empty bpmn_process_id and a zero
+                // process_definition_key. Resolve-or-skip instead.
+                if let Some((bpmn_process_id, process_definition_key, process_definition_version)) =
+                    self.state.instances.get(&instance_key).map(|inst| {
+                        let version = self
+                            .state
+                            .process_versions
+                            .get(&inst.process_definition_key)
+                            .map(|d| d.version)
+                            .unwrap_or(0);
+                        (
+                            inst.process_id.clone(),
+                            inst.process_definition_key,
+                            version,
+                        )
+                    })
+                {
+                    let agent_instance_key = self.mint_key();
+                    let root_process_instance_key = self.root_process_instance_key(instance_key);
+                    let agent_instance = crate::agent::AgentInstance {
+                        agent_instance_key,
+                        agent_definition_key: 0,
+                        element_instance_key,
+                        element_instance_keys: vec![element_instance_key],
+                        element_id: element_id.clone(),
+                        process_instance_key: instance_key,
+                        root_process_instance_key,
+                        bpmn_process_id,
+                        process_definition_key,
+                        process_definition_version,
+                        process_definition_version_tag: None,
+                        tenant_id: crate::DEFAULT_TENANT.to_string(),
+                        agent_type,
+                        status: crate::agent::AgentInstanceStatus::Initializing,
+                        definition,
+                        limits: limits.unwrap_or_default(),
+                        metrics: crate::agent::AgentInstanceMetrics::default(),
+                        tools: Vec::new(),
+                        job_key: 0,
+                        job_lease: 0,
+                        created_at: self.now,
+                        last_updated_at: self.now,
+                        completed_at: 0,
+                    };
+                    events.push(Event::AgentInstanceCreated {
+                        instance_key,
+                        agent_instance,
+                    });
+                }
+                events.extend(self.arm_boundary_events(
+                    instance_key,
+                    element_instance_key,
+                    scope,
+                    &element_id,
+                ));
             }
             // An inline-FEEL script task is a synchronous activity: it activates
             // and immediately completes (no job). Its FEEL expression is
@@ -9712,6 +10412,43 @@ pub enum EngineError {
         element_id: String,
         reason: String,
     },
+    /// An AgentInstance command referenced an `agent_instance_key` that does not
+    /// identify a known agent instance.
+    AgentInstanceNotFound { agent_instance_key: Key },
+    /// A CREATE/UPDATE command referenced an `element_instance_key` that is not
+    /// an *active* element instance (unknown, or already completed/terminated).
+    AgentInstanceElementInstanceInactive { element_instance_key: Key },
+    /// A CREATE command referenced an active element instance whose element is
+    /// not agent-eligible (not a service task / ad-hoc sub-process).
+    AgentInstanceElementNotEligible { element_instance_key: Key },
+    /// A CREATE command referenced an eligible element *type* (service task /
+    /// ad-hoc sub-process) that carries no `agentDefinition` (`agentDefinitionKey`).
+    AgentInstanceMissingAgentDefinition { element_instance_key: Key },
+    /// An UPDATE command's asserted `element_id` / `process_instance_key` do not
+    /// match the stored agent instance (a stale or misrouted update).
+    AgentInstanceOwnershipMismatch { agent_instance_key: Key },
+    /// An UPDATE command referenced an `element_instance_key` already owned by a
+    /// *different* agent instance (a conflicting instance).
+    AgentInstanceConflict {
+        agent_instance_key: Key,
+        element_instance_key: Key,
+        conflicting_agent_instance_key: Key,
+    },
+    /// An UPDATE command tried to set a status that is not settable via UPDATE
+    /// (only the *active* states are; `COMPLETED` is reached only via COMPLETE).
+    AgentInstanceStatusNotSettable {
+        agent_instance_key: Key,
+        status: crate::agent::AgentInstanceStatus,
+    },
+    /// A COMPLETE command targeted an agent instance that is already terminal
+    /// (`COMPLETED`); completion is not idempotent-repeatable.
+    AgentInstanceAlreadyCompleted { agent_instance_key: Key },
+    /// A CREATE/UPDATE batch would push the instance's cumulative metrics over a
+    /// configured (`!= -1`) limit; the batch is rejected and nothing is applied.
+    AgentInstanceLimitExceeded {
+        agent_instance_key: Key,
+        limit: crate::agent::AgentLimitKind,
+    },
 }
 
 /// Element classes this migration phase does not remap yet, mirroring Zeebe's
@@ -9937,6 +10674,75 @@ impl std::fmt::Display for EngineError {
                 write!(
                     f,
                     "migration of instance {instance_key} is not supported yet: active element {element_id} ({reason})"
+                )
+            }
+            EngineError::AgentInstanceNotFound { agent_instance_key } => {
+                write!(f, "no agent instance with key {agent_instance_key}")
+            }
+            EngineError::AgentInstanceElementInstanceInactive {
+                element_instance_key,
+            } => {
+                write!(
+                    f,
+                    "element instance {element_instance_key} is not active for an agent-instance command"
+                )
+            }
+            EngineError::AgentInstanceElementNotEligible {
+                element_instance_key,
+            } => {
+                write!(
+                    f,
+                    "element instance {element_instance_key} is not an agent-eligible element (service task / ad-hoc sub-process)"
+                )
+            }
+            EngineError::AgentInstanceMissingAgentDefinition {
+                element_instance_key,
+            } => {
+                write!(
+                    f,
+                    "element instance {element_instance_key} has no agentDefinition (agentDefinitionKey)"
+                )
+            }
+            EngineError::AgentInstanceOwnershipMismatch { agent_instance_key } => {
+                write!(
+                    f,
+                    "agent instance {agent_instance_key} update does not match its element/process instance"
+                )
+            }
+            EngineError::AgentInstanceConflict {
+                agent_instance_key,
+                element_instance_key,
+                conflicting_agent_instance_key,
+            } => {
+                write!(
+                    f,
+                    "agent instance {agent_instance_key} update references element instance {element_instance_key} already owned by agent instance {conflicting_agent_instance_key}"
+                )
+            }
+            EngineError::AgentInstanceStatusNotSettable {
+                agent_instance_key,
+                status,
+            } => {
+                write!(
+                    f,
+                    "status {} is not settable on agent instance {agent_instance_key} via UPDATE",
+                    status.as_str()
+                )
+            }
+            EngineError::AgentInstanceAlreadyCompleted { agent_instance_key } => {
+                write!(
+                    f,
+                    "agent instance {agent_instance_key} is already completed"
+                )
+            }
+            EngineError::AgentInstanceLimitExceeded {
+                agent_instance_key,
+                limit,
+            } => {
+                write!(
+                    f,
+                    "agent instance {agent_instance_key} batch exceeds its {} limit",
+                    limit.as_str()
                 )
             }
         }

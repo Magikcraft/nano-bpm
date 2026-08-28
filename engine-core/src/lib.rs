@@ -69,6 +69,7 @@
 //! assert!(engine.is_completed(instance_key));
 //! ```
 
+mod agent;
 mod cluster_vars;
 mod command;
 mod engine;
@@ -89,6 +90,13 @@ mod validate;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
+pub use agent::{
+    AgentDefinition, AgentHistoryCommitStatus, AgentHistoryContent, AgentHistoryContentType,
+    AgentHistoryIntent, AgentHistoryMetrics, AgentHistoryRecord, AgentHistoryRole,
+    AgentHistoryToolCall, AgentHistoryTurn, AgentInstance, AgentInstanceIntent,
+    AgentInstanceLimits, AgentInstanceMetrics, AgentInstanceMetricsDelta, AgentInstanceStatus,
+    AgentLimitKind, AgentTool, AgentType, AGENT_LIMIT_UNLIMITED,
+};
 pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT};
 #[cfg(feature = "serde")]
 pub use command::form_id_of;

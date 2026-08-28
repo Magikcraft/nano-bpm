@@ -70,6 +70,9 @@ pub(crate) fn read_store_method(query: ReadQuery) -> &'static str {
         ReadQuery::GetDecisionDefinitionXml => "decision_definition_xml",
         ReadQuery::SearchDecisionRequirements => "decision_requirements",
         ReadQuery::GetDecisionRequirementsXml => "decision_requirements_xml",
+        ReadQuery::SearchAgentInstances => "agent_instances",
+        ReadQuery::GetAgentInstance => "agent_instance",
+        ReadQuery::SearchAgentHistory => "agent_history",
     }
 }
 
@@ -428,6 +431,34 @@ impl ReadModel {
         self.shards
             .iter()
             .flat_map(|s| s.element_instances())
+            .collect()
+    }
+
+    /// Every projected agent instance across all shards. Filtering, sorting and
+    /// pagination are applied by the REST handler (mirroring `element_instances`)
+    /// so cross-shard ordering has a single home; the shared read store is the
+    /// source of the rows.
+    pub fn agent_instances(&self) -> Vec<AgentInstanceRow> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.agent_instances(&AgentInstanceFilter::default(), None))
+            .collect()
+    }
+
+    /// A single agent instance by its dedicated key, returning the first shard's
+    /// match (keys are unique across shards, so at most one shard answers).
+    pub fn agent_instance(&self, key: Key) -> Option<AgentInstanceRow> {
+        self.shards.iter().find_map(|s| s.agent_instance(key))
+    }
+
+    /// The agent history turns matching `filter` across all shards. The
+    /// `commit_status` default (COMMITTED-only when unset) lives in
+    /// [`AgentHistoryFilter`], so passing the filter through preserves it as the
+    /// single source of truth; the REST handler sorts and paginates the result.
+    pub fn agent_history(&self, filter: &AgentHistoryFilter) -> Vec<AgentHistoryRow> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.agent_history(filter, None))
             .collect()
     }
 

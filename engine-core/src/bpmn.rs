@@ -61,6 +61,15 @@
 //!   [`crate::feel`] at the exclusive gateway (comparisons, arithmetic, boolean
 //!   logic, member access — not just equality). A condition that fails to
 //!   evaluate to a boolean raises an `ExpressionEvaluation` incident.
+//! * A `serviceTask` bearing a `zeebe:agentDefinition agentType="aiAgentTask"`
+//!   (or `"external"`) extension marker becomes an engine-native
+//!   [`AgentTask`](crate::model::ElementKind::AgentTask): on activation the
+//!   engine mints a first-class `AgentInstance` (dedicated key, linked to the
+//!   element instance) in status `INITIALIZING`, rather than creating a job.
+//!   Placement mirrors Camunda's `AgentDefinitionValidator`: `aiAgentTask` is
+//!   only valid on a `serviceTask` and `aiAgentSubProcess` only on an
+//!   `adHocSubProcess`; the wrong placement (or an unknown `agentType`) is
+//!   rejected at parse time.
 
 use std::collections::HashMap;
 
@@ -161,6 +170,17 @@ pub enum ParseError {
         attribute: String,
         reason: String,
     },
+    /// A `zeebe:agentDefinition` extension marker was malformed or misplaced: its
+    /// `agentType` was missing/unknown, or it violated the placement rules from
+    /// Camunda's `AgentDefinitionValidator` — `agentType="aiAgentTask"` is only
+    /// valid on a `serviceTask` and `agentType="aiAgentSubProcess"` is only valid
+    /// on an `adHocSubProcess`. Zeebe rejects such a deployment at transform time
+    /// (`INVALID_ARGUMENT`), so Nano surfaces it as a hard parse error for parity.
+    InvalidAgentDefinition {
+        process_id: String,
+        element_id: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ParseError {
@@ -240,6 +260,14 @@ impl std::fmt::Display for ParseError {
             } => write!(
                 f,
                 "process {process_id}: task '{task_id}' zeebe:taskDefinition attribute '{attribute}' is invalid: {reason}"
+            ),
+            ParseError::InvalidAgentDefinition {
+                process_id,
+                element_id,
+                reason,
+            } => write!(
+                f,
+                "process {process_id}: zeebe:agentDefinition on '{element_id}' is invalid: {reason}"
             ),
         }
     }
@@ -915,6 +943,73 @@ fn parse_with_captures(
                                     // does not mistake it for a second none start,
                                     // and so #851 can resolve its `signalRef`.
                                     acc.nodes[idx].signal_ref = Some(signal_ref);
+                                }
+                            }
+                            "agentDefinition" => {
+                                // zeebe:agentDefinition agentType="…" — the
+                                // engine-native AgentInstance marker (Camunda
+                                // stable/8.10). It attaches to the enclosing
+                                // activity (a serviceTask or adHocSubProcess, both
+                                // tracked as cur_service_task). Placement is
+                                // validated at build: aiAgentTask only on a
+                                // serviceTask, aiAgentSubProcess only on an
+                                // adHocSubProcess (mirrors Camunda's
+                                // AgentDefinitionValidator). A missing/unknown
+                                // agentType, or the marker on any other element, is
+                                // a hard parse error.
+                                let raw = attr(attrs, "agentType").unwrap_or("");
+                                let agent_type = crate::agent::AgentType::parse(raw);
+                                if let Some(idx) = cur_service_task {
+                                    let element_id = acc.nodes[idx].id.clone();
+                                    let is_adhoc = acc.nodes[idx].is_adhoc;
+                                    match agent_type {
+                                        None => {
+                                            let reason = if raw.is_empty() {
+                                                "missing agentType attribute (expected aiAgentTask, aiAgentSubProcess or external)".to_string()
+                                            } else {
+                                                format!(
+                                                    "unknown agentType '{raw}' (expected aiAgentTask, aiAgentSubProcess or external)"
+                                                )
+                                            };
+                                            return Err(ParseError::InvalidAgentDefinition {
+                                                process_id: acc.id.clone(),
+                                                element_id,
+                                                reason,
+                                            });
+                                        }
+                                        Some(crate::agent::AgentType::AiAgentTask) if is_adhoc => {
+                                            return Err(ParseError::InvalidAgentDefinition {
+                                                process_id: acc.id.clone(),
+                                                element_id,
+                                                reason: "agentType 'aiAgentTask' is only valid on a serviceTask, not an adHocSubProcess".to_string(),
+                                            });
+                                        }
+                                        Some(crate::agent::AgentType::AiAgentSubProcess)
+                                            if !is_adhoc =>
+                                        {
+                                            return Err(ParseError::InvalidAgentDefinition {
+                                                process_id: acc.id.clone(),
+                                                element_id,
+                                                reason: "agentType 'aiAgentSubProcess' is only valid on an adHocSubProcess, not a serviceTask".to_string(),
+                                            });
+                                        }
+                                        Some(t) => acc.nodes[idx].agent_type = Some(t),
+                                    }
+                                } else {
+                                    // Attribute the error to the nearest enclosing
+                                    // flow node so it is diagnosable, rather than an
+                                    // empty id (there is no owning task here).
+                                    let element_id = flow_node_stack
+                                        .iter()
+                                        .rev()
+                                        .find_map(|e| *e)
+                                        .map(|idx| acc.nodes[idx].id.clone())
+                                        .unwrap_or_default();
+                                    return Err(ParseError::InvalidAgentDefinition {
+                                        process_id: acc.id.clone(),
+                                        element_id,
+                                        reason: "zeebe:agentDefinition is only valid on a serviceTask or adHocSubProcess".to_string(),
+                                    });
                                 }
                             }
                             "taskDefinition" => {
@@ -1897,6 +1992,12 @@ struct NodeAcc {
     /// `<association>`, never by ordinary token flow. Used to resolve (and
     /// disambiguate) which association endpoint is the real handler.
     is_for_compensation: bool,
+    /// The `agentType` from a `zeebe:agentDefinition` extension marker on this
+    /// activity, if present. Makes a `serviceTask` an engine-native
+    /// [`AgentTask`](crate::model::ElementKind::AgentTask). Placement is validated
+    /// at build (`aiAgentTask` only on a `serviceTask`, `aiAgentSubProcess` only
+    /// on an `adHocSubProcess`), mirroring Camunda's `AgentDefinitionValidator`.
+    agent_type: Option<crate::agent::AgentType>,
 }
 
 #[derive(Clone, Copy)]
@@ -2092,6 +2193,7 @@ impl ProcessAcc {
             is_compensation_throw: false,
             is_terminate: false,
             is_for_compensation: attr(attrs, "isForCompensation") == Some("true"),
+            agent_type: None,
         });
         let idx = self.nodes.len() - 1;
         Some(idx)
@@ -2755,13 +2857,54 @@ impl ProcessAcc {
                 NodeKind::Parallel => builder.parallel_gateway(node.id),
                 NodeKind::EventBased => builder.event_based_gateway(node.id),
                 NodeKind::Service => {
-                    // A scriptTask carrying an inline zeebe:script (expression +
-                    // resultVariable) is an inline-FEEL script task, evaluated on
-                    // activation with no job. A businessRuleTask carrying a
-                    // zeebe:calledDecision is a native DMN business rule task,
-                    // evaluated on activation with no job. Otherwise it is an
-                    // ordinary job-based service task.
-                    if let (Some(expr), Some(rv)) = (
+                    // A zeebe:agentDefinition marker makes this an engine-native
+                    // AgentInstance host (Camunda stable/8.10). Placement rules
+                    // (from AgentDefinitionValidator): aiAgentTask only on a
+                    // serviceTask, aiAgentSubProcess only on an adHocSubProcess.
+                    // Reject the wrong placement here. An `external` agent is
+                    // accepted on either. When present it wins over the
+                    // script/decision/job-based interpretations below.
+                    if let Some(agent_type) = node.agent_type {
+                        use crate::agent::AgentType;
+                        match agent_type {
+                            AgentType::AiAgentTask if node.is_adhoc => {
+                                return Err(ParseError::InvalidAgentDefinition {
+                                    process_id: self.id.clone(),
+                                    element_id: node.id.clone(),
+                                    reason: "agentType 'aiAgentTask' is only valid on a serviceTask, not an adHocSubProcess".to_string(),
+                                });
+                            }
+                            AgentType::AiAgentSubProcess if !node.is_adhoc => {
+                                return Err(ParseError::InvalidAgentDefinition {
+                                    process_id: self.id.clone(),
+                                    element_id: node.id.clone(),
+                                    reason: "agentType 'aiAgentSubProcess' is only valid on an adHocSubProcess, not a serviceTask".to_string(),
+                                });
+                            }
+                            _ => {}
+                        }
+                        // S1 hosts the AgentInstance on the serviceTask surface.
+                        // An aiAgentSubProcess stays on the existing ad-hoc
+                        // machinery (only its placement is validated here); its
+                        // engine-native hosting arrives in a later slice.
+                        if node.is_adhoc {
+                            let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
+                            builder.service_task_with_links(
+                                node.id,
+                                job_type,
+                                node.job_priority,
+                                node.task_headers,
+                                node.linked_resources,
+                            )
+                        } else {
+                            builder.agent_task(
+                                node.id,
+                                agent_type,
+                                crate::agent::AgentDefinition::default(),
+                                None,
+                            )
+                        }
+                    } else if let (Some(expr), Some(rv)) = (
                         node.script_expression.clone(),
                         node.script_result_variable.clone(),
                     ) {
@@ -6233,5 +6376,212 @@ mod feel_timer_tests {
 
         // A static ISO literal is parsed at deploy, not carried as a FEEL expr.
         assert!(def.element("fixed").unwrap().timer.is_none());
+    }
+
+    #[test]
+    fn should_parse_an_ai_agent_task_service_task() {
+        // A `serviceTask` bearing a `zeebe:agentDefinition agentType="aiAgentTask"`
+        // marker becomes an engine-native AgentTask element rather than a
+        // job-based service task (Camunda stable/8.10 AgentInstance parity).
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="agent-proc" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="agent">
+                <bpmn:extensionElements>
+                  <zeebe:agentDefinition agentType="aiAgentTask" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        let kind = &def.element("agent").unwrap().kind;
+        match kind {
+            crate::model::ElementKind::AgentTask { agent_type, .. } => {
+                assert_eq!(*agent_type, crate::agent::AgentType::AiAgentTask);
+            }
+            other => panic!("expected AgentTask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_ai_agent_task_on_a_non_service_task() {
+        // Placement rule (Camunda AgentDefinitionValidator): `aiAgentTask` is only
+        // valid on a `serviceTask`. On an `adHocSubProcess` it must be rejected.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="bad-agent" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:adHocSubProcess id="agent">
+                <bpmn:extensionElements>
+                  <zeebe:agentDefinition agentType="aiAgentTask" />
+                </bpmn:extensionElements>
+                <bpmn:task id="inner" />
+              </bpmn:adHocSubProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidAgentDefinition { ref element_id, .. } if element_id == "agent"),
+            "expected InvalidAgentDefinition, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_ai_agent_subprocess_on_a_service_task() {
+        // Placement rule: `aiAgentSubProcess` is only valid on an
+        // `adHocSubProcess`. On a plain `serviceTask` it must be rejected.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="bad-agent2" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="agent">
+                <bpmn:extensionElements>
+                  <zeebe:agentDefinition agentType="aiAgentSubProcess" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidAgentDefinition { ref element_id, .. } if element_id == "agent"),
+            "expected InvalidAgentDefinition, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_accept_ai_agent_subprocess_on_an_ad_hoc_sub_process() {
+        // The valid placement: `agentType="aiAgentSubProcess"` on a
+        // `bpmn:adHocSubProcess`. Unlike `aiAgentTask` (which becomes an
+        // engine-native `AgentTask`), the ad-hoc variant reuses the existing
+        // ad-hoc container machinery in S1 — so the container parses into a
+        // single job-bearing `ServiceTask` at the parent token-flow level, and
+        // its contained "tool" activities are pruned from the executable graph
+        // (invoked out-of-band by the worker, not by token flow).
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="agent-adhoc" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:adHocSubProcess id="agent">
+                <bpmn:extensionElements>
+                  <zeebe:agentDefinition agentType="aiAgentSubProcess" />
+                </bpmn:extensionElements>
+                <bpmn:serviceTask id="tool" />
+              </bpmn:adHocSubProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        // The ad-hoc container is retained as a single job-bearing ServiceTask,
+        // NOT an engine-native AgentTask.
+        let kind = &def.element("agent").unwrap().kind;
+        assert!(
+            matches!(kind, crate::model::ElementKind::ServiceTask { .. }),
+            "expected the ad-hoc agent container to be a ServiceTask, got {kind:?}"
+        );
+        // The contained tool activity is pruned from the executable graph.
+        assert!(
+            def.element("tool").is_none(),
+            "expected the ad-hoc tool `tool` to be pruned from the executable graph"
+        );
+    }
+
+    #[test]
+    fn should_reject_an_unknown_agent_type() {
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="bad-agent3" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="agent">
+                <bpmn:extensionElements>
+                  <zeebe:agentDefinition agentType="wat" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidAgentDefinition { ref reason, .. } if reason.contains("unknown agentType 'wat'")),
+            "expected InvalidAgentDefinition naming the unknown value, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_a_missing_agent_type_with_a_clear_reason() {
+        // An empty/absent `agentType` must not be reported as `unknown agentType ''`;
+        // the reason should say the attribute is missing.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="bad-agent4" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="agent">
+                <bpmn:extensionElements>
+                  <zeebe:agentDefinition />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidAgentDefinition { ref reason, .. } if reason.contains("missing agentType attribute")),
+            "expected InvalidAgentDefinition citing a missing attribute, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn misplaced_agent_definition_names_the_enclosing_flow_node() {
+        // A `zeebe:agentDefinition` on neither a serviceTask nor an adHocSubProcess
+        // (here a userTask) is rejected. The error must attribute the fault to the
+        // nearest enclosing flow node so it is diagnosable, not an empty id.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="bad-agent4" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:agentDefinition agentType="aiAgentTask" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidAgentDefinition { ref element_id, .. } if element_id == "review"),
+            "expected InvalidAgentDefinition attributed to 'review', got {err:?}"
+        );
     }
 }

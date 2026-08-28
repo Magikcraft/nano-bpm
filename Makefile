@@ -365,8 +365,12 @@ engine-wasm-ffi: ## Build the FFI cdylib for wasm32 and verify its exports (need
 	node $(ENGINE_DIR)/scripts/verify-wasm-ffi.mjs
 
 .PHONY: engine-wasm-ffi-dist
-engine-wasm-ffi-dist: engine-wasm-ffi ## Emit the release FFI wasm + manifest into dist/engine-wasm-ffi/ (needs wasm-opt/binaryen)
+engine-wasm-ffi-dist: engine-wasm-ffi engine-wasm-agent-instance-e2e ## Emit the release FFI wasm + manifest into dist/engine-wasm-ffi/ (needs wasm-opt/binaryen). Also runs the AgentInstance/AgentHistory end-to-end probe against the committed engine-wasm/pkg (needs node).
 	node $(ENGINE_DIR)/scripts/emit-dist.mjs
+
+.PHONY: engine-wasm-agent-instance-e2e
+engine-wasm-agent-instance-e2e: ## Run the AgentInstance/AgentHistory end-to-end probe against the committed engine-wasm/pkg read-model TestEngine (needs node). Guards the AgentInstance driver + read methods on the exported wasm surface and their REST parity (status/producedAt/object shapes).
+	cd $(WASM_DIR)/tests/agent-instance-e2e && npm install && npm test
 
 .PHONY: engine-wasm-check
 engine-wasm-check: ## Type-check the console wasm-bindgen crate for wasm32 (guards the `make release` console-wasm build; needs the wasm32 target)

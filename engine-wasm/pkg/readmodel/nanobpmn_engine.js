@@ -191,6 +191,38 @@ export class TestEngine {
         }
     }
     /**
+     * Complete an AgentInstance by its dedicated key, driving it to the terminal
+     * `COMPLETED` status. Returns the snapshot.
+     * @param {string} agent_instance_key
+     * @returns {string}
+     */
+    completeAgentInstance(agent_instance_key) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(agent_instance_key, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.testengine_completeAgentInstance(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
      * Complete an ad-hoc sub-process **agent** job — the container's
      * JOB_WORKER job (Camunda's agentic `aiagent-job-worker`) — carrying the
      * agent's activate-element instructions so the engine runs the selected
@@ -357,6 +389,42 @@ export class TestEngine {
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
             wasm.__wbindgen_export4(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
+     * Reconcile / create an AgentInstance for an already-activated agent task.
+     * `request_json` is `{ elementInstanceKey, definition?, limits?, history? }`
+     * where `definition` is `{ model?, provider?, systemPrompt? }`, `limits` is
+     * `{ maxTokens?, maxModelCalls?, maxToolCalls? }` (omitted limits default to
+     * unlimited), and `history` is an initial batch of turns (see the turn shape
+     * on `updateAgentInstance`). Returns the snapshot.
+     * @param {string} request_json
+     * @returns {string}
+     */
+    createAgentInstance(request_json) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.testengine_createAgentInstance(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
         }
     }
     /**
@@ -926,6 +994,86 @@ export class TestEngine {
         }
     }
     /**
+     * The AgentHistory turns for `agent_instance_key`, as an
+     * `AgentInstanceHistorySearchQueryResult` JSON object (`{ items, page }`),
+     * in the engine's canonical `(loopIteration, producedAt, historyItemKey)`
+     * order. `filter_json` is `{ commitStatus? }` where `commitStatus` is a REST
+     * spelling or array of them; **omitting it defaults to COMMITTED only**
+     * (PENDING/DISCARDED surface only when asked for explicitly). Accepts the
+     * canonical REST envelope `{ "filter": { commitStatus? } }` as well as the
+     * top-level shorthand. Mirrors
+     * `POST /agent-instances/{agentInstanceKey}/history/search`.
+     * @param {string} agent_instance_key
+     * @param {string} filter_json
+     * @returns {string}
+     */
+    searchAgentInstanceHistory(agent_instance_key, filter_json) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(agent_instance_key, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(filter_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.testengine_searchAgentInstanceHistory(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
+     * The AgentInstances matching an optional filter, as an
+     * `AgentInstanceSearchQueryResult` JSON object (`{ items, page }`). The
+     * filter is `{ agentInstanceKey?, agentDefinitionKey?, processInstanceKey?,
+     * rootProcessInstanceKey?, processDefinitionKey?, status?, elementId?,
+     * tenantId? }` (`status` a REST spelling, e.g. `"INITIALIZING"`); an
+     * empty/absent filter returns every instance. Accepts the canonical REST
+     * envelope `{ "filter": { … } }` as well as the top-level shorthand.
+     * Mirrors `POST /agent-instances/search`.
+     * @param {string} filter_json
+     * @returns {string}
+     */
+    searchAgentInstances(filter_json) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(filter_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.testengine_searchAgentInstances(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
      * All process instances, as a `ProcessInstanceSearchQueryResult` JSON object
      * (`{ items: [...], page: {...} }`). The request body is shape-validated like
      * `POST /process-instances/search`, but filter/sort/page fields are not yet
@@ -1183,6 +1331,51 @@ export class TestEngine {
             const ptr0 = passStringToWasm0(user_task_key, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
             const len0 = WASM_VECTOR_LEN;
             wasm.testengine_unassignUserTask(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Advance an AgentInstance: set its `status` (a REST spelling other than
+     * `COMPLETED`, which is reachable only through `completeAgentInstance` and is
+     * rejected here with a targeted error), accumulate `metrics`, optionally
+     * replace `tools`, and append a `history` batch. `request_json` is
+     * `{ agentInstanceKey, elementInstanceKey, elementId, processInstanceKey,
+     * status?, metrics?, tools?, jobKey?, jobLease?, history? }`. `tools` is a
+     * nullable changeset: omit it to leave the stored set unchanged, pass `null`
+     * to clear it, or an array to replace it. `jobKey`/`jobLease` are the
+     * activation's job attribution, stamped onto every appended turn (as the
+     * gateway does). A turn is `{ loopIteration?, producedAt?, role?, content?,
+     * systemPrompt?, historyItemId?, model?, provider? }`, where `producedAt` is
+     * an RFC-3339 `date-time` string (the REST spelling; a bare epoch-millis
+     * number is also accepted); `content` items are `{ contentType?, text?,
+     * documentReference?, object? }`, where `object` is arbitrary JSON (the REST
+     * wire shape). Returns the snapshot.
+     * @param {string} request_json
+     * @returns {string}
+     */
+    updateAgentInstance(request_json) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.testengine_updateAgentInstance(retptr, this.__wbg_ptr, ptr0, len0);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
             var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);

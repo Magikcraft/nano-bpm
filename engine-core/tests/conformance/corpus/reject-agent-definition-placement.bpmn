@@ -1,0 +1,18 @@
+<!-- verdict: reject | category: InvalidAgentDefinition -->
+<!-- oracle: AgentDefinitionValidator — agentType="aiAgentSubProcess" is only valid on a bpmn:adHocSubProcess, not a serviceTask (agent-instance-parity S1). -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="reject_agent_definition_placement" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="agent">
+      <bpmn:extensionElements>
+        <zeebe:agentDefinition agentType="aiAgentSubProcess" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="agent" />
+    <bpmn:sequenceFlow id="f1" sourceRef="agent" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>

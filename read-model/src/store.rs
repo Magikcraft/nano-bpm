@@ -23,8 +23,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use nanobpmn_engine_core::{
-    Event, IncidentKind, IncidentState, JobKind, JobState, Key, ListenerEventType,
-    ProcessInstanceState, TaskListenerEventType, UserTaskState, Value, partition_of,
+    AgentHistoryCommitStatus, AgentHistoryRecord, AgentHistoryRole, AgentInstance,
+    AgentInstanceStatus, Event, IncidentKind, IncidentState, JobKind, JobState, Key,
+    ListenerEventType, ProcessInstanceState, TaskListenerEventType, UserTaskState, Value,
+    partition_of,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -36,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 6;
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -46,7 +48,7 @@ const SCHEMA_VERSION: i64 = 4;
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -2825677536285512153;
+const SCHEMA_FINGERPRINT: i64 = 7948718529194504891;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -289,6 +291,71 @@ CREATE TABLE resources (
     tenant_id      TEXT NOT NULL DEFAULT '<default>'
 );
 CREATE INDEX idx_resources_id ON resources(resource_id);
+CREATE TABLE agent_instances (
+    agent_instance_key         INTEGER PRIMARY KEY,
+    agent_definition_key       INTEGER NOT NULL DEFAULT 0,
+    element_instance_key       INTEGER NOT NULL,
+    element_id                 TEXT NOT NULL,
+    process_instance_key       INTEGER NOT NULL,
+    root_process_instance_key  INTEGER NOT NULL,
+    process_definition_key     INTEGER NOT NULL,
+    process_definition_id      TEXT NOT NULL,
+    process_definition_version INTEGER NOT NULL DEFAULT 0,
+    tenant_id                  TEXT NOT NULL,
+    status                     TEXT NOT NULL,
+    agent_type                 TEXT NOT NULL,
+    model                      TEXT,
+    provider                   TEXT,
+    system_prompt              TEXT,
+    max_tokens                 INTEGER NOT NULL DEFAULT -1,
+    max_model_calls            INTEGER NOT NULL DEFAULT -1,
+    max_tool_calls             INTEGER NOT NULL DEFAULT -1,
+    input_tokens               INTEGER NOT NULL DEFAULT 0,
+    output_tokens              INTEGER NOT NULL DEFAULT 0,
+    reasoning_token_count      INTEGER NOT NULL DEFAULT 0,
+    cache_creation_token_count INTEGER NOT NULL DEFAULT 0,
+    cache_read_token_count     INTEGER NOT NULL DEFAULT 0,
+    model_calls                INTEGER NOT NULL DEFAULT 0,
+    tool_calls                 INTEGER NOT NULL DEFAULT 0,
+    job_key                    INTEGER NOT NULL DEFAULT 0,
+    tools_json                 TEXT NOT NULL DEFAULT '[]',
+    creation_date_ms           INTEGER NOT NULL,
+    last_updated_date_ms       INTEGER NOT NULL,
+    completion_date_ms         INTEGER,
+    process_definition_version_tag TEXT,
+    element_instance_keys_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX idx_agent_instances_process_instance ON agent_instances(process_instance_key);
+CREATE TABLE agent_history (
+    agent_history_key          INTEGER PRIMARY KEY,
+    agent_instance_key         INTEGER NOT NULL,
+    element_instance_key       INTEGER NOT NULL,
+    process_instance_key       INTEGER NOT NULL,
+    root_process_instance_key  INTEGER NOT NULL,
+    process_definition_key     INTEGER NOT NULL,
+    process_definition_id      TEXT NOT NULL,
+    tenant_id                  TEXT NOT NULL,
+    job_key                    INTEGER NOT NULL DEFAULT 0,
+    loop_iteration             INTEGER NOT NULL,
+    role                       TEXT NOT NULL,
+    produced_at_ms             INTEGER NOT NULL,
+    content_json               TEXT NOT NULL DEFAULT '[]',
+    system_prompt              TEXT,
+    tool_calls_json            TEXT NOT NULL DEFAULT '[]',
+    input_tokens               INTEGER NOT NULL DEFAULT 0,
+    output_tokens              INTEGER NOT NULL DEFAULT 0,
+    reasoning_token_count      INTEGER NOT NULL DEFAULT 0,
+    cache_creation_token_count INTEGER NOT NULL DEFAULT 0,
+    cache_read_token_count     INTEGER NOT NULL DEFAULT 0,
+    duration_ms                INTEGER NOT NULL DEFAULT 0,
+    history_item_id            TEXT,
+    tools_json                 TEXT NOT NULL DEFAULT '[]',
+    model                      TEXT,
+    provider                   TEXT,
+    is_duplicate               INTEGER NOT NULL DEFAULT 0,
+    commit_status              TEXT NOT NULL
+);
+CREATE INDEX idx_agent_history_instance ON agent_history(agent_instance_key);
 ";
 
 // --- read-model schema migration (issue #831) ---
@@ -4972,10 +5039,698 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             )?;
         }
 
+        Event::AgentInstanceCreated {
+            instance_key: _,
+            agent_instance,
+        } => {
+            project_agent_instance(tx, agent_instance)?;
+        }
+
+        Event::AgentInstanceUpdated {
+            instance_key: _,
+            agent_instance,
+        }
+        | Event::AgentInstanceCompleted {
+            instance_key: _,
+            agent_instance,
+        } => {
+            project_agent_instance(tx, agent_instance)?;
+        }
+
+        Event::AgentHistoryCreated {
+            instance_key: _,
+            record,
+        } => {
+            project_agent_history_record(tx, record)?;
+        }
+
+        Event::AgentHistoryCommitted {
+            instance_key: _,
+            agent_instance_key,
+            agent_history_keys,
+        } => {
+            transition_agent_history(
+                tx,
+                *agent_instance_key,
+                agent_history_keys,
+                AgentHistoryCommitStatus::Committed,
+            )?;
+        }
+
+        Event::AgentHistoryDiscarded {
+            instance_key: _,
+            agent_instance_key,
+            agent_history_keys,
+        } => {
+            transition_agent_history(
+                tx,
+                *agent_instance_key,
+                agent_history_keys,
+                AgentHistoryCommitStatus::Discarded,
+            )?;
+        }
+
         // Events with no queryable read-model projection.
         _ => {}
     }
     Ok(delta)
+}
+
+// ---------------------------------------------------------------------------
+// AgentInstance / AgentHistory read model (Camunda 8.10 parity, slice S4)
+// ---------------------------------------------------------------------------
+//
+// The engine is the system-of-record for AgentInstance state; here we project
+// its `AgentInstanceCreated` / `AgentHistory{Created,Committed,Discarded}` record
+// streams into two denormalized tables so the gateway REST layer (S5) can search
+// them by filter and sort. Both projections are idempotent/replay-safe: the
+// instance is a full-record UPSERT (a re-delivered `CREATED` — or a future
+// `UPDATED`/`COMPLETED` reusing [`project_agent_instance`] — refreshes the same
+// row), and a history turn is an append-only insert whose only post-insert
+// mutation is the PENDING -> COMMITTED / PENDING -> DISCARDED commit-status
+// transition (immutable once it leaves PENDING).
+
+/// The `SELECT` column list for [`AgentInstanceRow`], single-sourced so the
+/// full-scan search and the by-key lookup can never drift.
+const AGENT_INSTANCE_COLS: &str = "agent_instance_key, agent_definition_key, element_instance_key, \
+     element_id, process_instance_key, root_process_instance_key, process_definition_key, \
+     process_definition_id, process_definition_version, tenant_id, status, agent_type, model, \
+     provider, system_prompt, max_tokens, max_model_calls, max_tool_calls, input_tokens, \
+     output_tokens, reasoning_token_count, cache_creation_token_count, cache_read_token_count, \
+     model_calls, tool_calls, job_key, tools_json, creation_date_ms, last_updated_date_ms, \
+     completion_date_ms, process_definition_version_tag, element_instance_keys_json";
+
+/// The `SELECT` column list for [`AgentHistoryRow`], single-sourced.
+const AGENT_HISTORY_COLS: &str = "agent_history_key, agent_instance_key, element_instance_key, \
+     process_instance_key, root_process_instance_key, process_definition_key, \
+     process_definition_id, tenant_id, job_key, loop_iteration, role, produced_at_ms, \
+     content_json, system_prompt, tool_calls_json, input_tokens, output_tokens, \
+     reasoning_token_count, cache_creation_token_count, cache_read_token_count, duration_ms, \
+     history_item_id, tools_json, model, provider, is_duplicate, commit_status";
+
+/// Full-record UPSERT of an [`AgentInstance`] into the `agent_instances` table.
+/// Keyed by `agent_instance_key`; on conflict the mutable state (status, metrics,
+/// tools, job key, last-updated / completion timestamps) is refreshed while the
+/// creation identity is preserved — so a re-delivered `CREATED` is idempotent and
+/// a later `UPDATED`/`COMPLETED` event can reuse this same projection unchanged.
+fn project_agent_instance(tx: &rusqlite::Transaction, ai: &AgentInstance) -> rusqlite::Result<()> {
+    let tools_json = serde_json::to_string(&ai.tools).unwrap_or_else(|_| "[]".to_string());
+    let element_instance_keys_json =
+        serde_json::to_string(&ai.element_instance_keys).unwrap_or_else(|_| "[]".to_string());
+    // `0` in the engine means "not completed yet"; store it as SQL NULL so the
+    // completionDate filter/sort distinguishes live from completed instances.
+    let completion: Option<i64> = if ai.completed_at == 0 {
+        None
+    } else {
+        Some(ai.completed_at as i64)
+    };
+    tx.cexecute(
+        "INSERT INTO agent_instances (\
+             agent_instance_key, agent_definition_key, element_instance_key, element_id, \
+             process_instance_key, root_process_instance_key, process_definition_key, \
+             process_definition_id, process_definition_version, tenant_id, status, agent_type, \
+             model, provider, system_prompt, max_tokens, max_model_calls, max_tool_calls, \
+             input_tokens, output_tokens, reasoning_token_count, cache_creation_token_count, \
+             cache_read_token_count, model_calls, tool_calls, job_key, tools_json, \
+             creation_date_ms, last_updated_date_ms, completion_date_ms, \
+             process_definition_version_tag, element_instance_keys_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32) \
+         ON CONFLICT(agent_instance_key) DO UPDATE SET \
+             status = excluded.status, model = excluded.model, provider = excluded.provider, \
+             system_prompt = excluded.system_prompt, max_tokens = excluded.max_tokens, \
+             max_model_calls = excluded.max_model_calls, max_tool_calls = excluded.max_tool_calls, \
+             input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens, \
+             reasoning_token_count = excluded.reasoning_token_count, \
+             cache_creation_token_count = excluded.cache_creation_token_count, \
+             cache_read_token_count = excluded.cache_read_token_count, \
+             model_calls = excluded.model_calls, tool_calls = excluded.tool_calls, \
+             job_key = excluded.job_key, tools_json = excluded.tools_json, \
+             last_updated_date_ms = excluded.last_updated_date_ms, \
+             completion_date_ms = excluded.completion_date_ms, \
+             process_definition_version_tag = excluded.process_definition_version_tag, \
+             element_instance_keys_json = excluded.element_instance_keys_json",
+        params![
+            ai.agent_instance_key as i64,
+            ai.agent_definition_key as i64,
+            ai.element_instance_key as i64,
+            ai.element_id,
+            ai.process_instance_key as i64,
+            ai.root_process_instance_key as i64,
+            ai.process_definition_key as i64,
+            ai.bpmn_process_id,
+            ai.process_definition_version,
+            ai.tenant_id,
+            ai.status.as_str(),
+            ai.agent_type.as_str(),
+            ai.definition.model.as_ref(),
+            ai.definition.provider.as_ref(),
+            ai.definition.system_prompt.as_ref(),
+            ai.limits.max_tokens,
+            ai.limits.max_model_calls,
+            ai.limits.max_tool_calls,
+            ai.metrics.input_tokens,
+            ai.metrics.output_tokens,
+            ai.metrics.reasoning_token_count,
+            ai.metrics.cache_creation_token_count,
+            ai.metrics.cache_read_token_count,
+            ai.metrics.model_calls,
+            ai.metrics.tool_calls,
+            ai.job_key as i64,
+            tools_json,
+            ai.created_at as i64,
+            ai.last_updated_at as i64,
+            completion,
+            ai.process_definition_version_tag.as_ref(),
+            element_instance_keys_json,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Append-only insert of one materialised [`AgentHistoryRecord`] turn into the
+/// `agent_history` table. `ON CONFLICT(agent_history_key) DO NOTHING`: a turn is
+/// immutable once recorded, and a later commit/discard transition (applied by
+/// [`transition_agent_history`]) must survive a re-delivered `CREATED`.
+fn project_agent_history_record(
+    tx: &rusqlite::Transaction,
+    r: &AgentHistoryRecord,
+) -> rusqlite::Result<()> {
+    let content_json = serde_json::to_string(&r.content).unwrap_or_else(|_| "[]".to_string());
+    let tool_calls_json = serde_json::to_string(&r.tool_calls).unwrap_or_else(|_| "[]".to_string());
+    let tools_json = serde_json::to_string(&r.tools).unwrap_or_else(|_| "[]".to_string());
+    tx.cexecute(
+        "INSERT INTO agent_history (\
+             agent_history_key, agent_instance_key, element_instance_key, process_instance_key, \
+             root_process_instance_key, process_definition_key, process_definition_id, tenant_id, \
+             job_key, loop_iteration, role, produced_at_ms, content_json, system_prompt, \
+             tool_calls_json, input_tokens, output_tokens, reasoning_token_count, \
+             cache_creation_token_count, cache_read_token_count, duration_ms, history_item_id, \
+             tools_json, model, provider, is_duplicate, commit_status) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27) \
+         ON CONFLICT(agent_history_key) DO NOTHING",
+        params![
+            r.agent_history_key as i64,
+            r.agent_instance_key as i64,
+            r.element_instance_key as i64,
+            r.process_instance_key as i64,
+            r.root_process_instance_key as i64,
+            r.process_definition_key as i64,
+            r.bpmn_process_id,
+            r.tenant_id,
+            r.job_key as i64,
+            r.loop_iteration,
+            r.role.as_str(),
+            r.produced_at as i64,
+            content_json,
+            r.system_prompt.as_ref(),
+            tool_calls_json,
+            r.metrics.input_tokens,
+            r.metrics.output_tokens,
+            r.metrics.reasoning_token_count,
+            r.metrics.cache_creation_token_count,
+            r.metrics.cache_read_token_count,
+            r.metrics.duration_ms,
+            r.history_item_id.as_ref(),
+            tools_json,
+            r.model.as_ref(),
+            r.provider.as_ref(),
+            i64::from(r.is_duplicate),
+            r.commit_status.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Apply a PENDING -> `target` commit-status transition to the named turns of an
+/// agent instance. `AND commit_status = 'PENDING'` enforces immutability: only a
+/// still-pending turn transitions, so a re-delivered COMMITTED/DISCARDED event is
+/// a no-op and a committed turn can never be discarded (or vice versa).
+fn transition_agent_history(
+    tx: &rusqlite::Transaction,
+    agent_instance_key: Key,
+    agent_history_keys: &[Key],
+    target: AgentHistoryCommitStatus,
+) -> rusqlite::Result<()> {
+    if agent_history_keys.is_empty() {
+        return Ok(());
+    }
+    let placeholders = vec!["?"; agent_history_keys.len()].join(", ");
+    let sql = format!(
+        "UPDATE agent_history SET commit_status = ?1 \
+         WHERE agent_instance_key = ?2 AND commit_status = 'PENDING' \
+           AND agent_history_key IN ({placeholders})",
+    );
+    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(agent_history_keys.len() + 2);
+    values.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+    values.push(rusqlite::types::Value::Integer(agent_instance_key as i64));
+    for k in agent_history_keys {
+        values.push(rusqlite::types::Value::Integer(*k as i64));
+    }
+    tx.execute(&sql, rusqlite::params_from_iter(values))?;
+    Ok(())
+}
+
+/// Sort direction for the agent search surfaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
+impl SortOrder {
+    /// The SQL keyword — a fixed string literal, never user data (no injection).
+    fn keyword(self) -> &'static str {
+        match self {
+            SortOrder::Asc => "ASC",
+            SortOrder::Desc => "DESC",
+        }
+    }
+}
+
+/// A sortable AgentInstance field (the 8.10 `AgentInstanceSearchQuerySortRequest`
+/// keys). Each maps to a fixed column name — never a user-supplied string — so
+/// splicing it into `ORDER BY` carries no injection surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentInstanceSortField {
+    AgentInstanceKey,
+    AgentDefinitionKey,
+    Status,
+    ElementId,
+    ProcessInstanceKey,
+    RootProcessInstanceKey,
+    ProcessDefinitionKey,
+    TenantId,
+    CreationDate,
+    LastUpdatedDate,
+    CompletionDate,
+}
+
+impl AgentInstanceSortField {
+    fn column(self) -> &'static str {
+        match self {
+            AgentInstanceSortField::AgentInstanceKey => "agent_instance_key",
+            AgentInstanceSortField::AgentDefinitionKey => "agent_definition_key",
+            AgentInstanceSortField::Status => "status",
+            AgentInstanceSortField::ElementId => "element_id",
+            AgentInstanceSortField::ProcessInstanceKey => "process_instance_key",
+            AgentInstanceSortField::RootProcessInstanceKey => "root_process_instance_key",
+            AgentInstanceSortField::ProcessDefinitionKey => "process_definition_key",
+            AgentInstanceSortField::TenantId => "tenant_id",
+            AgentInstanceSortField::CreationDate => "creation_date_ms",
+            AgentInstanceSortField::LastUpdatedDate => "last_updated_date_ms",
+            AgentInstanceSortField::CompletionDate => "completion_date_ms",
+        }
+    }
+}
+
+/// Filter for [`ReadStore::agent_instances`]. Every dimension is optional; a
+/// `None` field imposes no constraint. Mirrors the 8.10 filterable fields.
+#[derive(Clone, Debug, Default)]
+pub struct AgentInstanceFilter {
+    pub agent_instance_key: Option<Key>,
+    pub agent_definition_key: Option<Key>,
+    pub status: Option<AgentInstanceStatus>,
+    pub element_id: Option<String>,
+    pub process_instance_key: Option<Key>,
+    pub root_process_instance_key: Option<Key>,
+    pub process_definition_key: Option<Key>,
+    pub tenant_id: Option<String>,
+}
+
+impl AgentInstanceFilter {
+    /// Builds the `WHERE …` clause (empty when unfiltered) plus the bound values.
+    /// Values are always **bound parameters**, never interpolated, so no
+    /// user-supplied string reaches the SQL text.
+    fn where_clause(&self) -> (String, Vec<rusqlite::types::Value>) {
+        use rusqlite::types::Value;
+        let mut clauses: Vec<String> = Vec::new();
+        let mut values: Vec<Value> = Vec::new();
+        let push_int = |clauses: &mut Vec<String>, values: &mut Vec<Value>, col: &str, v: i64| {
+            clauses.push(format!("{col} = ?{}", values.len() + 1));
+            values.push(Value::Integer(v));
+        };
+        if let Some(v) = self.agent_instance_key {
+            push_int(&mut clauses, &mut values, "agent_instance_key", v as i64);
+        }
+        if let Some(v) = self.agent_definition_key {
+            push_int(&mut clauses, &mut values, "agent_definition_key", v as i64);
+        }
+        if let Some(v) = self.process_instance_key {
+            push_int(&mut clauses, &mut values, "process_instance_key", v as i64);
+        }
+        if let Some(v) = self.root_process_instance_key {
+            push_int(
+                &mut clauses,
+                &mut values,
+                "root_process_instance_key",
+                v as i64,
+            );
+        }
+        if let Some(v) = self.process_definition_key {
+            push_int(
+                &mut clauses,
+                &mut values,
+                "process_definition_key",
+                v as i64,
+            );
+        }
+        if let Some(status) = self.status {
+            clauses.push(format!("status = ?{}", values.len() + 1));
+            values.push(Value::Text(status.as_str().to_string()));
+        }
+        if let Some(element_id) = &self.element_id {
+            clauses.push(format!("element_id = ?{}", values.len() + 1));
+            values.push(Value::Text(element_id.clone()));
+        }
+        if let Some(tenant_id) = &self.tenant_id {
+            clauses.push(format!("tenant_id = ?{}", values.len() + 1));
+            values.push(Value::Text(tenant_id.clone()));
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        (where_sql, values)
+    }
+}
+
+/// A sortable AgentHistory field (the 8.10 history-search sort keys:
+/// `producedAt`, `historyItemKey`, `loopIteration`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentHistorySortField {
+    ProducedAt,
+    HistoryItemKey,
+    LoopIteration,
+}
+
+impl AgentHistorySortField {
+    fn column(self) -> &'static str {
+        match self {
+            AgentHistorySortField::ProducedAt => "produced_at_ms",
+            AgentHistorySortField::HistoryItemKey => "agent_history_key",
+            AgentHistorySortField::LoopIteration => "loop_iteration",
+        }
+    }
+}
+
+/// Filter for [`ReadStore::agent_history`]. `commit_status` carries the derived
+/// commit-status filter: **`None` means the default — COMMITTED only** — so
+/// PENDING/DISCARDED turns surface only when a caller asks for them explicitly.
+#[derive(Clone, Debug, Default)]
+pub struct AgentHistoryFilter {
+    pub agent_instance_key: Option<Key>,
+    pub process_instance_key: Option<Key>,
+    /// The commit statuses to include. `None` (the default) restricts the result
+    /// to `COMMITTED`; `Some(list)` returns exactly the listed statuses (an empty
+    /// list is treated as the COMMITTED default rather than "match nothing").
+    pub commit_status: Option<Vec<AgentHistoryCommitStatus>>,
+}
+
+impl AgentHistoryFilter {
+    fn where_clause(&self) -> (String, Vec<rusqlite::types::Value>) {
+        use rusqlite::types::Value;
+        let mut clauses: Vec<String> = Vec::new();
+        let mut values: Vec<Value> = Vec::new();
+        if let Some(v) = self.agent_instance_key {
+            clauses.push(format!("agent_instance_key = ?{}", values.len() + 1));
+            values.push(Value::Integer(v as i64));
+        }
+        if let Some(v) = self.process_instance_key {
+            clauses.push(format!("process_instance_key = ?{}", values.len() + 1));
+            values.push(Value::Integer(v as i64));
+        }
+        // Default filter = COMMITTED (an omitted or empty commit_status).
+        let statuses: Vec<AgentHistoryCommitStatus> = match &self.commit_status {
+            Some(list) if !list.is_empty() => list.clone(),
+            _ => vec![AgentHistoryCommitStatus::Committed],
+        };
+        let placeholders: Vec<String> = statuses
+            .iter()
+            .map(|s| {
+                values.push(Value::Text(s.as_str().to_string()));
+                format!("?{}", values.len())
+            })
+            .collect();
+        clauses.push(format!("commit_status IN ({})", placeholders.join(", ")));
+        (format!(" WHERE {}", clauses.join(" AND ")), values)
+    }
+}
+
+/// A projected AgentInstance row (the read-model shape the 8.10
+/// `/v2/agent-instances` REST layer serves).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentInstanceRow {
+    pub agent_instance_key: Key,
+    pub agent_definition_key: Key,
+    pub element_instance_key: Key,
+    pub element_id: String,
+    pub process_instance_key: Key,
+    pub root_process_instance_key: Key,
+    pub process_definition_key: Key,
+    pub process_definition_id: String,
+    pub process_definition_version: i32,
+    pub tenant_id: String,
+    pub status: AgentInstanceStatus,
+    pub agent_type: String,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub system_prompt: Option<String>,
+    pub max_tokens: i64,
+    pub max_model_calls: i64,
+    pub max_tool_calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_token_count: i64,
+    pub cache_creation_token_count: i64,
+    pub cache_read_token_count: i64,
+    pub model_calls: i64,
+    pub tool_calls: i64,
+    pub job_key: Key,
+    /// The tools available to the agent, as a JSON array string (as projected).
+    pub tools_json: String,
+    pub creation_date_ms: u64,
+    pub last_updated_date_ms: u64,
+    /// The completion instant (ms), `None` until the instance is COMPLETED.
+    pub completion_date_ms: Option<u64>,
+    /// The process definition version tag, if any.
+    pub process_definition_version_tag: Option<String>,
+    /// Every element instance associated with this agent instance (the owning
+    /// `element_instance_key` is always the first). Projected as a JSON array.
+    pub element_instance_keys: Vec<Key>,
+}
+
+/// A projected AgentHistory turn row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentHistoryRow {
+    pub agent_history_key: Key,
+    pub agent_instance_key: Key,
+    pub element_instance_key: Key,
+    pub process_instance_key: Key,
+    pub root_process_instance_key: Key,
+    pub process_definition_key: Key,
+    pub process_definition_id: String,
+    pub tenant_id: String,
+    pub job_key: Key,
+    pub loop_iteration: i32,
+    pub role: AgentHistoryRole,
+    pub produced_at_ms: u64,
+    pub content_json: String,
+    pub system_prompt: Option<String>,
+    pub tool_calls_json: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_token_count: i64,
+    pub cache_creation_token_count: i64,
+    pub cache_read_token_count: i64,
+    pub duration_ms: i64,
+    pub history_item_id: Option<String>,
+    pub tools_json: String,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub is_duplicate: bool,
+    pub commit_status: AgentHistoryCommitStatus,
+}
+
+/// Parse a stored `AgentInstanceStatus` label back to the enum. An unrecognised
+/// value (only possible if a record predates a status) degrades to
+/// `INITIALIZING` rather than erroring the read.
+fn agent_status_from_label(s: &str) -> AgentInstanceStatus {
+    match s {
+        "TOOL_DISCOVERY" => AgentInstanceStatus::ToolDiscovery,
+        "THINKING" => AgentInstanceStatus::Thinking,
+        "TOOL_CALLING" => AgentInstanceStatus::ToolCalling,
+        "IDLE" => AgentInstanceStatus::Idle,
+        "COMPLETED" => AgentInstanceStatus::Completed,
+        _ => AgentInstanceStatus::Initializing,
+    }
+}
+
+fn agent_role_from_label(s: &str) -> AgentHistoryRole {
+    match s {
+        "ASSISTANT" => AgentHistoryRole::Assistant,
+        "TOOL_RESULT" => AgentHistoryRole::ToolResult,
+        "CONFIGURATION" => AgentHistoryRole::Configuration,
+        _ => AgentHistoryRole::User,
+    }
+}
+
+fn commit_status_from_label(s: &str) -> AgentHistoryCommitStatus {
+    match s {
+        "PENDING" => AgentHistoryCommitStatus::Pending,
+        "DISCARDED" => AgentHistoryCommitStatus::Discarded,
+        _ => AgentHistoryCommitStatus::Committed,
+    }
+}
+
+fn map_agent_instance(r: &rusqlite::Row) -> rusqlite::Result<AgentInstanceRow> {
+    Ok(AgentInstanceRow {
+        agent_instance_key: r.get::<_, i64>(0)? as Key,
+        agent_definition_key: r.get::<_, i64>(1)? as Key,
+        element_instance_key: r.get::<_, i64>(2)? as Key,
+        element_id: r.get(3)?,
+        process_instance_key: r.get::<_, i64>(4)? as Key,
+        root_process_instance_key: r.get::<_, i64>(5)? as Key,
+        process_definition_key: r.get::<_, i64>(6)? as Key,
+        process_definition_id: r.get(7)?,
+        process_definition_version: r.get(8)?,
+        tenant_id: r.get(9)?,
+        status: agent_status_from_label(&r.get::<_, String>(10)?),
+        agent_type: r.get(11)?,
+        model: r.get(12)?,
+        provider: r.get(13)?,
+        system_prompt: r.get(14)?,
+        max_tokens: r.get(15)?,
+        max_model_calls: r.get(16)?,
+        max_tool_calls: r.get(17)?,
+        input_tokens: r.get(18)?,
+        output_tokens: r.get(19)?,
+        reasoning_token_count: r.get(20)?,
+        cache_creation_token_count: r.get(21)?,
+        cache_read_token_count: r.get(22)?,
+        model_calls: r.get(23)?,
+        tool_calls: r.get(24)?,
+        job_key: r.get::<_, i64>(25)? as Key,
+        tools_json: r.get(26)?,
+        creation_date_ms: r.get::<_, i64>(27)? as u64,
+        last_updated_date_ms: r.get::<_, i64>(28)? as u64,
+        completion_date_ms: r.get::<_, Option<i64>>(29)?.map(|v| v as u64),
+        process_definition_version_tag: r.get(30)?,
+        element_instance_keys: {
+            let json: String = r.get(31)?;
+            serde_json::from_str::<Vec<i64>>(&json)
+                .map(|v| v.into_iter().map(|k| k as Key).collect())
+                .unwrap_or_default()
+        },
+    })
+}
+
+fn map_agent_history(r: &rusqlite::Row) -> rusqlite::Result<AgentHistoryRow> {
+    Ok(AgentHistoryRow {
+        agent_history_key: r.get::<_, i64>(0)? as Key,
+        agent_instance_key: r.get::<_, i64>(1)? as Key,
+        element_instance_key: r.get::<_, i64>(2)? as Key,
+        process_instance_key: r.get::<_, i64>(3)? as Key,
+        root_process_instance_key: r.get::<_, i64>(4)? as Key,
+        process_definition_key: r.get::<_, i64>(5)? as Key,
+        process_definition_id: r.get(6)?,
+        tenant_id: r.get(7)?,
+        job_key: r.get::<_, i64>(8)? as Key,
+        loop_iteration: r.get(9)?,
+        role: agent_role_from_label(&r.get::<_, String>(10)?),
+        produced_at_ms: r.get::<_, i64>(11)? as u64,
+        content_json: r.get(12)?,
+        system_prompt: r.get(13)?,
+        tool_calls_json: r.get(14)?,
+        input_tokens: r.get(15)?,
+        output_tokens: r.get(16)?,
+        reasoning_token_count: r.get(17)?,
+        cache_creation_token_count: r.get(18)?,
+        cache_read_token_count: r.get(19)?,
+        duration_ms: r.get(20)?,
+        history_item_id: r.get(21)?,
+        tools_json: r.get(22)?,
+        model: r.get(23)?,
+        provider: r.get(24)?,
+        is_duplicate: r.get::<_, i64>(25)? != 0,
+        commit_status: commit_status_from_label(&r.get::<_, String>(26)?),
+    })
+}
+
+impl ReadStore {
+    /// Search AgentInstance rows by `filter`, ordered by `sort` (field +
+    /// direction), or by `agent_instance_key ASC` when `sort` is `None`. The
+    /// order field maps to a fixed column and the direction to a fixed keyword,
+    /// so the only interpolation is compile-time-known text; all filter values
+    /// are bound parameters.
+    pub fn agent_instances(
+        &self,
+        filter: &AgentInstanceFilter,
+        sort: Option<(AgentInstanceSortField, SortOrder)>,
+    ) -> Vec<AgentInstanceRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let (where_sql, values) = filter.where_clause();
+        let (col, dir) = match sort {
+            Some((field, order)) => (field.column(), order.keyword()),
+            None => ("agent_instance_key", "ASC"),
+        };
+        let sql = format!(
+            "SELECT {AGENT_INSTANCE_COLS} FROM agent_instances{where_sql} \
+             ORDER BY {col} {dir}, agent_instance_key ASC"
+        );
+        let mut stmt = conn.prepare(&sql).expect("prepare agent_instances");
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(values), map_agent_instance)
+            .expect("query agent_instances");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// A single AgentInstance by its dedicated key.
+    pub fn agent_instance(&self, key: Key) -> Option<AgentInstanceRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            &format!(
+                "SELECT {AGENT_INSTANCE_COLS} FROM agent_instances WHERE agent_instance_key = ?1"
+            ),
+            params![key as i64],
+            map_agent_instance,
+        )
+        .optional()
+        .expect("query agent_instance")
+    }
+
+    /// Search AgentHistory turns by `filter`, ordered by `sort`, or by the
+    /// engine's canonical `(loop_iteration, produced_at_ms, agent_history_key)`
+    /// order when `sort` is `None`. With no `commit_status` in the filter only
+    /// COMMITTED turns are returned (see [`AgentHistoryFilter`]).
+    pub fn agent_history(
+        &self,
+        filter: &AgentHistoryFilter,
+        sort: Option<(AgentHistorySortField, SortOrder)>,
+    ) -> Vec<AgentHistoryRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let (where_sql, values) = filter.where_clause();
+        let order_sql = match sort {
+            Some((field, order)) => {
+                format!(
+                    "{} {}, agent_history_key ASC",
+                    field.column(),
+                    order.keyword()
+                )
+            }
+            None => "loop_iteration ASC, produced_at_ms ASC, agent_history_key ASC".to_string(),
+        };
+        let sql = format!(
+            "SELECT {AGENT_HISTORY_COLS} FROM agent_history{where_sql} ORDER BY {order_sql}"
+        );
+        let mut stmt = conn.prepare(&sql).expect("prepare agent_history");
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(values), map_agent_history)
+            .expect("query agent_history");
+        rows.filter_map(Result::ok).collect()
+    }
 }
 
 #[cfg(test)]
@@ -7841,6 +8596,513 @@ mod read_surface_tests {
         assert_eq!(
             job.created_at_ms, 0,
             "a negative persisted created_at_ms must clamp to 0, not wrap to a huge u64"
+        );
+    }
+}
+
+#[cfg(test)]
+mod agent_projection_tests {
+    use nanobpmn_engine_core::{
+        AgentDefinition, AgentHistoryCommitStatus, AgentHistoryMetrics, AgentHistoryRecord,
+        AgentHistoryRole, AgentInstance, AgentInstanceLimits, AgentInstanceMetrics,
+        AgentInstanceStatus, AgentType, Event, Key,
+    };
+
+    use super::{
+        AgentHistoryFilter, AgentHistorySortField, AgentInstanceFilter, AgentInstanceSortField,
+        ReadStore, SortOrder,
+    };
+
+    fn instance(
+        key: Key,
+        element_id: &str,
+        status: AgentInstanceStatus,
+        created_at: u64,
+    ) -> AgentInstance {
+        AgentInstance {
+            agent_instance_key: key,
+            agent_definition_key: 7,
+            element_instance_key: key + 1000,
+            element_instance_keys: vec![key + 1000],
+            element_id: element_id.to_string(),
+            process_instance_key: 42,
+            root_process_instance_key: 42,
+            bpmn_process_id: "proc".to_string(),
+            process_definition_key: 99,
+            process_definition_version: 1,
+            process_definition_version_tag: None,
+            tenant_id: "<default>".to_string(),
+            agent_type: AgentType::AiAgentTask,
+            status,
+            definition: AgentDefinition {
+                model: Some("gpt".to_string()),
+                provider: Some("openai".to_string()),
+                system_prompt: Some("be helpful".to_string()),
+            },
+            limits: AgentInstanceLimits::default(),
+            metrics: AgentInstanceMetrics::default(),
+            tools: Vec::new(),
+            job_key: 0,
+            job_lease: 0,
+            created_at,
+            last_updated_at: created_at,
+            completed_at: if matches!(status, AgentInstanceStatus::Completed) {
+                created_at + 500
+            } else {
+                0
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        key: Key,
+        instance_key: Key,
+        loop_iteration: i32,
+        produced_at: u64,
+        role: AgentHistoryRole,
+    ) -> AgentHistoryRecord {
+        AgentHistoryRecord {
+            agent_history_key: key,
+            agent_instance_key: instance_key,
+            element_instance_key: instance_key + 1000,
+            process_instance_key: 42,
+            root_process_instance_key: 42,
+            bpmn_process_id: "proc".to_string(),
+            process_definition_key: 99,
+            tenant_id: "<default>".to_string(),
+            job_key: 0,
+            job_lease: 0,
+            loop_iteration,
+            role,
+            produced_at,
+            content: Vec::new(),
+            system_prompt: None,
+            tool_calls: Vec::new(),
+            metrics: AgentHistoryMetrics::default(),
+            history_item_id: None,
+            tools: Vec::new(),
+            model: None,
+            provider: None,
+            limits: None,
+            is_duplicate: false,
+            commit_status: AgentHistoryCommitStatus::Pending,
+        }
+    }
+
+    fn store_with(events: &[Event]) -> ReadStore {
+        let store = ReadStore::open(None).unwrap();
+        let refs: Vec<&Event> = events.iter().collect();
+        store.export(&refs).unwrap();
+        store
+    }
+
+    #[test]
+    fn projects_agent_instances_and_searches_by_filter() {
+        let store = store_with(&[
+            Event::AgentInstanceCreated {
+                instance_key: 42,
+                agent_instance: instance(1, "agent-a", AgentInstanceStatus::Thinking, 100),
+            },
+            Event::AgentInstanceCreated {
+                instance_key: 42,
+                agent_instance: instance(2, "agent-b", AgentInstanceStatus::Completed, 200),
+            },
+        ]);
+
+        // Unfiltered: both instances project.
+        let all = store.agent_instances(&AgentInstanceFilter::default(), None);
+        assert_eq!(all.len(), 2);
+
+        // Filter by element_id returns just that instance.
+        let by_element = store.agent_instances(
+            &AgentInstanceFilter {
+                element_id: Some("agent-b".to_string()),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(by_element.len(), 1);
+        assert_eq!(by_element[0].agent_instance_key, 2);
+        assert_eq!(by_element[0].status, AgentInstanceStatus::Completed);
+        assert_eq!(by_element[0].completion_date_ms, Some(700));
+
+        // Filter by status.
+        let thinking = store.agent_instances(
+            &AgentInstanceFilter {
+                status: Some(AgentInstanceStatus::Thinking),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(thinking.len(), 1);
+        assert_eq!(thinking[0].agent_instance_key, 1);
+
+        // By-key lookup.
+        assert_eq!(store.agent_instance(1).unwrap().element_id, "agent-a");
+        assert!(store.agent_instance(999).is_none());
+    }
+
+    #[test]
+    fn projects_version_tag_and_element_instance_keys() {
+        let mut ai = instance(5, "agent-c", AgentInstanceStatus::Idle, 300);
+        ai.process_definition_version_tag = Some("v1.2.3".to_string());
+        ai.element_instance_keys = vec![1005, 2005, 3005];
+        let store = store_with(&[Event::AgentInstanceCreated {
+            instance_key: 42,
+            agent_instance: ai,
+        }]);
+        let row = store.agent_instance(5).expect("instance projects");
+        assert_eq!(
+            row.process_definition_version_tag.as_deref(),
+            Some("v1.2.3"),
+            "the version tag is projected"
+        );
+        assert_eq!(
+            row.element_instance_keys,
+            vec![1005, 2005, 3005],
+            "the full element-instance-key set is projected as a JSON array"
+        );
+
+        // ON CONFLICT must refresh the version tag: a later UPDATED event carrying a
+        // non-null tag replaces a previously-projected NULL (additive projection
+        // preserves the row, so the UPSERT must update the tag, not keep it stale).
+        let mut untagged = instance(6, "agent-d", AgentInstanceStatus::Initializing, 400);
+        untagged.process_definition_version_tag = None;
+        let mut tagged = instance(6, "agent-d", AgentInstanceStatus::Thinking, 400);
+        tagged.process_definition_version_tag = Some("v9.9.9".to_string());
+        let store = store_with(&[
+            Event::AgentInstanceCreated {
+                instance_key: 42,
+                agent_instance: untagged,
+            },
+            Event::AgentInstanceUpdated {
+                instance_key: 42,
+                agent_instance: tagged,
+            },
+        ]);
+        let row = store.agent_instance(6).expect("instance projects");
+        assert_eq!(
+            row.process_definition_version_tag.as_deref(),
+            Some("v9.9.9"),
+            "the version tag is refreshed on conflicting UPSERT, not left NULL"
+        );
+    }
+
+    #[test]
+    fn instance_sort_by_each_field_works() {
+        let store = store_with(&[
+            Event::AgentInstanceCreated {
+                instance_key: 42,
+                agent_instance: instance(2, "b", AgentInstanceStatus::Thinking, 100),
+            },
+            Event::AgentInstanceCreated {
+                instance_key: 42,
+                agent_instance: instance(1, "a", AgentInstanceStatus::Thinking, 300),
+            },
+        ]);
+
+        let by_key_asc = store.agent_instances(
+            &AgentInstanceFilter::default(),
+            Some((AgentInstanceSortField::AgentInstanceKey, SortOrder::Asc)),
+        );
+        assert_eq!(
+            by_key_asc
+                .iter()
+                .map(|r| r.agent_instance_key)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let by_creation_desc = store.agent_instances(
+            &AgentInstanceFilter::default(),
+            Some((AgentInstanceSortField::CreationDate, SortOrder::Desc)),
+        );
+        assert_eq!(
+            by_creation_desc
+                .iter()
+                .map(|r| r.agent_instance_key)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        // Every declared sort field must produce a stable, non-panicking order.
+        for field in [
+            AgentInstanceSortField::AgentInstanceKey,
+            AgentInstanceSortField::AgentDefinitionKey,
+            AgentInstanceSortField::Status,
+            AgentInstanceSortField::ElementId,
+            AgentInstanceSortField::ProcessInstanceKey,
+            AgentInstanceSortField::RootProcessInstanceKey,
+            AgentInstanceSortField::ProcessDefinitionKey,
+            AgentInstanceSortField::TenantId,
+            AgentInstanceSortField::CreationDate,
+            AgentInstanceSortField::LastUpdatedDate,
+            AgentInstanceSortField::CompletionDate,
+        ] {
+            let rows = store.agent_instances(
+                &AgentInstanceFilter::default(),
+                Some((field, SortOrder::Asc)),
+            );
+            assert_eq!(rows.len(), 2, "sort by {field:?} must return all rows");
+        }
+    }
+
+    #[test]
+    fn history_default_filter_returns_only_committed() {
+        // Three turns; commit #10, discard #12, leave #11 pending.
+        let store = store_with(&[
+            Event::AgentHistoryCreated {
+                instance_key: 42,
+                record: record(10, 1, 0, 100, AgentHistoryRole::User),
+            },
+            Event::AgentHistoryCreated {
+                instance_key: 42,
+                record: record(11, 1, 0, 200, AgentHistoryRole::Assistant),
+            },
+            Event::AgentHistoryCreated {
+                instance_key: 42,
+                record: record(12, 1, 1, 300, AgentHistoryRole::ToolResult),
+            },
+            Event::AgentHistoryCommitted {
+                instance_key: 42,
+                agent_instance_key: 1,
+                agent_history_keys: vec![10],
+            },
+            Event::AgentHistoryDiscarded {
+                instance_key: 42,
+                agent_instance_key: 1,
+                agent_history_keys: vec![12],
+            },
+        ]);
+
+        // No commit_status filter → COMMITTED only.
+        let committed = store.agent_history(
+            &AgentHistoryFilter {
+                agent_instance_key: Some(1),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(
+            committed
+                .iter()
+                .map(|r| r.agent_history_key)
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+
+        // Explicit PENDING filter surfaces the still-pending turn.
+        let pending = store.agent_history(
+            &AgentHistoryFilter {
+                agent_instance_key: Some(1),
+                process_instance_key: None,
+                commit_status: Some(vec![AgentHistoryCommitStatus::Pending]),
+            },
+            None,
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .map(|r| r.agent_history_key)
+                .collect::<Vec<_>>(),
+            vec![11]
+        );
+
+        // Explicit DISCARDED filter surfaces the discarded turn.
+        let discarded = store.agent_history(
+            &AgentHistoryFilter {
+                agent_instance_key: Some(1),
+                process_instance_key: None,
+                commit_status: Some(vec![AgentHistoryCommitStatus::Discarded]),
+            },
+            None,
+        );
+        assert_eq!(
+            discarded
+                .iter()
+                .map(|r| r.agent_history_key)
+                .collect::<Vec<_>>(),
+            vec![12]
+        );
+
+        // Empty list is treated as the COMMITTED default, not "match nothing".
+        let empty = store.agent_history(
+            &AgentHistoryFilter {
+                agent_instance_key: Some(1),
+                process_instance_key: None,
+                commit_status: Some(vec![]),
+            },
+            None,
+        );
+        assert_eq!(
+            empty
+                .iter()
+                .map(|r| r.agent_history_key)
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+    }
+
+    #[test]
+    fn history_sort_by_each_field_works() {
+        // All three committed so the default filter returns them.
+        let store = store_with(&[
+            Event::AgentHistoryCreated {
+                instance_key: 42,
+                record: record(30, 1, 2, 100, AgentHistoryRole::User),
+            },
+            Event::AgentHistoryCreated {
+                instance_key: 42,
+                record: record(31, 1, 0, 300, AgentHistoryRole::Assistant),
+            },
+            Event::AgentHistoryCreated {
+                instance_key: 42,
+                record: record(32, 1, 1, 200, AgentHistoryRole::ToolResult),
+            },
+            Event::AgentHistoryCommitted {
+                instance_key: 42,
+                agent_instance_key: 1,
+                agent_history_keys: vec![30, 31, 32],
+            },
+        ]);
+        let filter = AgentHistoryFilter {
+            agent_instance_key: Some(1),
+            ..Default::default()
+        };
+
+        let by_produced = store.agent_history(
+            &filter,
+            Some((AgentHistorySortField::ProducedAt, SortOrder::Asc)),
+        );
+        assert_eq!(
+            by_produced
+                .iter()
+                .map(|r| r.produced_at_ms)
+                .collect::<Vec<_>>(),
+            vec![100, 200, 300]
+        );
+
+        let by_key = store.agent_history(
+            &filter,
+            Some((AgentHistorySortField::HistoryItemKey, SortOrder::Desc)),
+        );
+        assert_eq!(
+            by_key
+                .iter()
+                .map(|r| r.agent_history_key)
+                .collect::<Vec<_>>(),
+            vec![32, 31, 30]
+        );
+
+        let by_iter = store.agent_history(
+            &filter,
+            Some((AgentHistorySortField::LoopIteration, SortOrder::Asc)),
+        );
+        assert_eq!(
+            by_iter.iter().map(|r| r.loop_iteration).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn projection_is_idempotent_and_replay_safe() {
+        let created = Event::AgentInstanceCreated {
+            instance_key: 42,
+            agent_instance: instance(1, "agent-a", AgentInstanceStatus::Thinking, 100),
+        };
+        let turn = Event::AgentHistoryCreated {
+            instance_key: 42,
+            record: record(10, 1, 0, 100, AgentHistoryRole::User),
+        };
+        let commit = Event::AgentHistoryCommitted {
+            instance_key: 42,
+            agent_instance_key: 1,
+            agent_history_keys: vec![10],
+        };
+        let store = store_with(&[created.clone(), turn.clone(), commit.clone()]);
+
+        // Redeliver every event: counts stay put and the commit status is preserved.
+        store.export(&[&created, &turn, &commit]).unwrap();
+        assert_eq!(
+            store
+                .agent_instances(&AgentInstanceFilter::default(), None)
+                .len(),
+            1
+        );
+        let committed = store.agent_history(
+            &AgentHistoryFilter {
+                agent_instance_key: Some(1),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(committed.len(), 1);
+        assert_eq!(
+            committed[0].commit_status,
+            AgentHistoryCommitStatus::Committed
+        );
+
+        // A committed turn can never be discarded (PENDING-guarded transition).
+        store
+            .export(&[&Event::AgentHistoryDiscarded {
+                instance_key: 42,
+                agent_instance_key: 1,
+                agent_history_keys: vec![10],
+            }])
+            .unwrap();
+        let still = store.agent_history(
+            &AgentHistoryFilter {
+                agent_instance_key: Some(1),
+                process_instance_key: None,
+                commit_status: Some(vec![AgentHistoryCommitStatus::Discarded]),
+            },
+            None,
+        );
+        assert!(
+            still.is_empty(),
+            "a committed turn must not become discarded"
+        );
+    }
+
+    #[test]
+    fn update_and_completed_events_reproject_the_mutable_state() {
+        // The read model must reflect a PATCH's status advance and a COMPLETE's
+        // terminal status + completion date (both events reuse the CREATE upsert),
+        // else GET-after-PATCH on the REST channel (S5) reports stale INITIALIZING.
+        let created = Event::AgentInstanceCreated {
+            instance_key: 42,
+            agent_instance: instance(1, "agent-a", AgentInstanceStatus::Initializing, 100),
+        };
+        let store = store_with(&[created]);
+        assert_eq!(
+            store.agent_instance(1).unwrap().status,
+            AgentInstanceStatus::Initializing
+        );
+
+        // UPDATED advances the projected status.
+        let updated = Event::AgentInstanceUpdated {
+            instance_key: 42,
+            agent_instance: instance(1, "agent-a", AgentInstanceStatus::Thinking, 100),
+        };
+        store.export(&[&updated]).unwrap();
+        assert_eq!(
+            store.agent_instance(1).unwrap().status,
+            AgentInstanceStatus::Thinking,
+            "an AgentInstanceUpdated event reprojects the advanced status"
+        );
+
+        // COMPLETED drives to the terminal status and records the completion date.
+        let completed = Event::AgentInstanceCompleted {
+            instance_key: 42,
+            agent_instance: instance(1, "agent-a", AgentInstanceStatus::Completed, 100),
+        };
+        store.export(&[&completed]).unwrap();
+        let row = store.agent_instance(1).unwrap();
+        assert_eq!(row.status, AgentInstanceStatus::Completed);
+        assert!(
+            row.completion_date_ms.is_some(),
+            "a completed instance carries its completion date"
         );
     }
 }

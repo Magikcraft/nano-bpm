@@ -309,7 +309,15 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > `terminateEventDefinition` that kills the remaining tokens in its enclosing
 > scope, then completes that scope). Instances carry JSON-like variables (`null`, booleans, numbers,
 > strings, lists and contexts) evaluated by an in-house FEEL engine ([`feel`])
-> for gateway conditions, job types and message correlation. Processes can be
+> for gateway conditions, job types and message correlation. It also supports
+> **engine-native AI agent tasks** (Camunda stable/8.10 AgentInstance parity): a
+> `serviceTask` bearing a `zeebe:agentDefinition agentType="aiAgentTask"` (or
+> `"external"`) marker activates into a first-class **`AgentInstance`** — keyed by
+> its own dedicated key, linked to the element instance, in status `INITIALIZING`
+> — that the engine holds as the system-of-record, rather than creating a job.
+> Placement mirrors Camunda's `AgentDefinitionValidator` (`aiAgentTask` only on a
+> `serviceTask`, `aiAgentSubProcess` only on an `adHocSubProcess`); the wrong
+> placement is rejected at deploy. Processes can be
 > built programmatically with [`ProcessBuilder`] or parsed from BPMN 2.0 XML for
 > that same subset (including `subProcess`, `boundaryEvent`/`errorEventDefinition`,
 > `intermediateCatchEvent`/`timerEventDefinition`, `messageEventDefinition`/

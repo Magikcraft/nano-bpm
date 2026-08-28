@@ -765,6 +765,27 @@ pub enum ElementKind {
     /// compensating a whole sub-process, `cancelRemainingInstances`, strictly
     /// ordered nested multi-activity compensation — are follow-ups.)
     CompensationThrowEvent,
+    /// An AI agent element (Camunda `zeebe:agentDefinition`, stable/8.10). Built
+    /// from a `bpmn:serviceTask` bearing `<zeebe:agentDefinition
+    /// agentType="aiAgentTask"/>` (or `agentType="external"`). On activation the
+    /// engine creates a first-class [`crate::AgentInstance`] (status
+    /// `INITIALIZING`) keyed by its own dedicated key and linked to the active
+    /// element instance — the engine becomes the system-of-record for the agent
+    /// state. LLM calls / prompt assembly / tool dispatch stay in the worker
+    /// layer; the token parks on the element while the agent runs, exactly like
+    /// a job-bearing service task. The `agentType="aiAgentSubProcess"` variant
+    /// (on a `bpmn:adHocSubProcess`) reuses the existing ad-hoc container
+    /// machinery and is not modelled as this kind.
+    AgentTask {
+        /// The `agentType` marker this element was built from.
+        agent_type: crate::agent::AgentType,
+        /// The static agent definition (model/provider/systemPrompt).
+        #[cfg_attr(feature = "serde", serde(default))]
+        definition: crate::agent::AgentDefinition,
+        /// The configured limits, if declared (`None` = all unlimited).
+        #[cfg_attr(feature = "serde", serde(default))]
+        limits: Option<crate::agent::AgentInstanceLimits>,
+    },
 }
 
 impl ElementKind {
@@ -794,6 +815,7 @@ impl ElementKind {
             | ElementKind::UserTask(_)
             | ElementKind::ScriptTask { .. }
             | ElementKind::Task
+            | ElementKind::AgentTask { .. }
             | ElementKind::SubProcess { .. }
             | ElementKind::CallActivity { .. } => true,
             ElementKind::StartEvent
@@ -846,6 +868,7 @@ impl ElementKind {
             | ElementKind::ConditionalBoundaryEvent { .. } => "BOUNDARY_EVENT",
             ElementKind::CompensationBoundaryEvent { .. } => "BOUNDARY_EVENT",
             ElementKind::ServiceTask { .. } => "SERVICE_TASK",
+            ElementKind::AgentTask { .. } => "SERVICE_TASK",
             ElementKind::BusinessRuleTask { .. } => "BUSINESS_RULE_TASK",
             ElementKind::ScriptTask { .. } => "SCRIPT_TASK",
             ElementKind::UserTask(_) => "USER_TASK",
@@ -1696,6 +1719,29 @@ impl ProcessBuilder {
                 priority,
                 custom_headers,
                 linked_resources,
+            },
+        )
+    }
+
+    /// Adds an AI agent task (Camunda `zeebe:agentDefinition`, stable/8.10):
+    /// a `bpmn:serviceTask` bearing the agent marker. On activation the engine
+    /// creates a first-class [`crate::AgentInstance`] (status `INITIALIZING`)
+    /// linked to the active element instance. `definition`/`limits` are the
+    /// static agent configuration (model/provider/systemPrompt + optional
+    /// limits); pass defaults for an unconfigured agent.
+    pub fn agent_task(
+        self,
+        id: impl Into<String>,
+        agent_type: crate::agent::AgentType,
+        definition: crate::agent::AgentDefinition,
+        limits: Option<crate::agent::AgentInstanceLimits>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::AgentTask {
+                agent_type,
+                definition,
+                limits,
             },
         )
     }
