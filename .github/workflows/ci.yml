@@ -173,11 +173,14 @@ jobs:
           toolchain: nightly-2026-06-26
           components: rustfmt
       # server/src/stub_impls.rs is codegen (gitignored) but is a `mod` of the
-      # server crate, so rustfmt needs *a* file there to resolve the module tree.
-      # A canonical one-line stub suffices for a parse-only format check — no need
-      # for the full Java/uv codegen the build jobs run.
-      - name: Stub codegen module
-        run: printf '// fmt stub\n' > server/src/stub_impls.rs
+      # server crate, so rustfmt needs *a* file there to resolve the module tree;
+      # the generated/ + generated-console/ path-dep manifests must also exist
+      # because `cargo fmt` runs `cargo metadata` over the server workspace
+      # (ADR 0064). Canonical stubs suffice for a parse-only format check — no
+      # need for the full Java/uv codegen the build jobs run. Shared with
+      # .githooks/pre-push so the local gate and this job stay in lockstep.
+      - name: Stub codegen inputs
+        run: ./scripts/fmt-stub-codegen.sh
       - name: Format check
         run: make fmt-check
 
