@@ -11425,19 +11425,30 @@ mod tests {
             r#"{"schemaVersion":1,"id":"boot-notoolkit"}"#,
         )
         .unwrap();
-        // Point the override at a path that does not exist so `find_urban_for`
-        // (override → pack → project-local → PATH) resolves nothing usable: the
-        // project has no `node_modules/.bin/urban`, the test env has no pack, and
-        // the Rust server CI image ships no `urban` on `PATH` (it is a Node/TS
-        // toolkit, absent from this job) — so resolution yields `None`.
+        // Make resolution hermetic across all four `find_urban_for` seams
+        // (override → pack → project-local → PATH) so the test yields `None`
+        // regardless of the host: the override points at a non-existent path,
+        // the project has no `node_modules/.bin/urban`, `NANOBPMN_EXTENSIONS_DIR`
+        // is isolated to an empty dir (no marketplace pack), and `PATH` is
+        // cleared for the duration (no ambient `urban`). Without the last two, a
+        // dev machine with the pack installed or an `urban` on `PATH` would
+        // resolve a real toolkit and the test would fail or spawn it.
+        let prev_path = std::env::var_os("PATH");
         unsafe {
             std::env::set_var("NANOBPMN_URBAN_BIN", root.join("does-not-exist-urban"));
+            std::env::set_var("NANOBPMN_EXTENSIONS_DIR", root.join("empty-extensions"));
+            std::env::remove_var("PATH");
         }
 
         let logs = ensure_urban_boot_ready(name).await;
 
         unsafe {
             std::env::remove_var("NANOBPMN_URBAN_BIN");
+            std::env::remove_var("NANOBPMN_EXTENSIONS_DIR");
+            match prev_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
         }
 
         assert!(
