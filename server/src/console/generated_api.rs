@@ -988,6 +988,25 @@ impl apis::projects::Projects for ServerImpl {
                     tokio::spawn(async move {
                         super::regenerate_workflow_models(&project).await;
                     });
+                } else if let Some(project) =
+                    v.get("name").and_then(|n| n.as_str()).map(str::to_string)
+                {
+                    // Post-create refresh (#1036): a pack-template / Urban app
+                    // ships neither `node_modules/` nor the derived
+                    // `nano-generated/` facade, so without this its first Run's
+                    // OpenAPI request 500s with "delegate failed to load" until
+                    // `npm i && urban gen` are run by hand. Run the *same* refresh
+                    // the update path uses (`finalize_after_update`) so the first
+                    // run is instant. Await it (mirroring the update handler) so
+                    // the app is ready before the response, and use the created
+                    // config's slug (not the display name). Best-effort: it guards
+                    // deps/gen internally, so a non-Urban builtin starter is a
+                    // cheap no-op, and a flaky install/gen only logs a warning —
+                    // it never fails the create the maker already succeeded at.
+                    let outcome = super::projects::finalize_after_update(&project).await;
+                    for warning in &outcome.warnings {
+                        tracing::debug!(project = %project, warning = %warning, "post-create refresh");
+                    }
                 }
                 Ok(apis::projects::CreateProjectResponse::Status201_ProjectCreated(from_val(v)))
             }
