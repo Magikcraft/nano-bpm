@@ -169,6 +169,12 @@ export default function AppView({
   // the old freshness guarantee for the paths the stream can't see (e.g. a
   // deleted-then-recreated same-name app, which clears a stale notFound).
   const didMountRef = useRef(false);
+  // Mirror `active` into a ref, updated during render so it is current on the
+  // very next commit. The message handler below reads the ref instead of the
+  // closed-over `active`, so a just-hidden iframe can't slip a navigation
+  // through on a stale `active=true` closure before the effect re-runs.
+  const activeRef = useRef(active);
+  activeRef.current = active;
   useEffect(() => {
     if (!didMountRef.current) {
       didMountRef.current = true;
@@ -258,7 +264,7 @@ export default function AppView({
       if (!action) return;
       if (action.kind === "theme") postTheme();
       else {
-        if (!active) return;
+        if (!activeRef.current) return;
         if ("stash" in action && action.stash) {
           try {
             sessionStorage.setItem(action.stash.key, action.stash.value);
@@ -278,7 +284,7 @@ export default function AppView({
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [postTheme, navigate, active]);
+  }, [postTheme, navigate]);
 
   // Re-push whenever the resolved theme on <html> changes — its inline token
   // overrides (theme packs / imports, which ThemeProvider may apply *async* as

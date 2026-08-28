@@ -37,9 +37,13 @@ export function PersistentAppViews() {
   // Derived state, adjusted during render (React re-renders before paint): the
   // just-navigated-to app mounts in the same commit, so there's no blank frame
   // between the route change and the view appearing. Append-only: mount order
-  // fixes each instance's React key for the life of the session.
+  // fixes each instance's React key for the life of the session. The functional
+  // update reads the latest committed list rather than the render-time closure,
+  // so rapid successive navigations can't overwrite each other's appends.
   if (AppView && activeName && !visited.includes(activeName)) {
-    setVisited([...visited, activeName]);
+    setVisited((prev) =>
+      prev.includes(activeName) ? prev : [...prev, activeName],
+    );
   }
   if (!AppView) return null;
   return (
