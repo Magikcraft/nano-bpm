@@ -5181,9 +5181,9 @@ pub async fn finalize_after_update(name: &str) -> PostUpdateOutcome {
             // "urban CLI not available" (from `gen_via_urban`), for which a
             // "run `urban gen` manually" hint would be impossible. Report the
             // consequence and the reason without prescribing a specific remedy.
-            Err(e) => outcome
-                .warnings
-                .push(format!("OpenAPI endpoints may 500 until derived types regenerate: {e}")),
+            Err(e) => outcome.warnings.push(format!(
+                "OpenAPI endpoints may 500 until derived types regenerate: {e}"
+            )),
         }
     }
 
