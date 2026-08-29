@@ -708,9 +708,14 @@ fn parse_with_captures(
                                 // callee id may be a `calledElement` attribute
                                 // (Camunda 7) or a nested `zeebe:calledElement
                                 // processId="…"` child (Camunda 8/Zeebe), captured
-                                // below. Nano expands call activities inline (see
-                                // ProcessDefinition::inline_call_activities) rather
-                                // than executing them natively.
+                                // below. Nano executes call activities natively —
+                                // on activation the engine spawns a child process
+                                // instance of the callee and completes the token
+                                // when the child finishes (see the `CallActivity`
+                                // arm of `Engine::run_activation_body`). Inline
+                                // expansion (ProcessDefinition::inline_call_activities)
+                                // is a legacy opt-in used by the processos harness,
+                                // not the default execution path.
                                 let idx = acc.add_node(attrs, NodeKind::Call);
                                 if let (Some(i), Some(c)) = (idx, attr(attrs, "calledElement")) {
                                     acc.nodes[i].called_process_id = Some(c.to_string());
