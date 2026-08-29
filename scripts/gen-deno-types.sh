@@ -8,13 +8,13 @@
 # We embed ONLY the `declare namespace Deno { ... }` blocks from `deno types`,
 # dropping the web globals (Request/Response/WebSocket/...) so they don't collide
 # with the editor's `dom` lib. The result is served verbatim by the gateway at
-# `GET /console/api/deno-types` (server/src/console/deno_ns.d.ts, include_str!).
+# `GET /console/api/deno-types` (server/crates/nano-server-console/src/deno_ns.d.ts, include_str!).
 #
 # Usage: scripts/gen-deno-types.sh   (requires `deno` on PATH)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="$ROOT/server/src/console/deno_ns.d.ts"
+OUT="$ROOT/server/crates/nano-server-console/src/deno_ns.d.ts"
 
 command -v deno >/dev/null || { echo "error: 'deno' not found on PATH" >&2; exit 1; }
 

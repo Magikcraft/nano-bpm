@@ -210,7 +210,7 @@ release: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_
 	@# Force the RustEmbed derive to re-run so the just-built console/dist (which
 	@# release builds bake in at compile time) is embedded, even if the gateway
 	@# sources are otherwise unchanged.
-	touch $(PROJECT_ROOT)/server/src/console/mod.rs
+	touch $(PROJECT_ROOT)/server/crates/nano-server-console/src/lib.rs
 	cd $(PROJECT_ROOT)/server && cargo build --release --features console
 	@echo "Built self-contained distribution: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
 	@echo "  landing /  ·  console /console  ·  API docs /swagger  ·  REST /v2"
@@ -220,7 +220,7 @@ debug: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IM
 	@# Force the RustEmbed derive to re-run so the just-built console/dist is
 	@# embedded, even if the gateway sources are otherwise unchanged (mirrors
 	@# `release`; the embed is a compile-time bake regardless of profile).
-	touch $(PROJECT_ROOT)/server/src/console/mod.rs
+	touch $(PROJECT_ROOT)/server/crates/nano-server-console/src/lib.rs
 	cd $(PROJECT_ROOT)/server && cargo build --features console
 	@echo "Built self-contained debug distribution: $(PROJECT_ROOT)/server/target/debug/nanobpm-gateway-rest-server"
 	@echo "  landing /  ·  console /console  ·  API docs /swagger  ·  REST /v2"

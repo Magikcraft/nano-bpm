@@ -1,0 +1,56 @@
+[package]
+name = "nano-server-console"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The self-contained web console extracted from the gateway binary under ADR
+# 0064 Phase 3 (issue #1050). Hosts the `/console/api/*` HTTP surface, the BPMN
+# modeller/IDE, the embedded worker runtime, and the cluster/topology dashboards.
+# The binary reaches this crate exclusively through the object-safe
+# `ConsoleServer` trait (Option B seam) — no `ServerImpl` leaks across the
+# boundary — so the default gateway build never links it.
+
+[dependencies]
+# ADR 0064 sibling crates.
+nano-server-storage = { path = "../nano-server-storage", features = ["console"] }
+nano-server-runtime = { path = "../nano-server-runtime", features = ["console"] }
+nano-trace-store = { path = "../nano-trace-store" }
+nano-server-net = { path = "../nano-server-net" }
+nanobpmn-engine-core = { path = "../../../engine-core", features = ["serde"] }
+nanobpmn-read-model = { path = "../../../read-model", features = ["native"] }
+
+async-trait = "0.1"
+axum = { version = "0.8", features = ["multipart", "ws"] }
+bytes = "1"
+chrono = "0.4"
+crc32fast = "1"
+dunce = "1"
+flate2 = "1.1.9"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
+headers = "0.4"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+mime_guess = "2"
+portable-pty = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["multipart", "rustls-tls", "http2", "stream"] }
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "io-util", "process"] }
+tracing = "0.1"
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+# ADR 0034: swap the embedded SPA bundle from `console/dist` to the lean
+# `console/dist-observe` operator profile. Mirrors the gateway bin's feature of
+# the same name so the bin can forward it.
+console-observe = []
+
+[build-dependencies]
+nano-version-stamp = { path = "../nano-version-stamp" }

@@ -90,7 +90,7 @@ if [ "$CONSOLE" = 1 ]; then
     cp -a "$REPO/console/dist/." "$CACHED_DIST/"
   fi
   # Force RustEmbed to re-embed the current console/dist.
-  touch "$REPO/server/src/console/mod.rs"
+  touch "$REPO/server/crates/nano-server-console/src/lib.rs"
 fi
 
 # --- 3. Build the gateway --------------------------------------------------------

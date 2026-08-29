@@ -3230,6 +3230,32 @@ pub fn value_to_json(value: &Value) -> serde_json::Value {
     }
 }
 
+/// Converts a `serde_json::Value` (the REST wire form) into an engine [`Value`].
+/// The inverse of [`value_to_json`]. Shared by the read model and the gateway's
+/// REST mapping (which re-exports it as `crate::json_to_value`) so the two sides
+/// use a single, drift-free encoding.
+pub fn json_to_value(json: &serde_json::Value) -> Value {
+    match json {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else {
+                Value::number(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => Value::Str(s.clone()),
+        serde_json::Value::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
+        serde_json::Value::Object(entries) => Value::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect(),
+        ),
+    }
+}
+
 /// The Zeebe/Camunda REST name for a DMN decision logic type. Shared by the read
 /// model's decision-instance projection and the gateway's REST mapping (which
 /// re-exports it as `crate::dmn_decision_type_name`).

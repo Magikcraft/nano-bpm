@@ -13323,7 +13323,7 @@ mod tests {
         )
         .unwrap();
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
-        let versions = crate::console::extensions::installed_pack_versions();
+        let versions = crate::extensions::installed_pack_versions();
 
         // No scaffold breadcrumb → never an update.
         assert_eq!(compute_update_available(None, &versions), (false, None));

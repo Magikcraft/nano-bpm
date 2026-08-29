@@ -138,7 +138,7 @@ if [ "$CONSOLE" = 1 ]; then
   features=(--features console "${features[@]}")
   # Force the RustEmbed derive to re-run so the current console/dist is baked in,
   # even if the gateway sources are otherwise unchanged (mirrors `make release`).
-  touch "$PROJECT_ROOT/server/src/console/mod.rs"
+  touch "$PROJECT_ROOT/server/crates/nano-server-console/src/lib.rs"
 fi
 
 if [ "$WINDOWS" = 1 ]; then

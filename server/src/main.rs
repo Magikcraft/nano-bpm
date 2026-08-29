@@ -10,7 +10,7 @@
 //! `ServerImpl` type, authentication/error glue, and the server bootstrap.
 
 #[cfg(feature = "console")]
-mod console;
+mod console_api;
 #[cfg(feature = "console")]
 mod consumers;
 mod falcon;
@@ -20477,28 +20477,11 @@ pub(crate) enum SetVariablesOutcome {
 
 /// Converts a JSON value into the engine [`Value`] tree, preserving numbers
 /// (integral vs. decimal), lists and objects so FEEL can operate on them.
-pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
-    match json {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Int(i)
-            } else {
-                Value::number(n.as_f64().unwrap_or(0.0))
-            }
-        }
-        serde_json::Value::String(s) => Value::Str(s.clone()),
-        serde_json::Value::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
-        serde_json::Value::Object(entries) => Value::Map(
-            entries
-                .iter()
-                .map(|(k, v)| (k.clone(), json_to_value(v)))
-                .collect(),
-        ),
-    }
-}
-
+/// Converts a `serde_json::Value` into an engine [`Value`] for the REST wire.
+/// Moved to the shared `nanobpmn-read-model` crate (the read-model projection
+/// needs the identical decoding); re-exported here so the gateway's REST mapping
+/// keeps a single source of truth with the projection.
+pub(crate) use nanobpmn_read_model::json_to_value;
 /// Converts an engine [`Value`] into a `serde_json::Value` for the REST wire.
 /// Moved to the shared `nanobpmn-read-model` crate (the read-model projection
 /// needs the identical encoding); re-exported here so the gateway's REST mapping
@@ -20783,27 +20766,12 @@ async fn instances_debug_body(server: &ServerImpl) -> Response {
         .expect("instances debug response builds")
 }
 
-/// Per-node partition leadership/recovery counts, derived purely from engine +
-/// Raft state (topology ownership vs. live leaders). Base-build (non-console) so
-/// both the Prometheus `/metrics` exporter and the console's richer
-/// `RecoveryDto` share one source of truth. Cheap: a borrow of each hosted
-/// partition's Raft metrics watch. All-zero in steady single-node / off-Raft.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct RecoveryCounts {
-    /// Partitions this node statically owns (its steady-state leadership set).
-    pub owned: u32,
-    /// Owned partitions this node currently leads again (reclaimed / steady).
-    pub reclaimed: u32,
-    /// Owned partitions currently led by a peer failover incumbent — the ones
-    /// this node is still catching up on.
-    pub catching_up: u32,
-    /// Partitions this node leads on behalf of a peer owner (this node is the
-    /// failover incumbent, handing leadership back).
-    pub handing_off: u32,
-    /// Largest replication lag (log entries) of a returning owner this node is
-    /// handing a partition back to, when known (incumbent side only).
-    pub handoff_lag_entries: Option<u64>,
-}
+/// Per-node partition leadership/recovery counts. Moved to the shared
+/// `nano-server-runtime` `cluster` module (ADR 0064 Phase 3) so both this
+/// binary's `recovery_counts`/`RecoveryDto` and the extracted console crate name
+/// the same type; re-exported here so existing `crate::`-qualified paths and the
+/// `recovery_counts` computation below keep resolving unchanged.
+pub(crate) use nano_server_runtime::cluster::RecoveryCounts;
 
 /// Computes this node's [`RecoveryCounts`] from the live Raft metrics of the
 /// partitions it hosts. See [`RecoveryCounts`]. Only meaningful with Raft
@@ -21344,7 +21312,7 @@ async fn console_app_running_guard(
 ) -> Response {
     use axum::response::IntoResponse;
     if let Some(name) = app_running_gate(req.uri().path(), req.method())
-        && crate::console::projects::supervisor()
+        && nano_server_console::projects::supervisor()
             .is_running(name)
             .await
     {
@@ -21585,61 +21553,12 @@ mod adhoc_metrics_tests {
     }
 }
 
-/// An [`axum::serve::Listener`] wrapper that disables Nagle (`TCP_NODELAY`) on
-/// every accepted connection. The gateway's WebSocket surfaces — the SDK command
-/// stream and the inter-node peer/Raft lane — exchange small, latency-sensitive
-/// request/response frames; with Nagle + delayed-ACK each round-trip can stall
-/// ~40 ms, which collapses Raft commit and job-stream throughput. The frames are
-/// explicitly length-delimited, so there is nothing to gain from TCP-level
-/// coalescing. (The client/dialling side sets the same option in [`crate::peer`].)
-struct NoDelayListener(tokio::net::TcpListener);
-
-impl axum::serve::Listener for NoDelayListener {
-    type Io = tokio::net::TcpStream;
-    type Addr = std::net::SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            match self.0.accept().await {
-                Ok((stream, addr)) => {
-                    let _ = stream.set_nodelay(true);
-                    return (stream, addr);
-                }
-                // Mirror axum's own TcpListener accept: a transient accept error
-                // (e.g. fd exhaustion) is retried after a short backoff rather
-                // than tearing down the server.
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
-            }
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.0.local_addr()
-    }
-}
-
-/// Connection peer address, wired through `ConnectInfo` so handlers can tell a
-/// loopback client from a remote one (the console's filesystem browser is
-/// loopback-only). A local newtype is required because the orphan rule forbids
-/// implementing axum's `Connected` for the foreign `SocketAddr` directly.
-#[derive(Clone, Copy)]
-pub(crate) struct PeerAddr(
-    // Read only by the console's loopback-gated filesystem browser; a server
-    // built without the `console` feature still carries it but never inspects it.
-    #[cfg_attr(not(feature = "console"), allow(dead_code))] pub(crate) SocketAddr,
-);
-
-/// Enables `ConnectInfo<PeerAddr>` extraction when the app is served over the
-/// custom [`NoDelayListener`]; axum ships a `Connected` impl for the stock
-/// `TcpListener` but not for a wrapper, so we forward the peer address the
-/// listener already yields.
-impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, NoDelayListener>>
-    for PeerAddr
-{
-    fn connect_info(stream: axum::serve::IncomingStream<'_, NoDelayListener>) -> Self {
-        PeerAddr(*stream.remote_addr())
-    }
-}
+/// The `TCP_NODELAY` serve listener and the `ConnectInfo` peer newtype were
+/// extracted into the `nano-server-net` leaf crate (ADR 0064 Phase 3) so the
+/// console crate can name the exact `ConnectInfo<PeerAddr>` type this binary
+/// registers. Re-exported here so existing `NoDelayListener` / `PeerAddr` /
+/// `crate::PeerAddr` paths keep resolving unchanged.
+pub(crate) use nano_server_net::{NoDelayListener, PeerAddr};
 
 /// Reported binary name for `--version` / `--help`.
 const GATEWAY_NAME: &str = "nanobpm-gateway-rest-server";
@@ -21738,7 +21657,7 @@ async fn main() {
     // setup — and serve until shutdown.
     #[cfg(feature = "console")]
     if obs_config.is_standalone_console() {
-        console::standalone::run(obs_config.standalone_console_peers.clone()).await;
+        nano_server_console::standalone::run(obs_config.standalone_console_peers.clone()).await;
         return;
     }
     // Enable jemalloc's background page-decay thread where supported (Linux), so
@@ -22421,9 +22340,9 @@ async fn main() {
     // router. Feature-gated; the default gateway build never includes it and the
     // non-console path keeps consuming `server` directly (byte-identical).
     #[cfg(feature = "console")]
-    crate::console::terminal_settings::init_from_env();
+    nano_server_console::terminal_settings::init_from_env();
     #[cfg(feature = "console")]
-    let console_router = crate::console::router(server.clone());
+    let console_router = nano_server_console::router(std::sync::Arc::new(server.clone()));
     // Build the generated (spec-first) console router while `server` is still
     // available — it is moved into the gateway router below.
     #[cfg(feature = "console")]
@@ -23456,7 +23375,7 @@ async fn main() {
     // Tell the console worker supervisor which port to dial for the command
     // stream when it spawns Deno worker subprocesses.
     #[cfg(feature = "console")]
-    crate::console::workers::set_gateway_port(local_port);
+    nano_server_console::workers::set_gateway_port(local_port);
 
     tracing::info!(
         "NanoBPM gateway REST stub server listening on http://{addr}{}",
@@ -23562,7 +23481,7 @@ async fn reap_supervised_projects() {
     #[cfg(feature = "console")]
     {
         tracing::info!("stopping supervised project runs");
-        crate::console::projects::supervisor().stop_all().await;
+        nano_server_console::projects::supervisor().stop_all().await;
     }
 }
 

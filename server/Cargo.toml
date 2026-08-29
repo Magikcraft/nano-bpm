@@ -48,6 +48,13 @@ nano-server-raft = { path = "crates/nano-server-raft" }
 # Console-only: gated on the `console` feature, so the default gateway build
 # never compiles it.
 nano-trace-store = { path = "crates/nano-trace-store", optional = true }
+# Low-level serve/listener primitives (ADR 0064 Phase 3): the `TCP_NODELAY`
+# listener wrapper and the `PeerAddr` connect-info newtype. Extracted so the
+# console crate can name the exact `ConnectInfo<PeerAddr>` type this binary
+# registers; used unconditionally by the serve path (a console-free build still
+# wires the connect-info newtype), so it is a plain (non-optional) dependency.
+nano-server-net = { path = "crates/nano-server-net" }
+nano-server-console = { path = "crates/nano-server-console", optional = true }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
@@ -79,42 +86,6 @@ tracing-appender = "0.2"
 openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
 anyhow = "1.0.102"
 
-# Embedded web console assets (the built Vite/React SPA under ../console/dist).
-# Feature-gated so the default gateway build is byte-identical and never needs a
-# built frontend. In debug builds rust-embed reads the files from disk (live
-# reload); release builds bake them into the binary for a self-contained
-# single-file distribution.
-rust-embed = { version = "8", optional = true }
-mime_guess = { version = "2", optional = true }
-
-# Console-only: build a `file://` URL for the Node loader-bootstrap passed via
-# `--import`. Node's ESM loader rejects a raw absolute path on Windows (a
-# `C:\...` argument parses as URL scheme `c:` → ERR_UNSUPPORTED_ESM_URL_SCHEME),
-# so paths outside the child CWD must be handed over as file URLs. Already in the
-# dependency graph transitively; declared here only to use it directly.
-url = { version = "2", optional = true }
-
-# Cross-platform PTY for the IDE's integrated terminal (issue #496): wezterm's
-# `portable-pty` abstracts over Unix openpty and Windows ConPTY so one code path
-# serves all hosts. Console-only + loopback-gated + opt-in (NANO_CONSOLE_TERMINAL)
-# — a full shell is arbitrary code execution, so it never widens the default
-# gateway's attack surface.
-portable-pty = { version = "0.9", optional = true }
-
-# Console-only HTTP client for the cluster-health probe: each node probes its
-# peers' always-on `GET /v2/topology` to report remote liveness/version/latency
-# in the Topology tab. hyper(-util) is already in the tree via axum, and peers
-# speak plain HTTP (no TLS — same as the Falcon uplink), so this adds no
-# new TLS stack. serde_json (already a dependency) parses the probed
-# `gatewayVersion`.
-hyper = { version = "1", features = ["client", "http1"], optional = true }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
-http-body-util = { version = "0.1", optional = true }
-flate2 = "1.1.9"
-# CRC-32 for the console's "export workers as an application" zip writer (a tiny
-# self-contained STORED-archive builder, see console/worker_export.rs). Already
-# in the lock as a transitive flate2 dep, so promoting it is offline-safe.
-crc32fast = "1"
 base64 = "0.22.1"
 tower-http = { version = "0.7.0", features = ["cors"] }
 # Unix filesystem stats (statvfs) for the disk-relative adaptive read-model
@@ -149,12 +120,12 @@ nano-server-storage = { path = "crates/nano-server-storage", features = ["test-h
 # gateway binary. Off by default — the production gateway build is unaffected and
 # does not require a built frontend under ../console/dist.
 [features]
-console = ["dep:nanobpm-console-api", "dep:nano-trace-store", "dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:portable-pty", "dep:url", "tokio/process", "tokio/io-util", "nano-server-storage/console", "nano-server-runtime/console"]
+console = ["dep:nanobpm-console-api", "dep:nano-trace-store", "tokio/process", "tokio/io-util", "nano-server-storage/console", "nano-server-runtime/console", "dep:nano-server-console"]
 # ADR 0034: build the console with the lean "observe" operator profile instead of
 # the full "studio" IDE. Additive over `console` — it only swaps the embedded
 # bundle from `console/dist` to `console/dist-observe` (~158KB gzip vs ~4.7MB),
 # so build that folder first with `npm run build:observe` in `console/`.
-console-observe = ["console"]
+console-observe = ["console", "nano-server-console/console-observe"]
 # Diagnostic-only: builds jemalloc with heap profiling (--enable-prof) and turns
 # on sampled allocation-backtrace capture at startup. Adds per-allocation
 # sampling overhead, so it is NEVER enabled in a production build — it exists to
@@ -242,3 +213,7 @@ warnings = "deny"
 # macOS unwinding outright). It's a platform-local artifact the deployed
 # x86_64-linux binary never emits, so we allow just this lint.
 linker_messages = "allow"
+
+[build-dependencies]
+# Shared version-stamp derivation (ADR 0064), also used by nano-server-console.
+nano-version-stamp = { path = "crates/nano-version-stamp" }

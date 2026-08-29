@@ -43,7 +43,7 @@ code is derived**:
 
 Nano's **own** console already proves the target pattern end-to-end: `spec-console/console-api.yaml`
 is the single source of truth from which `@hey-api/openapi-ts` generates the client SDK and
-`server/src/console/generated_api.rs` generates the controller layer, leaving humans to write only
+`server/src/console_api.rs` generates the controller layer, leaving humans to write only
 the delegated implementations. Urban apps should get the same contract-first surface Nano dogfoods.
 
 ## Decision

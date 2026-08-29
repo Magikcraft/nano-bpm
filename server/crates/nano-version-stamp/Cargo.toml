@@ -1,0 +1,14 @@
+[package]
+name = "nano-version-stamp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Shared build-script helper (ADR 0064). Derives the reported gateway version
+# from the single source of truth — the pushed `NANOBPM_VERSION` release tag,
+# falling back to `git describe`, then the crate version — and re-exports it to
+# the compiling crate as the `NANOBPM_VERSION` env. Used from every crate that
+# stamps the version (the gateway binary and the extracted console crate) so the
+# derivation lives in exactly one place and the two can never drift.
+
+[dependencies]

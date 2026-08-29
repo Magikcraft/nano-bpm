@@ -1,0 +1,12 @@
+[package]
+name = "nano-server-net"
+version = "0.0.16"
+edition = "2024"
+publish = false
+description = "Low-level serve/listener primitives shared by the nanobpm gateway binary and the extracted console crate (ADR 0064 Phase 3): the `TCP_NODELAY` listener wrapper and the `PeerAddr` connect-info newtype. Extracted so the console crate can name the exact `ConnectInfo<PeerAddr>` type the binary registers, while the `Connected` impl (which references the local listener) satisfies the orphan rule by living beside the type."
+
+[dependencies]
+# `axum::serve::Listener` + `axum::extract::connect_info::{Connected, IncomingStream}`.
+axum = { version = "0.8" }
+# The wrapped `TcpListener`/`TcpStream` the listener accepts on.
+tokio = { version = "1", features = ["net", "time"] }

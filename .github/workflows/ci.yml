@@ -139,11 +139,11 @@ jobs:
             # counts as success for branch protection) and still merges.
             # `spec-console/**` is intentionally NOT excluded: an API spec change
             # alters the generated Rust axum traits, so the server build must
-            # re-validate that `generated_api.rs` still satisfies them.
+            # re-validate that `console_api.rs` still satisfies them.
             code:
               - '**'
               - '!website/**'
-              - '!server/src/console/landing.html'
+              - '!server/crates/nano-server-console/src/landing.html'
               - '!console/**'
               - '!spec-app/**'
               - '!docs/**/*.md'
@@ -151,8 +151,8 @@ jobs:
       - name: Guard landing.html removal while still referenced by include_str!
         run: |
           set -euo pipefail
-          if [ ! -f server/src/console/landing.html ] && grep -q 'include_str!("landing.html")' server/src/console/mod.rs; then
-            echo '::error file=server/src/console/mod.rs::server/src/console/landing.html is missing but server/src/console/mod.rs still include_str!("landing.html").'
+          if [ ! -f server/crates/nano-server-console/src/landing.html ] && grep -q 'include_str!("landing.html")' server/crates/nano-server-console/src/lib.rs; then
+            echo '::error file=server/crates/nano-server-console/src/lib.rs::server/crates/nano-server-console/src/landing.html is missing but server/crates/nano-server-console/src/lib.rs still include_str!("landing.html").'
             exit 1
           fi
   fmt:
@@ -484,11 +484,11 @@ jobs:
         run: node website/build.mjs
       - name: Fail if the console landscape artifact is stale
         # website/build.mjs also renders the shared landscape table into
-        # server/src/console/landscape.gen.html (single source of truth for both
+        # server/crates/nano-server-console/src/landscape.gen.html (single source of truth for both
         # /architecture#landscape and the console /stack page). Fail if the
         # committed artifact doesn't match a fresh render (the maker edited
         # website/data/landscape.json but forgot `node website/build.mjs`).
-        run: git diff --exit-code -- server/src/console/landscape.gen.html
+        run: git diff --exit-code -- server/crates/nano-server-console/src/landscape.gen.html
 
   website-snippet:
     name: website snippet (typecheck)
@@ -756,7 +756,7 @@ jobs:
         with:
           deno-version: v2.x
       - name: Typecheck + unit-test the server console TS (ADR 0040)
-        # server/src/console/*.ts is the JS half of the console gateway — the fuse
+        # server/crates/nano-server-console/src/*.ts is the JS half of the console gateway — the fuse
         # composition algebra (`resolveShapes`), the typed model-metadata accessor
         # (`emitMeta`), and the structured Fused Domain Model emitter
         # (`emitDomainModelJson`) — embedded into the Rust binary via `include_str!`
@@ -768,7 +768,7 @@ jobs:
         # `data_cli.ts` is intentionally excluded: it imports the SDK's hyphenated
         # emit-time filenames (`./domain-types.ts`) that only exist post-render, so
         # it is not type-checkable in-tree and no test imports it.
-        run: deno test --allow-read --allow-write --allow-env server/src/console/
+        run: deno test --allow-read --allow-write --allow-env server/crates/nano-server-console/src/
 
 
   engine-wasm-release-guard:
