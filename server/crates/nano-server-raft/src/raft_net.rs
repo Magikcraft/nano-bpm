@@ -100,7 +100,7 @@ pub(crate) fn encode_rpc_payload(json: String) -> (String, bool) {
 
 /// Reverses [`encode_rpc_payload`]: returns the raw JSON, decompressing iff
 /// `compressed`.
-pub(crate) fn decode_rpc_payload(payload: &str, compressed: bool) -> Result<String, String> {
+pub fn decode_rpc_payload(payload: &str, compressed: bool) -> Result<String, String> {
     if !compressed {
         return Ok(payload.to_string());
     }
@@ -391,7 +391,7 @@ impl RaftTransport for LocalCluster {
 /// The production transport: carries a partition's Raft RPCs to peer nodes over
 /// the cluster's existing falcon WebSocket. The target [`NodeId`] is the
 /// cluster node id, so it maps straight onto the [`PeerSet`] uplink; the RPC is
-/// serialized into a [`crate::falcon::ClientFrame::Raft`] frame and the
+/// serialized into a [`nano_falcon_protocol::ClientFrame::Raft`] frame and the
 /// peer answers with the serialized [`RaftRpcResponse`] in its `CommandResult`.
 #[derive(Clone)]
 pub struct PeerTransport {

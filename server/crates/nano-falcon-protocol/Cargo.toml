@@ -1,0 +1,19 @@
+[package]
+name = "nano-falcon-protocol"
+version = "0.0.16"
+edition = "2024"
+publish = false
+description = "Falcon protocol wire types of the nanobpm gateway server (ADR 0064 Phase 2): ClientFrame/ServerFrame and their payload enums, plus the intra-cluster handshake auth constant and secret reader. The ServerImpl-driven falcon handlers/dispatcher stay in the binary (Phase 3 seam)."
+
+[dependencies]
+# The frame payloads carry engine-core value types (`Event`, `AdHocJobResult`,
+# `TaskListenerJobResult`); `serde` is required for those to (de)serialize on
+# the wire.
+nanobpmn-engine-core = { path = "../../../engine-core", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+[lints.rust]
+# Project policy: warnings are banned. `cargo build`/`check` fail on any rustc
+# warning (unused code, deprecations, future-incompat lints, etc.).
+warnings = "deny"

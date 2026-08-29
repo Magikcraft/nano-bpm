@@ -28,6 +28,19 @@ nanobpmn-read-model = { path = "../read-model", features = ["native"] }
 # `main.rs` re-exports its modules at the crate root so existing
 # `crate::journal::…` paths keep resolving.
 nano-server-storage = { path = "crates/nano-server-storage" }
+# Falcon protocol wire types (ADR 0064 Phase 2). The falcon handlers/dispatcher
+# stay in this binary (`src/falcon.rs`), which re-exports the frames at that
+# module's root so its handler code is unchanged.
+nano-falcon-protocol = { path = "crates/nano-falcon-protocol" }
+# Runtime/engine-glue layer (ADR 0064 Phase 2): backpressure, drain guard,
+# recovery throttle, runtime config, placement, cluster topology, the deepthi
+# engine actor, the partition router, and cmd_profile. Re-exported at the crate
+# root so existing `crate::deepthi::…` etc. paths keep resolving.
+nano-server-runtime = { path = "crates/nano-server-runtime" }
+# Raft/consensus layer (ADR 0064 Phase 2): the openraft state machine, log
+# store, falcon-backed transport, and peer uplink. Re-exported at the crate root
+# so existing `crate::raft::…` etc. paths keep resolving.
+nano-server-raft = { path = "crates/nano-server-raft" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
@@ -129,7 +142,7 @@ nano-server-storage = { path = "crates/nano-server-storage", features = ["test-h
 # gateway binary. Off by default — the production gateway build is unaffected and
 # does not require a built frontend under ../console/dist.
 [features]
-console = ["dep:nanobpm-console-api", "dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:portable-pty", "dep:url", "tokio/process", "tokio/io-util", "nano-server-storage/console"]
+console = ["dep:nanobpm-console-api", "dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:portable-pty", "dep:url", "tokio/process", "tokio/io-util", "nano-server-storage/console", "nano-server-runtime/console"]
 # ADR 0034: build the console with the lean "observe" operator profile instead of
 # the full "studio" IDE. Additive over `console` — it only swaps the embedded
 # bundle from `console/dist` to `console/dist-observe` (~158KB gzip vs ~4.7MB),

@@ -1,0 +1,37 @@
+[package]
+name = "nano-server-raft"
+version = "0.0.16"
+edition = "2024"
+publish = false
+description = "Raft/consensus layer of the nanobpm gateway server (ADR 0064 Phase 2): the per-partition openraft state machine (raft), the segmented-journal-backed log store (raft_logstore), the falcon-backed raft transport (raft_net), and the intra-cluster peer uplink (peer). The only openraft consumer."
+
+[dependencies]
+# Lower workspace layers this consensus layer builds on.
+nano-server-storage = { path = "../nano-server-storage" }
+nano-server-runtime = { path = "../nano-server-runtime" }
+# Falcon wire frames: `raft_net` serializes RPCs into `ClientFrame::Raft` and
+# `peer` speaks the full intra-cluster frame vocabulary.
+nano-falcon-protocol = { path = "../nano-falcon-protocol" }
+nanobpmn-engine-core = { path = "../../../engine-core", features = ["serde"] }
+# Vendored openraft 0.9.24 (the `[patch.crates-io]` at the workspace root pins
+# the correctness fix). This crate is the primary — and only — openraft consumer.
+openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "fs"] }
+# WebSocket *client* for the intra-cluster peer uplink (`peer.rs`): a node speaks
+# the same Falcon protocol it serves. `ws://` only — the cluster mesh is a
+# trusted private network.
+tokio-tungstenite = "0.29"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
+tracing = "0.1"
+anyhow = "1.0.102"
+# Raft log frame compression in `raft_logstore` and base64 payload framing in
+# `raft_net`.
+flate2 = "1.1.9"
+base64 = "0.22.1"
+
+[lints.rust]
+# Project policy: warnings are banned. `cargo build`/`check` fail on any rustc
+# warning (unused code, deprecations, future-incompat lints, etc.).
+warnings = "deny"

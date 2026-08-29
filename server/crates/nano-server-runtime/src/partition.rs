@@ -273,7 +273,10 @@ impl Partitions {
     }
 
     /// Number of partitions.
-    #[allow(dead_code)]
+    // A `Partitions` always owns at least one partition, so there is no
+    // meaningful `is_empty`; `len` is used only by the gateway binary's tests
+    // (dead in a plain build, hence the `dead_code` allow).
+    #[allow(dead_code, clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.router.partition_count()
     }
