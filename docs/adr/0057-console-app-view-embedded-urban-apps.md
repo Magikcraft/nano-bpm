@@ -77,6 +77,34 @@ operator — but the console never becomes a stream proxy. Because the agentic c
 (not a console- or engine-hosted relay), the cockpit's transport is **identical whether it runs framed
 or standalone**: in both cases it is just the app's frontend talking to the app's backend.
 
+#### Amendment (issue #1054): byte-opaque WebSocket tunneling through the app-view proxy
+
+The principle above — *the app's frontend talking to the app's backend* — is preserved, but its
+original implementation ("the console never proxies the stream") broke the embedded case. When the
+cockpit is viewed **framed**, its live terminal derives its WebSocket URL from `location.host`, which
+resolves to the **console** origin, not the app's loopback port. The app-view HTTP reverse proxy
+(`/console/app-view/{name}/…`) rejected every `Upgrade` request with `501`, so the framed terminal
+could never reach the app's agentic channel and sat forever "waiting for live output". The rejected
+alternative — the app self-connecting to its own origin — requires every browser to reach the app's
+raw loopback port, which breaks hosted/remote consoles and forces each app to re-derive its
+externally-reachable URL.
+
+The app-view proxy therefore **tunnels WebSockets transparently**: a request whose `Connection` header
+contains `upgrade` and whose `Upgrade` header is `websocket` is upgraded at the console and bridged
+bidirectionally to the app's own UI port, as a **byte-opaque pipe**. This keeps the ADR's core property
+true at the byte level (the app's frontend still talks to the app's backend; the console is a dumb pipe
+in between), under strict guardrails:
+
+- **Byte-opaque.** The console does not parse, filter, or mutate frames.
+- **No credential injection.** The tunnel injects no auth; the app self-authenticates end-to-end (the
+  app's own token rides the upgrade), so §2's trust model is unchanged — the console gains no
+  privileged reach into the stream.
+- **WebSocket-only.** Any *other* `Upgrade` token (e.g. `h2c`) is still refused with `501`; the console
+  is not a general stream proxy.
+- **Same guards as HTTP.** Upstream resolution is identical to the HTTP path (unsafe name → 400, app
+  not running → 503, headless → 404), resolved once at connect time; an unreachable app is a `502`, and
+  if the app dies mid-session the browser socket is closed cleanly.
+
 ### 4. Typed, versioned handshake
 
 A small message contract, versioned, everything inert/mediated:

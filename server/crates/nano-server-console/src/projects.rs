@@ -6918,6 +6918,29 @@ impl ProjectSupervisor {
         }
     }
 
+    /// Test-only: mark `name` as running with a handshake-detected UI `port`
+    /// (0 ⇒ headless). Lets the app-view proxy tests drive `is_running` /
+    /// `app_ui` on the *global* supervisor without spawning a real app process.
+    #[cfg(test)]
+    pub(crate) async fn test_force_running(&self, name: &str, port: u16) {
+        let inner = self.entry(name).await;
+        *inner.phase.lock().await = Phase::Running;
+        inner
+            .detected_port
+            .store(u32::from(port), Ordering::Relaxed);
+    }
+
+    /// Test-only: return `name` to the stopped state seeded by
+    /// [`test_force_running`], so a shared global-supervisor entry doesn't leak
+    /// a "running" verdict into a later test.
+    #[cfg(test)]
+    pub(crate) async fn test_force_stopped(&self, name: &str) {
+        if let Some(inner) = self.existing_entry(name).await {
+            *inner.phase.lock().await = Phase::Stopped;
+            inner.detected_port.store(0, Ordering::Relaxed);
+        }
+    }
+
     pub async fn log_history(&self, name: &str) -> Vec<LogLine> {
         let inner = self.entry(name).await;
         inner.log_ring.lock().await.iter().cloned().collect()

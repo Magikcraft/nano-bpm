@@ -21,8 +21,11 @@ use std::time::Duration;
 
 use axum::{
     Router,
-    extract::{ConnectInfo, Path, Query, RawQuery, State},
-    http::{HeaderMap, StatusCode, header},
+    extract::{
+        ConnectInfo, FromRequestParts, Path, Query, RawQuery, State,
+        ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, StatusCode, header, request::Parts},
     response::{
         IntoResponse, Json, Redirect, Response,
         sse::{Event, KeepAlive, Sse},
@@ -30,6 +33,7 @@ use axum::{
     routing::{any, get},
 };
 use futures_util::stream::{Stream, unfold};
+use futures_util::{SinkExt, StreamExt};
 use nano_server_runtime::backpressure::SlaMode;
 use nano_server_runtime::cluster::{RecoveryCounts, Topology};
 use nano_server_storage::readstore::ReadModel;
@@ -215,11 +219,12 @@ pub fn router(server: ConsoleServerRef) -> Router {
                 .patch(gateway_proxy),
         )
         // Console App View reverse proxy (ADR 0057, issue #638 — Slice 5). A dumb
-        // same-origin HTTP passthrough to a *running* app's declared UI port on
+        // same-origin passthrough to a *running* app's declared UI port on
         // loopback, so the studio can frame the app's own UI even when the host
         // isn't the user's machine (and without mixed content). It injects no
-        // auth (the app authenticates itself) and does NOT proxy WebSocket/other
-        // streams (ADR 0057 §3 — the console never becomes a stream proxy).
+        // auth (the app authenticates itself). HTTP is proxied directly;
+        // WebSocket upgrades are tunneled byte-opaquely to the same port (ADR
+        // 0057 §3 amendment, issue #1054). Other Upgrade streams stay refused.
         .route("/console/app-view/{name}", any(app_view_root_redirect))
         .route("/console/app-view/{name}/", any(app_view_proxy_index))
         .route("/console/app-view/{name}/{*rest}", any(app_view_proxy))
@@ -1147,9 +1152,10 @@ async fn app_view_proxy_index(
     RawQuery(query): RawQuery,
     method: axum::http::Method,
     headers: HeaderMap,
+    MaybeWebSocketUpgrade(ws): MaybeWebSocketUpgrade,
     body: axum::body::Bytes,
 ) -> Response {
-    app_view_proxy_inner(name, String::new(), query, method, headers, body).await
+    app_view_proxy_inner(name, String::new(), query, method, headers, ws, body).await
 }
 
 /// Wildcard (`/console/app-view/{name}/{*rest}`).
@@ -1158,9 +1164,32 @@ async fn app_view_proxy(
     RawQuery(query): RawQuery,
     method: axum::http::Method,
     headers: HeaderMap,
+    MaybeWebSocketUpgrade(ws): MaybeWebSocketUpgrade,
     body: axum::body::Bytes,
 ) -> Response {
-    app_view_proxy_inner(name, rest, query, method, headers, body).await
+    app_view_proxy_inner(name, rest, query, method, headers, ws, body).await
+}
+
+/// An optional [`WebSocketUpgrade`] extractor: `Some` for a well-formed
+/// WebSocket handshake, `None` for a plain HTTP request. `WebSocketUpgrade`
+/// itself has no `OptionalFromRequestParts` impl (a non-WS request is a hard
+/// rejection), so the app-view proxy — one route that must serve *both* HTTP
+/// and WebSocket — wraps it here to branch at runtime.
+struct MaybeWebSocketUpgrade(Option<WebSocketUpgrade>);
+
+impl<S> FromRequestParts<S> for MaybeWebSocketUpgrade
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Infallible> {
+        Ok(Self(
+            WebSocketUpgrade::from_request_parts(parts, state)
+                .await
+                .ok(),
+        ))
+    }
 }
 
 async fn app_view_proxy_inner(
@@ -1169,43 +1198,44 @@ async fn app_view_proxy_inner(
     query: Option<String>,
     method: axum::http::Method,
     headers: HeaderMap,
+    ws: Option<WebSocketUpgrade>,
     body: axum::body::Bytes,
 ) -> Response {
     if !workspace::is_safe_name(&name) {
         return (StatusCode::BAD_REQUEST, "invalid project name").into_response();
     }
 
-    // Refuse to proxy WebSocket / other Upgrade streams: the console never
-    // becomes a stream proxy (ADR 0057 §3). Urban's page runtime polls over
-    // plain HTTP, so UI apps still work.
-    if headers
+    // Upgrade streams. Transparent WebSocket tunneling (ADR 0057 §3, issue
+    // #1054): a request whose `Connection` header contains `upgrade` AND whose
+    // `Upgrade` header is `websocket` is bridged byte-opaquely to the app's own
+    // UI port (see `app_view_ws_tunnel`). Any OTHER `Upgrade` token (e.g. `h2c`)
+    // is still refused with 501 — this path is WebSocket-only, and the console
+    // never becomes a general stream proxy.
+    let connection_upgrades = headers
         .get(header::CONNECTION)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_ascii_lowercase().contains("upgrade"))
-        .unwrap_or(false)
-        || headers.contains_key(header::UPGRADE)
-    {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "WebSocket/Upgrade proxying is not supported for the app view",
-        )
-            .into_response();
+        .unwrap_or(false);
+    if connection_upgrades || headers.contains_key(header::UPGRADE) {
+        let is_websocket = headers
+            .get(header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
+        return match (is_websocket, ws) {
+            (true, Some(ws)) => app_view_ws_tunnel(ws, name, rest, query, headers).await,
+            _ => (
+                StatusCode::NOT_IMPLEMENTED,
+                "only WebSocket upgrades are proxied for the app view; other \
+                 Upgrade streams are not supported",
+            )
+                .into_response(),
+        };
     }
 
-    let sup = projects::supervisor();
-    if !sup.is_running(&name).await {
-        return (StatusCode::SERVICE_UNAVAILABLE, "app is not running").into_response();
-    }
-    let ui = sup.app_ui(&name).await;
-    let port = match ui.port {
-        Some(p) if ui.enabled => p,
-        _ => {
-            return (
-                StatusCode::NOT_FOUND,
-                "app declares no embedded UI (headless)",
-            )
-                .into_response();
-        }
+    let port = match app_view_resolve_port(&name).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
 
     let url = match query.as_deref() {
@@ -1283,6 +1313,214 @@ async fn app_view_proxy_inner(
         out_headers.append(k.clone(), v.clone());
     }
     out
+}
+
+/// Resolve a running app's embedded-UI loopback port, or the error response the
+/// proxy should return. Shared by the HTTP and WebSocket paths so both enforce
+/// the ADR 0057 guards in the same order: `is_running` → 503, then the app must
+/// declare a reachable UI port → else 404 (headless). The safe-name check
+/// happens earlier, in `app_view_proxy_inner`.
+async fn app_view_resolve_port(name: &str) -> Result<u16, Response> {
+    let sup = projects::supervisor();
+    if !sup.is_running(name).await {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "app is not running").into_response());
+    }
+    let ui = sup.app_ui(name).await;
+    match ui.port {
+        Some(p) if ui.enabled => Ok(p),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            "app declares no embedded UI (headless)",
+        )
+            .into_response()),
+    }
+}
+
+/// Transparent WebSocket tunnel for the app-view proxy (ADR 0057 §3, issue
+/// #1054).
+///
+/// The gateway completes the WS handshake with the browser and opens a client
+/// connection to the app's own UI port, then bridges frames bidirectionally as
+/// a byte-opaque pipe (see [`app_view_ws_bridge`]). It parses no frames, injects
+/// no credentials, and does not re-resolve the port mid-stream — the app
+/// self-authenticates end-to-end, exactly as on the HTTP path.
+///
+/// Ordering matters: the upstream connection is opened *before* the browser
+/// handshake completes, so (a) an unreachable app fails fast as a 502 rather
+/// than a half-open browser socket, and (b) the subprotocol the app selects can
+/// be echoed back to the browser in the same 101 response.
+async fn app_view_ws_tunnel(
+    ws: WebSocketUpgrade,
+    name: String,
+    rest: String,
+    query: Option<String>,
+    headers: HeaderMap,
+) -> Response {
+    let port = match app_view_resolve_port(&name).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
+    let target = match query.as_deref() {
+        Some(q) if !q.is_empty() => format!("ws://127.0.0.1:{port}/{rest}?{q}"),
+        _ => format!("ws://127.0.0.1:{port}/{rest}"),
+    };
+
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = match target.as_str().into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("upstream ws {target}: {e}"),
+            )
+                .into_response();
+        }
+    };
+    // Forward the browser's requested subprotocol(s) upstream verbatim so the
+    // app can negotiate against them.
+    if let Some(proto) = headers.get(header::SEC_WEBSOCKET_PROTOCOL).cloned() {
+        request
+            .headers_mut()
+            .insert(header::SEC_WEBSOCKET_PROTOCOL, proto);
+    }
+
+    let (upstream, response) = match tokio_tungstenite::connect_async(request).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("upstream ws {target}: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    // Echo the app-selected subprotocol back to the browser. `WebSocketUpgrade`
+    // only writes it into the 101 when the browser actually offered it, which it
+    // did (we forwarded that same list upstream), so negotiation is preserved.
+    let ws = match response
+        .headers()
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(selected) => ws.protocols([selected.to_owned()]),
+        None => ws,
+    };
+
+    ws.on_upgrade(move |browser| app_view_ws_bridge(browser, upstream))
+}
+
+/// The upstream half of an app-view WebSocket tunnel: a client connection to the
+/// app's loopback UI port.
+type AppViewUpstream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Bridges one browser WebSocket to one upstream app WebSocket for the life of
+/// the connection, copying frames verbatim in both directions.
+///
+/// A single `select!` loop owns both sockets and awaits each `send` before
+/// reading the next frame, so neither direction can buffer unboundedly — the
+/// same streaming-backpressure discipline the HTTP proxy documents and the PTY
+/// socket relies on. When either side closes (a Close frame, EOF, or a transport
+/// error) the close is propagated to the peer and the loop tears both halves
+/// down, so a dead app can never leave a half-open browser socket spinning.
+async fn app_view_ws_bridge(browser: WebSocket, upstream: AppViewUpstream) {
+    let (mut browser_tx, mut browser_rx) = browser.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream.split();
+
+    loop {
+        tokio::select! {
+            from_browser = browser_rx.next() => {
+                match from_browser {
+                    Some(Ok(msg)) => {
+                        let closing = matches!(msg, Message::Close(_));
+                        if upstream_tx.send(axum_to_tungstenite(msg)).await.is_err() {
+                            break;
+                        }
+                        if closing {
+                            break;
+                        }
+                    }
+                    // Browser closed or errored: signal the app and stop.
+                    _ => {
+                        let _ = upstream_tx
+                            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+                            .await;
+                        break;
+                    }
+                }
+            }
+            from_upstream = upstream_rx.next() => {
+                match from_upstream {
+                    Some(Ok(msg)) => {
+                        let closing =
+                            matches!(msg, tokio_tungstenite::tungstenite::Message::Close(_));
+                        if let Some(msg) = tungstenite_to_axum(msg)
+                            && browser_tx.send(msg).await.is_err()
+                        {
+                            break;
+                        }
+                        if closing {
+                            break;
+                        }
+                    }
+                    // App gone (EOF or transport error) mid-session: close the
+                    // browser socket cleanly with a "going away" frame.
+                    _ => {
+                        let _ = browser_tx
+                            .send(Message::Close(Some(CloseFrame {
+                                code: 1001,
+                                reason: Utf8Bytes::from_static("upstream app closed"),
+                            })))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = upstream_tx.close().await;
+    let _ = browser_tx.close().await;
+}
+
+/// Convert a browser (axum) frame into its upstream (tungstenite) equivalent.
+/// Byte-opaque: payloads move verbatim; no inspection or mutation.
+fn axum_to_tungstenite(msg: Message) -> tokio_tungstenite::tungstenite::Message {
+    use tokio_tungstenite::tungstenite::Message as Ts;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame as TsCloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    match msg {
+        Message::Text(t) => Ts::Text(t.as_str().into()),
+        Message::Binary(b) => Ts::Binary(b),
+        Message::Ping(b) => Ts::Ping(b),
+        Message::Pong(b) => Ts::Pong(b),
+        Message::Close(Some(cf)) => Ts::Close(Some(TsCloseFrame {
+            code: CloseCode::from(cf.code),
+            reason: cf.reason.as_str().into(),
+        })),
+        Message::Close(None) => Ts::Close(None),
+    }
+}
+
+/// Convert an upstream (tungstenite) frame into its browser (axum) equivalent.
+/// Raw `Frame` frames are dropped (never surfaced by a read), as recommended by
+/// the tungstenite maintainers.
+fn tungstenite_to_axum(msg: tokio_tungstenite::tungstenite::Message) -> Option<Message> {
+    use tokio_tungstenite::tungstenite::Message as Ts;
+    match msg {
+        Ts::Text(t) => Some(Message::Text(t.as_str().into())),
+        Ts::Binary(b) => Some(Message::Binary(b)),
+        Ts::Ping(b) => Some(Message::Ping(b)),
+        Ts::Pong(b) => Some(Message::Pong(b)),
+        Ts::Close(Some(cf)) => Some(Message::Close(Some(CloseFrame {
+            code: u16::from(cf.code),
+            reason: cf.reason.as_str().into(),
+        }))),
+        Ts::Close(None) => Some(Message::Close(None)),
+        Ts::Frame(_) => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4112,6 +4350,328 @@ mod app_view_proxy_tests {
             app_view_rewrite_location("//evil.example/x", "acme", 3000),
             "//evil.example/x"
         );
+    }
+}
+
+// Transparent WebSocket tunneling through the app-view proxy (ADR 0057 §3,
+// issue #1054). These drive the real routes end-to-end: a WS client → the
+// console proxy → a mock upstream app WS, with the global supervisor seeded to
+// report the mock as the "running" app's UI port.
+#[cfg(test)]
+mod app_view_ws_tests {
+    // Each test serializes on a std Mutex guard (`glock`) held across `.await`
+    // and a few return the large tungstenite handshake error — both are benign
+    // here and mirror the existing supervisor-test pattern.
+    #![allow(clippy::await_holding_lock)]
+    #![allow(clippy::result_large_err)]
+
+    use super::{app_view_proxy, app_view_proxy_index};
+    use axum::Router;
+    use axum::routing::any;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+    // The proxy resolves the upstream through the *global* supervisor, so these
+    // tests share process-wide state. Serialize them; each still uses a distinct
+    // project name so their supervisor entries never collide.
+    fn glock() -> MutexGuard<'static, ()> {
+        static L: OnceLock<Mutex<()>> = OnceLock::new();
+        L.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Bring up the app-view proxy routes on an ephemeral loopback port.
+    async fn start_console() -> u16 {
+        let app = Router::new()
+            .route("/console/app-view/{name}/", any(app_view_proxy_index))
+            .route("/console/app-view/{name}/{*rest}", any(app_view_proxy));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        port
+    }
+
+    /// A mock upstream app: negotiates a subprotocol (echoes the first the
+    /// client offered) and echoes every data frame. When it observes the
+    /// client's Close it signals `on_close` (if provided) so a test can assert
+    /// browser→upstream close propagation. Returns the bound port.
+    async fn start_echo_upstream(on_close: Option<mpsc::UnboundedSender<()>>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let on_close = on_close.clone();
+                tokio::spawn(async move {
+                    let callback = |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                                    mut resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                        if let Some(proto) = req
+                            .headers()
+                            .get("sec-websocket-protocol")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.split(',').next())
+                            .map(|s| s.trim().to_owned())
+                            && let Ok(hv) = HeaderValue::from_str(&proto)
+                        {
+                            resp.headers_mut().insert("sec-websocket-protocol", hv);
+                        }
+                        Ok(resp)
+                    };
+                    let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, callback).await
+                    else {
+                        return;
+                    };
+                    while let Some(Ok(msg)) = ws.next().await {
+                        match msg {
+                            WsMessage::Text(_) | WsMessage::Binary(_) => {
+                                if ws.send(msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                            WsMessage::Close(_) => {
+                                if let Some(tx) = &on_close {
+                                    let _ = tx.send(());
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// A mock upstream that, on connect, sends one Text frame then closes — to
+    /// assert upstream→browser close propagation.
+    async fn start_closing_upstream() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    let _ = ws.send(WsMessage::text("hello")).await;
+                    let _ = ws.send(WsMessage::Close(None)).await;
+                });
+            }
+        });
+        port
+    }
+
+    /// Open a browser-side WS to the console proxy for project `name`/`path`.
+    async fn connect(
+        console_port: u16,
+        name: &str,
+        path: &str,
+        subprotocols: &[&str],
+    ) -> Result<
+        (
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tokio_tungstenite::tungstenite::handshake::client::Response,
+        ),
+        tokio_tungstenite::tungstenite::Error,
+    > {
+        let url = format!("ws://127.0.0.1:{console_port}/console/app-view/{name}/{path}");
+        let mut request = url.into_client_request().unwrap();
+        if !subprotocols.is_empty() {
+            request.headers_mut().insert(
+                "sec-websocket-protocol",
+                HeaderValue::from_str(&subprotocols.join(", ")).unwrap(),
+            );
+        }
+        tokio_tungstenite::connect_async(request).await
+    }
+
+    #[tokio::test]
+    async fn upgrade_happy_path_round_trips_frames_and_negotiates_subprotocol() {
+        let _g = glock();
+        let name = "ws_happy";
+        let upstream = start_echo_upstream(None).await;
+        super::projects::supervisor()
+            .test_force_running(name, upstream)
+            .await;
+        let console = start_console().await;
+
+        let (mut ws, resp) = connect(console, name, "agentic", &["v1.nano", "other"])
+            .await
+            .expect("handshake should succeed");
+        // The app-selected subprotocol is echoed back to the browser.
+        assert_eq!(
+            resp.headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some("v1.nano"),
+        );
+
+        // Text round-trips.
+        ws.send(WsMessage::text("ping")).await.unwrap();
+        match ws.next().await {
+            Some(Ok(WsMessage::Text(t))) => assert_eq!(t.as_str(), "ping"),
+            other => panic!("expected echoed text, got {other:?}"),
+        }
+        // Binary round-trips.
+        ws.send(WsMessage::binary(vec![1u8, 2, 3])).await.unwrap();
+        match ws.next().await {
+            Some(Ok(WsMessage::Binary(b))) => assert_eq!(&b[..], &[1, 2, 3]),
+            other => panic!("expected echoed binary, got {other:?}"),
+        }
+
+        super::projects::supervisor().test_force_stopped(name).await;
+    }
+
+    #[tokio::test]
+    async fn upstream_close_reaches_the_browser() {
+        let _g = glock();
+        let name = "ws_upclose";
+        let upstream = start_closing_upstream().await;
+        super::projects::supervisor()
+            .test_force_running(name, upstream)
+            .await;
+        let console = start_console().await;
+
+        let (mut ws, _) = connect(console, name, "agentic", &[]).await.unwrap();
+        // First the data frame, then a clean close propagated from upstream.
+        assert!(matches!(ws.next().await, Some(Ok(WsMessage::Text(_)))));
+        let mut saw_close = matches!(ws.next().await, Some(Ok(WsMessage::Close(_))) | None);
+        if !saw_close {
+            saw_close = matches!(ws.next().await, Some(Ok(WsMessage::Close(_))) | None);
+        }
+        assert!(saw_close, "upstream close should reach the browser");
+
+        super::projects::supervisor().test_force_stopped(name).await;
+    }
+
+    #[tokio::test]
+    async fn browser_close_reaches_the_upstream() {
+        let _g = glock();
+        let name = "ws_downclose";
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let upstream = start_echo_upstream(Some(tx)).await;
+        super::projects::supervisor()
+            .test_force_running(name, upstream)
+            .await;
+        let console = start_console().await;
+
+        let (mut ws, _) = connect(console, name, "agentic", &[]).await.unwrap();
+        ws.send(WsMessage::Close(None)).await.unwrap();
+        // Drain so the close handshake completes.
+        while ws.next().await.transpose().ok().flatten().is_some() {}
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .ok()
+            .flatten();
+        assert!(
+            observed.is_some(),
+            "browser close should reach the upstream"
+        );
+
+        super::projects::supervisor().test_force_stopped(name).await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_path_503_when_app_not_running() {
+        let _g = glock();
+        let console = start_console().await;
+        // A name that was never marked running resolves to not-running → 503.
+        match connect(console, "ws_stopped", "agentic", &[]).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                assert_eq!(resp.status().as_u16(), 503);
+            }
+            other => panic!("expected 503 Http error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_path_404_when_app_is_headless() {
+        let _g = glock();
+        let name = "ws_headless";
+        // Running, but no reachable UI port (detected port 0) → headless → 404.
+        super::projects::supervisor()
+            .test_force_running(name, 0)
+            .await;
+        let console = start_console().await;
+        match connect(console, name, "agentic", &[]).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                assert_eq!(resp.status().as_u16(), 404);
+            }
+            other => panic!("expected 404 Http error, got {other:?}"),
+        }
+        super::projects::supervisor().test_force_stopped(name).await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_path_400_on_unsafe_name() {
+        let _g = glock();
+        let console = start_console().await;
+        // `%24bad` decodes to `$bad`, which `is_safe_name` rejects → 400.
+        match connect(console, "%24bad", "agentic", &[]).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                assert_eq!(resp.status().as_u16(), 400);
+            }
+            other => panic!("expected 400 Http error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_websocket_upgrade_token_still_501() {
+        let _g = glock();
+        let name = "ws_h2c";
+        // Running with a real port so the 501 is decided by the upgrade token,
+        // not by a guard firing first.
+        let upstream = start_echo_upstream(None).await;
+        super::projects::supervisor()
+            .test_force_running(name, upstream)
+            .await;
+        let console = start_console().await;
+
+        // Raw HTTP GET with `Upgrade: h2c` — a non-WebSocket upgrade.
+        let raw = tokio::net::TcpStream::connect(("127.0.0.1", console))
+            .await
+            .unwrap();
+        let (mut rd, mut wr) = raw.into_split();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let req = format!(
+            "GET /console/app-view/{name}/agentic HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: h2c\r\n\
+             \r\n"
+        );
+        wr.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        // Read the status line + headers.
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = rd.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&buf);
+        assert!(
+            head.starts_with("HTTP/1.1 501"),
+            "non-WebSocket Upgrade must still 501, got: {head:?}"
+        );
+
+        super::projects::supervisor().test_force_stopped(name).await;
     }
 }
 
