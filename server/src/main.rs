@@ -1822,7 +1822,7 @@ pub struct ServerImpl {
     /// the exporter thread (process-optimization design doc §3). In-memory and
     /// bounded; served under `/console/api/traces`. Console builds only.
     #[cfg(feature = "console")]
-    pub trace_store: Arc<console::trace::TraceStore>,
+    pub trace_store: Arc<nano_trace_store::TraceStore>,
 }
 
 /// RAII counter for the request-processing concurrency gauge: bumps the gauge on
@@ -2347,7 +2347,7 @@ impl ServerImpl {
             cluster_variables: ClusterVariableStore::new(cluster_variables),
             job_statistics: JobStatisticsState::default(),
             #[cfg(feature = "console")]
-            trace_store: Arc::new(console::trace::TraceStore::from_env()),
+            trace_store: Arc::new(nano_trace_store::TraceStore::from_env()),
         }
     }
 }
@@ -3058,7 +3058,7 @@ fn spawn_exporter(
     inflight: Arc<AtomicUsize>,
     activity: Arc<AtomicU64>,
     retirements: Option<RetirementBuffer>,
-    #[cfg(feature = "console")] trace_store: Arc<console::trace::TraceStore>,
+    #[cfg(feature = "console")] trace_store: Arc<nano_trace_store::TraceStore>,
 ) {
     // Read-model history retention (per shard): how many terminal
     // (Completed/Terminated) instances to retain before the oldest are evicted

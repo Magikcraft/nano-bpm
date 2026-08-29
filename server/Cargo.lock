@@ -1488,6 +1488,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-trace-store"
+version = "0.0.16"
+dependencies = [
+ "nanobpmn-engine-core",
+ "nanobpmn-read-model",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nanobpm-console-api"
 version = "0.1.0"
 dependencies = [
@@ -1561,6 +1571,7 @@ dependencies = [
  "nano-server-raft",
  "nano-server-runtime",
  "nano-server-storage",
+ "nano-trace-store",
  "nanobpm-console-api",
  "nanobpm-gateway-rest",
  "nanobpmn-engine-core",

@@ -88,6 +88,7 @@ server/
                             # runtime_config, placement, cluster, deepthi, partition
     nano-falcon-protocol/   # ClientFrame/ServerFrame wire types only
     nano-server-raft/       # raft, raft_logstore, raft_net, peer
+    nano-trace-store/       # TraceStore (shared leaf crate; breaks the console↔core cycle)
     nano-server-console/    # console/* — requires the ServerImpl seam (below)
 ```
 
@@ -136,7 +137,28 @@ End state takes the always-compiled binary from ~103k to ~55k lines; with consol
 ## Open questions
 
 - Phase 3 seam choice: shared `nano-server-core` crate vs. trait seam for console's
-  `ServerImpl` usage — decided when Phase 3 is scoped.
+  `ServerImpl` usage.
+  - **Step 1 (done, #1050): `TraceStore` extracted into the `nano-trace-store` leaf
+    crate**, breaking the `ServerImpl.trace_store: Arc<console::trace::TraceStore>` ↔
+    `console → crate::ServerImpl` import cycle (knot #2 of the audit). Both the binary and
+    a future console crate can now depend on it; the console module aliases it back
+    (`pub use nano_trace_store as trace;`) so intra-console `trace::…` paths are unchanged.
+  - **Open sub-decision blocking the rest of Phase 3 — the `generated_api.rs` orphan-rule
+    knot.** `server/src/console/generated_api.rs` holds **14 `impl apis::* for ServerImpl`
+    blocks** (the generated `nanobpm-console-api` Api traits) and makes **~92 `super::` calls**
+    into `console/mod.rs` DTO/mapping logic. Rust's orphan rule requires an
+    `impl ForeignTrait for ForeignType` to live in the crate that defines the trait
+    (`nanobpm-console-api`, generated — not editable) **or** the type (`ServerImpl`). So under
+    option (a) — `ServerImpl` in `nano-server-core`, `nano-server-console` depends on core —
+    these 14 impls **must** live in core, but their ~92 calls into console logic would then
+    make **core depend on console**, re-forming a cycle. Option (a) is therefore only viable
+    if `generated_api.rs` **and the `console/mod.rs` DTO/mapping functions it calls** also move
+    into `nano-server-core` (a larger core than the ADR's one-line sketch implies, which
+    shrinks the compile-time win Phase 3 targets), or if option (b)'s trait seam is used to keep
+    the console-facing surface out of core. The concrete boundary — how much of `console/mod.rs`
+    crosses into core with the Api-trait impls, vs. (b) a `ConsoleServer` trait over the ~15
+    `ServerImpl` methods console calls — is the decision that scopes the remainder of Phase 3
+    and shapes Phase 4 (#1051); it is deliberately left for that scoping rather than guessed.
 - Is test relocation (Phase 4) worth the visibility promotion it requires, or do the inline
   test modules stay in the binary where `pub(crate)` access is free?
 - Does `console-observe` (ADR 0034) need any feature-graph reshaping once console is its own

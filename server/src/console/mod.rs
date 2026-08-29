@@ -47,7 +47,11 @@ pub(super) mod pty;
 pub mod server_update;
 pub(crate) mod standalone;
 pub(super) mod terminal_settings;
-pub mod trace;
+// The in-memory instance-trace store was extracted into the `nano-trace-store`
+// leaf crate (ADR 0064 Phase 3) to break the console↔core import cycle. Alias
+// it back to `trace` here so every `trace::…` path in this module keeps
+// resolving unchanged.
+pub use nano_trace_store as trace;
 pub mod trigger_sources;
 pub mod triggers;
 pub mod urban;
