@@ -1248,7 +1248,7 @@ async fn app_view_proxy_inner(
 
     let port = match app_view_resolve_port(&name).await {
         Ok(p) => p,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let url = match query.as_deref() {
@@ -1333,19 +1333,23 @@ async fn app_view_proxy_inner(
 /// the ADR 0057 guards in the same order: `is_running` → 503, then the app must
 /// declare a reachable UI port → else 404 (headless). The safe-name check
 /// happens earlier, in `app_view_proxy_inner`.
-async fn app_view_resolve_port(name: &str) -> Result<u16, Response> {
+async fn app_view_resolve_port(name: &str) -> Result<u16, Box<Response>> {
     let sup = projects::supervisor();
     if !sup.is_running(name).await {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "app is not running").into_response());
+        return Err(Box::new(
+            (StatusCode::SERVICE_UNAVAILABLE, "app is not running").into_response(),
+        ));
     }
     let ui = sup.app_ui(name).await;
     match ui.port {
         Some(p) if ui.enabled => Ok(p),
-        _ => Err((
-            StatusCode::NOT_FOUND,
-            "app declares no embedded UI (headless)",
-        )
-            .into_response()),
+        _ => Err(Box::new(
+            (
+                StatusCode::NOT_FOUND,
+                "app declares no embedded UI (headless)",
+            )
+                .into_response(),
+        )),
     }
 }
 
@@ -1373,7 +1377,7 @@ async fn app_view_ws_tunnel(
 ) -> Response {
     let port = match app_view_resolve_port(&name).await {
         Ok(p) => p,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let target = match query.as_deref() {
