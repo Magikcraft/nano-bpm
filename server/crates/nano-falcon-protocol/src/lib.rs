@@ -342,7 +342,7 @@ pub enum ClientFrame {
         /// receiver — never materialized into an intermediate `serde_json::Value`
         /// DOM (which, for a large variables map, would allocate a node per field).
         /// When `zip` is set the string is raw-deflate + base64 (large payloads
-        /// only — see `crate::raft_net::encode_rpc_payload`).
+        /// only — see `nano_server_raft::raft_net::encode_rpc_payload`).
         rpc: String,
         /// Whether `rpc` is deflate+base64 compressed. Absent ⇒ `false` (raw JSON),
         /// so small control RPCs add no field and older raw frames still parse.
@@ -371,7 +371,7 @@ pub enum ClientFrame {
     /// follower replica applies each `CreateInstance` but never the matching
     /// retirement, so completed instances accumulate as never-reaped `Active` shells
     /// (the RF>1 hot-state leak). On receipt the follower drops these keys from its
-    /// replica engine (`crate::journal::Journal::retire_instances`). Fire-and-forget
+    /// replica engine (`nano_server_storage::journal::Journal::retire_instances`). Fire-and-forget
     /// (no `corr`) and idempotent: a dropped/stale digest only delays retirement
     /// (memory converges on the next digest), and a lagging learner that has not yet
     /// applied a create simply ignores the miss (it is re-snapshotted from the leader).
@@ -383,7 +383,7 @@ pub enum ClientFrame {
     /// Loss-tolerant reconciliation backstop for [`ClientFrame::RetirementDigest`]
     /// (RF>1). The partition owner broadcasts `low_water` — the smallest key still
     /// `Active` on it — every tick; on receipt a follower drops every resident
-    /// replica instance below it (`crate::journal::Journal::retire_below`). Unlike
+    /// replica instance below it (`nano_server_storage::journal::Journal::retire_below`). Unlike
     /// the per-key digest this is idempotent and self-healing: because the mark is
     /// re-sent each tick and reaps below it wholesale, a follower converges even
     /// when best-effort per-key frames are dropped under load. Fire-and-forget (no
@@ -431,7 +431,7 @@ pub enum ClientFrame {
     /// peer so the whole cluster applies a single, uniform admission policy (a
     /// split — some nodes shedding to preserve latency while others keep admitting
     /// — would make client behaviour depend on which node routed the create).
-    /// `mode` is the `crate::backpressure::SlaMode` string (`"latency"` /
+    /// `mode` is the `nano_server_runtime::backpressure::SlaMode` string (`"latency"` /
     /// `"admission"`). Fire-and-forget (no `corr`): the recipient applies it
     /// locally and does **not** re-broadcast (no fan-out loop); a briefly
     /// unreachable node keeps its prior mode until the next switch or a restart
