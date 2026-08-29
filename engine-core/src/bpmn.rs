@@ -1897,7 +1897,9 @@ struct NodeAcc {
     /// For service tasks: the resolved job type (defaults to the id at build).
     job_type: Option<String>,
     /// For call activities: the `calledElement` / `zeebe:calledElement processId`
-    /// of the invoked process, expanded inline at assembly time.
+    /// of the invoked process. Executed natively as a child process instance;
+    /// inline expansion at assembly time is a legacy opt-in (used by the
+    /// processos harness).
     called_process_id: Option<String>,
     /// For call activities: the `zeebe:calledElement propagateAllParentVariables`
     /// flag. `None` when the attribute is absent (defaults to `true` at build,
