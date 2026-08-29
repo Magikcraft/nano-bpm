@@ -100,7 +100,8 @@ in between), under strict guardrails:
   app's own token rides the upgrade), so §2's trust model is unchanged — the console gains no
   privileged reach into the stream.
 - **WebSocket-only.** Any *other* `Upgrade` token (e.g. `h2c`) is still refused with `501`; the console
-  is not a general stream proxy.
+  is not a general stream proxy. An `Upgrade: websocket` request whose handshake is *malformed* (missing
+  or invalid `Sec-WebSocket-*` headers) is a client error → `400`, not `501`.
 - **Same guards as HTTP.** Upstream resolution is identical to the HTTP path (unsafe name → 400, app
   not running → 503, headless → 404), resolved once at connect time; an unreachable app is a `502`, and
   if the app dies mid-session the browser socket is closed cleanly.

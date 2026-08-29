@@ -1171,10 +1171,15 @@ async fn app_view_proxy(
 }
 
 /// An optional [`WebSocketUpgrade`] extractor: `Some` for a well-formed
-/// WebSocket handshake, `None` for a plain HTTP request. `WebSocketUpgrade`
-/// itself has no `OptionalFromRequestParts` impl (a non-WS request is a hard
-/// rejection), so the app-view proxy — one route that must serve *both* HTTP
-/// and WebSocket — wraps it here to branch at runtime.
+/// WebSocket handshake, `None` otherwise — which covers *both* a plain HTTP
+/// request *and* a request that advertises `Upgrade: websocket` but whose
+/// handshake is malformed (the extractor's rejection is swallowed by `.ok()`
+/// below). Callers that need to tell those two `None` cases apart must inspect
+/// the `Upgrade` header themselves (see `app_view_proxy_inner`, which maps a
+/// malformed WS handshake to 400 and a non-WS upgrade token to 501).
+/// `WebSocketUpgrade` itself has no `OptionalFromRequestParts` impl (a non-WS
+/// request is a hard rejection), so the app-view proxy — one route that must
+/// serve *both* HTTP and WebSocket — wraps it here to branch at runtime.
 struct MaybeWebSocketUpgrade(Option<WebSocketUpgrade>);
 
 impl<S> FromRequestParts<S> for MaybeWebSocketUpgrade
@@ -1184,6 +1189,8 @@ where
     type Rejection = Infallible;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Infallible> {
+        // `.ok()` swallows the rejection, so `None` here means either "not a
+        // WebSocket request at all" or "WebSocket handshake was malformed".
         Ok(Self(
             WebSocketUpgrade::from_request_parts(parts, state)
                 .await
@@ -1208,9 +1215,10 @@ async fn app_view_proxy_inner(
     // Upgrade streams. Transparent WebSocket tunneling (ADR 0057 §3, issue
     // #1054): a request whose `Connection` header contains `upgrade` AND whose
     // `Upgrade` header is `websocket` is bridged byte-opaquely to the app's own
-    // UI port (see `app_view_ws_tunnel`). Any OTHER `Upgrade` token (e.g. `h2c`)
-    // is still refused with 501 — this path is WebSocket-only, and the console
-    // never becomes a general stream proxy.
+    // UI port (see `app_view_ws_tunnel`). A `websocket` token whose handshake is
+    // malformed (so extraction yielded `None`) is a client error → 400. Any
+    // OTHER `Upgrade` token (e.g. `h2c`) is refused with 501 — this path is
+    // WebSocket-only, and the console never becomes a general stream proxy.
     let connection_upgrades = headers
         .get(header::CONNECTION)
         .and_then(|v| v.to_str().ok())
@@ -1224,7 +1232,12 @@ async fn app_view_proxy_inner(
             .unwrap_or(false);
         return match (is_websocket, ws) {
             (true, Some(ws)) => app_view_ws_tunnel(ws, name, rest, query, headers).await,
-            _ => (
+            (true, None) => (
+                StatusCode::BAD_REQUEST,
+                "malformed WebSocket handshake for the app view",
+            )
+                .into_response(),
+            (false, _) => (
                 StatusCode::NOT_IMPLEMENTED,
                 "only WebSocket upgrades are proxied for the app view; other \
                  Upgrade streams are not supported",
@@ -4365,16 +4378,18 @@ mod app_view_ws_tests {
     #![allow(clippy::await_holding_lock)]
     #![allow(clippy::result_large_err)]
 
-    use super::{app_view_proxy, app_view_proxy_index};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
     use axum::Router;
     use axum::routing::any;
     use futures_util::{SinkExt, StreamExt};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+    use super::{app_view_proxy, app_view_proxy_index};
 
     // The proxy resolves the upstream through the *global* supervisor, so these
     // tests share process-wide state. Serialize them; each still uses a distinct
@@ -4669,6 +4684,56 @@ mod app_view_ws_tests {
         assert!(
             head.starts_with("HTTP/1.1 501"),
             "non-WebSocket Upgrade must still 501, got: {head:?}"
+        );
+
+        super::projects::supervisor().test_force_stopped(name).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_websocket_handshake_is_400() {
+        let _g = glock();
+        let name = "ws_malformed";
+        // Real port so the status is decided by the (malformed) handshake, not
+        // by a guard firing first.
+        let upstream = start_echo_upstream(None).await;
+        super::projects::supervisor()
+            .test_force_running(name, upstream)
+            .await;
+        let console = start_console().await;
+
+        // `Upgrade: websocket` but WITHOUT the mandatory `Sec-WebSocket-Key` /
+        // `Sec-WebSocket-Version` headers → `WebSocketUpgrade` extraction fails,
+        // so this is a malformed WS handshake, which must be a 400 (client
+        // error) rather than a 501 (non-WS upgrade token).
+        let raw = tokio::net::TcpStream::connect(("127.0.0.1", console))
+            .await
+            .unwrap();
+        let (mut rd, mut wr) = raw.into_split();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let req = format!(
+            "GET /console/app-view/{name}/agentic HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             \r\n"
+        );
+        wr.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = rd.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&buf);
+        assert!(
+            head.starts_with("HTTP/1.1 400"),
+            "malformed WebSocket handshake must be 400, got: {head:?}"
         );
 
         super::projects::supervisor().test_force_stopped(name).await;
