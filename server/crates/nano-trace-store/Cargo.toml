@@ -1,0 +1,20 @@
+[package]
+name = "nano-trace-store"
+version = "0.0.16"
+edition = "2024"
+publish = false
+description = "Shared in-memory instance-trace store for the nanobpm gateway (ADR 0064 Phase 3). Extracted from the console module's `trace.rs` into its own leaf crate so that both the core server crate (which owns the `ServerImpl.trace_store` field) and the console crate can depend on it without forming an import cycle."
+
+[dependencies]
+nanobpmn-engine-core = { path = "../../../engine-core", features = ["serde"] }
+# `value_to_json` (engine `Value` → `serde_json::Value`) lives in the shared
+# read-model crate so the trace store and the read-model projection share one
+# encoding. The `native` backend is inert here (only the pure conversion helper
+# is used) but matches the workspace's feature unification.
+nanobpmn-read-model = { path = "../../../read-model", features = ["native"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints.rust]
+# Project policy: warnings are banned.
+warnings = "deny"

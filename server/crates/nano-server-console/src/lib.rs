@@ -13,7 +13,9 @@
 //! - Everything here is additive and feature-gated, so the default gateway build
 //!   is unaffected.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -28,26 +30,29 @@ use axum::{
     routing::{any, get},
 };
 use futures_util::stream::{Stream, unfold};
+use nano_server_runtime::backpressure::SlaMode;
+use nano_server_runtime::cluster::{RecoveryCounts, Topology};
+use nano_server_storage::readstore::ReadModel;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-
-use crate::ServerImpl;
-use crate::backpressure::SlaMode;
 
 pub mod agent_brief;
 pub mod config;
 pub mod connectors;
 mod envelope_scan;
 pub mod extensions;
-mod generated_api;
 pub mod projects;
-pub(super) mod pty;
+pub mod pty;
 pub mod server_update;
-pub(crate) mod standalone;
-pub(super) mod terminal_settings;
-pub mod trace;
+pub mod standalone;
+pub mod terminal_settings;
+// The in-memory instance-trace store was extracted into the `nano-trace-store`
+// leaf crate (ADR 0064 Phase 3) to break the console↔core import cycle. Alias
+// it back to `trace` here so every `trace::…` path in this module keeps
+// resolving unchanged.
+pub use nano_trace_store as trace;
 pub mod trigger_sources;
 pub mod triggers;
 pub mod urban;
@@ -56,7 +61,8 @@ pub mod workers;
 pub mod workspace;
 
 /// The built frontend bundle. Path is relative to this source file
-/// (`server/src/console/`), so it points at the repo-level `console/dist`.
+/// (`server/crates/nano-server-console/src/`), so it points at the repo-level
+/// `console/dist`.
 ///
 /// ADR 0034 ships two console build profiles. The default `console` feature
 /// bakes in the full "studio" RAD IDE from `console/dist`. The additive
@@ -65,12 +71,12 @@ pub mod workspace;
 /// `npm run build:observe` in `console/`. Only one `Assets` is compiled.
 #[cfg(not(feature = "console-observe"))]
 #[derive(RustEmbed)]
-#[folder = "../console/dist"]
+#[folder = "../../../console/dist"]
 struct Assets;
 
 #[cfg(feature = "console-observe")]
 #[derive(RustEmbed)]
-#[folder = "../console/dist-observe"]
+#[folder = "../../../console/dist-observe"]
 struct Assets;
 
 /// The standalone marketing landing page (self-contained: inline canvas particle
@@ -120,12 +126,61 @@ static STACK_PAGE: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// Result of a console API core handler: a JSON body on success, or an HTTP
-/// status + message on failure. The generated trait layer (`generated_api`)
-/// maps these onto the spec's typed response variants.
-pub(super) type ApiResult = Result<serde_json::Value, (StatusCode, String)>;
+/// status + message on failure. The binary's generated trait layer
+/// (`server/src/console_api.rs`) maps these onto the spec's typed response
+/// variants.
+pub type ApiResult = Result<serde_json::Value, (StatusCode, String)>;
+
+/// The console's view of the running gateway node (ADR 0064 Phase 3, Option B
+/// seam).
+///
+/// The web console reaches the live gateway **only** through this object-safe
+/// trait, so the binary's `ServerImpl` god-object never crosses the crate
+/// boundary. The binary implements it in `server/src/console_api.rs` and hands
+/// the [`router`] an `Arc<dyn ConsoleServer>` ([`ConsoleServerRef`]). Every
+/// console handler takes `&dyn ConsoleServer`, and the binary's generated
+/// `impl apis::* for ServerImpl` blocks pass `&ServerImpl`, which coerces.
+#[async_trait::async_trait]
+pub trait ConsoleServer: Send + Sync + 'static {
+    /// The read-model projection backing every list/detail view.
+    fn store(&self) -> &Arc<ReadModel>;
+
+    /// The in-memory instance-trace store (studio "Traces" tab).
+    fn trace_store(&self) -> &trace::TraceStore;
+
+    /// The static cluster topology (node/partition/replica layout).
+    fn cluster_topology(&self) -> &Topology;
+
+    /// The current backpressure SLA mode.
+    fn sla_mode(&self) -> SlaMode;
+
+    /// Switch the backpressure SLA mode at runtime.
+    async fn switch_sla_mode(&self, mode: SlaMode);
+
+    /// Whether Raft replication is enabled on this node.
+    fn raft_enabled(&self) -> bool;
+
+    /// Per-node recovery counters for the topology dashboard.
+    fn recovery_counts(&self) -> RecoveryCounts;
+
+    /// Live Raft leader/term for a partition this node hosts, as
+    /// `(current_leader, current_term)`; `None` when the node does not host the
+    /// group (the caller then falls back to the static topology leader).
+    fn raft_partition_metrics(&self, partition: u64) -> Option<(Option<u32>, u64)>;
+
+    /// Overlay the live engine `Activated` lease state onto a set of job keys for
+    /// the instance-detail view. Returns an empty map when this node does not
+    /// host the partition (non-leader) — the caller then leaves the read-model
+    /// rows as-is.
+    async fn instance_job_overlay(&self, partition: u64, keys: Vec<u64>) -> HashMap<u64, LiveJob>;
+}
+
+/// A shared, type-erased handle to the gateway node — the console router's axum
+/// state (Option B seam, ADR 0064 Phase 3).
+pub type ConsoleServerRef = Arc<dyn ConsoleServer>;
 
 /// Mounts the console SPA and its JSON API onto the gateway.
-pub fn router(server: ServerImpl) -> Router {
+pub fn router(server: ConsoleServerRef) -> Router {
     Router::new()
         .route("/", get(landing))
         .route("/features", get(features))
@@ -634,7 +689,7 @@ async fn whitepaper_index(headers: HeaderMap) -> Response {
 }
 
 #[derive(Serialize)]
-pub(super) struct TopologyDto {
+pub struct TopologyDto {
     /// This gateway node's id.
     node_id: u32,
     num_nodes: u32,
@@ -677,11 +732,11 @@ struct PartitionDto {
 }
 
 /// `GET /console/api/topology` — the cluster/topology view's data source.
-pub(super) fn topology(server: &ServerImpl) -> TopologyDto {
-    let topology = server.engine.topology();
+pub fn topology(server: &dyn ConsoleServer) -> TopologyDto {
+    let topology = server.cluster_topology();
     let num_nodes = topology.num_nodes();
     let num_partitions = topology.num_partitions;
-    let raft_on = crate::raft_enabled();
+    let raft_on = server.raft_enabled();
 
     let nodes: Vec<NodeDto> = (0..num_nodes)
         .map(|node| NodeDto {
@@ -696,16 +751,8 @@ pub(super) fn topology(server: &ServerImpl) -> TopologyDto {
             let owner = topology.owner_of(p);
             // Prefer the live Raft leader/term when this node hosts the group;
             // fall back to the static topology leader otherwise.
-            let raft_part = server.raft_registry().get(p);
-            let (leader, term, hosted) = match raft_part {
-                Some(part) => {
-                    let m = part.raft.metrics().borrow().clone();
-                    (
-                        m.current_leader.map(|id| id as u32),
-                        Some(m.current_term),
-                        true,
-                    )
-                }
+            let (leader, term, hosted) = match server.raft_partition_metrics(p) {
+                Some((leader, term)) => (leader, Some(term), true),
                 None => (Some(topology.leader_of(p)), None, false),
             };
             // A partition is "recovering" when we can see its live leader (we host
@@ -745,7 +792,7 @@ pub(super) fn topology(server: &ServerImpl) -> TopologyDto {
 /// reachable right now, its gateway version, and the round-trip latency.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ClusterHealthDto {
+pub struct ClusterHealthDto {
     checked_at_ms: u64,
     nodes: Vec<NodeHealthDto>,
 }
@@ -775,8 +822,8 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// `GET /console/api/cluster/health` — probes every peer concurrently and
 /// reports live reachability/version/latency. Self is reported without a network
 /// round-trip (it is, by definition, up and serving this request).
-pub(super) async fn cluster_health(server: &ServerImpl) -> ClusterHealthDto {
-    let topology = server.engine.topology();
+pub async fn cluster_health(server: &dyn ConsoleServer) -> ClusterHealthDto {
+    let topology = server.cluster_topology();
     let self_id = topology.node_id;
     let self_version = env!("NANOBPM_VERSION").to_string();
     let num_nodes = topology.num_nodes();
@@ -1362,7 +1409,7 @@ async fn app_view_icon(Path(name): Path<String>) -> Response {
 /// the dashboard never perturbs a running performance demo.
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct MetricsDto {
+pub struct MetricsDto {
     /// Server clock at snapshot time (ms). The frontend uses successive
     /// timestamps as the exact dt for rate computation.
     timestamp_ms: u64,
@@ -1505,8 +1552,8 @@ fn recovery_dto_from_counts(
 /// Computes this node's [`RecoveryDto`] from the live Raft metrics of the groups
 /// it hosts, via the base-build [`crate::recovery_counts`] (shared with the
 /// Prometheus `/metrics` exporter so a local and a scraped node agree).
-fn build_recovery(server: &ServerImpl) -> RecoveryDto {
-    let c = crate::recovery_counts(server);
+fn build_recovery(server: &dyn ConsoleServer) -> RecoveryDto {
+    let c = server.recovery_counts();
     recovery_dto_from_counts(
         c.owned,
         c.reclaimed,
@@ -1519,8 +1566,8 @@ fn build_recovery(server: &ServerImpl) -> RecoveryDto {
 /// Builds this node's metrics snapshot DTO. Shared by `GET /console/api/metrics`
 /// (the local dashboard) and the self entry of the cluster-wide aggregation, so
 /// both report identical numbers.
-fn build_local_metrics(server: &ServerImpl) -> MetricsDto {
-    let s = crate::metrics::snapshot();
+pub fn build_local_metrics(server: &dyn ConsoleServer) -> MetricsDto {
+    let s = nano_server_storage::metrics::snapshot();
 
     let mean_ms = |sum: f64, count: u64| {
         if count == 0 {
@@ -1546,7 +1593,7 @@ fn build_local_metrics(server: &ServerImpl) -> MetricsDto {
 
     MetricsDto {
         timestamp_ms,
-        active_instances: server.store.active_instance_count() as i64,
+        active_instances: server.store().active_instance_count() as i64,
 
         creates_rest: s.creates_rest,
         creates_stream: s.creates_stream,
@@ -1570,7 +1617,7 @@ fn build_local_metrics(server: &ServerImpl) -> MetricsDto {
 
         writer_busy_ratio: busy_ratio,
 
-        resident_bytes: crate::memory::resident_bytes().map(|b| b as u64),
+        resident_bytes: nano_server_storage::memory::resident_bytes().map(|b| b as u64),
 
         ceiling_throughput: s.ceiling_throughput_active,
         ceiling_memory: s.ceiling_memory_active,
@@ -1601,7 +1648,7 @@ fn build_local_metrics(server: &ServerImpl) -> MetricsDto {
 /// aggregate. Self is read locally (no round-trip).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ClusterMetricsDto {
+pub struct ClusterMetricsDto {
     checked_at_ms: u64,
     nodes: Vec<NodeMetricsDto>,
     aggregate: AggregateMetricsDto,
@@ -1635,15 +1682,21 @@ struct AggregateMetricsDto {
 
 /// `GET /console/api/cluster/metrics` — probes every node's metrics and returns
 /// the per-node breakdown plus a reachable-node aggregate.
-pub(super) async fn cluster_metrics(server: &ServerImpl) -> ClusterMetricsDto {
-    let topology = server.engine.topology();
+pub async fn cluster_metrics(server: &dyn ConsoleServer) -> ClusterMetricsDto {
+    let topology = server.cluster_topology();
     let self_id = topology.node_id;
     let num_nodes = topology.num_nodes();
+
+    // `build_local_metrics` only reads this node's state and is synchronous, so
+    // compute it once up front. Peer probes are the only async work, and they
+    // need just the address — this keeps the per-node futures `'static` without
+    // cloning a (now type-erased) `&dyn ConsoleServer` into them.
+    let self_metrics = build_local_metrics(server);
 
     let probes = (0..num_nodes).map(|node| {
         let is_self = node == self_id;
         let address = topology.peer_addr(node).unwrap_or("").to_string();
-        let server = server.clone();
+        let self_metrics = is_self.then(|| self_metrics.clone());
         async move {
             if is_self {
                 return NodeMetricsDto {
@@ -1652,7 +1705,7 @@ pub(super) async fn cluster_metrics(server: &ServerImpl) -> ClusterMetricsDto {
                     is_self: true,
                     reachable: true,
                     error: None,
-                    metrics: Some(build_local_metrics(&server)),
+                    metrics: self_metrics,
                 };
             }
             match probe_peer_metrics(&address).await {
@@ -2005,8 +2058,8 @@ struct InstanceDto {
     tags: Vec<String>,
 }
 
-impl From<&crate::readstore::ProcessInstanceRow> for InstanceDto {
-    fn from(r: &crate::readstore::ProcessInstanceRow) -> Self {
+impl From<&nano_server_storage::readstore::ProcessInstanceRow> for InstanceDto {
+    fn from(r: &nano_server_storage::readstore::ProcessInstanceRow) -> Self {
         InstanceDto {
             key: r.key.to_string(),
             process_id: r.process_id.clone(),
@@ -2025,7 +2078,7 @@ impl From<&crate::readstore::ProcessInstanceRow> for InstanceDto {
 /// render a pager without a second request.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct InstancePage {
+pub struct InstancePage {
     items: Vec<InstanceDto>,
     total: i64,
     page: i64,
@@ -2070,7 +2123,7 @@ struct IncidentDto {
 }
 
 #[derive(Serialize)]
-pub(super) struct InstanceDetailDto {
+pub struct InstanceDetailDto {
     instance: InstanceDto,
     variables: Vec<VariableDto>,
     jobs: Vec<JobDto>,
@@ -2084,7 +2137,7 @@ pub(super) struct InstanceDetailDto {
 /// active (sub)process bodies, so the Explorer overlay can highlight a waiting
 /// instance's location.
 #[derive(Serialize)]
-pub(super) struct ActiveElementDto {
+pub struct ActiveElementDto {
     element_id: String,
     element_type: String,
     element_name: Option<String>,
@@ -2095,7 +2148,7 @@ pub(super) struct ActiveElementDto {
 /// (`Active` / `Completed` / `Terminated`) — the same names the console
 /// projects for a row (see [`InstanceDto`]) — so "filter by what you see" holds.
 /// An unrecognized value yields `None`, i.e. no state constraint (unfiltered).
-pub(super) fn parse_instance_state_filter(
+pub fn parse_instance_state_filter(
     state: &str,
 ) -> Option<nanobpmn_engine_core::ProcessInstanceState> {
     use nanobpmn_engine_core::ProcessInstanceState;
@@ -2115,18 +2168,18 @@ pub(super) fn parse_instance_state_filter(
 /// materializing and sorting every row (which made the Process Explorer hang).
 /// The `filter` (state + has-incident) is applied server-side so the pager
 /// total and page boundaries stay correct.
-pub(super) fn instances(
-    server: &ServerImpl,
+pub fn instances(
+    server: &dyn ConsoleServer,
     page: i64,
     page_size: i64,
-    filter: crate::readstore::InstanceFilter,
+    filter: nano_server_storage::readstore::InstanceFilter,
 ) -> InstancePage {
     let page = page.max(0);
     let page_size = page_size.clamp(1, 500);
-    let total = server.store.process_instance_count(&filter);
+    let total = server.store().process_instance_count(&filter);
     let rows =
         server
-            .store
+            .store()
             .process_instances_page(page_size, page.saturating_mul(page_size), &filter);
     InstancePage {
         items: rows.iter().map(InstanceDto::from).collect(),
@@ -2140,11 +2193,11 @@ pub(super) fn instances(
 /// state (not the read model). Used to overlay the studio-only `Activated`
 /// status — see [`apply_job_activation_overlay`] and [`instance_detail`].
 #[derive(Clone, Debug)]
-struct LiveJob {
-    state: String,
-    worker: Option<String>,
-    deadline_ms: Option<u64>,
-    activated_at_ms: Option<u64>,
+pub struct LiveJob {
+    pub state: String,
+    pub worker: Option<String>,
+    pub deadline_ms: Option<u64>,
+    pub activated_at_ms: Option<u64>,
 }
 
 /// Overlays live engine job state onto read-model job DTOs (studio-only, nano
@@ -2203,12 +2256,12 @@ fn apply_job_activation_overlay(
 
 /// `GET /console/api/instances/{key}` — one instance with its variables, jobs,
 /// and incidents. Returns `None` when the key is malformed or unknown (404).
-pub(super) async fn instance_detail(server: &ServerImpl, key: &str) -> Option<InstanceDetailDto> {
+pub async fn instance_detail(server: &dyn ConsoleServer, key: &str) -> Option<InstanceDetailDto> {
     let key = key.parse::<u64>().ok()?;
-    let row = server.store.process_instance(key)?;
+    let row = server.store().process_instance(key)?;
 
     let variables: Vec<VariableDto> = server
-        .store
+        .store()
         .instance_variables(key)
         .iter()
         .map(|v| VariableDto {
@@ -2219,7 +2272,7 @@ pub(super) async fn instance_detail(server: &ServerImpl, key: &str) -> Option<In
         .collect();
 
     let mut jobs: Vec<JobDto> = server
-        .store
+        .store()
         .jobs()
         .iter()
         .filter(|j| j.instance_key == key)
@@ -2252,33 +2305,15 @@ pub(super) async fn instance_detail(server: &ServerImpl, key: &str) -> Option<In
         .filter(|d| d.state == "Created" || d.state == "Activated")
         .filter_map(|d| d.key.parse::<u64>().ok())
         .collect();
-    if !overlay_keys.is_empty()
-        && let Some(handle) = server.engine_handle_for(nanobpmn_engine_core::partition_of(key))
-    {
-        let live = handle
-            .with(move |journal| {
-                let mut m = std::collections::HashMap::new();
-                for k in overlay_keys {
-                    if let Some(job) = journal.engine().job(k) {
-                        m.insert(
-                            k,
-                            LiveJob {
-                                state: format!("{:?}", job.state),
-                                worker: job.worker.clone(),
-                                deadline_ms: job.deadline,
-                                activated_at_ms: job.activated_at,
-                            },
-                        );
-                    }
-                }
-                m
-            })
+    if !overlay_keys.is_empty() {
+        let live = server
+            .instance_job_overlay(nanobpmn_engine_core::partition_of(key), overlay_keys)
             .await;
         apply_job_activation_overlay(&mut jobs, &live);
     }
 
     let incidents: Vec<IncidentDto> = server
-        .store
+        .store()
         .incidents()
         .iter()
         .filter(|i| i.instance_key == key)
@@ -2293,7 +2328,7 @@ pub(super) async fn instance_detail(server: &ServerImpl, key: &str) -> Option<In
         .collect();
 
     let active_elements: Vec<ActiveElementDto> = server
-        .store
+        .store()
         .active_element_instances(key)
         .into_iter()
         .map(|e| ActiveElementDto {
@@ -2491,41 +2526,41 @@ mod job_activation_overlay_tests {
 
 /// (most-recent first). Backed by the in-memory [`trace::TraceStore`] folded
 /// off the engine event stream (process-optimization design doc §3, Tier A).
-pub(super) fn traces(server: &ServerImpl, limit: usize) -> Vec<trace::TraceSummaryDto> {
+pub fn traces(server: &dyn ConsoleServer, limit: usize) -> Vec<trace::TraceSummaryDto> {
     let limit = limit.clamp(1, 1000);
-    server.trace_store.list(limit)
+    server.trace_store().list(limit)
 }
 
 /// `GET /console/api/traces/{key}` — the full per-element trace for one
 /// instance. `None` when the key is malformed or no longer retained in the ring.
-pub(super) fn trace_detail(server: &ServerImpl, key: &str) -> Option<trace::InstanceTraceDto> {
+pub fn trace_detail(server: &dyn ConsoleServer, key: &str) -> Option<trace::InstanceTraceDto> {
     let key = key.parse::<u64>().ok()?;
-    server.trace_store.get(key)
+    server.trace_store().get(key)
 }
 
 /// `GET /console/api/traces/{key}/otel` — the instance trace rendered as an
 /// OTLP/JSON trace document (root process span + per-element + per-job spans),
 /// ingestible by an OpenTelemetry collector.
-pub(super) fn trace_otel(server: &ServerImpl, key: &str) -> Option<serde_json::Value> {
+pub fn trace_otel(server: &dyn ConsoleServer, key: &str) -> Option<serde_json::Value> {
     let key = key.parse::<u64>().ok()?;
-    server.trace_store.otel(key)
+    server.trace_store().otel(key)
 }
 
 /// `GET /console/api/traces/config` — the capture configuration and in-memory
 /// ring state of this node's [`trace::TraceStore`].
-pub(super) fn trace_config(server: &ServerImpl) -> trace::TraceConfigDto {
-    server.trace_store.config()
+pub fn trace_config(server: &dyn ConsoleServer) -> trace::TraceConfigDto {
+    server.trace_store().config()
 }
 
 /// `PUT /console/api/traces/config` — toggle variable / stimulus capture at
 /// runtime. Node-local and non-persistent (resets to the `NANOBPMN_TRACE_*`
 /// env defaults on restart). Returns the resulting configuration.
-pub(super) fn set_trace_config(
-    server: &ServerImpl,
+pub fn set_trace_config(
+    server: &dyn ConsoleServer,
     variables: Option<bool>,
     stimuli: Option<bool>,
 ) -> trace::TraceConfigDto {
-    server.trace_store.set_capture(variables, stimuli)
+    server.trace_store().set_capture(variables, stimuli)
 }
 
 /// `GET /console/api/stream` — Server-Sent Events feed for live updates.
@@ -2537,9 +2572,9 @@ pub(super) fn set_trace_config(
 /// fires immediately so the client syncs on connect; keep-alive comments keep
 /// intermediaries from dropping an idle connection.
 async fn stream(
-    State(server): State<ServerImpl>,
+    State(server): State<ConsoleServerRef>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let store = server.store.clone();
+    let store = server.store().clone();
     // `usize::MAX` as the seed guarantees the first poll differs, emitting an
     // immediate snapshot on connect.
     let s = unfold((store, usize::MAX), |(store, last)| async move {
@@ -2573,7 +2608,7 @@ async fn stream(
 /// `not_deployed` (no deployed definition for the model's primary process id),
 /// `in_sync` (deployed XML is byte-for-byte the file), `modified` (a definition
 /// is deployed but differs), or `unparsable` (the file is not valid BPMN).
-fn deploy_status_of(server: &ServerImpl, xml: &str) -> ModelStatus {
+fn deploy_status_of(server: &dyn ConsoleServer, xml: &str) -> ModelStatus {
     let process_ids: Vec<String> = match parse_bpmn(xml) {
         Ok(defs) => defs.iter().map(|d| d.id.clone()).collect(),
         Err(_) => {
@@ -2590,7 +2625,7 @@ fn deploy_status_of(server: &ServerImpl, xml: &str) -> ModelStatus {
     let primary = process_ids.first().cloned();
     let deployed = primary.as_ref().and_then(|id| {
         server
-            .store
+            .store()
             .process_definitions()
             .into_iter()
             // Deploy status compares against the current (latest) version, so
@@ -2601,7 +2636,7 @@ fn deploy_status_of(server: &ServerImpl, xml: &str) -> ModelStatus {
         None => ("not_deployed", None, None),
         Some(row) => {
             let deployed_xml = server
-                .store
+                .store()
                 .process_definition_xml(row.key)
                 .unwrap_or_default();
             let status = if deployed_xml == xml {
@@ -2650,7 +2685,7 @@ struct ModelDto {
 
 /// `GET /console/api/models` — the model library, with each model's deploy
 /// status relative to the engine. Sorted by name.
-pub(super) fn models(server: &ServerImpl) -> ApiResult {
+pub fn models(server: &dyn ConsoleServer) -> ApiResult {
     let names = workspace::list_model_names().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2679,7 +2714,7 @@ pub(super) fn models(server: &ServerImpl) -> ApiResult {
 }
 
 /// `GET /console/api/models/{name}` — one model's XML and deploy status.
-pub(super) fn model_get(server: &ServerImpl, name: &str) -> ApiResult {
+pub fn model_get(server: &dyn ConsoleServer, name: &str) -> ApiResult {
     let Some(path) = workspace::model_path(name) else {
         return Err((StatusCode::BAD_REQUEST, "invalid model name".to_string()));
     };
@@ -2699,7 +2734,7 @@ pub(super) fn model_get(server: &ServerImpl, name: &str) -> ApiResult {
 
 /// `PUT /console/api/models/{name}` — overwrite (save) a model's XML. The body
 /// is the raw BPMN XML. The model must already exist (use POST to create).
-pub(super) fn model_save(server: &ServerImpl, name: &str, xml: String) -> ApiResult {
+pub fn model_save(server: &dyn ConsoleServer, name: &str, xml: String) -> ApiResult {
     let Some(path) = workspace::model_path(name) else {
         return Err((StatusCode::BAD_REQUEST, "invalid model name".to_string()));
     };
@@ -2729,7 +2764,7 @@ pub(super) fn model_save(server: &ServerImpl, name: &str, xml: String) -> ApiRes
 
 /// `POST /console/api/models` — create a new model. 409 if a model with the
 /// same name already exists.
-pub(super) fn model_create(server: &ServerImpl, name: String, xml: String) -> ApiResult {
+pub fn model_create(server: &dyn ConsoleServer, name: String, xml: String) -> ApiResult {
     let Some(path) = workspace::model_path(&name) else {
         return Err((StatusCode::BAD_REQUEST, "invalid model name".to_string()));
     };
@@ -2765,7 +2800,7 @@ pub(super) fn model_create(server: &ServerImpl, name: String, xml: String) -> Ap
 
 /// `DELETE /console/api/models/{name}` — remove a model from the workspace.
 /// This never touches the engine; an already-deployed definition stays deployed.
-pub(super) fn model_delete(name: &str) -> ApiResult {
+pub fn model_delete(name: &str) -> ApiResult {
     let Some(path) = workspace::model_path(name) else {
         return Err((StatusCode::BAD_REQUEST, "invalid model name".to_string()));
     };
@@ -2827,7 +2862,7 @@ const WORKER_DENO_JSON: &str = r#"{
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct WorkerSummaryDto {
+pub struct WorkerSummaryDto {
     name: String,
     files: Vec<String>,
     updated_at_ms: u64,
@@ -2846,7 +2881,7 @@ struct BrowseQuery {
     path: Option<String>,
 }
 
-pub(super) async fn worker_summary(name: &str) -> Option<WorkerSummaryDto> {
+pub async fn worker_summary(name: &str) -> Option<WorkerSummaryDto> {
     let dir = workspace::worker_dir(name)?;
     if !dir.is_dir() {
         return None;
@@ -2863,7 +2898,7 @@ pub(super) async fn worker_summary(name: &str) -> Option<WorkerSummaryDto> {
 }
 
 /// `GET /console/api/workers` — list workers with files and runtime status.
-pub(super) async fn workers_list() -> ApiResult {
+pub async fn workers_list() -> ApiResult {
     let names = workspace::list_worker_names().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2884,7 +2919,7 @@ pub(super) async fn workers_list() -> ApiResult {
 }
 
 /// `POST /console/api/workers` — scaffold a new worker directory.
-pub(super) async fn worker_create(name: String, job_type: Option<String>) -> ApiResult {
+pub async fn worker_create(name: String, job_type: Option<String>) -> ApiResult {
     let Some(dir) = workspace::worker_dir(&name) else {
         return Err((StatusCode::BAD_REQUEST, "invalid worker name".to_string()));
     };
@@ -2918,12 +2953,12 @@ pub(super) async fn worker_create(name: String, job_type: Option<String>) -> Api
 }
 
 /// `GET /console/api/worker-sdk` — the embedded worker SDK TypeScript source.
-pub(super) fn worker_sdk_source() -> String {
+pub fn worker_sdk_source() -> String {
     worker_export::worker_sdk_source().to_string()
 }
 
 /// `GET /console/api/deno-types` — the embedded Deno namespace ambient types.
-pub(super) fn deno_types_source() -> String {
+pub fn deno_types_source() -> String {
     worker_export::deno_namespace_types().to_string()
 }
 
@@ -2974,7 +3009,7 @@ async fn workers_export(Json(body): Json<ExportWorkersBody>) -> Response {
 }
 
 /// `GET /console/api/workers/{name}` — one worker's files and runtime status.
-pub(super) async fn worker_get(name: &str) -> ApiResult {
+pub async fn worker_get(name: &str) -> ApiResult {
     match worker_summary(name).await {
         Some(s) => Ok(serde_json::to_value(s).unwrap()),
         None => Err((StatusCode::NOT_FOUND, "no such worker".to_string())),
@@ -2982,7 +3017,7 @@ pub(super) async fn worker_get(name: &str) -> ApiResult {
 }
 
 /// `DELETE /console/api/workers/{name}` — remove a worker (must be stopped).
-pub(super) async fn worker_delete(name: &str) -> ApiResult {
+pub async fn worker_delete(name: &str) -> ApiResult {
     let Some(dir) = workspace::worker_dir(name) else {
         return Err((StatusCode::BAD_REQUEST, "invalid worker name".to_string()));
     };
@@ -3005,7 +3040,7 @@ pub(super) async fn worker_delete(name: &str) -> ApiResult {
 }
 
 /// `GET /console/api/workers/{name}/file?path=worker.ts` — read a worker file.
-pub(super) fn worker_file_get(name: &str, rel: &str) -> Result<String, (StatusCode, String)> {
+pub fn worker_file_get(name: &str, rel: &str) -> Result<String, (StatusCode, String)> {
     let Some(path) = workspace::worker_file_path(name, rel) else {
         return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
@@ -3014,7 +3049,7 @@ pub(super) fn worker_file_get(name: &str, rel: &str) -> Result<String, (StatusCo
 
 /// `PUT /console/api/workers/{name}/file?path=worker.ts` — save (create or
 /// overwrite) a worker file. Body is the raw file content.
-pub(super) fn worker_file_save(name: &str, rel: &str, body: &str) -> ApiResult {
+pub fn worker_file_save(name: &str, rel: &str, body: &str) -> ApiResult {
     let Some(dir) = workspace::worker_dir(name) else {
         return Err((StatusCode::BAD_REQUEST, "invalid worker name".to_string()));
     };
@@ -3034,7 +3069,7 @@ pub(super) fn worker_file_save(name: &str, rel: &str, body: &str) -> ApiResult {
 }
 
 /// `POST /console/api/workers/{name}/file` — create a new empty worker file.
-pub(super) fn worker_file_create(name: &str, rel: &str) -> ApiResult {
+pub fn worker_file_create(name: &str, rel: &str) -> ApiResult {
     let Some(dir) = workspace::worker_dir(name) else {
         return Err((StatusCode::BAD_REQUEST, "invalid worker name".to_string()));
     };
@@ -3060,7 +3095,7 @@ pub(super) fn worker_file_create(name: &str, rel: &str) -> ApiResult {
 }
 
 /// `DELETE /console/api/workers/{name}/file?path=...` — remove a worker file.
-pub(super) fn worker_file_delete(name: &str, rel: &str) -> ApiResult {
+pub fn worker_file_delete(name: &str, rel: &str) -> ApiResult {
     let Some(path) = workspace::worker_file_path(name, rel) else {
         return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
@@ -3077,7 +3112,7 @@ pub(super) fn worker_file_delete(name: &str, rel: &str) -> ApiResult {
 }
 
 /// `POST /console/api/workers/{name}/start` — start the worker subprocess.
-pub(super) async fn worker_start(name: &str) -> ApiResult {
+pub async fn worker_start(name: &str) -> ApiResult {
     let sup = workers::supervisor();
     match sup.start(name).await {
         Ok(()) => Ok(serde_json::to_value(sup.runtime(name).await).unwrap()),
@@ -3092,7 +3127,7 @@ pub(super) async fn worker_start(name: &str) -> ApiResult {
 // ---------------------------------------------------------------------------
 
 /// `GET /console/api/lib` — list the shared library files.
-pub(super) fn lib_list() -> ApiResult {
+pub fn lib_list() -> ApiResult {
     match workspace::list_lib_files() {
         Ok(files) => Ok(serde_json::json!({ "files": files })),
         Err(e) => Err((
@@ -3103,7 +3138,7 @@ pub(super) fn lib_list() -> ApiResult {
 }
 
 /// `GET /console/api/lib/file?path=money.ts` — read a shared library file.
-pub(super) fn lib_file_get(rel: &str) -> Result<String, (StatusCode, String)> {
+pub fn lib_file_get(rel: &str) -> Result<String, (StatusCode, String)> {
     let Some(path) = workspace::lib_file_path(rel) else {
         return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
@@ -3112,7 +3147,7 @@ pub(super) fn lib_file_get(rel: &str) -> Result<String, (StatusCode, String)> {
 
 /// `PUT /console/api/lib/file?path=money.ts` — save (create or overwrite) a
 /// shared library file. Body is the raw file content.
-pub(super) fn lib_file_save(rel: &str, body: &str) -> ApiResult {
+pub fn lib_file_save(rel: &str, body: &str) -> ApiResult {
     let Ok(_) = workspace::ensure_lib_dir() else {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3132,7 +3167,7 @@ pub(super) fn lib_file_save(rel: &str, body: &str) -> ApiResult {
 }
 
 /// `POST /console/api/lib/file` — create a new empty shared library file.
-pub(super) fn lib_file_create(rel: &str) -> ApiResult {
+pub fn lib_file_create(rel: &str) -> ApiResult {
     let Ok(_) = workspace::ensure_lib_dir() else {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3158,7 +3193,7 @@ pub(super) fn lib_file_create(rel: &str) -> ApiResult {
 }
 
 /// `DELETE /console/api/lib/file?path=...` — remove a shared library file.
-pub(super) fn lib_file_delete(rel: &str) -> ApiResult {
+pub fn lib_file_delete(rel: &str) -> ApiResult {
     let Some(path) = workspace::lib_file_path(rel) else {
         return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
@@ -3175,7 +3210,7 @@ pub(super) fn lib_file_delete(rel: &str) -> ApiResult {
 }
 
 /// `POST /console/api/workers/{name}/stop` — stop the worker subprocess.
-pub(super) async fn worker_stop(name: &str) -> ApiResult {
+pub async fn worker_stop(name: &str) -> ApiResult {
     let sup = workers::supervisor();
     match sup.stop(name).await {
         Ok(()) => Ok(serde_json::to_value(sup.runtime(name).await).unwrap()),
@@ -3243,7 +3278,7 @@ async fn recv_live(
 
 /// `GET /console/api/projects` — list projects (tiles) with resource counts and
 /// live run status.
-pub(super) async fn projects_list() -> ApiResult {
+pub async fn projects_list() -> ApiResult {
     let mut list = projects::list_projects().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3274,7 +3309,7 @@ pub(super) async fn projects_list() -> ApiResult {
 }
 
 /// Extensions + which lang/app packs are usable on this machine.
-pub(super) fn extensions_overview() -> serde_json::Value {
+pub fn extensions_overview() -> serde_json::Value {
     let exts = extensions::all_extensions();
     let trust = extensions::load_trust();
     let list: Vec<_> = exts.iter().map(extension_json).collect();
@@ -3308,7 +3343,7 @@ fn extension_json(e: &extensions::ExtManifest) -> serde_json::Value {
 }
 
 /// `POST /console/api/projects` — scaffold a new project.
-pub(super) fn project_create(
+pub fn project_create(
     name: &str,
     description: &str,
     template: &str,
@@ -3323,12 +3358,12 @@ pub(super) fn project_create(
 }
 
 /// `GET /console/api/extensions` — installed + built-in packs and trust state.
-pub(super) fn extensions_list() -> serde_json::Value {
+pub fn extensions_list() -> serde_json::Value {
     extensions_overview()
 }
 
 /// `GET /console/api/config/server` — SLA mode + read-only env-parameter registry.
-pub(super) fn config_server(server: &ServerImpl) -> serde_json::Value {
+pub fn config_server(server: &dyn ConsoleServer) -> serde_json::Value {
     config::server_config_json(server.sla_mode())
 }
 
@@ -3336,7 +3371,7 @@ pub(super) fn config_server(server: &ServerImpl) -> serde_json::Value {
 /// `{"mode":"latency"|"admission"}`. An unrecognised mode is rejected (400)
 /// rather than silently fail-safing, so an operator gets clear feedback; the
 /// updated config is returned on success.
-pub(super) async fn config_server_sla(server: &ServerImpl, mode: &str) -> ApiResult {
+pub async fn config_server_sla(server: &dyn ConsoleServer, mode: &str) -> ApiResult {
     let mode = match mode.trim().to_ascii_lowercase().as_str() {
         "latency" => SlaMode::Latency,
         "admission" => SlaMode::Admission,
@@ -3354,7 +3389,7 @@ pub(super) async fn config_server_sla(server: &ServerImpl, mode: &str) -> ApiRes
 /// `GET /console/api/config/ide` — toolchain dependencies + language-pack config.
 /// Probing toolchains shells out (`<bin> --version`), so run it off the async
 /// runtime's worker threads.
-pub(super) async fn config_ide() -> ApiResult {
+pub async fn config_ide() -> ApiResult {
     match tokio::task::spawn_blocking(config::ide_config_json).await {
         Ok(v) => Ok(v),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
@@ -3363,7 +3398,7 @@ pub(super) async fn config_ide() -> ApiResult {
 
 /// `GET /console/api/extensions/marketplace` — packs on npm tagged `nano-ide-ext`,
 /// categorised by language/app/example, with installed status.
-pub(super) async fn extensions_marketplace() -> ApiResult {
+pub async fn extensions_marketplace() -> ApiResult {
     match tokio::task::spawn_blocking(extensions::marketplace).await {
         Ok(Ok(list)) => Ok(serde_json::json!({ "entries": list })),
         Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, e)),
@@ -3375,7 +3410,7 @@ pub(super) async fn extensions_marketplace() -> ApiResult {
 /// Reads an installed pack's bundled README, else fetches it from npm. Returns
 /// 404 when no README can be found. `npm view` shells out, so run it off the
 /// async runtime's worker threads.
-pub(super) async fn extensions_readme(pkg: String) -> ApiResult {
+pub async fn extensions_readme(pkg: String) -> ApiResult {
     let name = pkg.clone();
     match tokio::task::spawn_blocking(move || extensions::pack_readme(&name)).await {
         Ok(Some(r)) => Ok(serde_json::json!({
@@ -3395,7 +3430,7 @@ pub(super) async fn extensions_readme(pkg: String) -> ApiResult {
 /// result is scoped to the delta between `from` and the latest — i.e. what
 /// changed since the running version. Returns 404 when no changelog can be
 /// found. Shells out (`npm pack`), so run it off the async worker threads.
-pub(super) async fn extensions_changelog(
+pub async fn extensions_changelog(
     pkg: String,
     from: Option<String>,
     to: Option<String>,
@@ -3432,7 +3467,7 @@ pub(super) async fn extensions_changelog(
 }
 
 /// `GET /console/api/server/update` — server version + self-update status.
-pub(super) async fn server_update() -> ApiResult {
+pub async fn server_update() -> ApiResult {
     Ok(
         serde_json::to_value(server_update::status().await).unwrap_or_else(|_| {
             serde_json::json!({
@@ -3446,7 +3481,7 @@ pub(super) async fn server_update() -> ApiResult {
 }
 
 /// `POST /console/api/extensions/install` — install a `nano-ide-ext-*` pkg from npm.
-pub(super) async fn extensions_install(pkg: String) -> ApiResult {
+pub async fn extensions_install(pkg: String) -> ApiResult {
     match tokio::task::spawn_blocking(move || {
         extensions::install_from_npm(&pkg).map(|m| extension_json(&m))
     })
@@ -3462,7 +3497,7 @@ pub(super) async fn extensions_install(pkg: String) -> ApiResult {
 /// Idempotently ensures the Urban toolkit (`nano-ide-app-urban` pack + its
 /// `urban`/`create-urban-app` deps) is present, then reports whether the CLI
 /// resolves. Runs on the blocking pool (npm + fs work).
-pub(super) async fn ensure_urban_toolkit() -> Result<bool, (StatusCode, String)> {
+pub async fn ensure_urban_toolkit() -> Result<bool, (StatusCode, String)> {
     match tokio::task::spawn_blocking(extensions::ensure_urban_toolkit).await {
         Ok(Ok(available)) => Ok(available),
         Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e)),
@@ -3471,7 +3506,7 @@ pub(super) async fn ensure_urban_toolkit() -> Result<bool, (StatusCode, String)>
 }
 
 /// `POST /console/api/extensions/remove` — uninstall an installed pack.
-pub(super) fn extensions_remove(pkg: &str) -> ApiResult {
+pub fn extensions_remove(pkg: &str) -> ApiResult {
     match extensions::remove(pkg) {
         Ok(()) => Ok(serde_json::Value::Null),
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
@@ -3479,7 +3514,7 @@ pub(super) fn extensions_remove(pkg: &str) -> ApiResult {
 }
 
 /// `POST /console/api/extensions/trust` — toggle yolo / approve-always per pack.
-pub(super) fn extensions_trust(
+pub fn extensions_trust(
     yolo: Option<bool>,
     approve: Option<String>,
     revoke: Option<String>,
@@ -3503,7 +3538,7 @@ pub(super) fn extensions_trust(
 /// `GET /console/api/projects/{name}` — config + file tree + run state. The
 /// `runState.status` here can be `crashed`, which the generated layer maps to
 /// the spec's `error` run status.
-pub(super) async fn project_detail(name: &str) -> ApiResult {
+pub async fn project_detail(name: &str) -> ApiResult {
     let Some(cfg) = projects::read_config(name) else {
         return Err((StatusCode::NOT_FOUND, "no such project".to_string()));
     };
@@ -3618,7 +3653,7 @@ mod missing_toolchain_tests {
 }
 
 /// `DELETE /console/api/projects/{name}` — remove a project (must be stopped).
-pub(super) async fn project_delete(name: &str) -> ApiResult {
+pub async fn project_delete(name: &str) -> ApiResult {
     if projects::supervisor().is_running(name).await {
         return Err((
             StatusCode::CONFLICT,
@@ -3638,7 +3673,7 @@ pub(super) async fn project_delete(name: &str) -> ApiResult {
 }
 
 /// `POST /console/api/projects/{name}/rename` — rename a project (must be stopped).
-pub(super) async fn project_rename(name: &str, new_name: &str) -> ApiResult {
+pub async fn project_rename(name: &str, new_name: &str) -> ApiResult {
     if projects::supervisor().is_running(name).await {
         return Err((
             StatusCode::CONFLICT,
@@ -3655,7 +3690,7 @@ pub(super) async fn project_rename(name: &str, new_name: &str) -> ApiResult {
 }
 
 /// `GET /console/api/projects/{name}/config` — the project config.
-pub(super) fn project_config_get(name: &str) -> ApiResult {
+pub fn project_config_get(name: &str) -> ApiResult {
     match projects::read_config(name) {
         Some(cfg) => Ok(serde_json::to_value(cfg).unwrap()),
         None => Err((StatusCode::NOT_FOUND, "no such project".to_string())),
@@ -3663,7 +3698,7 @@ pub(super) fn project_config_get(name: &str) -> ApiResult {
 }
 
 /// `PUT /console/api/projects/{name}/config` — update the project config.
-pub(super) fn project_config_put(name: &str, mut cfg: projects::ProjectConfig) -> ApiResult {
+pub fn project_config_put(name: &str, mut cfg: projects::ProjectConfig) -> ApiResult {
     if projects::read_config(name).is_none() {
         return Err((StatusCode::NOT_FOUND, "no such project".to_string()));
     }
@@ -3682,7 +3717,7 @@ pub(super) fn project_config_put(name: &str, mut cfg: projects::ProjectConfig) -
 /// configurations snapshotted from the scaffolding pack and the id of the
 /// active one (or `null` when none is set — in which case the resolver picks
 /// the `default: true` entry, else the first).
-pub(super) fn project_run_configs_list(name: &str) -> ApiResult {
+pub fn project_run_configs_list(name: &str) -> ApiResult {
     let Some(cfg) = projects::read_config(name) else {
         return Err((StatusCode::NOT_FOUND, "no such project".to_string()));
     };
@@ -3697,7 +3732,7 @@ pub(super) fn project_run_configs_list(name: &str) -> ApiResult {
 /// the Run/Compile buttons should use. Body: `{ "id": "stock-rest" }`; pass
 /// `null` (or omit) to clear the pin and revert to `default: true` / first.
 /// Rejects unknown ids so the picker can't silently persist a typo.
-pub(super) fn project_active_run_config_put(name: &str, id: Option<String>) -> ApiResult {
+pub fn project_active_run_config_put(name: &str, id: Option<String>) -> ApiResult {
     let Some(mut cfg) = projects::read_config(name) else {
         return Err((StatusCode::NOT_FOUND, "no such project".to_string()));
     };
@@ -3728,7 +3763,7 @@ pub(super) fn project_active_run_config_put(name: &str, id: Option<String>) -> A
     }
 }
 
-pub(super) fn now_ms_proj() -> u64 {
+pub fn now_ms_proj() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -3736,7 +3771,7 @@ pub(super) fn now_ms_proj() -> u64 {
 }
 
 /// `GET /console/api/projects/{name}/files` — the recursive file tree.
-pub(super) fn project_files(name: &str) -> ApiResult {
+pub fn project_files(name: &str) -> ApiResult {
     match projects::file_tree(name) {
         Some(tree) => Ok(serde_json::json!({ "files": tree })),
         None => Err((StatusCode::NOT_FOUND, "no such project".to_string())),
@@ -3804,7 +3839,7 @@ async fn project_file_get(Path(name): Path<String>, Query(q): Query<FilePathQuer
 /// With no `path`, opens on the operator's home directory.
 ///
 async fn fs_browse(
-    ConnectInfo(peer): ConnectInfo<crate::PeerAddr>,
+    ConnectInfo(peer): ConnectInfo<nano_server_net::PeerAddr>,
     headers: HeaderMap,
     Query(q): Query<BrowseQuery>,
 ) -> Response {
@@ -3825,7 +3860,7 @@ async fn fs_browse(
 /// (`enabled`, env `locked`, whether this caller is `local`, and the `source`).
 /// Ungated: it only reports state, and the pty upgrade is gated regardless.
 async fn config_terminal(
-    ConnectInfo(peer): ConnectInfo<crate::PeerAddr>,
+    ConnectInfo(peer): ConnectInfo<nano_server_net::PeerAddr>,
     headers: HeaderMap,
 ) -> Response {
     let local = request_is_loopback(&peer, &headers);
@@ -3841,7 +3876,7 @@ struct TerminalToggle {
 /// it. Loopback-gated (turning on a shell is local-operator-only); `409` when
 /// `NANO_CONSOLE_TERMINAL` has locked it off.
 async fn config_terminal_set(
-    ConnectInfo(peer): ConnectInfo<crate::PeerAddr>,
+    ConnectInfo(peer): ConnectInfo<nano_server_net::PeerAddr>,
     headers: HeaderMap,
     Json(body): Json<TerminalToggle>,
 ) -> Response {
@@ -3895,7 +3930,7 @@ fn authority_is_loopback(authority: &str) -> bool {
 /// clients (curl, our tooling) send no `Origin` and stay allowed. Reused by
 /// every endpoint that touches the operator's machine directly (filesystem
 /// browsing, the integrated terminal) so the policy can never drift.
-pub(super) fn request_is_loopback(peer: &crate::PeerAddr, headers: &HeaderMap) -> bool {
+pub fn request_is_loopback(peer: &nano_server_net::PeerAddr, headers: &HeaderMap) -> bool {
     if !peer.0.ip().is_loopback() {
         return false;
     }
@@ -3924,7 +3959,7 @@ mod loopback_gate_tests {
     use super::*;
 
     fn req(peer_ip: &str, host: &str, origin: Option<&str>) -> bool {
-        let peer = crate::PeerAddr(SocketAddr::new(peer_ip.parse().unwrap(), 12345));
+        let peer = nano_server_net::PeerAddr(SocketAddr::new(peer_ip.parse().unwrap(), 12345));
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, host.parse().unwrap());
         if let Some(o) = origin {
@@ -4131,7 +4166,7 @@ mod app_view_icon_tests {
     }
 }
 
-pub(super) fn project_file_save(name: &str, rel: &str, body: &str) -> ApiResult {
+pub fn project_file_save(name: &str, rel: &str, body: &str) -> ApiResult {
     let Some(path) = projects::safe_project_path(name, rel) else {
         return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
@@ -4148,7 +4183,7 @@ pub(super) fn project_file_save(name: &str, rel: &str, body: &str) -> ApiResult 
 }
 
 /// `POST /console/api/projects/{name}/file` — create an empty file or a folder.
-pub(super) fn project_path_create(name: &str, rel: &str, dir: bool) -> ApiResult {
+pub fn project_path_create(name: &str, rel: &str, dir: bool) -> ApiResult {
     let Some(path) = projects::safe_project_path(name, rel) else {
         return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
@@ -4244,7 +4279,7 @@ fn regen_path(is_urban: bool, urban_available: bool) -> RegenPath {
 /// datasource's live schema via the embedded emitter. Failure is logged, never
 /// surfaced — the maker's operation already succeeded and the types are an
 /// authoring-time contract only.
-async fn regenerate_domain_types(name: &str) {
+pub async fn regenerate_domain_types(name: &str) {
     // #514 dry-out (ADR 0052/0053/0054): an Urban-shaped app (`nano.app.json`)
     // delegates artifact generation to the shared `@nanobpm/urban` toolkit
     // (`urban gen`) — the manifest is the single contract and urban is the *one*
@@ -4329,7 +4364,7 @@ mod regen_path_tests {
 /// trigger matches it precisely: a `.bpmn` directly under `resources/processes/`
 /// (extension case-insensitive). A `.bpmn` saved elsewhere is not scanned, so it
 /// must not spuriously retrigger a regeneration that could not reflect it.
-pub(super) fn is_model_resource(rel: &str) -> bool {
+pub fn is_model_resource(rel: &str) -> bool {
     // Mirror `safe_project_path`'s leading-slash tolerance so the trigger matches
     // exactly what was saved.
     let path = std::path::Path::new(rel.trim_start_matches('/'));
@@ -4346,7 +4381,7 @@ pub(super) fn is_model_resource(rel: &str) -> bool {
 /// and a save re-generates the `resources/processes/*.bpmn` the SDK derives from.
 /// Matched precisely (a `.ts` in `workflows/`, not nested, not the project root)
 /// so an unrelated `.ts` save never triggers a Deno round-trip.
-pub(super) fn is_workflow_source(rel: &str) -> bool {
+pub fn is_workflow_source(rel: &str) -> bool {
     let path = std::path::Path::new(rel.trim_start_matches('/'));
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("ts"))
@@ -4359,7 +4394,7 @@ pub(super) fn is_workflow_source(rel: &str) -> bool {
 /// derived domain/worker types from them — mirroring the `is_model_resource`
 /// path. Failure is logged, never surfaced: the save already succeeded and the
 /// models are a derived, always-regenerable artifact.
-async fn regenerate_workflow_models(name: &str) {
+pub async fn regenerate_workflow_models(name: &str) {
     match projects::generate_models(name).await {
         Ok(ids) if !ids.is_empty() => {
             tracing::debug!(
@@ -4377,12 +4412,12 @@ async fn regenerate_workflow_models(name: &str) {
 
 /// `GET /console/api/projects/{name}/data/sources` — the datasources the App
 /// manifest declares (resolved driver/url) plus the default source name.
-pub(super) async fn project_data_sources(name: &str) -> ApiResult {
+pub async fn project_data_sources(name: &str) -> ApiResult {
     project_data_op(name, serde_json::json!({ "op": "sources" })).await
 }
 
 /// `GET /console/api/projects/{name}/data/{source}/schema` — tables/columns/indexes.
-pub(super) async fn project_data_schema(name: &str, source: &str) -> ApiResult {
+pub async fn project_data_schema(name: &str, source: &str) -> ApiResult {
     project_data_op(
         name,
         serde_json::json!({ "op": "schema", "source": source }),
@@ -4392,7 +4427,7 @@ pub(super) async fn project_data_schema(name: &str, source: &str) -> ApiResult {
 
 /// `POST /console/api/projects/{name}/data/{source}/query` — run a row-returning
 /// statement, returning `{ columns, rows }`.
-pub(super) async fn project_data_query(
+pub async fn project_data_query(
     name: &str,
     source: &str,
     sql: &str,
@@ -4407,7 +4442,7 @@ pub(super) async fn project_data_query(
 
 /// `POST /console/api/projects/{name}/data/{source}/exec` — run a non-row
 /// statement (INSERT/UPDATE/DELETE/DDL), returning `{ changed, lastInsertId? }`.
-pub(super) async fn project_data_exec(
+pub async fn project_data_exec(
     name: &str,
     source: &str,
     sql: &str,
@@ -4429,11 +4464,7 @@ pub(super) async fn project_data_exec(
 /// `POST /console/api/projects/{name}/data/{source}/script` — run several
 /// statements atomically in one transaction (the structure editor's table
 /// rebuild). Returns `{ changed }`.
-pub(super) async fn project_data_script(
-    name: &str,
-    source: &str,
-    statements: Vec<String>,
-) -> ApiResult {
+pub async fn project_data_script(name: &str, source: &str, statements: Vec<String>) -> ApiResult {
     let res = project_data_op(
         name,
         serde_json::json!({ "op": "script", "source": source, "statements": statements }),
@@ -4449,7 +4480,7 @@ pub(super) async fn project_data_script(
 
 /// `GET /console/api/projects/{name}/data/{source}/migrations` — the ordered
 /// migration files with applied status.
-pub(super) async fn project_data_migrations(name: &str, source: &str) -> ApiResult {
+pub async fn project_data_migrations(name: &str, source: &str) -> ApiResult {
     project_data_op(
         name,
         serde_json::json!({ "op": "migrations", "source": source }),
@@ -4459,7 +4490,7 @@ pub(super) async fn project_data_migrations(name: &str, source: &str) -> ApiResu
 
 /// `POST /console/api/projects/{name}/data/{source}/migrate` — apply pending
 /// migrations, returning the names applied.
-pub(super) async fn project_data_migrate(name: &str, source: &str) -> ApiResult {
+pub async fn project_data_migrate(name: &str, source: &str) -> ApiResult {
     let res = project_data_op(
         name,
         serde_json::json!({ "op": "migrate", "source": source }),
@@ -4487,7 +4518,7 @@ pub(super) async fn project_data_migrate(name: &str, source: &str) -> ApiResult 
 /// `urban data` introspection (`write:false`, no second write) and report the
 /// path `urban gen` persisted. The editor's cached SDK typings are invalidated
 /// client-side either way.
-pub(super) async fn project_data_domaintypes(name: &str, source: &str) -> ApiResult {
+pub async fn project_data_domaintypes(name: &str, source: &str) -> ApiResult {
     // Route to the one deriver (`urban gen`) only when the app is Urban-shaped
     // *and* its toolkit resolves *and* that toolkit actually carries the `data`
     // op. During the transition — before the marketplace pack ships a `urban`
@@ -4558,7 +4589,7 @@ pub(super) async fn project_data_domaintypes(name: &str, source: &str) -> ApiRes
 /// outputs (`domain-rows.d.ts` + the worker/message bindings) — so it never
 /// regenerates the typed SDK the maker consumes. (It still runs through
 /// `run_data_op`, which ensures the `nano-generated/` SDK scaffolding exists.)
-pub(super) async fn project_data_preview_domaintypes(
+pub async fn project_data_preview_domaintypes(
     name: &str,
     source: &str,
     shapes: serde_json::Value,
@@ -4606,7 +4637,7 @@ fn trigger_error(e: triggers::TriggerError) -> (StatusCode, String) {
 /// `POST /console/api/projects/{name}/triggers/enqueue` — the manual/synthetic
 /// source (ADR 0025 phase 1): persist an event into the durable inbox, returning
 /// `{ enqueued, id? }`. A repeated idempotency key is a no-op (`enqueued=false`).
-pub(super) async fn project_trigger_enqueue(
+pub async fn project_trigger_enqueue(
     name: &str,
     trigger_id: &str,
     idempotency_key: Option<String>,
@@ -4681,7 +4712,7 @@ async fn project_hook(
 
 /// `GET /console/api/projects/{name}/triggers/inbox` — inbox counts by state
 /// plus the most recently updated rows.
-pub(super) async fn project_trigger_inbox(name: &str) -> ApiResult {
+pub async fn project_trigger_inbox(name: &str) -> ApiResult {
     triggers::inbox_status(name)
         .await
         .map(|s| serde_json::to_value(s).unwrap_or_default())
@@ -4691,13 +4722,13 @@ pub(super) async fn project_trigger_inbox(name: &str) -> ApiResult {
 /// `GET /console/api/projects/{name}/triggers` — the manifest's declared
 /// triggers resolved against the source registry (ADR 0025 phase 2), for the
 /// Triggers panel + source picker.
-pub(super) async fn project_triggers(name: &str) -> ApiResult {
+pub async fn project_triggers(name: &str) -> ApiResult {
     triggers::triggers_overview(name)
         .await
         .map_err(trigger_error)
 }
 
-pub(super) async fn project_trigger_add(
+pub async fn project_trigger_add(
     name: &str,
     id: &str,
     kind: &str,
@@ -4712,13 +4743,13 @@ pub(super) async fn project_trigger_add(
 }
 
 /// `GET /console/api/projects/{name}/connectors` — enabled connectors + registry.
-pub(super) fn project_connectors(name: &str) -> ApiResult {
+pub fn project_connectors(name: &str) -> ApiResult {
     connectors::connectors_overview(name).map_err(trigger_error)
 }
 
 /// `POST /console/api/projects/{name}/connectors` — enable a connector, then
 /// return the refreshed overview.
-pub(super) fn project_connector_add(
+pub fn project_connector_add(
     name: &str,
     task_type: &str,
     connection: Option<&str>,
@@ -4729,7 +4760,7 @@ pub(super) fn project_connector_add(
 }
 
 /// `DELETE /console/api/projects/{name}/file?path=...` — remove a file or folder.
-pub(super) fn project_path_delete(name: &str, rel: &str) -> ApiResult {
+pub fn project_path_delete(name: &str, rel: &str) -> ApiResult {
     let Some(path) = projects::safe_project_path(name, rel) else {
         return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
@@ -4751,7 +4782,7 @@ pub(super) fn project_path_delete(name: &str, rel: &str) -> ApiResult {
 }
 
 /// `POST /console/api/projects/{name}/run` — deploy + start the application.
-pub(super) async fn project_run(name: &str) -> ApiResult {
+pub async fn project_run(name: &str) -> ApiResult {
     let sup = projects::supervisor();
     match sup.run(name).await {
         Ok(()) => Ok(serde_json::to_value(sup.run_state(name).await).unwrap()),
@@ -4760,7 +4791,7 @@ pub(super) async fn project_run(name: &str) -> ApiResult {
 }
 
 /// `POST /console/api/projects/{name}/stop` — stop the application.
-pub(super) async fn project_stop(name: &str) -> ApiResult {
+pub async fn project_stop(name: &str) -> ApiResult {
     let sup = projects::supervisor();
     match sup.stop(name).await {
         Ok(()) => Ok(serde_json::to_value(sup.run_state(name).await).unwrap()),
@@ -4770,7 +4801,7 @@ pub(super) async fn project_stop(name: &str) -> ApiResult {
 
 /// `POST /console/api/projects/{name}/compile` — compile the project (host or
 /// cross-compile). Runs in the background; progress streams over the log SSE.
-pub(super) fn project_compile(name: &str, targets: Vec<String>) -> ApiResult {
+pub fn project_compile(name: &str, targets: Vec<String>) -> ApiResult {
     if projects::read_config(name).is_none() {
         return Err((StatusCode::NOT_FOUND, "no such project".to_string()));
     }

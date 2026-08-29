@@ -6,7 +6,7 @@
 //! ## Strategy
 //! The OpenAPI spec was authored *from* the hand-written DTOs, so the generated
 //! models serialize to identical JSON. Each trait method therefore delegates to
-//! a `super::` core function (which returns a DTO or a `serde_json::Value`) and
+//! a `nano_server_console::` core function (which returns a DTO or a `serde_json::Value`) and
 //! round-trips through `serde_json` into the generated response model.
 //!
 //! ## Deviations from the hand-written handlers
@@ -96,7 +96,7 @@ impl apis::cluster::Cluster for ServerImpl {
         _host: &Host,
         _cookies: &CookieJar,
     ) -> Result<apis::cluster::GetClusterHealthResponse, ()> {
-        let dto = super::cluster_health(self).await;
+        let dto = nano_server_console::cluster_health(self).await;
         Ok(apis::cluster::GetClusterHealthResponse::Status200_ClusterHealth(from_dto(dto)))
     }
 
@@ -106,7 +106,7 @@ impl apis::cluster::Cluster for ServerImpl {
         _host: &Host,
         _cookies: &CookieJar,
     ) -> Result<apis::cluster::GetClusterMetricsResponse, ()> {
-        let dto = super::cluster_metrics(self).await;
+        let dto = nano_server_console::cluster_metrics(self).await;
         Ok(apis::cluster::GetClusterMetricsResponse::Status200_ClusterMetrics(from_dto(dto)))
     }
 
@@ -116,7 +116,7 @@ impl apis::cluster::Cluster for ServerImpl {
         _host: &Host,
         _cookies: &CookieJar,
     ) -> Result<apis::cluster::GetMetricsResponse, ()> {
-        let dto = super::build_local_metrics(self);
+        let dto = nano_server_console::build_local_metrics(self);
         Ok(apis::cluster::GetMetricsResponse::Status200_MetricsSnapshot(from_dto(dto)))
     }
 
@@ -126,7 +126,7 @@ impl apis::cluster::Cluster for ServerImpl {
         _host: &Host,
         _cookies: &CookieJar,
     ) -> Result<apis::cluster::GetTopologyResponse, ()> {
-        let dto = super::topology(self);
+        let dto = nano_server_console::topology(self);
         Ok(apis::cluster::GetTopologyResponse::Status200_ClusterTopology(from_dto(dto)))
     }
 }
@@ -143,9 +143,9 @@ impl apis::config::Config for ServerImpl {
     ) -> Result<apis::config::GetIdeConfigResponse, ()> {
         // Only 200 is declared; the sole error path is a task-join failure, so
         // fall back to computing the config on the current thread.
-        let v = super::config_ide()
+        let v = nano_server_console::config_ide()
             .await
-            .unwrap_or_else(|_| super::config::ide_config_json());
+            .unwrap_or_else(|_| nano_server_console::config::ide_config_json());
         Ok(apis::config::GetIdeConfigResponse::Status200_IDEConfig(
             from_val(v),
         ))
@@ -157,7 +157,7 @@ impl apis::config::Config for ServerImpl {
         _host: &Host,
         _cookies: &CookieJar,
     ) -> Result<apis::config::GetServerConfigResponse, ()> {
-        let v = super::config_server(self);
+        let v = nano_server_console::config_server(self);
         Ok(apis::config::GetServerConfigResponse::Status200_ServerConfig(from_val(v)))
     }
 
@@ -168,7 +168,7 @@ impl apis::config::Config for ServerImpl {
         _cookies: &CookieJar,
         body: &models::SetSlaRequest,
     ) -> Result<apis::config::SetSlaModeResponse, ()> {
-        match super::config_server_sla(self, &body.mode).await {
+        match nano_server_console::config_server_sla(self, &body.mode).await {
             Ok(v) => {
                 Ok(apis::config::SetSlaModeResponse::Status200_UpdatedServerConfig(from_val(v)))
             }
@@ -190,7 +190,7 @@ impl apis::server::Server for ServerImpl {
         _cookies: &CookieJar,
     ) -> Result<apis::server::GetServerUpdateResponse, ()> {
         // Only 200 is declared; the handler is offline-soft and never errors.
-        let v = super::server_update()
+        let v = nano_server_console::server_update()
             .await
             .unwrap_or_else(|_| serde_json::json!({}));
         Ok(apis::server::GetServerUpdateResponse::Status200_ServerUpdateStatus(from_val(v)))
@@ -205,7 +205,7 @@ impl apis::extensions::Extensions for ServerImpl {
         _host: &Host,
         _cookies: &CookieJar,
     ) -> Result<apis::extensions::GetExtensionsResponse, ()> {
-        let v = super::extensions_list();
+        let v = nano_server_console::extensions_list();
         Ok(apis::extensions::GetExtensionsResponse::Status200_ExtensionsOverview(from_val(v)))
     }
 
@@ -216,7 +216,7 @@ impl apis::extensions::Extensions for ServerImpl {
         _cookies: &CookieJar,
     ) -> Result<apis::extensions::GetMarketplaceResponse, ()> {
         // Only 200 is declared; on a registry error fall back to empty entries.
-        let v = super::extensions_marketplace()
+        let v = nano_server_console::extensions_marketplace()
             .await
             .unwrap_or_else(|_| serde_json::json!({ "entries": [] }));
         Ok(apis::extensions::GetMarketplaceResponse::Status200_MarketplaceListing(from_val(v)))
@@ -229,7 +229,7 @@ impl apis::extensions::Extensions for ServerImpl {
         _cookies: &CookieJar,
         query_params: &models::GetExtensionReadmeQueryParams,
     ) -> Result<apis::extensions::GetExtensionReadmeResponse, ()> {
-        match super::extensions_readme(query_params.pkg.clone()).await {
+        match nano_server_console::extensions_readme(query_params.pkg.clone()).await {
             Ok(v) => {
                 Ok(apis::extensions::GetExtensionReadmeResponse::Status200_PackREADME(from_val(v)))
             }
@@ -246,7 +246,7 @@ impl apis::extensions::Extensions for ServerImpl {
         _cookies: &CookieJar,
         query_params: &models::GetExtensionChangelogQueryParams,
     ) -> Result<apis::extensions::GetExtensionChangelogResponse, ()> {
-        match super::extensions_changelog(
+        match nano_server_console::extensions_changelog(
             query_params.pkg.clone(),
             query_params.from.clone(),
             query_params.to.clone(),
@@ -276,7 +276,7 @@ impl apis::extensions::Extensions for ServerImpl {
         _cookies: &CookieJar,
         body: &models::ExtPkgRequest,
     ) -> Result<apis::extensions::InstallExtensionResponse, ()> {
-        match super::extensions_install(body.pkg.clone()).await {
+        match nano_server_console::extensions_install(body.pkg.clone()).await {
             Ok(v) => Ok(
                 apis::extensions::InstallExtensionResponse::Status201_InstalledExtension(from_val(
                     v,
@@ -294,7 +294,7 @@ impl apis::extensions::Extensions for ServerImpl {
         _host: &Host,
         _cookies: &CookieJar,
     ) -> Result<apis::extensions::InstallUrbanToolkitResponse, ()> {
-        match super::ensure_urban_toolkit().await {
+        match nano_server_console::ensure_urban_toolkit().await {
             Ok(available) => Ok(
                 apis::extensions::InstallUrbanToolkitResponse::Status200_UrbanToolkitAvailabilityAfterEnsuringInstallation(
                     models::UrbanToolkitStatus { available },
@@ -313,7 +313,7 @@ impl apis::extensions::Extensions for ServerImpl {
         _cookies: &CookieJar,
         body: &models::ExtPkgRequest,
     ) -> Result<apis::extensions::RemoveExtensionResponse, ()> {
-        match super::extensions_remove(&body.pkg) {
+        match nano_server_console::extensions_remove(&body.pkg) {
             Ok(_) => Ok(apis::extensions::RemoveExtensionResponse::Status204_Removed),
             Err((_, msg)) => {
                 Ok(apis::extensions::RemoveExtensionResponse::Status400_InvalidRequest(msg))
@@ -332,8 +332,8 @@ impl apis::extensions::Extensions for ServerImpl {
         let approve = flatten_nullable(&body.approve);
         let revoke = flatten_nullable(&body.revoke);
         // Only 200 is declared; on a save error fall back to the current view.
-        let v = super::extensions_trust(yolo, approve, revoke)
-            .unwrap_or_else(|_| super::extensions_list());
+        let v = nano_server_console::extensions_trust(yolo, approve, revoke)
+            .unwrap_or_else(|_| nano_server_console::extensions_list());
         Ok(
             apis::extensions::TrustExtensionResponse::Status200_UpdatedExtensionsOverview(
                 from_val(v),
@@ -353,7 +353,7 @@ impl apis::instances::Instances for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::GetInstancePathParams,
     ) -> Result<apis::instances::GetInstanceResponse, ()> {
-        match super::instance_detail(self, &path_params.key).await {
+        match nano_server_console::instance_detail(self, &path_params.key).await {
             Some(dto) => {
                 Ok(apis::instances::GetInstanceResponse::Status200_InstanceDetail(from_dto(dto)))
             }
@@ -376,10 +376,10 @@ impl apis::instances::Instances for ServerImpl {
             state: query_params
                 .state
                 .as_deref()
-                .and_then(super::parse_instance_state_filter),
+                .and_then(nano_server_console::parse_instance_state_filter),
             has_incident: query_params.has_incident,
         };
-        let dto = super::instances(self, page, page_size, filter);
+        let dto = nano_server_console::instances(self, page, page_size, filter);
         Ok(
             apis::instances::ListInstancesResponse::Status200_OnePageOfProcessInstances(from_dto(
                 dto,
@@ -503,7 +503,7 @@ impl apis::traces::Traces for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::GetTracePathParams,
     ) -> Result<apis::traces::GetTraceResponse, ()> {
-        match super::trace_detail(self, &path_params.key) {
+        match nano_server_console::trace_detail(self, &path_params.key) {
             Some(dto) => Ok(apis::traces::GetTraceResponse::Status200_InstanceTrace(
                 from_dto(dto),
             )),
@@ -520,7 +520,7 @@ impl apis::traces::Traces for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::GetTraceOtelPathParams,
     ) -> Result<apis::traces::GetTraceOtelResponse, ()> {
-        match super::trace_otel(self, &path_params.key) {
+        match nano_server_console::trace_otel(self, &path_params.key) {
             Some(v) => Ok(apis::traces::GetTraceOtelResponse::Status200_OpaqueOTLP(
                 from_val(v),
             )),
@@ -538,7 +538,7 @@ impl apis::traces::Traces for ServerImpl {
         query_params: &models::ListTracesQueryParams,
     ) -> Result<apis::traces::ListTracesResponse, ()> {
         let limit = query_params.limit.map(|l| l as usize).unwrap_or(100);
-        let dtos = super::traces(self, limit);
+        let dtos = nano_server_console::traces(self, limit);
         Ok(apis::traces::ListTracesResponse::Status200_TraceSummaries(
             from_dto(dtos),
         ))
@@ -552,7 +552,7 @@ impl apis::traces::Traces for ServerImpl {
     ) -> Result<apis::traces::GetTraceConfigResponse, ()> {
         Ok(
             apis::traces::GetTraceConfigResponse::Status200_TraceConfiguration(from_dto(
-                super::trace_config(self),
+                nano_server_console::trace_config(self),
             )),
         )
     }
@@ -566,7 +566,7 @@ impl apis::traces::Traces for ServerImpl {
     ) -> Result<apis::traces::SetTraceConfigResponse, ()> {
         let variables = flatten_nullable(&body.capture_variables);
         let stimuli = flatten_nullable(&body.capture_stimuli);
-        let dto = super::set_trace_config(self, variables, stimuli);
+        let dto = nano_server_console::set_trace_config(self, variables, stimuli);
         Ok(
             apis::traces::SetTraceConfigResponse::Status200_UpdatedTraceConfiguration(from_dto(
                 dto,
@@ -586,7 +586,7 @@ impl apis::models::Models for ServerImpl {
         _cookies: &CookieJar,
         body: &models::CreateModelRequest,
     ) -> Result<apis::models::CreateModelResponse, ()> {
-        match super::model_create(self, body.name.clone(), body.xml.clone()) {
+        match nano_server_console::model_create(self, body.name.clone(), body.xml.clone()) {
             Ok(v) => Ok(apis::models::CreateModelResponse::Status201_ModelCreated(
                 from_val(v),
             )),
@@ -606,7 +606,7 @@ impl apis::models::Models for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::DeleteModelPathParams,
     ) -> Result<apis::models::DeleteModelResponse, ()> {
-        match super::model_delete(&path_params.name) {
+        match nano_server_console::model_delete(&path_params.name) {
             Ok(_) => Ok(apis::models::DeleteModelResponse::Status204_Deleted),
             Err((_, msg)) => Ok(apis::models::DeleteModelResponse::Status404_NotFound(msg)),
         }
@@ -619,7 +619,7 @@ impl apis::models::Models for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::GetModelPathParams,
     ) -> Result<apis::models::GetModelResponse, ()> {
-        match super::model_get(self, &path_params.name) {
+        match nano_server_console::model_get(self, &path_params.name) {
             Ok(v) => Ok(apis::models::GetModelResponse::Status200_Model(from_val(v))),
             Err((_, msg)) => Ok(apis::models::GetModelResponse::Status404_NotFound(msg)),
         }
@@ -632,7 +632,7 @@ impl apis::models::Models for ServerImpl {
         _cookies: &CookieJar,
     ) -> Result<apis::models::ListModelsResponse, ()> {
         // Only 200 is declared; on a workspace error fall back to empty.
-        let v = super::models(self).unwrap_or_else(|_| serde_json::json!([]));
+        let v = nano_server_console::models(self).unwrap_or_else(|_| serde_json::json!([]));
         Ok(apis::models::ListModelsResponse::Status200_ModelSummaries(
             from_val(v),
         ))
@@ -646,7 +646,7 @@ impl apis::models::Models for ServerImpl {
         path_params: &models::SaveModelPathParams,
         body: &String,
     ) -> Result<apis::models::SaveModelResponse, ()> {
-        match super::model_save(self, &path_params.name, body.clone()) {
+        match nano_server_console::model_save(self, &path_params.name, body.clone()) {
             Ok(v) => Ok(apis::models::SaveModelResponse::Status200_SavedModel(
                 from_val(v),
             )),
@@ -668,7 +668,7 @@ impl apis::lib::Lib for ServerImpl {
         _cookies: &CookieJar,
         body: &models::CreateFileRequest,
     ) -> Result<apis::lib::CreateLibFileResponse, ()> {
-        match super::lib_file_create(&body.path) {
+        match nano_server_console::lib_file_create(&body.path) {
             Ok(_) => Ok(apis::lib::CreateLibFileResponse::Status201_Created),
             Err((code, msg)) if code == http::StatusCode::CONFLICT => Ok(
                 apis::lib::CreateLibFileResponse::Status409_AlreadyExists(msg),
@@ -686,7 +686,7 @@ impl apis::lib::Lib for ServerImpl {
         _cookies: &CookieJar,
         query_params: &models::DeleteLibFileQueryParams,
     ) -> Result<apis::lib::DeleteLibFileResponse, ()> {
-        match super::lib_file_delete(&query_params.path) {
+        match nano_server_console::lib_file_delete(&query_params.path) {
             Ok(_) => Ok(apis::lib::DeleteLibFileResponse::Status204_Deleted),
             Err((_, msg)) => Ok(apis::lib::DeleteLibFileResponse::Status400_InvalidRequest(
                 msg,
@@ -701,7 +701,7 @@ impl apis::lib::Lib for ServerImpl {
         _cookies: &CookieJar,
         query_params: &models::GetLibFileQueryParams,
     ) -> Result<apis::lib::GetLibFileResponse, ()> {
-        match super::lib_file_get(&query_params.path) {
+        match nano_server_console::lib_file_get(&query_params.path) {
             Ok(contents) => Ok(apis::lib::GetLibFileResponse::Status200_FileContents(
                 contents,
             )),
@@ -719,7 +719,8 @@ impl apis::lib::Lib for ServerImpl {
         _cookies: &CookieJar,
     ) -> Result<apis::lib::ListLibFilesResponse, ()> {
         // Only 200 is declared; on error fall back to empty.
-        let v = super::lib_list().unwrap_or_else(|_| serde_json::json!({ "files": [] }));
+        let v =
+            nano_server_console::lib_list().unwrap_or_else(|_| serde_json::json!({ "files": [] }));
         Ok(apis::lib::ListLibFilesResponse::Status200_LibraryFilePaths(
             from_val(v),
         ))
@@ -733,7 +734,7 @@ impl apis::lib::Lib for ServerImpl {
         query_params: &models::SaveLibFileQueryParams,
         body: &String,
     ) -> Result<apis::lib::SaveLibFileResponse, ()> {
-        match super::lib_file_save(&query_params.path, body) {
+        match nano_server_console::lib_file_save(&query_params.path, body) {
             Ok(_) => Ok(apis::lib::SaveLibFileResponse::Status204_Saved),
             Err((_, msg)) => Ok(apis::lib::SaveLibFileResponse::Status400_InvalidRequest(
                 msg,
@@ -754,7 +755,7 @@ impl apis::workers::Workers for ServerImpl {
         body: &models::CreateWorkerRequest,
     ) -> Result<apis::workers::CreateWorkerResponse, ()> {
         let job_type = flatten_nullable(&body.job_type);
-        match super::worker_create(body.name.clone(), job_type).await {
+        match nano_server_console::worker_create(body.name.clone(), job_type).await {
             Ok(v) => Ok(apis::workers::CreateWorkerResponse::Status201_WorkerCreated(from_val(v))),
             Err((code, msg)) if code == http::StatusCode::CONFLICT => {
                 Ok(apis::workers::CreateWorkerResponse::Status409_AlreadyExists(msg))
@@ -771,7 +772,7 @@ impl apis::workers::Workers for ServerImpl {
         path_params: &models::CreateWorkerFilePathParams,
         body: &models::CreateFileRequest,
     ) -> Result<apis::workers::CreateWorkerFileResponse, ()> {
-        match super::worker_file_create(&path_params.name, &body.path) {
+        match nano_server_console::worker_file_create(&path_params.name, &body.path) {
             Ok(_) => Ok(apis::workers::CreateWorkerFileResponse::Status201_Created),
             Err((code, msg)) if code == http::StatusCode::CONFLICT => {
                 Ok(apis::workers::CreateWorkerFileResponse::Status409_AlreadyExists(msg))
@@ -792,7 +793,7 @@ impl apis::workers::Workers for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::DeleteWorkerPathParams,
     ) -> Result<apis::workers::DeleteWorkerResponse, ()> {
-        match super::worker_delete(&path_params.name).await {
+        match nano_server_console::worker_delete(&path_params.name).await {
             Ok(_) => Ok(apis::workers::DeleteWorkerResponse::Status204_Deleted),
             Err((_, msg)) => Ok(apis::workers::DeleteWorkerResponse::Status404_NotFound(msg)),
         }
@@ -806,7 +807,7 @@ impl apis::workers::Workers for ServerImpl {
         path_params: &models::DeleteWorkerFilePathParams,
         query_params: &models::DeleteWorkerFileQueryParams,
     ) -> Result<apis::workers::DeleteWorkerFileResponse, ()> {
-        match super::worker_file_delete(&path_params.name, &query_params.path) {
+        match nano_server_console::worker_file_delete(&path_params.name, &query_params.path) {
             Ok(_) => Ok(apis::workers::DeleteWorkerFileResponse::Status204_Deleted),
             Err((_, msg)) => {
                 Ok(apis::workers::DeleteWorkerFileResponse::Status400_InvalidRequest(msg))
@@ -822,7 +823,7 @@ impl apis::workers::Workers for ServerImpl {
     ) -> Result<apis::workers::GetDenoTypesResponse, ()> {
         Ok(
             apis::workers::GetDenoTypesResponse::Status200_DenoTypeDeclarations(
-                super::deno_types_source(),
+                nano_server_console::deno_types_source(),
             ),
         )
     }
@@ -834,7 +835,7 @@ impl apis::workers::Workers for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::GetWorkerPathParams,
     ) -> Result<apis::workers::GetWorkerResponse, ()> {
-        match super::worker_get(&path_params.name).await {
+        match nano_server_console::worker_get(&path_params.name).await {
             Ok(v) => Ok(apis::workers::GetWorkerResponse::Status200_WorkerSummary(
                 from_val(v),
             )),
@@ -850,7 +851,7 @@ impl apis::workers::Workers for ServerImpl {
         path_params: &models::GetWorkerFilePathParams,
         query_params: &models::GetWorkerFileQueryParams,
     ) -> Result<apis::workers::GetWorkerFileResponse, ()> {
-        match super::worker_file_get(&path_params.name, &query_params.path) {
+        match nano_server_console::worker_file_get(&path_params.name, &query_params.path) {
             Ok(contents) => {
                 Ok(apis::workers::GetWorkerFileResponse::Status200_FileContents(contents))
             }
@@ -871,7 +872,7 @@ impl apis::workers::Workers for ServerImpl {
     ) -> Result<apis::workers::GetWorkerSdkResponse, ()> {
         Ok(
             apis::workers::GetWorkerSdkResponse::Status200_WorkerSDKSource(
-                super::worker_sdk_source(),
+                nano_server_console::worker_sdk_source(),
             ),
         )
     }
@@ -883,7 +884,7 @@ impl apis::workers::Workers for ServerImpl {
         _cookies: &CookieJar,
     ) -> Result<apis::workers::ListWorkersResponse, ()> {
         // Only 200 is declared; on a workspace error fall back to empty.
-        let v = super::workers_list()
+        let v = nano_server_console::workers_list()
             .await
             .unwrap_or_else(|_| serde_json::json!({ "workers": [], "denoAvailable": false }));
         Ok(
@@ -902,7 +903,7 @@ impl apis::workers::Workers for ServerImpl {
         query_params: &models::SaveWorkerFileQueryParams,
         body: &String,
     ) -> Result<apis::workers::SaveWorkerFileResponse, ()> {
-        match super::worker_file_save(&path_params.name, &query_params.path, body) {
+        match nano_server_console::worker_file_save(&path_params.name, &query_params.path, body) {
             Ok(_) => Ok(apis::workers::SaveWorkerFileResponse::Status204_Saved),
             Err((_, msg)) => {
                 Ok(apis::workers::SaveWorkerFileResponse::Status400_InvalidRequest(msg))
@@ -917,7 +918,7 @@ impl apis::workers::Workers for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::StartWorkerPathParams,
     ) -> Result<apis::workers::StartWorkerResponse, ()> {
-        match super::worker_start(&path_params.name).await {
+        match nano_server_console::worker_start(&path_params.name).await {
             Ok(v) => {
                 Ok(apis::workers::StartWorkerResponse::Status200_WorkerRuntimeState(from_val(v)))
             }
@@ -932,7 +933,7 @@ impl apis::workers::Workers for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::StopWorkerPathParams,
     ) -> Result<apis::workers::StopWorkerResponse, ()> {
-        match super::worker_stop(&path_params.name).await {
+        match nano_server_console::worker_stop(&path_params.name).await {
             Ok(v) => {
                 Ok(apis::workers::StopWorkerResponse::Status200_WorkerRuntimeState(from_val(v)))
             }
@@ -954,7 +955,7 @@ impl apis::projects::Projects for ServerImpl {
         body: &models::CompileRequest,
     ) -> Result<apis::projects::CompileProjectResponse, ()> {
         let targets = body.targets.clone().unwrap_or_default();
-        match super::project_compile(&path_params.name, targets) {
+        match nano_server_console::project_compile(&path_params.name, targets) {
             Ok(v) => Ok(
                 apis::projects::CompileProjectResponse::Status200_WhetherACompileWasStarted(
                     from_val(v),
@@ -976,7 +977,7 @@ impl apis::projects::Projects for ServerImpl {
         let description = body.description.clone().unwrap_or_default();
         let template = flatten_nullable(&body.template).unwrap_or_else(|| "starter".to_string());
         let options = flatten_nullable(&body.options).unwrap_or_default();
-        match super::project_create(&body.name, &description, &template, &options) {
+        match nano_server_console::project_create(&body.name, &description, &template, &options) {
             Ok(v) => {
                 // Code-first projects (ADR 0048): generate the initial laid-out
                 // `resources/processes/*.bpmn` from the scaffolded `workflows/*.ts`
@@ -997,7 +998,7 @@ impl apis::projects::Projects for ServerImpl {
                 if template == "workflow-starter" {
                     if let Some(project) = created_slug {
                         tokio::spawn(async move {
-                            super::regenerate_workflow_models(&project).await;
+                            nano_server_console::regenerate_workflow_models(&project).await;
                         });
                     }
                 } else if let Some(project) = created_slug {
@@ -1013,7 +1014,8 @@ impl apis::projects::Projects for ServerImpl {
                     // deps/gen internally, so a non-Urban builtin starter is a
                     // cheap no-op, and a flaky install/gen only logs a warning —
                     // it never fails the create the maker already succeeded at.
-                    let outcome = super::projects::finalize_after_update(&project).await;
+                    let outcome =
+                        nano_server_console::projects::finalize_after_update(&project).await;
                     for warning in &outcome.warnings {
                         tracing::warn!(project = %project, warning = %warning, "post-create refresh");
                     }
@@ -1038,10 +1040,11 @@ impl apis::projects::Projects for ServerImpl {
     ) -> Result<apis::projects::ImportProjectResponse, ()> {
         let name = body.name.trim().to_string();
         let path = body.path.trim().to_string();
-        let out =
-            tokio::task::spawn_blocking(move || super::projects::import_project_ref(&name, &path))
-                .await
-                .unwrap_or_else(|e| Err(format!("import task panicked: {e}")));
+        let out = tokio::task::spawn_blocking(move || {
+            nano_server_console::projects::import_project_ref(&name, &path)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("import task panicked: {e}")));
         match out {
             Ok(r) => Ok(
                 apis::projects::ImportProjectResponse::Status200_ProjectReferenceRegistered(
@@ -1067,7 +1070,7 @@ impl apis::projects::Projects for ServerImpl {
         body: &models::CreateProjectPathRequest,
     ) -> Result<apis::projects::CreateProjectPathResponse, ()> {
         let dir = body.dir.unwrap_or(false);
-        match super::project_path_create(&path_params.name, &body.path, dir) {
+        match nano_server_console::project_path_create(&path_params.name, &body.path, dir) {
             Ok(_) => Ok(apis::projects::CreateProjectPathResponse::Status201_Created),
             Err((code, msg)) if code == http::StatusCode::CONFLICT => {
                 Ok(apis::projects::CreateProjectPathResponse::Status409_AlreadyExists(msg))
@@ -1085,7 +1088,7 @@ impl apis::projects::Projects for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::DeleteProjectPathParams,
     ) -> Result<apis::projects::DeleteProjectResponse, ()> {
-        match super::project_delete(&path_params.name).await {
+        match nano_server_console::project_delete(&path_params.name).await {
             Ok(_) => Ok(apis::projects::DeleteProjectResponse::Status204_Deleted),
             Err((_, msg)) => Ok(apis::projects::DeleteProjectResponse::Status404_NotFound(
                 msg,
@@ -1101,7 +1104,7 @@ impl apis::projects::Projects for ServerImpl {
         path_params: &models::DeleteProjectPathPathParams,
         query_params: &models::DeleteProjectPathQueryParams,
     ) -> Result<apis::projects::DeleteProjectPathResponse, ()> {
-        match super::project_path_delete(&path_params.name, &query_params.path) {
+        match nano_server_console::project_path_delete(&path_params.name, &query_params.path) {
             Ok(_) => Ok(apis::projects::DeleteProjectPathResponse::Status204_Deleted),
             Err((_, msg)) => {
                 Ok(apis::projects::DeleteProjectPathResponse::Status400_InvalidRequest(msg))
@@ -1116,7 +1119,7 @@ impl apis::projects::Projects for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::GetProjectPathParams,
     ) -> Result<apis::projects::GetProjectResponse, ()> {
-        match super::project_detail(&path_params.name).await {
+        match nano_server_console::project_detail(&path_params.name).await {
             Ok(mut v) => {
                 fix_run_status(&mut v);
                 Ok(apis::projects::GetProjectResponse::Status200_ProjectDetail(
@@ -1134,7 +1137,7 @@ impl apis::projects::Projects for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::GetProjectConfigPathParams,
     ) -> Result<apis::projects::GetProjectConfigResponse, ()> {
-        match super::project_config_get(&path_params.name) {
+        match nano_server_console::project_config_get(&path_params.name) {
             Ok(v) => {
                 Ok(apis::projects::GetProjectConfigResponse::Status200_ProjectConfig(from_val(v)))
             }
@@ -1149,7 +1152,7 @@ impl apis::projects::Projects for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::GetRunConfigsPathParams,
     ) -> Result<apis::projects::GetRunConfigsResponse, ()> {
-        match super::project_run_configs_list(&path_params.name) {
+        match nano_server_console::project_run_configs_list(&path_params.name) {
             Ok(v) => Ok(
                 apis::projects::GetRunConfigsResponse::Status200_RunConfigurationsPlusTheActiveId(
                     from_val(v),
@@ -1168,7 +1171,7 @@ impl apis::projects::Projects for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::ListProjectFilesPathParams,
     ) -> Result<apis::projects::ListProjectFilesResponse, ()> {
-        match super::project_files(&path_params.name) {
+        match nano_server_console::project_files(&path_params.name) {
             Ok(v) => Ok(apis::projects::ListProjectFilesResponse::Status200_FileTree(from_val(v))),
             Err((_, msg)) => Ok(apis::projects::ListProjectFilesResponse::Status404_NotFound(msg)),
         }
@@ -1181,13 +1184,15 @@ impl apis::projects::Projects for ServerImpl {
         _cookies: &CookieJar,
     ) -> Result<apis::projects::ListProjectsResponse, ()> {
         // Only 200 is declared; on error fall back to empty.
-        let mut v = super::projects_list().await.unwrap_or_else(|_| {
-            serde_json::json!({
-                "projects": [],
-                "denoAvailable": false,
-                "platforms": super::projects::PLATFORMS,
-            })
-        });
+        let mut v = nano_server_console::projects_list()
+            .await
+            .unwrap_or_else(|_| {
+                serde_json::json!({
+                    "projects": [],
+                    "denoAvailable": false,
+                    "platforms": nano_server_console::projects::PLATFORMS,
+                })
+            });
         fix_run_status(&mut v);
         Ok(
             apis::projects::ListProjectsResponse::Status200_ProjectsPlusRuntimeAvailability(
@@ -1204,7 +1209,7 @@ impl apis::projects::Projects for ServerImpl {
         path_params: &models::RenameProjectPathParams,
         body: &models::RenameProjectRequest,
     ) -> Result<apis::projects::RenameProjectResponse, ()> {
-        match super::project_rename(&path_params.name, &body.new_name).await {
+        match nano_server_console::project_rename(&path_params.name, &body.new_name).await {
             Ok(v) => Ok(
                 apis::projects::RenameProjectResponse::Status200_UpdatedProjectConfig(from_val(v)),
             ),
@@ -1232,7 +1237,7 @@ impl apis::projects::Projects for ServerImpl {
         // Conflict resolution: specific take-upstream paths and/or a bulk
         // "take theirs" for every conflict. `resolveConflicts: mine` is the
         // default (keep local) and needs no explicit handling.
-        let resolution = super::projects::ConflictResolution {
+        let resolution = nano_server_console::projects::ConflictResolution {
             take_theirs: body
                 .as_ref()
                 .and_then(|b| b.take_theirs.clone())
@@ -1248,7 +1253,7 @@ impl apis::projects::Projects for ServerImpl {
         // npm pack + filesystem work — keep it off the async runtime.
         let update_name = name.clone();
         let res = tokio::task::spawn_blocking(move || {
-            super::projects::update_from_template(
+            nano_server_console::projects::update_from_template(
                 &update_name,
                 apply,
                 version.as_deref(),
@@ -1263,7 +1268,8 @@ impl apis::projects::Projects for ServerImpl {
                 // regenerating artifacts after a pack update. Best-effort: any
                 // problem is reported as a warning on the plan, not a failure.
                 if apply && plan.applied && plan.conflicts.is_empty() {
-                    plan.post_update = Some(super::projects::finalize_after_update(&name).await);
+                    plan.post_update =
+                        Some(nano_server_console::projects::finalize_after_update(&name).await);
                 }
                 let v = serde_json::to_value(plan).expect("update plan serializes");
                 Ok(R::Status200_TheOverlayPlan(from_val(v)))
@@ -1288,7 +1294,7 @@ impl apis::projects::Projects for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::RunProjectPathParams,
     ) -> Result<apis::projects::RunProjectResponse, ()> {
-        match super::project_run(&path_params.name).await {
+        match nano_server_console::project_run(&path_params.name).await {
             Ok(mut v) => {
                 fix_run_status(&mut v);
                 Ok(apis::projects::RunProjectResponse::Status200_RunState(
@@ -1307,9 +1313,9 @@ impl apis::projects::Projects for ServerImpl {
         path_params: &models::SaveProjectConfigPathParams,
         body: &models::ProjectConfig,
     ) -> Result<apis::projects::SaveProjectConfigResponse, ()> {
-        let cfg: super::projects::ProjectConfig =
+        let cfg: nano_server_console::projects::ProjectConfig =
             from_val(serde_json::to_value(body).expect("config serializes"));
-        match super::project_config_put(&path_params.name, cfg) {
+        match nano_server_console::project_config_put(&path_params.name, cfg) {
             Ok(v) => Ok(
                 apis::projects::SaveProjectConfigResponse::Status200_SavedProjectConfig(from_val(
                     v,
@@ -1330,7 +1336,7 @@ impl apis::projects::Projects for ServerImpl {
         query_params: &models::SaveProjectFileQueryParams,
         body: &String,
     ) -> Result<apis::projects::SaveProjectFileResponse, ()> {
-        match super::project_file_save(&path_params.name, &query_params.path, body) {
+        match nano_server_console::project_file_save(&path_params.name, &query_params.path, body) {
             Ok(_) => {
                 // Regenerate the typed SDK when a process model is saved: the
                 // model is the source of truth for worker/message I/O + custom
@@ -1339,9 +1345,9 @@ impl apis::projects::Projects for ServerImpl {
                 // model. Best-effort — the save already succeeded and the types
                 // are an authoring-time contract only (mirrors the DDL/migrate
                 // regen triggers on the data path).
-                if super::is_model_resource(&query_params.path) {
-                    super::regenerate_domain_types(&path_params.name).await;
-                } else if super::is_workflow_source(&query_params.path) {
+                if nano_server_console::is_model_resource(&query_params.path) {
+                    nano_server_console::regenerate_domain_types(&path_params.name).await;
+                } else if nano_server_console::is_workflow_source(&query_params.path) {
                     // Code-first inverse (ADR 0048): a `workflows/*.ts` save
                     // (re)generates the laid-out `resources/processes/*.bpmn` the
                     // SDK derives, then refreshes the types from them. Fire-and-
@@ -1349,7 +1355,7 @@ impl apis::projects::Projects for ServerImpl {
                     // we must not block the save response on; best-effort.
                     let project = path_params.name.clone();
                     tokio::spawn(async move {
-                        super::regenerate_workflow_models(&project).await;
+                        nano_server_console::regenerate_workflow_models(&project).await;
                     });
                 }
                 Ok(apis::projects::SaveProjectFileResponse::Status204_Saved)
@@ -1369,7 +1375,7 @@ impl apis::projects::Projects for ServerImpl {
         body: &models::ActiveRunConfigRequest,
     ) -> Result<apis::projects::SetActiveRunConfigResponse, ()> {
         let id = flatten_nullable(&body.id);
-        match super::project_active_run_config_put(&path_params.name, id) {
+        match nano_server_console::project_active_run_config_put(&path_params.name, id) {
             Ok(v) => {
                 Ok(apis::projects::SetActiveRunConfigResponse::Status200_TheActiveRun(from_val(v)))
             }
@@ -1389,7 +1395,7 @@ impl apis::projects::Projects for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::StopProjectPathParams,
     ) -> Result<apis::projects::StopProjectResponse, ()> {
-        match super::project_stop(&path_params.name).await {
+        match nano_server_console::project_stop(&path_params.name).await {
             Ok(mut v) => {
                 fix_run_status(&mut v);
                 Ok(apis::projects::StopProjectResponse::Status200_RunState(
@@ -1427,7 +1433,7 @@ impl apis::data::Data for ServerImpl {
     ) -> Result<apis::data::GetDataSourcesResponse, ()> {
         use apis::data::GetDataSourcesResponse as R;
         data_ok_or!(
-            super::project_data_sources(&path_params.name).await,
+            nano_server_console::project_data_sources(&path_params.name).await,
             R::Status200_DatasourcesPlusTheDefaultSourceName,
             R::Status400_InvalidRequest,
             R::Status404_NotFound
@@ -1443,7 +1449,7 @@ impl apis::data::Data for ServerImpl {
     ) -> Result<apis::data::GetDataSchemaResponse, ()> {
         use apis::data::GetDataSchemaResponse as R;
         data_ok_or!(
-            super::project_data_schema(&path_params.name, &path_params.source).await,
+            nano_server_console::project_data_schema(&path_params.name, &path_params.source).await,
             R::Status200_DatasourceSchema,
             R::Status400_InvalidRequest,
             R::Status404_NotFound
@@ -1465,8 +1471,13 @@ impl apis::data::Data for ServerImpl {
             .map(|ps| ps.iter().map(|o| o.0.clone()).collect())
             .unwrap_or_default();
         data_ok_or!(
-            super::project_data_query(&path_params.name, &path_params.source, &body.sql, params)
-                .await,
+            nano_server_console::project_data_query(
+                &path_params.name,
+                &path_params.source,
+                &body.sql,
+                params
+            )
+            .await,
             R::Status200_QueryResult,
             R::Status400_InvalidRequest,
             R::Status404_NotFound
@@ -1488,8 +1499,13 @@ impl apis::data::Data for ServerImpl {
             .map(|ps| ps.iter().map(|o| o.0.clone()).collect())
             .unwrap_or_default();
         data_ok_or!(
-            super::project_data_exec(&path_params.name, &path_params.source, &body.sql, params)
-                .await,
+            nano_server_console::project_data_exec(
+                &path_params.name,
+                &path_params.source,
+                &body.sql,
+                params
+            )
+            .await,
             R::Status200_ExecResult,
             R::Status400_InvalidRequest,
             R::Status404_NotFound
@@ -1506,7 +1522,7 @@ impl apis::data::Data for ServerImpl {
     ) -> Result<apis::data::ExecDataScriptResponse, ()> {
         use apis::data::ExecDataScriptResponse as R;
         data_ok_or!(
-            super::project_data_script(
+            nano_server_console::project_data_script(
                 &path_params.name,
                 &path_params.source,
                 body.statements.clone(),
@@ -1527,7 +1543,8 @@ impl apis::data::Data for ServerImpl {
     ) -> Result<apis::data::GetDataMigrationsResponse, ()> {
         use apis::data::GetDataMigrationsResponse as R;
         data_ok_or!(
-            super::project_data_migrations(&path_params.name, &path_params.source).await,
+            nano_server_console::project_data_migrations(&path_params.name, &path_params.source)
+                .await,
             R::Status200_MigrationStatus,
             R::Status400_InvalidRequest,
             R::Status404_NotFound
@@ -1543,7 +1560,7 @@ impl apis::data::Data for ServerImpl {
     ) -> Result<apis::data::MigrateDataResponse, ()> {
         use apis::data::MigrateDataResponse as R;
         data_ok_or!(
-            super::project_data_migrate(&path_params.name, &path_params.source).await,
+            nano_server_console::project_data_migrate(&path_params.name, &path_params.source).await,
             R::Status200_MigrationsApplied,
             R::Status400_InvalidRequest,
             R::Status404_NotFound
@@ -1559,7 +1576,8 @@ impl apis::data::Data for ServerImpl {
     ) -> Result<apis::data::RegenerateDomainTypesResponse, ()> {
         use apis::data::RegenerateDomainTypesResponse as R;
         data_ok_or!(
-            super::project_data_domaintypes(&path_params.name, &path_params.source).await,
+            nano_server_console::project_data_domaintypes(&path_params.name, &path_params.source)
+                .await,
             R::Status200_TheEmittedDomainTypes,
             R::Status400_InvalidRequest,
             R::Status404_NotFound
@@ -1584,7 +1602,7 @@ impl apis::data::Data for ServerImpl {
             .as_ref()
             .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null));
         data_ok_or!(
-            super::project_data_preview_domaintypes(
+            nano_server_console::project_data_preview_domaintypes(
                 &path_params.name,
                 &path_params.source,
                 shapes,
@@ -1620,7 +1638,7 @@ impl apis::triggers::Triggers for ServerImpl {
                 .collect(),
         );
         data_ok_or!(
-            super::project_trigger_add(
+            nano_server_console::project_trigger_add(
                 &path_params.name,
                 &body.id,
                 &body.r_type,
@@ -1652,8 +1670,13 @@ impl apis::triggers::Triggers for ServerImpl {
         );
         let idem = flatten_nullable(&body.idempotency_key);
         data_ok_or!(
-            super::project_trigger_enqueue(&path_params.name, &body.trigger_id, idem, event_body)
-                .await,
+            nano_server_console::project_trigger_enqueue(
+                &path_params.name,
+                &body.trigger_id,
+                idem,
+                event_body
+            )
+            .await,
             R::Status200_EnqueueOutcome,
             R::Status400_InvalidRequest,
             R::Status404_NotFound
@@ -1669,7 +1692,7 @@ impl apis::triggers::Triggers for ServerImpl {
     ) -> Result<apis::triggers::GetTriggerInboxResponse, ()> {
         use apis::triggers::GetTriggerInboxResponse as R;
         data_ok_or!(
-            super::project_trigger_inbox(&path_params.name).await,
+            nano_server_console::project_trigger_inbox(&path_params.name).await,
             R::Status200_InboxStatus,
             R::Status400_InvalidRequest,
             R::Status404_NotFound
@@ -1685,7 +1708,7 @@ impl apis::triggers::Triggers for ServerImpl {
     ) -> Result<apis::triggers::GetTriggersResponse, ()> {
         use apis::triggers::GetTriggersResponse as R;
         data_ok_or!(
-            super::project_triggers(&path_params.name).await,
+            nano_server_console::project_triggers(&path_params.name).await,
             R::Status200_Triggers,
             R::Status400_InvalidRequest,
             R::Status404_NotFound
@@ -1709,7 +1732,7 @@ impl apis::connectors::Connectors for ServerImpl {
             .unwrap_or_default();
         let connection = flatten_nullable(&body.connection);
         data_ok_or!(
-            super::project_connector_add(
+            nano_server_console::project_connector_add(
                 &path_params.name,
                 &body.r_type,
                 connection.as_deref(),
@@ -1730,10 +1753,83 @@ impl apis::connectors::Connectors for ServerImpl {
     ) -> Result<apis::connectors::GetConnectorsResponse, ()> {
         use apis::connectors::GetConnectorsResponse as R;
         data_ok_or!(
-            super::project_connectors(&path_params.name),
+            nano_server_console::project_connectors(&path_params.name),
             R::Status200_Connectors,
             R::Status400_InvalidRequest,
             R::Status404_NotFound
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The console seam (ADR 0064 Phase 3, Option B).
+//
+// `nano-server-console` reaches this binary's `ServerImpl` exclusively through
+// the object-safe `ConsoleServer` trait, so the god-object type never crosses
+// the crate boundary. The console router receives an `Arc<dyn ConsoleServer>`.
+// ---------------------------------------------------------------------------
+#[async_trait]
+impl nano_server_console::ConsoleServer for ServerImpl {
+    fn store(&self) -> &std::sync::Arc<crate::readstore::ReadModel> {
+        &self.store
+    }
+
+    fn trace_store(&self) -> &nano_trace_store::TraceStore {
+        self.trace_store.as_ref()
+    }
+
+    fn cluster_topology(&self) -> &crate::cluster::Topology {
+        self.engine.topology()
+    }
+
+    fn sla_mode(&self) -> crate::backpressure::SlaMode {
+        ServerImpl::sla_mode(self)
+    }
+
+    async fn switch_sla_mode(&self, mode: crate::backpressure::SlaMode) {
+        ServerImpl::switch_sla_mode(self, mode).await
+    }
+
+    fn raft_enabled(&self) -> bool {
+        crate::raft_enabled()
+    }
+
+    fn recovery_counts(&self) -> crate::cluster::RecoveryCounts {
+        crate::recovery_counts(self)
+    }
+
+    fn raft_partition_metrics(&self, partition: u64) -> Option<(Option<u32>, u64)> {
+        let part = self.raft_registry().get(partition)?;
+        let m = part.raft.metrics().borrow().clone();
+        Some((m.current_leader.map(|id| id as u32), m.current_term))
+    }
+
+    async fn instance_job_overlay(
+        &self,
+        partition: u64,
+        keys: Vec<u64>,
+    ) -> std::collections::HashMap<u64, nano_server_console::LiveJob> {
+        let Some(handle) = self.engine_handle_for(partition) else {
+            return std::collections::HashMap::new();
+        };
+        handle
+            .with(move |journal| {
+                let mut m = std::collections::HashMap::new();
+                for k in keys {
+                    if let Some(job) = journal.engine().job(k) {
+                        m.insert(
+                            k,
+                            nano_server_console::LiveJob {
+                                state: format!("{:?}", job.state),
+                                worker: job.worker.clone(),
+                                deadline_ms: job.deadline,
+                                activated_at_ms: job.activated_at,
+                            },
+                        );
+                    }
+                }
+                m
+            })
+            .await
     }
 }

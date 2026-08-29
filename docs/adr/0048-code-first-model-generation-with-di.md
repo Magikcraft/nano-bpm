@@ -14,7 +14,7 @@ ADR 0033 §6 increment 12 (`envelope_scan::scan_project` — the `resources/proc
 and the code: `workflow/src/layout.ts` (`layoutBpmn` / `declarativeToLayoutedBpmn`, the DI generator),
 `server/src/console/projects.rs` (`generate_models`, the server-side generation path that mirrors
 `derive_models`), `server/src/console/mod.rs` (`is_workflow_source`, `regenerate_workflow_models`),
-`server/src/console/generated_api.rs` (the save + create hooks).
+`server/src/console_api.rs` (the save + create hooks).
 
 ## Context
 

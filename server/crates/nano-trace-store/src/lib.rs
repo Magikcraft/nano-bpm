@@ -94,7 +94,7 @@ fn snapshot_vars(vars: &HashMap<String, Value>, max_bytes: usize) -> VarSnapshot
     // externally-tagged, which is not what consumers expect.
     let value = serde_json::Value::Object(
         vars.iter()
-            .map(|(k, v)| (k.clone(), crate::value_to_json(v)))
+            .map(|(k, v)| (k.clone(), nanobpmn_read_model::value_to_json(v)))
             .collect(),
     );
     let bytes = serde_json::to_vec(&value).map(|v| v.len()).unwrap_or(0);

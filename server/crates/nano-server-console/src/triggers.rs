@@ -467,7 +467,7 @@ fn parse_action(action: &Json, trigger_id: &str) -> Result<Action, TriggerError>
 /// The FEEL scope is `{ body: <event body> }` (ADR 0029 §5 / 0025 §1).
 pub(crate) fn plan_call(action: &Action, body: &Json) -> Result<EngineCall, TriggerError> {
     let mut ctx: HashMap<String, nanobpmn_engine_core::Value> = HashMap::new();
-    ctx.insert("body".to_string(), crate::json_to_value(body));
+    ctx.insert("body".to_string(), nanobpmn_read_model::json_to_value(body));
     match action {
         Action::Start { process, variables } => Ok(EngineCall::Start {
             process: process.clone(),
@@ -504,7 +504,7 @@ fn eval_variables(
     };
     let v = nanobpmn_engine_core::feel::eval(expr, ctx)
         .map_err(|e| TriggerError::Feel(e.to_string()))?;
-    match crate::value_to_json(&v) {
+    match nanobpmn_read_model::value_to_json(&v) {
         Json::Null => Ok(json!({})),
         obj @ Json::Object(_) => Ok(obj),
         other => Err(TriggerError::Feel(format!(
@@ -1496,7 +1496,7 @@ await new Promise((r) => setTimeout(r, 60000));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
-            axum::serve(listener, crate::console::test_ingress_router())
+            axum::serve(listener, crate::test_ingress_router())
                 .await
                 .ok();
         });
@@ -1505,7 +1505,7 @@ await new Promise((r) => setTimeout(r, 60000));
         // Launch + supervise the pack driver via the real source layer.
         let manifest = read_manifest(&name).unwrap();
         let handle = LoopHandle::new_running();
-        crate::console::trigger_sources::spawn_sources(&name, &manifest, handle.clone());
+        crate::trigger_sources::spawn_sources(&name, &manifest, handle.clone());
 
         // Poll until both events land in the inbox (or time out ~10s).
         let mut pending = 0;
@@ -1583,7 +1583,7 @@ await new Promise((r) => setTimeout(r, 60000));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
-            axum::serve(listener, crate::console::test_ingress_router())
+            axum::serve(listener, crate::test_ingress_router())
                 .await
                 .ok();
         });
@@ -1591,7 +1591,7 @@ await new Promise((r) => setTimeout(r, 60000));
 
         let manifest = read_manifest(&name).unwrap();
         let handle = LoopHandle::new_running();
-        crate::console::trigger_sources::spawn_sources(&name, &manifest, handle.clone());
+        crate::trigger_sources::spawn_sources(&name, &manifest, handle.clone());
 
         // Give a would-be driver the full grace period to launch + emit (a real
         // launch posts within ~1s), then check the inbox once. A single expensive
@@ -1707,7 +1707,7 @@ for (let i = 0; i < 100; i++) {
 
         let manifest = read_manifest(&name).unwrap();
         let handle = LoopHandle::new_running();
-        crate::console::trigger_sources::spawn_workers(&name, &manifest, handle.clone());
+        crate::trigger_sources::spawn_workers(&name, &manifest, handle.clone());
 
         let mut launched = false;
         for _ in 0..100 {
@@ -1742,7 +1742,7 @@ for (let i = 0; i < 100; i++) {
 
         let manifest = read_manifest(&name).unwrap();
         let handle = LoopHandle::new_running();
-        crate::console::trigger_sources::spawn_workers(&name, &manifest, handle.clone());
+        crate::trigger_sources::spawn_workers(&name, &manifest, handle.clone());
 
         // Give a would-be worker the full grace period to launch + connect (the
         // happy-path twin observes a launch well inside this budget), then check

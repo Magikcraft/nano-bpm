@@ -59,7 +59,7 @@ fn default_shell() -> String {
 /// Upgrade handler. Enforces the loopback + opt-in gates, resolves the project
 /// directory, then hands the socket to [`run_pty`].
 pub(super) async fn pty_ws(
-    ConnectInfo(peer): ConnectInfo<crate::PeerAddr>,
+    ConnectInfo(peer): ConnectInfo<nano_server_net::PeerAddr>,
     headers: HeaderMap,
     Path(name): Path<String>,
     ws: WebSocketUpgrade,

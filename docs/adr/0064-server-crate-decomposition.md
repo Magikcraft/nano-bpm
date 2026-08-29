@@ -88,6 +88,7 @@ server/
                             # runtime_config, placement, cluster, deepthi, partition
     nano-falcon-protocol/   # ClientFrame/ServerFrame wire types only
     nano-server-raft/       # raft, raft_logstore, raft_net, peer
+    nano-trace-store/       # TraceStore (shared leaf crate; breaks the console↔core cycle)
     nano-server-console/    # console/* — requires the ServerImpl seam (below)
 ```
 
@@ -101,12 +102,14 @@ Migration is **phased**, each phase behavior-preserving and independently mergea
 - **Phase 2 — `nano-server-runtime`, `nano-falcon-protocol`, `nano-server-raft`.** Same
   pattern. `falcon.rs` splits along its existing seam: wire frames to the protocol crate,
   the `ServerImpl`-driven dispatcher stays in the binary.
-- **Phase 3 — `nano-server-console`.** Requires untying the `ServerImpl` knot: pull
-  `TraceStore` into a small shared crate (breaks the cycle), then either (a) move `ServerImpl`
-  + `stub_impls.rs` into a `nano-server-core` crate both the binary and console depend on —
-  teaching `scripts/gen-stub-server.py` the new import path — or (b) define a trait seam over
-  the ~15 methods console actually calls. Default: (a), less churn, matches how the generated
-  stubs already work.
+- **Phase 3 — `nano-server-console` (done, #1050).** Untied the `ServerImpl` knot in two
+  steps: first pulled `TraceStore` into the shared `nano-trace-store` leaf crate (breaks the
+  cycle), then took option (b) — a `ConsoleServer` trait seam over the ~9 methods console
+  actually calls — rather than (a)'s shared `nano-server-core`. Option (b) avoided dragging the
+  console DTO/mapping surface into a core crate to satisfy the `generated_api.rs` orphan-rule
+  knot (see Open questions); the 14 generated `impl apis::* for ServerImpl` blocks stay in the
+  binary (`server/src/console_api.rs`). Shared leaves `nano-server-net` and `nano-version-stamp`
+  were split out to remove the last binary↔console couplings.
 - **Phase 4 — test relocation (optional).** `clustered_startup_tests` +
   `subscription_placement_tests` (~9,800 lines, 29% of `main.rs`) drive `pub(crate)` internals
   via `build_server_in_memory`; once `ServerImpl` lives in a library crate they can move to
@@ -136,9 +139,46 @@ End state takes the always-compiled binary from ~103k to ~55k lines; with consol
 ## Open questions
 
 - Phase 3 seam choice: shared `nano-server-core` crate vs. trait seam for console's
-  `ServerImpl` usage — decided when Phase 3 is scoped.
-- Is test relocation (Phase 4) worth the visibility promotion it requires, or do the inline
-  test modules stay in the binary where `pub(crate)` access is free?
-- Does `console-observe` (ADR 0034) need any feature-graph reshaping once console is its own
-  crate, or does a feature on the binary that enables a feature on `nano-server-console`
-  suffice?
+  `ServerImpl` usage.
+  - **Step 1 (done, #1050): `TraceStore` extracted into the `nano-trace-store` leaf
+    crate**, breaking the `ServerImpl.trace_store: Arc<console::trace::TraceStore>` ↔
+    `console → crate::ServerImpl` import cycle (knot #2 of the audit). Both the binary and
+    a future console crate can now depend on it; the console module aliases it back
+    (`pub use nano_trace_store as trace;`) so intra-console `trace::…` paths are unchanged.
+  - **Step 2 (done, #1050): the console extracted into `nano-server-console` behind a
+    `ConsoleServer` trait seam — option (b).** Rather than move `ServerImpl` (and, per the
+    orphan-rule knot below, its Api-trait impls plus the DTO/mapping logic they call) into a
+    shared core crate, the console now depends on the binary only through the object-safe
+    `ConsoleServer` trait (`nano_server_console::ConsoleServer`), an `Arc<dyn ConsoleServer>`
+    router state, and `&dyn ConsoleServer` handler params. The trait exposes the ~9 methods the
+    console actually needs (`store`, `trace_store`, `cluster_topology`, `sla_mode` /
+    `switch_sla_mode`, `raft_enabled`, `recovery_counts`, `raft_partition_metrics`,
+    `instance_job_overlay`) and deliberately hides binary-only types (`Partitions`,
+    `DeepthiHandle`, the raft registry). The `generated_api.rs` orphan-rule knot (below) is
+    resolved by keeping the 14 `impl apis::* for ServerImpl` blocks in the binary
+    (`server/src/console_api.rs`), where they call into `nano_server_console::…` and add one
+    `impl ConsoleServer for ServerImpl`. Two shared leaf helpers were also extracted to break
+    remaining coupling: `nano-server-net` (`PeerAddr` + `NoDelayListener`, needed unconditionally
+    by the binary and by the console's `ConnectInfo<PeerAddr>`) and `nano-version-stamp` (the
+    `NANOBPM_VERSION` build-script derivation, shared by both build scripts so the two can never
+    drift), and `json_to_value` / `RecoveryCounts` moved to `nanobpmn-read-model` /
+    `nano-server-runtime` respectively.
+  - **The `generated_api.rs` orphan-rule knot (resolved by option (b) above).**
+    `server/src/console_api.rs` (was `console/generated_api.rs`) holds **14 `impl apis::* for
+    ServerImpl` blocks** (the generated `nanobpm-console-api` Api traits). Rust's orphan rule
+    requires an `impl ForeignTrait for ForeignType` to live in the crate that defines the trait
+    (`nanobpm-console-api`, generated — not editable) **or** the type (`ServerImpl`). Under
+    option (a) — `ServerImpl` in `nano-server-core`, `nano-server-console` depends on core —
+    these 14 impls **must** live in core, but their calls into console logic would then make
+    **core depend on console**, re-forming a cycle; option (a) would therefore have to drag the
+    console DTO/mapping surface into core too. Option (b)'s trait seam keeps that surface in
+    `nano-server-console` and the impls in the binary, so no cycle forms.
+- Test relocation: the inline `#[cfg(test)]` modules moved **with** their code into
+  `nano-server-console`; the visibility promotion this required (module-private `pub(super)`
+  items became `pub`, the console's now-public API surface) was mechanical and the workspace
+  boundary's `-D warnings` caught every leak, so relocation was worth it.
+- `console-observe` (ADR 0034) needs no feature-graph reshaping: the crate carries a matching
+  `console-observe` feature (swapping the embedded `console/dist` → `console/dist-observe`
+  RustEmbed folder), and the binary's `console-observe = ["console",
+  "nano-server-console/console-observe"]` simply forwards it — a feature on the binary that
+  enables a feature on `nano-server-console` suffices.

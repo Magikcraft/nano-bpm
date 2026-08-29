@@ -23,6 +23,28 @@
 //! When `NANOBPMN_NODES` is unset (or one entry) the topology is single-node and
 //! every partition is local — byte-for-byte today's behaviour.
 
+/// Per-node partition leadership/recovery counts, derived purely from engine +
+/// Raft state (topology ownership vs. live leaders). Base-build (non-console) so
+/// both the Prometheus `/metrics` exporter and the console's richer
+/// `RecoveryDto` share one source of truth. Cheap: a borrow of each hosted
+/// partition's Raft metrics watch. All-zero in steady single-node / off-Raft.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecoveryCounts {
+    /// Partitions this node statically owns (its steady-state leadership set).
+    pub owned: u32,
+    /// Owned partitions this node currently leads again (reclaimed / steady).
+    pub reclaimed: u32,
+    /// Owned partitions currently led by a peer failover incumbent — the ones
+    /// this node is still catching up on.
+    pub catching_up: u32,
+    /// Partitions this node leads on behalf of a peer owner (this node is the
+    /// failover incumbent, handing leadership back).
+    pub handing_off: u32,
+    /// Largest replication lag (log entries) of a returning owner this node is
+    /// handing a partition back to, when known (incumbent side only).
+    pub handoff_lag_entries: Option<u64>,
+}
+
 /// The cluster's static topology, computed identically on every node.
 #[derive(Clone, Debug)]
 pub struct Topology {

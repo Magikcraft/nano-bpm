@@ -4,7 +4,7 @@
 // (gzip, level 9) sibling next to every compressible asset above a small size
 // floor. The gateway embeds these siblings (rust-embed) and serves them
 // directly when the client's `Accept-Encoding` allows, instead of gzip-ing each
-// asset on every request (see server/src/console/mod.rs::serve_embedded).
+// asset on every request (see server/crates/nano-server-console/src/lib.rs::serve_embedded).
 //
 // Two wins over the previous per-request gzip:
 //   - Brotli-11 is ~15-20% smaller than gzip on JS/CSS and is computed once, at

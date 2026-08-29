@@ -20,10 +20,10 @@
 
 use std::process::Command;
 
+use nano_server_runtime::backpressure::SlaMode;
 use serde::Serialize;
 
 use super::extensions;
-use crate::backpressure::SlaMode;
 
 // ---------------------------------------------------------------------------
 // Server config
@@ -506,8 +506,9 @@ pub fn ide_config_json() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use nano_server_runtime::backpressure::parse_sla_mode;
+
     use super::*;
-    use crate::backpressure::parse_sla_mode;
 
     #[test]
     fn server_config_reports_sla_mode_and_params() {

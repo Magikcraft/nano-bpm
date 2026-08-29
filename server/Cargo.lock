@@ -1436,6 +1436,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-server-console"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "crc32fast",
+ "dunce",
+ "flate2",
+ "futures-util",
+ "headers",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "mime_guess",
+ "nano-server-net",
+ "nano-server-runtime",
+ "nano-server-storage",
+ "nano-trace-store",
+ "nano-version-stamp",
+ "nanobpmn-engine-core",
+ "nanobpmn-read-model",
+ "portable-pty",
+ "reqwest",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "nano-server-net"
+version = "0.0.16"
+dependencies = [
+ "axum",
+ "tokio",
+]
+
+[[package]]
 name = "nano-server-raft"
 version = "0.0.16"
 dependencies = [
@@ -1486,6 +1530,20 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "nano-trace-store"
+version = "0.0.16"
+dependencies = [
+ "nanobpmn-engine-core",
+ "nanobpmn-read-model",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nano-version-stamp"
+version = "0.1.0"
 
 [[package]]
 name = "nanobpm-console-api"
@@ -1546,29 +1604,25 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
- "crc32fast",
  "dunce",
- "flate2",
  "futures-util",
  "headers",
  "http",
- "http-body-util",
- "hyper",
- "hyper-util",
  "libc",
- "mime_guess",
  "nano-falcon-protocol",
+ "nano-server-console",
+ "nano-server-net",
  "nano-server-raft",
  "nano-server-runtime",
  "nano-server-storage",
+ "nano-trace-store",
+ "nano-version-stamp",
  "nanobpm-console-api",
  "nanobpm-gateway-rest",
  "nanobpmn-engine-core",
  "nanobpmn-read-model",
  "openraft",
- "portable-pty",
  "reqwest",
- "rust-embed",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1580,7 +1634,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "url",
 ]
 
 [[package]]
