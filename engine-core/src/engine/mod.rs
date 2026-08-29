@@ -5661,10 +5661,16 @@ impl Engine {
             // `calledElement` (Zeebe parity) and parks its own token in ACTIVATED
             // while the child runs. The child carries `parentProcessInstanceKey`/
             // `parentElementInstanceKey` back to this element instance so tooling
-            // can draw the parent↔child tree. Variables cross the instance
-            // boundary through the call activity's input mappings (seeding the
-            // child, isolated scope) and, on child completion, its output mappings
-            // (see `complete_call_activity`). The parent token completes when the
+            // can draw the parent↔child tree. Variable propagation across the
+            // instance boundary defaults to Zeebe's full-scope behaviour: the
+            // whole parent scope seeds the child on spawn and the whole child
+            // scope merges back on completion. `propagateAllParentVariables=false`
+            // suppresses the parent→child copy (only the input mappings seed the
+            // child) and `propagateAllChildVariables=false` suppresses the
+            // child→parent copy (only the output mappings merge back); input
+            // mappings (seeding the child, isolated scope) and, on child
+            // completion, output mappings (see `complete_call_activity`) are
+            // applied on top of whichever propagation the flags leave enabled. The parent token completes when the
             // child finishes (see `complete_finished_instances`); cancelling the
             // parent cancels the in-flight child (see `cascade_cancel_children`).
             Some(ElementKind::CallActivity {

@@ -735,13 +735,16 @@ fn parse_with_captures(
                                     if let Some(p) = attr(attrs, "processId") {
                                         acc.nodes[idx].called_process_id = Some(p.to_string());
                                     }
-                                    if let Some(v) = attr(attrs, "propagateAllParentVariables") {
-                                        acc.nodes[idx].propagate_all_parent_variables =
-                                            Some(v != "false");
+                                    // Only record the explicit `="false"` case;
+                                    // an explicit `="true"` is treated the same as
+                                    // absent (left `None`) so the builder applies
+                                    // the Zeebe `true` default, avoiding redundant
+                                    // `Some(true)` values.
+                                    if attr(attrs, "propagateAllParentVariables") == Some("false") {
+                                        acc.nodes[idx].propagate_all_parent_variables = Some(false);
                                     }
-                                    if let Some(v) = attr(attrs, "propagateAllChildVariables") {
-                                        acc.nodes[idx].propagate_all_child_variables =
-                                            Some(v != "false");
+                                    if attr(attrs, "propagateAllChildVariables") == Some("false") {
+                                        acc.nodes[idx].propagate_all_child_variables = Some(false);
                                     }
                                 }
                             }
