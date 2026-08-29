@@ -38,9 +38,13 @@ pub fn emit() {
     println!("cargo:rustc-env=NANOBPM_VERSION={version}");
 }
 
-/// Absolute path to a file inside the git dir (e.g. `HEAD`, `logs/HEAD`), resolved
-/// via `git rev-parse --git-path` so it is correct for packed refs and linked
-/// worktrees. `None` when git is absent or the command fails.
+/// Path to a file inside the git dir (e.g. `HEAD`, `logs/HEAD`), resolved via
+/// `git rev-parse --git-path` so it is correct for packed refs and linked
+/// worktrees. The path may be relative (git resolves it against the current
+/// directory, which we pin to `CARGO_MANIFEST_DIR`); callers here consume it the
+/// same way — `Path::exists` and `cargo:rerun-if-changed` both resolve relative
+/// paths against that manifest dir — so it is deliberately not forced absolute.
+/// `None` when git is absent or the command fails.
 fn git_path(rel: &str) -> Option<String> {
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
     let out = Command::new("git")
