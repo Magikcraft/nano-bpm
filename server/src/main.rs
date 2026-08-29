@@ -37,6 +37,17 @@ use axum::body::Body;
 use axum::extract::Multipart;
 use axum::response::Response;
 use http::StatusCode;
+// The runtime/engine-glue and raft/consensus layers were extracted into the
+// `nano-server-runtime` and `nano-server-raft` library crates (ADR 0064,
+// Phase 2). Re-export their modules at this crate's root so every existing
+// `crate::deepthi::…` / `crate::raft::…` path in this binary keeps resolving
+// unchanged. (The falcon wire frames live in `nano-falcon-protocol` and are
+// re-exported inside `falcon.rs` itself.)
+pub(crate) use nano_server_raft::{peer, raft, raft_logstore, raft_net};
+pub(crate) use nano_server_runtime::{
+    backpressure, cluster, cmd_profile, deepthi, drain_guard, partition, placement,
+    recovery_throttle, runtime_config,
+};
 // The storage layer was extracted into the `nano-server-storage` library crate
 // (ADR 0064, Phase 1). Re-export its modules at this crate's root so every
 // existing `crate::journal::…` / `crate::metrics::…` path in this binary keeps
@@ -50,17 +61,6 @@ pub(crate) use nano_server_storage::remote_sink;
 pub(crate) use nano_server_storage::seglog;
 pub(crate) use nano_server_storage::varspill;
 pub(crate) use nano_server_storage::varstore;
-// The runtime/engine-glue and raft/consensus layers were extracted into the
-// `nano-server-runtime` and `nano-server-raft` library crates (ADR 0064,
-// Phase 2). Re-export their modules at this crate's root so every existing
-// `crate::deepthi::…` / `crate::raft::…` path in this binary keeps resolving
-// unchanged. (The falcon wire frames live in `nano-falcon-protocol` and are
-// re-exported inside `falcon.rs` itself.)
-pub(crate) use nano_server_raft::{peer, raft, raft_logstore, raft_net};
-pub(crate) use nano_server_runtime::{
-    backpressure, cluster, cmd_profile, deepthi, drain_guard, partition, placement,
-    recovery_throttle, runtime_config,
-};
 use nanobpm_gateway_rest::{apis, models, types};
 use nanobpmn_engine_core as agent_model;
 use nanobpmn_engine_core::bpmn::parse_bpmn;

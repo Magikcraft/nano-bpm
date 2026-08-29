@@ -25,12 +25,12 @@ use std::time::Duration;
 
 use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
+use nano_falcon_protocol::{ClientFrame, ReadKind, ServerFrame, UserTaskOp};
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::cluster::Topology;
-use nano_falcon_protocol::{ClientFrame, ReadKind, ServerFrame, UserTaskOp};
 
 /// Default ceiling on how long a forwarded request waits for its peer's
 /// `CommandResult` before giving up. Overridable via `NANOBPMN_PEER_TIMEOUT_MS`.
