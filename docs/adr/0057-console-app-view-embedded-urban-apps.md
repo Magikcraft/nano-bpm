@@ -96,9 +96,10 @@ true at the byte level (the app's frontend still talks to the app's backend; the
 in between), under strict guardrails:
 
 - **Byte-opaque.** The console does not parse, filter, or mutate frames.
-- **No credential injection.** The tunnel injects no auth; the app self-authenticates end-to-end (the
-  app's own token rides the upgrade), so §2's trust model is unchanged — the console gains no
-  privileged reach into the stream.
+- **No credential injection.** The tunnel injects no auth of its own; it forwards the browser's *own*
+  end-to-end auth headers (`Cookie`/`Authorization`) upstream, exactly as the HTTP path forwards
+  `Authorization`, so the app self-authenticates end-to-end (the app's own token/cookie rides the
+  upgrade) and §2's trust model is unchanged — the console gains no privileged reach into the stream.
 - **WebSocket-only.** Any *other* `Upgrade` token (e.g. `h2c`) is still refused with `501`; the console
   is not a general stream proxy. An `Upgrade: websocket` request whose handshake is *malformed* (missing
   or invalid `Sec-WebSocket-*` headers) is a client error → `400`, not `501`.

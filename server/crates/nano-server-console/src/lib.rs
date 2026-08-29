@@ -1354,9 +1354,11 @@ async fn app_view_resolve_port(name: &str) -> Result<u16, Response> {
 ///
 /// The gateway completes the WS handshake with the browser and opens a client
 /// connection to the app's own UI port, then bridges frames bidirectionally as
-/// a byte-opaque pipe (see [`app_view_ws_bridge`]). It parses no frames, injects
-/// no credentials, and does not re-resolve the port mid-stream — the app
-/// self-authenticates end-to-end, exactly as on the HTTP path.
+/// a byte-opaque pipe (see [`app_view_ws_bridge`]). It parses no frames and
+/// injects no credentials of its own — it forwards the browser's *own*
+/// end-to-end auth headers (`Cookie`/`Authorization`) upstream, exactly as the
+/// HTTP path does — and does not re-resolve the port mid-stream, so the app
+/// self-authenticates end-to-end just like on the HTTP path.
 ///
 /// Ordering matters: the upstream connection is opened *before* the browser
 /// handshake completes, so (a) an unreachable app fails fast as a 502 rather
@@ -1396,6 +1398,18 @@ async fn app_view_ws_tunnel(
         request
             .headers_mut()
             .insert(header::SEC_WEBSOCKET_PROTOCOL, proto);
+    }
+    // Preserve the browser's *own* end-to-end auth context on the upgrade, just
+    // as the HTTP proxy path forwards `Authorization`. Same-origin browsers send
+    // `Cookie` automatically on the WS handshake (they cannot set custom headers
+    // on it), so a cookie-authenticated app that works over the HTTP proxy would
+    // otherwise silently fail to authenticate its WebSocket. This forwards
+    // credentials the browser already presented — it injects none — so the
+    // "self-authenticates end-to-end, injects no credentials" posture holds.
+    for name in [header::COOKIE, header::AUTHORIZATION] {
+        if let Some(v) = headers.get(&name).cloned() {
+            request.headers_mut().insert(name, v);
+        }
     }
 
     let (upstream, response) = match tokio_tungstenite::connect_async(request).await {
@@ -4465,6 +4479,38 @@ mod app_view_ws_tests {
         port
     }
 
+    /// A mock upstream that captures the `Cookie`/`Authorization` headers it
+    /// receives on the WS handshake and reports them back through `tx`, so a
+    /// test can assert the tunnel forwards the browser's end-to-end auth
+    /// context. Accepts the upgrade but exchanges no frames.
+    #[allow(clippy::type_complexity)]
+    async fn start_auth_capturing_upstream(
+        tx: mpsc::UnboundedSender<(Option<String>, Option<String>)>,
+    ) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let callback = |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                                    resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                        let get = |name: &str| {
+                            req.headers()
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_owned)
+                        };
+                        let _ = tx.send((get("cookie"), get("authorization")));
+                        Ok(resp)
+                    };
+                    let _ = tokio_tungstenite::accept_hdr_async(stream, callback).await;
+                });
+            }
+        });
+        port
+    }
+
     /// A mock upstream that, on connect, sends one Text frame then closes — to
     /// assert upstream→browser close propagation.
     async fn start_closing_upstream() -> u16 {
@@ -4593,6 +4639,44 @@ mod app_view_ws_tests {
             observed.is_some(),
             "browser close should reach the upstream"
         );
+
+        super::projects::supervisor().test_force_stopped(name).await;
+    }
+
+    #[tokio::test]
+    async fn forwards_end_to_end_auth_headers_upstream() {
+        let _g = glock();
+        let name = "ws_auth";
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let upstream = start_auth_capturing_upstream(tx).await;
+        super::projects::supervisor()
+            .test_force_running(name, upstream)
+            .await;
+        let console = start_console().await;
+
+        // A real browser sends `Cookie` automatically and cannot set
+        // `Authorization` on a WS handshake; tungstenite lets us set both so we
+        // can assert the tunnel forwards whatever end-to-end auth arrived.
+        let url = format!("ws://127.0.0.1:{console}/console/app-view/{name}/agentic");
+        let mut request = url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("cookie", HeaderValue::from_static("session=abc123"));
+        request
+            .headers_mut()
+            .insert("authorization", HeaderValue::from_static("Bearer tok-42"));
+        let (_ws, _resp) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("handshake should succeed");
+
+        let (cookie, authorization) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .ok()
+                .flatten()
+                .expect("upstream should observe the handshake");
+        assert_eq!(cookie.as_deref(), Some("session=abc123"));
+        assert_eq!(authorization.as_deref(), Some("Bearer tok-42"));
 
         super::projects::supervisor().test_force_stopped(name).await;
     }
