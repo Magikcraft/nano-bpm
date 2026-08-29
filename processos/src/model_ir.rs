@@ -302,8 +302,18 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
             attrs.push(format!("expression {}", quote(expression)));
             attrs.push(format!("resultVariable {}", quote(result_variable)));
         }
-        ElementKind::CallActivity { called_process_id } => {
+        ElementKind::CallActivity {
+            called_process_id,
+            propagate_all_parent_variables,
+            propagate_all_child_variables,
+        } => {
             attrs.push(format!("calledElement {}", quote(called_process_id)));
+            attrs.push(format!(
+                "propagateAllParentVariables {propagate_all_parent_variables}"
+            ));
+            attrs.push(format!(
+                "propagateAllChildVariables {propagate_all_child_variables}"
+            ));
         }
         ElementKind::SignalIntermediateCatchEvent { signal_name } => {
             attrs.push(format!("signal {}", quote(signal_name)));
@@ -1187,6 +1197,8 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
         },
         "callActivity" => ElementKind::CallActivity {
             called_process_id: attrs.require("calledElement", id)?,
+            propagate_all_parent_variables: attrs.bool_or("propagateAllParentVariables", true)?,
+            propagate_all_child_variables: attrs.bool_or("propagateAllChildVariables", true)?,
         },
         "signalIntermediateCatchEvent" => ElementKind::SignalIntermediateCatchEvent {
             signal_name: attrs.require("signal", id)?,

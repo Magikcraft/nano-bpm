@@ -372,12 +372,28 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
     KindSpec {
         keyword: "callActivity",
         doc: "Invokes another process definition and waits for it to complete.",
-        attrs: &[AttrSpec {
-            key: "calledElement",
-            required: true,
-            ty: AttrType::Str,
-            doc: "The `calledElement` / `zeebe:calledElement processId`.",
-        }],
+        attrs: &[
+            AttrSpec {
+                key: "calledElement",
+                required: true,
+                ty: AttrType::Str,
+                doc: "The `calledElement` / `zeebe:calledElement processId`.",
+            },
+            AttrSpec {
+                key: "propagateAllParentVariables",
+                required: true,
+                ty: AttrType::Bool,
+                doc: "`true` (Zeebe default) copies all visible parent variables into the child; \
+                      `false` copies only the input-mapping results.",
+            },
+            AttrSpec {
+                key: "propagateAllChildVariables",
+                required: true,
+                ty: AttrType::Bool,
+                doc: "`true` (Zeebe default) merges the child's variables back into the parent \
+                      (child wins); `false` crosses back only the output mappings.",
+            },
+        ],
     },
     KindSpec {
         keyword: "signalIntermediateCatchEvent",
@@ -981,6 +997,8 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
             "callActivity",
             ElementKind::CallActivity {
                 called_process_id: "phase_review".into(),
+                propagate_all_parent_variables: true,
+                propagate_all_child_variables: true,
             },
         ),
         (

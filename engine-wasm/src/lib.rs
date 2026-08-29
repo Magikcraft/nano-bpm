@@ -4521,6 +4521,87 @@ mod read_channel_tests {
     }
 
     #[test]
+    fn call_activity_propagates_variables_both_ways_through_the_shipped_artifact() {
+        // Issue #1057 (Zeebe parity): a *bare* callActivity (no ioMappings,
+        // propagate flags absent ⇒ both `true`) must copy the parent's variables
+        // into the child at spawn AND merge the child's variables back into the
+        // parent on completion — end-to-end through the shipped wasm surface the
+        // console / Bojtos consume, not just the Rust unit layer.
+        //
+        // The child scriptTask computes `doubled = orderId * 2`. Observing
+        // `doubled` on the *parent* proves BOTH directions in one shot: `orderId`
+        // reached the child (parent→child), and its result crossed back
+        // (child→parent). The parent parks on a downstream job so it stays ACTIVE
+        // and its variables remain in the read model.
+        const CHILD: &str = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="prop-child">
+              <bpmn:startEvent id="s" />
+              <bpmn:scriptTask id="dbl">
+                <bpmn:extensionElements>
+                  <zeebe:script expression="=orderId * 2" resultVariable="doubled" />
+                </bpmn:extensionElements>
+              </bpmn:scriptTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="dbl" />
+              <bpmn:sequenceFlow id="b" sourceRef="dbl" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        const PARENT: &str = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="prop-parent">
+              <bpmn:startEvent id="s" />
+              <bpmn:callActivity id="c1">
+                <bpmn:extensionElements>
+                  <zeebe:calledElement processId="prop-child" />
+                </bpmn:extensionElements>
+              </bpmn:callActivity>
+              <bpmn:serviceTask id="park">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="park-work" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="c1" />
+              <bpmn:sequenceFlow id="b" sourceRef="c1" targetRef="park" />
+              <bpmn:sequenceFlow id="d" sourceRef="park" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let mut eng = TestEngine::new();
+        eng.deploy(CHILD).unwrap();
+        eng.deploy(PARENT).unwrap();
+        let snap = parse(
+            &eng.create_instance("prop-parent", r#"{"orderId": 21}"#, None)
+                .unwrap(),
+        );
+        let parent_key = snap["instances"]
+            .as_array()
+            .and_then(|xs| xs.iter().find(|i| i["processId"] == "prop-parent"))
+            .map(|i| i["key"].as_str().unwrap().to_string())
+            .expect("parent instance created");
+
+        let vars = parse(&eng.search_variables("").unwrap());
+        let items = vars["items"].as_array().expect("items array");
+        let doubled = items.iter().find(|v| {
+            v["name"] == "doubled" && v["processInstanceKey"] == serde_json::json!(parent_key)
+        });
+        assert!(
+            doubled.is_some(),
+            "the child's computed `doubled` must merge back onto the parent \
+             (propagateAllChildVariables default true): {vars}"
+        );
+        assert_eq!(
+            doubled.unwrap()["value"],
+            "42",
+            "orderId=21 reached the child (propagateAllParentVariables default true) \
+             and doubled=42 crossed back"
+        );
+    }
+
+    #[test]
     fn state_filter_honours_the_nested_rest_filter_shape() {
         // The canonical REST body nests the filter under `filter`
         // (`UserTaskSearchQuery`), so a caller pasting the real gateway body must

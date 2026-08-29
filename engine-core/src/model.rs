@@ -681,6 +681,19 @@ pub enum ElementKind {
         /// The `calledElement` / `zeebe:calledElement processId` of the invoked
         /// process definition.
         called_process_id: String,
+        /// Zeebe `propagateAllParentVariables` (`zeebe:calledElement`). When
+        /// `true` (the Zeebe default when the attribute is absent), **all**
+        /// variables visible in the call activity's scope are copied into the
+        /// child instance at spawn; when `false`, only the call activity's local
+        /// variables — the results of its input mappings — cross the boundary.
+        propagate_all_parent_variables: bool,
+        /// Zeebe `propagateAllChildVariables` (`zeebe:calledElement`). When
+        /// `true` (the Zeebe default when the attribute is absent), the child's
+        /// final variables are merged back into the parent scope on completion
+        /// (the child's value wins on a name collision); when `false`, only the
+        /// call activity's output mappings cross back (nothing crosses if there
+        /// are none).
+        propagate_all_child_variables: bool,
     },
     /// A signal intermediate catch event. On activation it opens a signal
     /// subscription keyed by `signal_name` and the token rests on it; the token
@@ -1318,7 +1331,10 @@ fn splice_call_activities(
                 is_default: f.is_default,
             })
             .collect();
-        if let ElementKind::CallActivity { called_process_id } = &el.kind {
+        if let ElementKind::CallActivity {
+            called_process_id, ..
+        } = &el.kind
+        {
             let called = library.get(called_process_id).ok_or_else(|| {
                 format!(
                     "call activity '{}' references unknown process '{}'",
@@ -1647,16 +1663,33 @@ impl ProcessBuilder {
     /// [`ElementKind::CallActivity`]). Executed natively by the engine as a child
     /// process instance; the legacy inline-expansion mode
     /// ([`ProcessDefinition::inline_call_activities`]) remains available as an
-    /// opt-in.
+    /// opt-in. Both Zeebe variable-propagation flags default to `true` (the Zeebe
+    /// default when `zeebe:calledElement` omits them); use
+    /// [`Self::call_activity_with_propagation`] to override them.
     pub fn call_activity(
         self,
         id: impl Into<String>,
         called_process_id: impl Into<String>,
     ) -> Self {
+        self.call_activity_with_propagation(id, called_process_id, true, true)
+    }
+
+    /// Adds a call activity, explicitly setting the Zeebe
+    /// `propagateAllParentVariables` / `propagateAllChildVariables` flags (see
+    /// [`ElementKind::CallActivity`]).
+    pub fn call_activity_with_propagation(
+        self,
+        id: impl Into<String>,
+        called_process_id: impl Into<String>,
+        propagate_all_parent_variables: bool,
+        propagate_all_child_variables: bool,
+    ) -> Self {
         self.add(
             id,
             ElementKind::CallActivity {
                 called_process_id: called_process_id.into(),
+                propagate_all_parent_variables,
+                propagate_all_child_variables,
             },
         )
     }

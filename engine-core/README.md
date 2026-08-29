@@ -258,6 +258,20 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   inner scope (like the error boundary) before routing out the boundary, while a
   **non-interrupting** one spawns a parallel token and leaves the inner scope
   running.
+- A **call activity** invokes another deployed process as a distinct **child
+  process instance** of its `calledElement` / `zeebe:calledElement processId`
+  (Zeebe/C8 parity), linked back to the caller via `parentProcessInstanceKey` /
+  `parentElementInstanceKey`; the call activity's token parks until the child
+  completes, then routes along its outgoing flow. Variables cross the boundary per
+  Zeebe semantics: `zeebe:calledElement` `propagateAllParentVariables` /
+  `propagateAllChildVariables` both default to `true` — a bare call activity
+  copies all variables visible in its scope into the child at spawn and merges all
+  of the child's final variables back into the parent scope on completion (the
+  child's value wins on a name collision); setting either to `="false"` narrows
+  that direction (input-mapping results only in, output-mappings only back), and
+  `zeebe:ioMapping` input/output mappings always apply on top. Cancelling the
+  parent cancels the in-flight child; a missing or misdeployed callee raises a
+  recoverable `CalledElementError` incident.
 - **Bounded hot state (optional eviction).** By default the engine retains
   completed instances forever — `is_completed`, `instance`, and the read APIs all
   keep working — which is ideal for an embedder that queries the engine directly.

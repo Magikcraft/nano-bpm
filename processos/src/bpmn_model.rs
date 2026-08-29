@@ -171,8 +171,20 @@ fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
         ElementKind::SubProcess { start_event } => {
             m.insert("innerStartEvent".into(), json!(start_event));
         }
-        ElementKind::CallActivity { called_process_id } => {
+        ElementKind::CallActivity {
+            called_process_id,
+            propagate_all_parent_variables,
+            propagate_all_child_variables,
+        } => {
             m.insert("calledElement".into(), json!(called_process_id));
+            m.insert(
+                "propagateAllParentVariables".into(),
+                json!(propagate_all_parent_variables),
+            );
+            m.insert(
+                "propagateAllChildVariables".into(),
+                json!(propagate_all_child_variables),
+            );
         }
         _ => {}
     }
@@ -390,8 +402,9 @@ pub fn read_model_xml(xml: &str, target: Option<&str>) -> Result<Value, String> 
             // Resolve a callActivity node id to the process it calls; else treat t as a process id.
             let mut process_id = t.to_string();
             for d in &defs {
-                if let Some(ElementKind::CallActivity { called_process_id }) =
-                    d.elements.get(t).map(|e| &e.kind)
+                if let Some(ElementKind::CallActivity {
+                    called_process_id, ..
+                }) = d.elements.get(t).map(|e| &e.kind)
                 {
                     process_id = called_process_id.clone();
                     break;
@@ -2067,11 +2080,24 @@ fn emit_element(
             out.push_str("      </bpmn:extensionElements>\n");
             out.push_str("    </bpmn:scriptTask>\n");
         }
-        ElementKind::CallActivity { called_process_id } => {
+        ElementKind::CallActivity {
+            called_process_id,
+            propagate_all_parent_variables,
+            propagate_all_child_variables,
+        } => {
+            // Emit the Zeebe-native `zeebe:calledElement` child so the variable
+            // propagation flags round-trip through the engine parser (which reads
+            // them from that element, not from a `calledElement` attribute).
+            out.push_str(&format!("    <bpmn:callActivity id=\"{eid}\"{na}>\n"));
+            out.push_str("      <bpmn:extensionElements>\n");
             out.push_str(&format!(
-                "    <bpmn:callActivity id=\"{eid}\"{na} calledElement=\"{}\"/>\n",
+                "        <zeebe:calledElement processId=\"{}\" \
+propagateAllParentVariables=\"{propagate_all_parent_variables}\" \
+propagateAllChildVariables=\"{propagate_all_child_variables}\"/>\n",
                 xml_escape(called_process_id)
             ));
+            out.push_str("      </bpmn:extensionElements>\n");
+            out.push_str("    </bpmn:callActivity>\n");
         }
         ElementKind::ExclusiveGateway => {
             let da = default_flows
