@@ -1427,6 +1427,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-falcon-protocol"
+version = "0.0.16"
+dependencies = [
+ "nanobpmn-engine-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nano-server-raft"
+version = "0.0.16"
+dependencies = [
+ "anyhow",
+ "base64",
+ "flate2",
+ "futures-util",
+ "nano-falcon-protocol",
+ "nano-server-runtime",
+ "nano-server-storage",
+ "nanobpmn-engine-core",
+ "openraft",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
+name = "nano-server-runtime"
+version = "0.0.16"
+dependencies = [
+ "nano-server-storage",
+ "nanobpmn-engine-core",
+ "serde_yaml",
+ "tikv-jemalloc-ctl",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nano-server-storage"
 version = "0.0.16"
 dependencies = [
@@ -1516,6 +1557,9 @@ dependencies = [
  "hyper-util",
  "libc",
  "mime_guess",
+ "nano-falcon-protocol",
+ "nano-server-raft",
+ "nano-server-runtime",
  "nano-server-storage",
  "nanobpm-console-api",
  "nanobpm-gateway-rest",

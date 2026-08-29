@@ -9,31 +9,22 @@
 //! (see scripts/gen-stub-server.py). This file owns only the stable pieces: the
 //! `ServerImpl` type, authentication/error glue, and the server bootstrap.
 
-mod backpressure;
-mod cluster;
-mod cmd_profile;
 #[cfg(feature = "console")]
 mod console;
 #[cfg(feature = "console")]
 mod consumers;
-mod deepthi;
-mod drain_guard;
 mod falcon;
-// Intra-cluster peer uplink (falcon client to peers). The forwarding
-// seam that drives it (create-forward, by-key forward, broadcast) lands in the
-// following increments; the transport is integration-tested now.
-mod partition;
-#[allow(dead_code)]
-mod peer;
-mod placement;
 mod query;
-mod raft;
-mod raft_logstore;
-mod raft_net;
-mod recovery_throttle;
 mod response_contract;
-mod runtime_config;
 mod stub_impls;
+
+// Cross-crate peer-uplink integration tests. `peer` moved into
+// `nano-server-raft`, but these tests drive a real falcon **server**
+// (`ServerImpl` + the falcon dispatcher/router) that lives in this binary and
+// cannot be a dependency of the raft library crate, so they live here (ADR 0064
+// Phase 2; full inline-test relocation is Phase 4).
+#[cfg(test)]
+mod peer_forward_tests;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -59,6 +50,17 @@ pub(crate) use nano_server_storage::remote_sink;
 pub(crate) use nano_server_storage::seglog;
 pub(crate) use nano_server_storage::varspill;
 pub(crate) use nano_server_storage::varstore;
+// The runtime/engine-glue and raft/consensus layers were extracted into the
+// `nano-server-runtime` and `nano-server-raft` library crates (ADR 0064,
+// Phase 2). Re-export their modules at this crate's root so every existing
+// `crate::deepthi::…` / `crate::raft::…` path in this binary keeps resolving
+// unchanged. (The falcon wire frames live in `nano-falcon-protocol` and are
+// re-exported inside `falcon.rs` itself.)
+pub(crate) use nano_server_raft::{peer, raft, raft_logstore, raft_net};
+pub(crate) use nano_server_runtime::{
+    backpressure, cluster, cmd_profile, deepthi, drain_guard, partition, placement,
+    recovery_throttle, runtime_config,
+};
 use nanobpm_gateway_rest::{apis, models, types};
 use nanobpmn_engine_core as agent_model;
 use nanobpmn_engine_core::bpmn::parse_bpmn;

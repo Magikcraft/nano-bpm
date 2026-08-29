@@ -1,0 +1,34 @@
+[package]
+name = "nano-server-runtime"
+version = "0.0.16"
+edition = "2024"
+publish = false
+description = "Runtime/engine-glue layer of the nanobpm gateway server (ADR 0064 Phase 2): backpressure, drain guard, recovery throttle, runtime config, partition placement, cluster topology, the single-writer engine actor (deepthi), the partition router, and per-command allocation/latency profiling."
+
+[dependencies]
+# The storage layer this runtime layer journals through / records metrics into.
+nano-server-storage = { path = "../nano-server-storage" }
+nanobpmn-engine-core = { path = "../../../engine-core", features = ["serde"] }
+# Only the single-writer `deepthi` actor's oneshot reply channels need tokio.
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+# YAML for the optional runtime config file (`runtime_config.rs`, ADR 0035).
+serde_yaml = "0.9"
+
+# jemalloc mallctl access for `cmd_profile.rs` (per-thread allocation
+# profiling). Not available on MSVC; the alloc-byte side degrades to 0 there and
+# the wall-time side is unaffected (see `cmd_profile.rs`).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats"] }
+
+[features]
+# Cfg marker only: `runtime_config.rs` gates a few config fields' dead-code
+# allowance on `not(feature = "console")` (they are only read by the gateway
+# binary's console layer). The feature must exist for those `cfg` predicates to
+# be known cfgs; the gateway bin's `console` feature forwards here.
+console = []
+
+[lints.rust]
+# Project policy: warnings are banned. `cargo build`/`check` fail on any rustc
+# warning (unused code, deprecations, future-incompat lints, etc.).
+warnings = "deny"
