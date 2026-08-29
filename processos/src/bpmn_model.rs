@@ -171,8 +171,20 @@ fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
         ElementKind::SubProcess { start_event } => {
             m.insert("innerStartEvent".into(), json!(start_event));
         }
-        ElementKind::CallActivity { called_process_id } => {
+        ElementKind::CallActivity {
+            called_process_id,
+            propagate_all_parent_variables,
+            propagate_all_child_variables,
+        } => {
             m.insert("calledElement".into(), json!(called_process_id));
+            m.insert(
+                "propagateAllParentVariables".into(),
+                json!(propagate_all_parent_variables),
+            );
+            m.insert(
+                "propagateAllChildVariables".into(),
+                json!(propagate_all_child_variables),
+            );
         }
         _ => {}
     }
@@ -390,8 +402,9 @@ pub fn read_model_xml(xml: &str, target: Option<&str>) -> Result<Value, String> 
             // Resolve a callActivity node id to the process it calls; else treat t as a process id.
             let mut process_id = t.to_string();
             for d in &defs {
-                if let Some(ElementKind::CallActivity { called_process_id }) =
-                    d.elements.get(t).map(|e| &e.kind)
+                if let Some(ElementKind::CallActivity {
+                    called_process_id, ..
+                }) = d.elements.get(t).map(|e| &e.kind)
                 {
                     process_id = called_process_id.clone();
                     break;
@@ -2067,11 +2080,32 @@ fn emit_element(
             out.push_str("      </bpmn:extensionElements>\n");
             out.push_str("    </bpmn:scriptTask>\n");
         }
-        ElementKind::CallActivity { called_process_id } => {
+        ElementKind::CallActivity {
+            called_process_id,
+            propagate_all_parent_variables,
+            propagate_all_child_variables,
+        } => {
+            // Emit the Zeebe-native `zeebe:calledElement` child so the variable
+            // propagation flags round-trip through the engine parser (which reads
+            // them from that element, not from a `calledElement` attribute). The
+            // engine parser pushes the callActivity onto its io_stack, so any
+            // authored `zeebe:ioMapping` and/or `multiInstanceLoopCharacteristics`
+            // attach to this element too — round-trip them alongside the
+            // calledElement so re-parsing the emitted BPMN does not silently drop
+            // mappings/MI (the ioMapping nests in the same extensionElements block;
+            // the MI block is a direct child of the callActivity).
+            out.push_str(&format!("    <bpmn:callActivity id=\"{eid}\"{na}>\n"));
+            out.push_str("      <bpmn:extensionElements>\n");
             out.push_str(&format!(
-                "    <bpmn:callActivity id=\"{eid}\"{na} calledElement=\"{}\"/>\n",
+                "        <zeebe:calledElement processId=\"{}\" \
+propagateAllParentVariables=\"{propagate_all_parent_variables}\" \
+propagateAllChildVariables=\"{propagate_all_child_variables}\"/>\n",
                 xml_escape(called_process_id)
             ));
+            emit_io_mapping(el, out);
+            out.push_str("      </bpmn:extensionElements>\n");
+            emit_multi_instance(el, out);
+            out.push_str("    </bpmn:callActivity>\n");
         }
         ElementKind::ExclusiveGateway => {
             let da = default_flows
@@ -4321,6 +4355,74 @@ mod tests {
         assert_eq!(work.io.inputs.len(), 1, "input mapping preserved");
         assert_eq!(work.io.outputs.len(), 1, "output mapping preserved");
         assert!(work.multi_instance.is_some(), "multi-instance preserved");
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_a_call_activity_with_io_and_multi_instance() {
+        // A `<bpmn:callActivity>` emits an OPEN tag for its `zeebe:calledElement`,
+        // and the engine parser pushes it onto the io_stack — so an authored
+        // `zeebe:ioMapping` and/or `multiInstanceLoopCharacteristics` attach to it
+        // too. The serializer must round-trip those alongside the calledElement; a
+        // callActivity emit that only wrote the calledElement would silently drop
+        // mappings/MI when the emitted BPMN is parsed again.
+        use nanobpmn_engine_core::{Mapping, MultiInstance};
+        let mut def = nanobpmn_engine_core::ProcessBuilder::new("Orchestrator")
+            .start_event("Start")
+            .call_activity_with_propagation("Call", "Child", false, true)
+            .end_event("Done")
+            .connect("Start", "Call")
+            .connect("Call", "Done")
+            .build()
+            .unwrap();
+        {
+            let call = def.elements.get_mut("Call").unwrap();
+            call.io.inputs.push(Mapping {
+                source: "= order.id".to_string(),
+                target: "orderId".to_string(),
+            });
+            call.io.outputs.push(Mapping {
+                source: "= result".to_string(),
+                target: "outcome".to_string(),
+            });
+            call.multi_instance = Some(MultiInstance {
+                input_collection: "= items".to_string(),
+                input_element: Some("item".to_string()),
+                ..Default::default()
+            });
+        }
+
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<bpmn:callActivity id=\"Call\"") && xml.contains("</bpmn:callActivity>"),
+            "call activity with io/MI must emit an OPEN tag, got:\n{xml}"
+        );
+        assert!(
+            xml.contains("<zeebe:ioMapping>"),
+            "must emit ioMapping:\n{xml}"
+        );
+        assert!(
+            xml.contains("multiInstanceLoopCharacteristics"),
+            "must emit multi-instance:\n{xml}"
+        );
+
+        let reparsed = parse_bpmn(&xml).expect("serialized call activity re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+        let call = &reparsed[0].elements["Call"];
+        assert!(
+            matches!(
+                call.kind,
+                ElementKind::CallActivity {
+                    propagate_all_parent_variables: false,
+                    propagate_all_child_variables: true,
+                    ..
+                }
+            ),
+            "propagation flags preserved, got {:?}",
+            call.kind
+        );
+        assert_eq!(call.io.inputs.len(), 1, "input mapping preserved");
+        assert_eq!(call.io.outputs.len(), 1, "output mapping preserved");
+        assert!(call.multi_instance.is_some(), "multi-instance preserved");
     }
 
     #[test]

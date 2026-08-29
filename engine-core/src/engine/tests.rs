@@ -3238,7 +3238,7 @@ fn top_level_terminate_end_in_a_called_process_completes_the_parent_call_activit
     let created = engine
         .apply_command(Command::create_instance("orch"))
         .unwrap();
-    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let parent_key = parent_key_of(&created, "orch");
     let child_key = engine
         .pending_jobs()
         .first()
@@ -8474,7 +8474,7 @@ fn a_call_activity_spawns_a_distinct_child_process_instance_with_parent_linkage(
     let created = engine
         .apply_command(Command::create_instance("orch"))
         .unwrap();
-    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let parent_key = parent_key_of(&created, "orch");
 
     // The call-activity element instance the child links back to.
     let call_eik = created
@@ -8547,7 +8547,7 @@ fn cancelling_a_call_activity_parent_cancels_its_child() {
     let created = engine
         .apply_command(Command::create_instance("orch"))
         .unwrap();
-    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let parent_key = parent_key_of(&created, "orch");
     let child_key = engine
         .pending_jobs()
         .first()
@@ -8608,7 +8608,7 @@ fn interrupting_a_call_activity_via_a_boundary_cancels_its_child() {
     let created = engine
         .apply_command_at(Command::create_instance("orch"), 1_000)
         .unwrap();
-    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let parent_key = parent_key_of(&created, "orch");
     let child_key = engine
         .pending_jobs()
         .first()
@@ -8671,7 +8671,7 @@ fn cancelling_a_parent_reaps_a_child_already_mid_termination() {
     let created = engine
         .apply_command(Command::create_instance("orch"))
         .unwrap();
-    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let parent_key = parent_key_of(&created, "orch");
     let child_key = engine
         .state()
         .instances
@@ -8736,7 +8736,7 @@ fn a_failing_called_element_expression_raises_an_expression_evaluation_incident(
     let created = engine
         .apply_command(Command::create_instance("orch"))
         .unwrap();
-    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let parent_key = parent_key_of(&created, "orch");
 
     let active = engine.active_incidents();
     assert_eq!(active.len(), 1, "the failed expression parks one incident");
@@ -8782,7 +8782,7 @@ fn an_unknown_called_process_raises_a_called_element_incident_not_expression_eva
     let created = engine
         .apply_command(Command::create_instance("orch"))
         .unwrap();
-    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let parent_key = parent_key_of(&created, "orch");
 
     let active = engine.active_incidents();
     assert_eq!(active.len(), 1, "the unknown callee parks one incident");
@@ -8803,6 +8803,9 @@ fn an_unknown_called_process_raises_a_called_element_incident_not_expression_eva
 fn a_call_activity_propagates_variables_via_io_mappings_across_isolated_scopes() {
     // The callee is a pass-through (pstart -> pend) so it completes on its seed
     // variables, letting us observe both directions of the mapping in one command.
+    // Both Zeebe propagation flags are OFF here, so the *only* channel across the
+    // isolated scopes is the ioMapping (the parity defaults are exercised by the
+    // `call_activity_*propagate*` tests).
     let child = ProcessBuilder::new("phase")
         .start_event("pstart")
         .end_event("pend")
@@ -8819,7 +8822,7 @@ fn a_call_activity_propagates_variables_via_io_mappings_across_isolated_scopes()
             target: "parentEcho".to_string(),
         }],
     };
-    let mut engine = deploy_native_call(io, child);
+    let mut engine = deploy_native_call_with_propagation(io, child, false, false);
 
     let created = engine
         .apply_command(Command::create_instance_with(
@@ -8827,7 +8830,7 @@ fn a_call_activity_propagates_variables_via_io_mappings_across_isolated_scopes()
             vars(&[("orderId", Value::Int(42))]),
         ))
         .unwrap();
-    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let parent_key = parent_key_of(&created, "orch");
 
     // The child is seeded ONLY through the input mapping (isolated scope): it
     // sees `childOrder`, not the parent's other variable `orderId`.
@@ -8864,6 +8867,253 @@ fn a_call_activity_propagates_variables_via_io_mappings_across_isolated_scopes()
                 if *instance_key == parent_key && variables.contains_key("childOrder")
         )),
         "only the mapped output crosses back, not the child's raw scope"
+    );
+}
+
+/// Deploys the `orch` orchestrator whose `c1` call activity invokes `phase`
+/// (child) with explicit Zeebe `propagateAllParentVariables` /
+/// `propagateAllChildVariables` flags, optionally with an ioMapping.
+fn deploy_native_call_with_propagation(
+    io: crate::model::IoMapping,
+    child: ProcessDefinition,
+    propagate_all_parent: bool,
+    propagate_all_child: bool,
+) -> Engine {
+    let mut orchestrator = ProcessBuilder::new("orch")
+        .start_event("start")
+        .call_activity_with_propagation("c1", "phase", propagate_all_parent, propagate_all_child)
+        .end_event("end")
+        .connect("start", "c1")
+        .connect("c1", "end");
+    if !io.is_empty() {
+        orchestrator = orchestrator.with_io("c1", io);
+    }
+    let orchestrator = orchestrator.build().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(child)).unwrap();
+    engine
+        .apply_command(Command::DeployProcess(orchestrator))
+        .unwrap();
+    engine
+}
+
+/// A pass-through callee that, while running, writes two of its own variables:
+/// a fresh `childOnly` and an overwrite of the shared `shared` (so a merge-back
+/// collision is observable — Zeebe semantics: the child's value wins).
+fn propagating_child() -> ProcessDefinition {
+    ProcessBuilder::new("phase")
+        .start_event("pstart")
+        .script_task("s1", "=99", "childOnly")
+        .script_task("s2", "=\"child\"", "shared")
+        .end_event("pend")
+        .connect("pstart", "s1")
+        .connect("s1", "s2")
+        .connect("s2", "pend")
+        .build()
+        .unwrap()
+}
+
+/// Finds the child instance's seed variables (its `ProcessInstanceCreated`).
+fn child_seed_of(events: &[Event]) -> HashMap<String, Value> {
+    events
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                process_id,
+                variables,
+                ..
+            } if process_id == "phase" => Some(variables.clone()),
+            _ => None,
+        })
+        .expect("child created")
+}
+
+/// The instance key of the `ProcessInstanceCreated` event for `process_id`.
+///
+/// A native call activity emits `ProcessInstanceCreated` for **both** the parent
+/// and the spawned child, so selecting the first event carrying an instance key
+/// is order-dependent and could latch onto the child. Match the parent's
+/// `process_id` explicitly instead.
+fn parent_key_of(events: &[Event], process_id: &str) -> Key {
+    events
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_id: pid,
+                ..
+            } if pid == process_id => Some(*instance_key),
+            _ => None,
+        })
+        .expect("parent process instance created")
+}
+
+/// The last value a variable took in the parent scope across the command's
+/// `VariablesUpdated` events (`None` if it never crossed back).
+fn parent_var_after<'a>(events: &'a [Event], parent_key: Key, name: &str) -> Option<&'a Value> {
+    events.iter().rev().find_map(|e| match e {
+        Event::VariablesUpdated {
+            instance_key,
+            variables,
+        } if *instance_key == parent_key => variables.get(name),
+        _ => None,
+    })
+}
+
+#[test]
+fn call_activity_default_propagates_all_parent_and_child_variables() {
+    // Zeebe default (both attributes absent ⇒ true), no ioMappings: all visible
+    // parent variables cross into the child, and all of the child's final
+    // variables merge back into the parent (child wins on a collision).
+    let mut engine =
+        deploy_native_call_with_propagation(Default::default(), propagating_child(), true, true);
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[
+                ("orderId", Value::Int(42)),
+                ("shared", Value::Str("parent".into())),
+            ]),
+        ))
+        .unwrap();
+    let parent_key = parent_key_of(&created, "orch");
+
+    // Parent → child: the whole visible parent scope crossed into the child.
+    let seed = child_seed_of(&created);
+    assert_eq!(seed.get("orderId"), Some(&Value::Int(42)));
+    assert_eq!(seed.get("shared"), Some(&Value::Str("parent".into())));
+
+    // Child → parent: the child's fresh variable crossed back, and the shared
+    // collision resolved to the child's value.
+    assert!(engine.is_completed(parent_key));
+    assert_eq!(
+        parent_var_after(&created, parent_key, "childOnly"),
+        Some(&Value::Int(99))
+    );
+    assert_eq!(
+        parent_var_after(&created, parent_key, "shared"),
+        Some(&Value::Str("child".into())),
+        "child wins on a merge-back name collision"
+    );
+}
+
+#[test]
+fn call_activity_propagate_all_parent_false_copies_only_input_mapping_results() {
+    // propagateAllParentVariables="false": only the call activity's local
+    // variables — its input-mapping results — cross into the child. The child
+    // variables still merge back (propagateAllChildVariables defaults true).
+    let io = crate::model::IoMapping {
+        inputs: vec![crate::model::Mapping {
+            source: "=orderId".to_string(),
+            target: "childOrder".to_string(),
+        }],
+        outputs: Vec::new(),
+    };
+    let mut engine = deploy_native_call_with_propagation(io, propagating_child(), false, true);
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[
+                ("orderId", Value::Int(42)),
+                ("shared", Value::Str("parent".into())),
+            ]),
+        ))
+        .unwrap();
+    let parent_key = parent_key_of(&created, "orch");
+
+    // Only the input mapping seeded the child; the parent's other variables did
+    // not cross.
+    let seed = child_seed_of(&created);
+    assert_eq!(seed.get("childOrder"), Some(&Value::Int(42)));
+    assert!(
+        !seed.contains_key("orderId") && !seed.contains_key("shared"),
+        "with propagateAllParentVariables=false only input-mapping results cross"
+    );
+
+    // Child → parent still merges (default true): the child's fresh variable and
+    // its own (mapping-seeded) childOrder cross back.
+    assert!(engine.is_completed(parent_key));
+    assert_eq!(
+        parent_var_after(&created, parent_key, "childOnly"),
+        Some(&Value::Int(99))
+    );
+}
+
+#[test]
+fn call_activity_propagate_all_child_false_without_output_mappings_copies_nothing_back() {
+    // propagateAllChildVariables="false" with no output mappings: nothing crosses
+    // back. Parent → child still copies all visible variables (default true).
+    let mut engine =
+        deploy_native_call_with_propagation(Default::default(), propagating_child(), true, false);
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[
+                ("orderId", Value::Int(42)),
+                ("shared", Value::Str("parent".into())),
+            ]),
+        ))
+        .unwrap();
+    let parent_key = parent_key_of(&created, "orch");
+
+    // Parent → child copied everything.
+    let seed = child_seed_of(&created);
+    assert_eq!(seed.get("orderId"), Some(&Value::Int(42)));
+
+    // Child → parent copied nothing: the child's fresh variable never appears in
+    // the parent, and the shared collision left the parent's value intact.
+    assert!(engine.is_completed(parent_key));
+    assert_eq!(
+        parent_var_after(&created, parent_key, "childOnly"),
+        None,
+        "no child variable crosses back with propagateAllChildVariables=false and no output mappings"
+    );
+    assert!(
+        !created.iter().any(|e| matches!(
+            e,
+            Event::VariablesUpdated { instance_key, variables }
+                if *instance_key == parent_key
+                    && variables.get("shared") == Some(&Value::Str("child".into()))
+        )),
+        "the child's overwrite of the shared variable must not cross back"
+    );
+}
+
+#[test]
+fn call_activity_propagate_all_child_false_still_applies_output_mappings() {
+    // propagateAllChildVariables="false" but WITH an output mapping: only the
+    // mapped output crosses back (output mappings always apply), the child's raw
+    // scope does not.
+    let io = crate::model::IoMapping {
+        inputs: Vec::new(),
+        outputs: vec![crate::model::Mapping {
+            source: "=childOnly".to_string(),
+            target: "echoed".to_string(),
+        }],
+    };
+    let mut engine = deploy_native_call_with_propagation(io, propagating_child(), true, false);
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "orch",
+            vars(&[("orderId", Value::Int(42))]),
+        ))
+        .unwrap();
+    let parent_key = parent_key_of(&created, "orch");
+
+    assert!(engine.is_completed(parent_key));
+    // The output mapping projected childOnly into the parent as `echoed`…
+    assert_eq!(
+        parent_var_after(&created, parent_key, "echoed"),
+        Some(&Value::Int(99))
+    );
+    // …but the child's raw variable did not cross back wholesale.
+    assert!(
+        !created.iter().any(|e| matches!(
+            e,
+            Event::VariablesUpdated { instance_key, variables }
+                if *instance_key == parent_key && variables.contains_key("childOnly")
+        )),
+        "with propagateAllChildVariables=false only the mapped output crosses back"
     );
 }
 

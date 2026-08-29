@@ -148,8 +148,10 @@ attr-scriptTask-resultVariable  ::= "resultVariable" sp attr-str   # Variable na
 # callActivity — Invokes another process definition and waits for it to complete.
 elem-callActivity  ::= indent "callActivity" sp id (sp string)? (sp attrs-callActivity)? nl
 attrs-callActivity   ::= "{" nl (indent2 attr-line-callActivity nl)+ indent "}"
-attr-line-callActivity  ::= attr-callActivity-calledElement | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-callActivity  ::= attr-callActivity-calledElement | attr-callActivity-propagateAllParentVariables | attr-callActivity-propagateAllChildVariables | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
 attr-callActivity-calledElement  ::= "calledElement" sp attr-str   # The `calledElement` / `zeebe:calledElement processId`.
+attr-callActivity-propagateAllParentVariables  ::= "propagateAllParentVariables" sp attr-bool   # `true` (Zeebe default) copies all visible parent variables into the child; `false` copies only the input-mapping results.
+attr-callActivity-propagateAllChildVariables  ::= "propagateAllChildVariables" sp attr-bool   # `true` (Zeebe default) merges the child's variables back into the parent (child wins); `false` crosses back only the output mappings.
 
 # signalIntermediateCatchEvent — Signal catch. Correlates by name only.
 elem-signalIntermediateCatchEvent  ::= indent "signalIntermediateCatchEvent" sp id (sp string)? (sp attrs-signalIntermediateCatchEvent)? nl

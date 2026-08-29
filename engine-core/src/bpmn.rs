@@ -708,9 +708,14 @@ fn parse_with_captures(
                                 // callee id may be a `calledElement` attribute
                                 // (Camunda 7) or a nested `zeebe:calledElement
                                 // processId="…"` child (Camunda 8/Zeebe), captured
-                                // below. Nano expands call activities inline (see
-                                // ProcessDefinition::inline_call_activities) rather
-                                // than executing them natively.
+                                // below. Nano executes call activities natively —
+                                // on activation the engine spawns a child process
+                                // instance of the callee and completes the token
+                                // when the child finishes (see the `CallActivity`
+                                // arm of `Engine::run_activation_body`). Inline
+                                // expansion (ProcessDefinition::inline_call_activities)
+                                // is a legacy opt-in used by the processos harness,
+                                // not the default execution path.
                                 let idx = acc.add_node(attrs, NodeKind::Call);
                                 if let (Some(i), Some(c)) = (idx, attr(attrs, "calledElement")) {
                                     acc.nodes[i].called_process_id = Some(c.to_string());
@@ -723,10 +728,29 @@ fn parse_with_captures(
                                 }
                             }
                             // zeebe:calledElement processId="…" — the Camunda 8
-                            // form of a call activity's callee reference.
+                            // form of a call activity's callee reference. Its
+                            // optional propagateAllParentVariables /
+                            // propagateAllChildVariables attributes control Zeebe
+                            // variable propagation across the call boundary; each
+                            // defaults to `true` when absent (captured here as
+                            // `Some(false)` only for an explicit `="false"`, so the
+                            // builder can apply the Zeebe default).
                             "calledElement" => {
-                                if let (Some(idx), Some(p)) = (cur_call, attr(attrs, "processId")) {
-                                    acc.nodes[idx].called_process_id = Some(p.to_string());
+                                if let Some(idx) = cur_call {
+                                    if let Some(p) = attr(attrs, "processId") {
+                                        acc.nodes[idx].called_process_id = Some(p.to_string());
+                                    }
+                                    // Only record the explicit `="false"` case;
+                                    // an explicit `="true"` is treated the same as
+                                    // absent (left `None`) so the builder applies
+                                    // the Zeebe `true` default, avoiding redundant
+                                    // `Some(true)` values.
+                                    if attr(attrs, "propagateAllParentVariables") == Some("false") {
+                                        acc.nodes[idx].propagate_all_parent_variables = Some(false);
+                                    }
+                                    if attr(attrs, "propagateAllChildVariables") == Some("false") {
+                                        acc.nodes[idx].propagate_all_child_variables = Some(false);
+                                    }
                                 }
                             }
                             "subProcess" => {
@@ -1873,8 +1897,18 @@ struct NodeAcc {
     /// For service tasks: the resolved job type (defaults to the id at build).
     job_type: Option<String>,
     /// For call activities: the `calledElement` / `zeebe:calledElement processId`
-    /// of the invoked process, expanded inline at assembly time.
+    /// of the invoked process. Executed natively as a child process instance;
+    /// inline expansion at assembly time is a legacy opt-in (used by the
+    /// processos harness).
     called_process_id: Option<String>,
+    /// For call activities: the `zeebe:calledElement propagateAllParentVariables`
+    /// flag. `None` when the attribute is absent (defaults to `true` at build,
+    /// matching Zeebe).
+    propagate_all_parent_variables: Option<bool>,
+    /// For call activities: the `zeebe:calledElement propagateAllChildVariables`
+    /// flag. `None` when the attribute is absent (defaults to `true` at build,
+    /// matching Zeebe).
+    propagate_all_child_variables: Option<bool>,
     /// For service tasks: the raw `zeebe:priorityDefinition` job-priority
     /// expression (literal or FEEL), resolved at job creation. Controls
     /// activation order; `None` means no declaration (default priority).
@@ -2160,6 +2194,8 @@ impl ProcessAcc {
             name: attr(attrs, "name").map(str::to_string),
             job_type: None,
             called_process_id: None,
+            propagate_all_parent_variables: None,
+            propagate_all_child_variables: None,
             job_priority: None,
             duration_millis: None,
             message_ref: None,
@@ -2991,7 +3027,12 @@ impl ProcessAcc {
                             reason: format!("call activity {} has no calledElement", node.id),
                         }
                     })?;
-                    builder.call_activity(node.id, called)
+                    builder.call_activity_with_propagation(
+                        node.id,
+                        called,
+                        node.propagate_all_parent_variables.unwrap_or(true),
+                        node.propagate_all_child_variables.unwrap_or(true),
+                    )
                 }
             };
             if let Some(parent) = parent {
@@ -6168,12 +6209,16 @@ mod tests {
             def.element("c1").unwrap().kind,
             ElementKind::CallActivity {
                 called_process_id: "Phase01".to_string(),
+                propagate_all_parent_variables: true,
+                propagate_all_child_variables: true,
             }
         );
         assert_eq!(
             def.element("c2").unwrap().kind,
             ElementKind::CallActivity {
                 called_process_id: "Phase02".to_string(),
+                propagate_all_parent_variables: true,
+                propagate_all_child_variables: true,
             }
         );
         // The call activity's outgoing flow is preserved for inline expansion.
@@ -6183,6 +6228,60 @@ mod tests {
             .outgoing
             .iter()
             .any(|f| f.to == "c2"));
+    }
+
+    #[test]
+    fn should_parse_call_activity_variable_propagation_flags() {
+        // Guard the silent-drop failure mode: the Zeebe
+        // propagateAllParentVariables / propagateAllChildVariables attributes on
+        // `zeebe:calledElement` must be captured (absent ⇒ true, explicit
+        // `="false"` honored), not dropped on the floor.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="orch">
+              <bpmn:startEvent id="start" />
+              <bpmn:callActivity id="c_default">
+                <bpmn:extensionElements>
+                  <zeebe:calledElement processId="P" />
+                </bpmn:extensionElements>
+              </bpmn:callActivity>
+              <bpmn:callActivity id="c_no_parent">
+                <bpmn:extensionElements>
+                  <zeebe:calledElement processId="P" propagateAllParentVariables="false" />
+                </bpmn:extensionElements>
+              </bpmn:callActivity>
+              <bpmn:callActivity id="c_no_child">
+                <bpmn:extensionElements>
+                  <zeebe:calledElement processId="P" propagateAllChildVariables="false" />
+                </bpmn:extensionElements>
+              </bpmn:callActivity>
+              <bpmn:callActivity id="c_both_false">
+                <bpmn:extensionElements>
+                  <zeebe:calledElement processId="P"
+                                       propagateAllParentVariables="false"
+                                       propagateAllChildVariables="false" />
+                </bpmn:extensionElements>
+              </bpmn:callActivity>
+              <bpmn:endEvent id="end" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        let flags = |id: &str| match &def.element(id).unwrap().kind {
+            ElementKind::CallActivity {
+                propagate_all_parent_variables,
+                propagate_all_child_variables,
+                ..
+            } => (
+                *propagate_all_parent_variables,
+                *propagate_all_child_variables,
+            ),
+            other => panic!("{id} should be a call activity, got {other:?}"),
+        };
+        assert_eq!(flags("c_default"), (true, true), "absent ⇒ both true");
+        assert_eq!(flags("c_no_parent"), (false, true));
+        assert_eq!(flags("c_no_child"), (true, false));
+        assert_eq!(flags("c_both_false"), (false, false));
     }
 
     #[test]

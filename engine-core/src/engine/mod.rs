@@ -5661,13 +5661,23 @@ impl Engine {
             // `calledElement` (Zeebe parity) and parks its own token in ACTIVATED
             // while the child runs. The child carries `parentProcessInstanceKey`/
             // `parentElementInstanceKey` back to this element instance so tooling
-            // can draw the parent↔child tree. Variables cross the instance
-            // boundary through the call activity's input mappings (seeding the
-            // child, isolated scope) and, on child completion, its output mappings
-            // (see `complete_call_activity`). The parent token completes when the
+            // can draw the parent↔child tree. Variable propagation across the
+            // instance boundary defaults to Zeebe's full-scope behaviour: the
+            // whole parent scope seeds the child on spawn and the whole child
+            // scope merges back on completion. `propagateAllParentVariables=false`
+            // suppresses the parent→child copy (only the input mappings seed the
+            // child) and `propagateAllChildVariables=false` suppresses the
+            // child→parent copy (only the output mappings merge back); input
+            // mappings (seeding the child, isolated scope) and, on child
+            // completion, output mappings (see `complete_call_activity`) are
+            // applied on top of whichever propagation the flags leave enabled. The parent token completes when the
             // child finishes (see `complete_finished_instances`); cancelling the
             // parent cancels the in-flight child (see `cascade_cancel_children`).
-            Some(ElementKind::CallActivity { called_process_id }) => {
+            Some(ElementKind::CallActivity {
+                called_process_id,
+                propagate_all_parent_variables,
+                ..
+            }) => {
                 // Boundary events on the call activity are armed like any other
                 // activity (timers/messages interrupt the wait for the child).
                 events.extend(self.arm_boundary_events(
@@ -5681,6 +5691,7 @@ impl Engine {
                     element_instance_key,
                     &element_id,
                     &called_process_id,
+                    propagate_all_parent_variables,
                     &element_vars,
                 );
                 events.extend(spawn_events);
@@ -9720,8 +9731,12 @@ impl Engine {
         element_instance_key: Key,
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
-        let called = match self.element_kind(instance_key, &element_id) {
-            Some(ElementKind::CallActivity { called_process_id }) => called_process_id,
+        let (called, propagate_all_parent) = match self.element_kind(instance_key, &element_id) {
+            Some(ElementKind::CallActivity {
+                called_process_id,
+                propagate_all_parent_variables,
+                ..
+            }) => (called_process_id, propagate_all_parent_variables),
             _ => return (Vec::new(), Vec::new()),
         };
         let scope = self.scope_of(instance_key, element_instance_key);
@@ -9731,6 +9746,7 @@ impl Engine {
             element_instance_key,
             &element_id,
             &called,
+            propagate_all_parent,
             &element_vars,
         )
     }
@@ -9739,16 +9755,19 @@ impl Engine {
     /// links it back to the parent (`parentProcessInstanceKey` /
     /// `parentElementInstanceKey`). The parent's call-activity element instance
     /// stays ACTIVATED (its token parked) until the child finishes. Variables
-    /// cross the boundary through the call activity's input mappings only
-    /// (isolated child scope), matching the issue's parity target. An unknown
-    /// callee, or exceeding the recursion depth cap, parks the token on a
-    /// recoverable incident instead.
+    /// cross the boundary through the call activity's input mappings and, when
+    /// `propagate_all_parent` is set (Zeebe `propagateAllParentVariables`, the
+    /// default), *all* variables visible in the call activity's scope — the input
+    /// mappings applied on top (isolated child scope). An unknown callee, or
+    /// exceeding the recursion depth cap, parks the token on a recoverable
+    /// incident instead.
     fn spawn_call_activity_child(
         &mut self,
         parent_instance: Key,
         call_eik: Key,
         element_id: &str,
         called_process_id: &str,
+        propagate_all_parent: bool,
         element_vars: &HashMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         // The callee id may be a literal or a FEEL `=` expression (C8
@@ -9835,10 +9854,15 @@ impl Engine {
                 Vec::new(),
             );
         };
-        // Input mappings seed the (isolated) child variables; nothing else of the
-        // parent's scope crosses the boundary.
+        // Input mappings are evaluated into the call activity's local scope
+        // regardless (Zeebe: they seed the child's local variables). With
+        // `propagate_all_parent` (the Zeebe `propagateAllParentVariables`
+        // default), *all* variables visible in the call activity's scope also
+        // cross into the child, with the input-mapping results layered on top
+        // (child-local wins). With it off, only the input-mapping results cross —
+        // an isolated child seeded purely by the mappings.
         let inputs = self.io_inputs(parent_instance, element_id);
-        let child_vars = if inputs.is_empty() {
+        let input_results = if inputs.is_empty() {
             HashMap::new()
         } else {
             match self.eval_io_mappings_in(element_vars, &inputs) {
@@ -9861,6 +9885,13 @@ impl Engine {
                     return (vec![event], Vec::new());
                 }
             }
+        };
+        let child_vars = if propagate_all_parent {
+            let mut merged = element_vars.clone();
+            merged.extend(input_results);
+            merged
+        } else {
+            input_results
         };
         let child_key = self.mint_key();
         (
@@ -9885,11 +9916,12 @@ impl Engine {
     }
 
     /// Completes a call-activity token once its child process instance finished.
-    /// Projects the child's final variables through the call activity's output
-    /// mappings (isolated scopes), completes the element, disarms its boundary
-    /// events and takes its outgoing flow. A no-op if the element instance is no
-    /// longer active (a boundary event interrupted the wait before the child
-    /// finished).
+    /// With `propagateAllChildVariables` (the Zeebe default) the child's final
+    /// variables are merged back into the parent scope (child wins on a name
+    /// collision); the call activity's output mappings then project on top
+    /// (isolated scopes). Completes the element, disarms its boundary events and
+    /// takes its outgoing flow. A no-op if the element instance is no longer
+    /// active (a boundary event interrupted the wait before the child finished).
     fn complete_call_activity(
         &mut self,
         instance_key: Key,
@@ -9906,6 +9938,15 @@ impl Engine {
         if !still_active {
             return (Vec::new(), Vec::new());
         }
+        // Zeebe `propagateAllChildVariables` (default true when the attribute is
+        // absent). When off, only the output mappings cross back.
+        let propagate_all_child = match self.element_kind(instance_key, &element_id) {
+            Some(ElementKind::CallActivity {
+                propagate_all_child_variables,
+                ..
+            }) => propagate_all_child_variables,
+            _ => true,
+        };
         let scope = self.scope_of(instance_key, element_instance_key);
         let mut events = vec![
             Event::ElementCompleting {
@@ -9923,6 +9964,18 @@ impl Engine {
         events.extend(self.cancel_boundary_message_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_signal_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_conditional_subscriptions_on(element_instance_key));
+        // propagateAllChildVariables: merge every variable the child finished with
+        // back into the parent scope (child wins on collision) *before* the output
+        // mappings, so an explicit output mapping still overrides a propagated
+        // value.
+        if propagate_all_child && !child_variables.is_empty() {
+            events.extend(self.propagated_updates(
+                instance_key,
+                scope,
+                child_variables.clone(),
+                false,
+            ));
+        }
         let outputs = self.io_outputs(instance_key, &element_id);
         if !outputs.is_empty() {
             match self.eval_io_mappings_in(&child_variables, &outputs) {
