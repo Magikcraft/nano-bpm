@@ -126,8 +126,12 @@ second serde job). Two rules, enforced by the #1069 CI drift guard
   removing a variant, retagging, changing a field's type, or reordering in a way
   that changes the serialized form is **not** rescued by serde defaults. It
   requires bumping `SNAPSHOT_FORMAT_VERSION` (`engine-core/src/engine/mod.rs`,
-  #1068) — which the snapshot loader surfaces as a typed `SnapshotLoadError::
-  FormatMismatch`. You do **not** hand-write a per-version migration ladder:
+  #1068) — which the snapshot loader surfaces as a typed `SnapshotLoadError`:
+  `FormatMismatch` when the on-disk snapshot is *newer* than this build supports
+  (`check_format_version`), or `Corrupt` when an *older* snapshot no longer
+  deserializes under the bumped format. `recover`/`recover_multi` trigger
+  migration on **any** `SnapshotLoadError`, so both cases route to the replay
+  path. You do **not** hand-write a per-version migration ladder:
   #1071's replay-migrator (`recover`/`recover_multi` in
   `server/crates/nano-server-storage/src/seglog.rs`) transparently rebuilds the
   engine by REPLAYING the event journal — the compacted prefix is kept in a

@@ -1307,10 +1307,13 @@ fn list_cold(dir: &Path) -> io::Result<Vec<(u64, u64, PathBuf)>> {
     Ok(cold)
 }
 
-/// The contiguous global event range `[min_start, max_end)` the cold archive
-/// currently spans, or `None` when it is empty. The migrator uses this (together
-/// with the hot journal's `first_index`) to decide whether the full history is
-/// available for a from-scratch replay.
+/// The global event bounds `[min_start, max_end)` the cold archive currently
+/// spans, or `None` when it is empty. This is ONLY a bounds calculation over the
+/// cold files' start/end indices — it does **not** assert the archive is a
+/// gap-free contiguous prefix (an internal gap, overlap, or mis-sized file is not
+/// detected here). The migrator uses it (together with the hot journal's
+/// `first_index`) for a cheap coverage estimate, but the actual soundness gate is
+/// [`read_cold_prefix`]'s validated `[0, cold_end)` walk.
 pub fn cold_archive_span(dir: &Path) -> io::Result<Option<(u64, u64)>> {
     let cold = list_cold(dir)?;
     let Some((first_start, _, _)) = cold.first() else {
@@ -1402,7 +1405,7 @@ fn read_cold_prefix(dir: &Path) -> io::Result<(Vec<Event>, u64)> {
                      expects {}",
                     path.display(),
                     decoded.len(),
-                    end - start
+                    end.saturating_sub(start)
                 ),
             ));
         }
@@ -1432,7 +1435,7 @@ fn read_cold_prefix_tagged(
                      expects {}",
                     path.display(),
                     decoded.len(),
-                    end - start
+                    end.saturating_sub(start)
                 ),
             ));
         }
