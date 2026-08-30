@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use nanobpmn_engine_core::{Engine, EngineSnapshot, Event, partition_of};
+use nanobpmn_engine_core::{Engine, EngineSnapshot, Event, SNAPSHOT_FORMAT_VERSION, partition_of};
 
 /// The active segment keeps the historical journal name so an existing
 /// single-file data dir is adopted unchanged.
@@ -603,6 +603,225 @@ struct PersistedSnapshot {
     engine: EngineSnapshot,
 }
 
+// ----------------------------------------------------------------------------
+// Versioned, self-describing snapshot envelope (L2 / #1068).
+//
+// Historically a `snapshot.*.bin` / `msnapshot.bin` was bare `serde_json` of the
+// payload struct with no version marker: there was no way to tell which format a
+// file was — or that this build cannot read it — without attempting a full
+// deserialize (and a failed deserialize was silently swallowed via `.ok()?`,
+// which could rewind durable state — the #1065 incident).
+//
+// The new layout prepends an ALWAYS-parseable, minimal, single-line JSON
+// **header** terminated by `\n`, then the existing serialized payload:
+//
+//     {"format_version":1,"incarnation":<u64>,"engine_fingerprint":"<str>"}\n
+//     <payload json bytes...>
+//
+// The header shape is FIXED FOR ALL TIME (never add/rename a header field) so
+// any future build can read `format_version` without deserializing the payload
+// body. Compact `serde_json` never emits a raw `0x0A`, so the first `\n` is an
+// unambiguous header/payload delimiter and its ABSENCE marks a legacy headerless
+// file (treated as `format_version = 0`).
+// ----------------------------------------------------------------------------
+
+/// Data-dir file holding this durable lifetime's incarnation id (see
+/// [`SnapshotHeader::incarnation`]). Generated once per data dir and stamped
+/// into every snapshot header.
+const INCARNATION_NAME: &str = "journal.incarnation";
+
+/// The always-parseable envelope header prefixed to every persisted snapshot.
+///
+/// Its shape MUST never change — a reader of any future format version has to be
+/// able to parse this to learn the `format_version` before it decides whether it
+/// can read the payload at all.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotHeader {
+    /// The [`SNAPSHOT_FORMAT_VERSION`] the payload was serialized at. `0` denotes
+    /// a legacy headerless file (synthesised on read; never written).
+    format_version: u32,
+    /// Monotonic epoch id of this data directory's durable lifetime, persisted in
+    /// [`INCARNATION_NAME`] and regenerated when the data dir is reset/restored.
+    /// Consumed cross-repo by nano-workforce#622 to reconcile after reset/restore
+    /// (blackboard contract `snapshot-envelope-header-v1`).
+    incarnation: u64,
+    /// Coarse engine build identity (engine-core crate version) — diagnostic
+    /// only. The authoritative serialized-shape drift fingerprint is #1069's
+    /// concern and is a separate mechanism.
+    engine_fingerprint: String,
+}
+
+/// A typed, FATAL failure to load a present snapshot file. Distinct from
+/// `Ok(None)`, which means ONLY "no snapshot file exists". A present snapshot is
+/// never silently ignored: an incompatible or corrupt file aborts recovery
+/// (fail-closed) rather than rewinding to an earlier state.
+///
+/// Delivered to callers wrapped in an [`io::Error`] of kind
+/// [`io::ErrorKind::InvalidData`]; recover it with
+/// [`io::Error::get_ref`]/[`downcast_ref`](std::error::Error) so #1071's
+/// replay-migrator can branch on [`SnapshotLoadError::FormatMismatch`].
+#[derive(Debug)]
+pub enum SnapshotLoadError {
+    /// The snapshot's declared `format_version` is newer than this build can
+    /// read. #1071 branches on this to migration; fail-closed is the fallback.
+    /// (This is the `SnapshotFormatMismatch { found, supported }` of the epic.)
+    FormatMismatch {
+        /// The `format_version` found in the on-disk header.
+        found: u32,
+        /// The highest `format_version` this build supports
+        /// ([`SNAPSHOT_FORMAT_VERSION`]).
+        supported: u32,
+    },
+    /// The snapshot file is present but its header or payload could not be
+    /// parsed. Fatal — never a silent `None`, never a rewinding fallback.
+    Corrupt {
+        /// Human-readable reason (which stage failed and why).
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for SnapshotLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotLoadError::FormatMismatch { found, supported } => write!(
+                f,
+                "snapshot format version {found} is newer than this build supports \
+                 (max {supported}); refusing to load (fail-closed)"
+            ),
+            SnapshotLoadError::Corrupt { reason } => {
+                write!(f, "snapshot present but unreadable: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotLoadError {}
+
+impl From<SnapshotLoadError> for io::Error {
+    fn from(e: SnapshotLoadError) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, e)
+    }
+}
+
+/// The coarse engine build identity stamped into [`SnapshotHeader::engine_fingerprint`].
+fn engine_fingerprint() -> String {
+    format!("nanobpmn-engine-core@{}", nanobpmn_engine_core::VERSION)
+}
+
+/// Reads (or, on first use, generates and durably persists) this data
+/// directory's incarnation id. Stable for the lifetime of the data dir; a
+/// reset/restore that removes [`INCARNATION_NAME`] yields a fresh id, which is
+/// how nano-workforce#622 detects a reset/restore.
+fn read_or_init_incarnation(dir: &Path) -> io::Result<u64> {
+    let path = dir.join(INCARNATION_NAME);
+    if let Ok(s) = fs::read_to_string(&path)
+        && let Ok(v) = s.trim().parse::<u64>()
+        && v != 0
+    {
+        return Ok(v);
+    }
+    // Seed from wall-clock nanoseconds (monotonic enough to distinguish
+    // successive incarnations of the same dir); persisted so it is stable.
+    // Clamp to a non-zero value: `0` is reserved for the synthetic legacy
+    // headerless envelope (`incarnation: 0` in `parse_envelope`) and the
+    // cross-repo contract (nano-workforce#622) requires a non-zero id, so a
+    // clock before UNIX_EPOCH (or a stale on-disk `0`) must not surface as `0`.
+    let incarnation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        .max(1);
+    let tmp = dir.join(format!("{INCARNATION_NAME}.tmp"));
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(incarnation.to_string().as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    fsync_dir(dir);
+    Ok(incarnation)
+}
+
+/// Writes `payload` to `path` atomically (tmp + rename + fsync), prefixed with
+/// the versioned envelope header. `dir` is the containing data dir (source of
+/// the incarnation id). Shared by [`write_snapshot`] and [`write_multi_snapshot`].
+fn write_enveloped<T: serde::Serialize>(dir: &Path, path: &Path, payload: &T) -> io::Result<()> {
+    let header = SnapshotHeader {
+        format_version: SNAPSHOT_FORMAT_VERSION,
+        incarnation: read_or_init_incarnation(dir)?,
+        engine_fingerprint: engine_fingerprint(),
+    };
+    let tmp = path.with_extension("bin.tmp");
+    {
+        // Stream to the file (BufWriter) rather than building a full `Vec<u8>`
+        // first; under a large backlog the intermediate buffer is multi-GB (all
+        // resident variable payloads serialized at once).
+        let f = File::create(&tmp)?;
+        let mut w = BufWriter::new(f);
+        // Header first, on its own line — always parseable, fixed shape.
+        serde_json::to_writer(&mut w, &header)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        w.write_all(b"\n")?;
+        serde_json::to_writer(&mut w, payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let f = w.into_inner()?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    fsync_dir(dir);
+    Ok(())
+}
+
+/// Splits raw snapshot bytes into `(header, payload)`. A missing header line
+/// (no `\n`, i.e. legacy headerless compact JSON) yields the synthetic
+/// `format_version = 0` header and the whole file as payload. A present-but-
+/// unparseable header line is a fatal [`SnapshotLoadError::Corrupt`].
+fn parse_envelope(bytes: &[u8]) -> Result<(SnapshotHeader, &[u8]), SnapshotLoadError> {
+    match bytes.iter().position(|&b| b == b'\n') {
+        Some(nl) => {
+            let header: SnapshotHeader =
+                serde_json::from_slice(&bytes[..nl]).map_err(|e| SnapshotLoadError::Corrupt {
+                    reason: format!("unparseable envelope header: {e}"),
+                })?;
+            Ok((header, &bytes[nl + 1..]))
+        }
+        None => Ok((
+            SnapshotHeader {
+                format_version: 0,
+                incarnation: 0,
+                engine_fingerprint: String::new(),
+            },
+            bytes,
+        )),
+    }
+}
+
+/// Validates the header's `format_version` against what this build supports.
+/// A version this build cannot read is a typed [`SnapshotLoadError::FormatMismatch`].
+fn check_format_version(header: &SnapshotHeader) -> Result<(), SnapshotLoadError> {
+    if header.format_version > SNAPSHOT_FORMAT_VERSION {
+        return Err(SnapshotLoadError::FormatMismatch {
+            found: header.format_version,
+            supported: SNAPSHOT_FORMAT_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// Reads ONLY the `format_version` from a snapshot file's envelope header,
+/// without deserializing the (possibly corrupt or incompatible) payload body.
+/// `Ok(None)` when the file does not exist. Used by #1071's migrator and by the
+/// envelope tests to prove the version is legible even from an unreadable payload.
+pub fn peek_snapshot_format_version(path: &Path) -> io::Result<Option<u32>> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let (header, _) = parse_envelope(&bytes)?;
+    Ok(Some(header.format_version))
+}
+
 fn is_seg_file(name: &str) -> Option<u64> {
     let rest = name.strip_prefix(SEG_PREFIX)?.strip_suffix(SEG_SUFFIX)?;
     rest.parse::<u64>().ok()
@@ -727,10 +946,27 @@ fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<
     Ok(events)
 }
 
-/// Loads the latest valid persisted snapshot in `dir`, if any.
-fn load_latest_snapshot(dir: &Path) -> Option<(EngineSnapshot, u64)> {
+/// Loads the latest persisted snapshot in `dir`.
+///
+/// `Ok(None)` means ONLY "no snapshot file exists". A snapshot that is present
+/// but at an incompatible format version, or present but corrupt/unreadable, is
+/// a FATAL typed error ([`SnapshotLoadError`], surfaced as an [`io::Error`]) —
+/// never a silent `None`, never a fallback that rewinds durable state.
+///
+/// The loaded value keeps `covered_events` as the SECOND tuple element to match
+/// the callers in [`recover`].
+fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>> {
     let mut best: Option<(u64, PathBuf)> = None;
-    for entry in fs::read_dir(dir).ok()?.flatten() {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // A read_dir entry error would otherwise be silently skipped by `.flatten()`,
+    // which could return `Ok(None)` (or pick a stale snapshot) despite a present
+    // snapshot — undermining the fail-closed guarantee. Propagate it instead.
+    for entry in rd {
+        let entry = entry?;
         let name = entry.file_name();
         if let Some(covered) = is_snap_file(&name.to_string_lossy())
             && best.as_ref().map(|(c, _)| covered > *c).unwrap_or(true)
@@ -738,10 +974,18 @@ fn load_latest_snapshot(dir: &Path) -> Option<(EngineSnapshot, u64)> {
             best = Some((covered, entry.path()));
         }
     }
-    let (_, path) = best?;
-    let bytes = fs::read(&path).ok()?;
-    let snap: PersistedSnapshot = serde_json::from_slice(&bytes).ok()?;
-    Some((snap.engine, snap.covered_events))
+    let Some((_, path)) = best else {
+        return Ok(None);
+    };
+    // A file we selected by name is PRESENT: from here on, every failure is fatal.
+    let bytes = fs::read(&path)?;
+    let (header, payload) = parse_envelope(&bytes)?;
+    check_format_version(&header)?;
+    let snap: PersistedSnapshot =
+        serde_json::from_slice(payload).map_err(|e| SnapshotLoadError::Corrupt {
+            reason: format!("snapshot payload deserialize failed: {e}"),
+        })?;
+    Ok(Some((snap.engine, snap.covered_events)))
 }
 
 /// The outcome of recovering a segmented journal directory.
@@ -803,11 +1047,14 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
     let first_index = first_index.unwrap_or(active_start);
     events.extend(active_events);
 
-    let fresh = total_events == 0 && load_latest_snapshot(dir).is_none();
+    // Load the snapshot ONCE. A present-but-incompatible/corrupt snapshot is a
+    // fatal typed error here (propagated via `?`), never a silent rewind.
+    let snapshot = load_latest_snapshot(dir)?;
+    let fresh = total_events == 0 && snapshot.is_none();
 
     // Rebuild the engine: snapshot (if any) + replay of the events the snapshot
     // did not cover; otherwise a full replay of the surviving events.
-    let engine = match load_latest_snapshot(dir) {
+    let engine = match snapshot {
         Some((snap, covered)) => {
             let mut engine = Engine::from_snapshot(snap);
             // Replay only events after the snapshot boundary.
@@ -852,22 +1099,7 @@ pub fn write_snapshot(dir: &Path, snap: EngineSnapshot, covered_events: u64) -> 
         engine: snap,
     };
     let final_path = dir.join(format!("{SNAP_PREFIX}{covered_events:020}{SNAP_SUFFIX}"));
-    let tmp = dir.join(format!(
-        "{SNAP_PREFIX}{covered_events:020}{SNAP_SUFFIX}.tmp"
-    ));
-    {
-        // Stream to the file (BufWriter) rather than building a full `Vec<u8>`
-        // first; see `write_multi_snapshot` for why the intermediate buffer is
-        // a multi-GB transient under a large backlog.
-        let f = File::create(&tmp)?;
-        let mut w = BufWriter::new(f);
-        serde_json::to_writer(&mut w, &payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let f = w.into_inner()?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, &final_path)?;
-    fsync_dir(dir);
+    write_enveloped(dir, &final_path, &payload)?;
 
     // Drop superseded snapshots (keep only the newest covered count).
     if let Ok(rd) = fs::read_dir(dir) {
@@ -951,40 +1183,42 @@ pub fn write_multi_snapshot(
             .collect(),
     };
     let final_path = dir.join(MULTI_SNAP_NAME);
-    let tmp = dir.join(format!("{MULTI_SNAP_NAME}.tmp"));
-    {
-        // Stream the JSON straight to the file through a BufWriter instead of
-        // materialising the whole snapshot into a `Vec<u8>` first: under a large
-        // active backlog that intermediate buffer is multi-GB (all resident
-        // variable payloads serialized at once) and was a major driver of the
-        // transient RSS balloon during the 60s snapshot tick. The snapshots
-        // share the live variables by Arc, so only this serialization ever
-        // duplicated them.
-        let f = File::create(&tmp)?;
-        let mut w = BufWriter::new(f);
-        serde_json::to_writer(&mut w, &payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let f = w.into_inner()?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, &final_path)?;
-    fsync_dir(dir);
+    // Stream the JSON straight to the file through a BufWriter instead of
+    // materialising the whole snapshot into a `Vec<u8>` first: under a large
+    // active backlog that intermediate buffer is multi-GB (all resident variable
+    // payloads serialized at once) and was a major driver of the transient RSS
+    // balloon during the 60s snapshot tick. The snapshots share the live
+    // variables by Arc, so only this serialization ever duplicated them.
+    write_enveloped(dir, &final_path, &payload)?;
     Ok(())
 }
 
 /// Loads the combined per-partition snapshot, as a map from global partition id
-/// to `(covered_count, snapshot)`. `None` when absent or unreadable.
+/// to `(covered_count, snapshot)`.
+///
+/// `Ok(None)` means ONLY "no combined snapshot file exists". A present-but-
+/// incompatible or corrupt file is a FATAL typed error ([`SnapshotLoadError`],
+/// surfaced as an [`io::Error`]) — never a silent `None`, never a rewind.
 fn load_multi_snapshot(
     dir: &Path,
-) -> Option<std::collections::HashMap<u64, (u64, EngineSnapshot)>> {
-    let bytes = fs::read(dir.join(MULTI_SNAP_NAME)).ok()?;
-    let snap: MultiPersistedSnapshot = serde_json::from_slice(&bytes).ok()?;
-    Some(
+) -> io::Result<Option<std::collections::HashMap<u64, (u64, EngineSnapshot)>>> {
+    let bytes = match fs::read(dir.join(MULTI_SNAP_NAME)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let (header, payload) = parse_envelope(&bytes)?;
+    check_format_version(&header)?;
+    let snap: MultiPersistedSnapshot =
+        serde_json::from_slice(payload).map_err(|e| SnapshotLoadError::Corrupt {
+            reason: format!("multi-snapshot payload deserialize failed: {e}"),
+        })?;
+    Ok(Some(
         snap.entries
             .into_iter()
             .map(|e| (e.partition, (e.covered, e.engine)))
             .collect(),
-    )
+    ))
 }
 
 /// The outcome of recovering a multi-partition segmented journal directory.
@@ -1127,7 +1361,7 @@ pub fn recover_multi(
         .cloned()
         .collect();
 
-    let combined = load_multi_snapshot(dir);
+    let combined = load_multi_snapshot(dir)?;
     let fresh = total_events == 0 && combined.is_none();
 
     // Rebuild each owned partition's engine: snapshot + its surviving tail, or a
@@ -2637,5 +2871,281 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&empty_dir);
+    }
+
+    // ------------------------------------------------------------------------
+    // Versioned self-describing snapshot envelope (L2 / #1068).
+    // ------------------------------------------------------------------------
+
+    /// Builds a small, deploy-only engine snapshot for envelope tests.
+    fn demo_snapshot() -> EngineSnapshot {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(demo()))
+            .expect("deploy");
+        engine.snapshot()
+    }
+
+    fn snap_path(dir: &Path, covered: u64) -> PathBuf {
+        dir.join(format!("{SNAP_PREFIX}{covered:020}{SNAP_SUFFIX}"))
+    }
+
+    /// Extracts the typed [`SnapshotLoadError`] from a loader's [`io::Error`].
+    fn typed_err(e: &io::Error) -> &SnapshotLoadError {
+        e.get_ref()
+            .and_then(|e| e.downcast_ref::<SnapshotLoadError>())
+            .expect("loader error must carry a typed SnapshotLoadError")
+    }
+
+    /// GREEN: a snapshot round-trips through the envelope, and the header stamps
+    /// the current format version, a non-zero incarnation, and a build
+    /// fingerprint — all readable without touching the payload body.
+    #[test]
+    fn envelope_round_trips_and_stamps_header() {
+        let dir = temp_dir("envelope-roundtrip");
+        fs::create_dir_all(&dir).unwrap();
+        let covered = 7;
+        write_snapshot(&dir, demo_snapshot(), covered).expect("write");
+
+        // The on-disk file is `header-line \n payload`.
+        let bytes = fs::read(snap_path(&dir, covered)).unwrap();
+        let (header, payload) = parse_envelope(&bytes).expect("parse header");
+        assert_eq!(header.format_version, SNAPSHOT_FORMAT_VERSION);
+        assert_ne!(header.incarnation, 0, "incarnation must be populated");
+        assert!(
+            header
+                .engine_fingerprint
+                .starts_with("nanobpmn-engine-core@"),
+            "fingerprint = {}",
+            header.engine_fingerprint
+        );
+        // The payload after the header is the real PersistedSnapshot.
+        let _: PersistedSnapshot = serde_json::from_slice(payload).expect("payload decodes");
+
+        // The loader returns the engine plus `covered_events` as the 2ND tuple
+        // element (caller contract).
+        let (loaded, loaded_covered) = load_latest_snapshot(&dir)
+            .expect("load ok")
+            .expect("snapshot present");
+        assert_eq!(loaded_covered, covered);
+        assert_eq!(
+            loaded.state.processes.len(),
+            1,
+            "round-tripped snapshot carries the deployed process"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `Ok(None)` is returned ONLY when no snapshot file exists.
+    #[test]
+    fn absent_snapshot_is_ok_none() {
+        let dir = temp_dir("envelope-absent");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(load_latest_snapshot(&dir).expect("ok").is_none());
+        assert!(load_multi_snapshot(&dir).expect("ok").is_none());
+        assert!(
+            peek_snapshot_format_version(&snap_path(&dir, 1))
+                .expect("ok")
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The format version is readable even when the PAYLOAD is corrupt, and a
+    /// corrupt payload is a FATAL typed error — never a silent `None`.
+    #[test]
+    fn version_readable_from_corrupt_payload_and_load_is_fatal() {
+        let dir = temp_dir("envelope-corrupt");
+        fs::create_dir_all(&dir).unwrap();
+        let covered = 3;
+        let header = SnapshotHeader {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            incarnation: 42,
+            engine_fingerprint: "test".into(),
+        };
+        let mut file = serde_json::to_vec(&header).unwrap();
+        file.push(b'\n');
+        file.extend_from_slice(b"this is not valid snapshot json }{");
+        fs::write(snap_path(&dir, covered), &file).unwrap();
+
+        // Version legible without decoding the (garbage) payload.
+        assert_eq!(
+            peek_snapshot_format_version(&snap_path(&dir, covered)).unwrap(),
+            Some(SNAPSHOT_FORMAT_VERSION)
+        );
+
+        // Loading it is a fatal typed Corrupt error, NOT Ok(None).
+        let err = load_latest_snapshot(&dir).expect_err("must be fatal, not None");
+        assert!(matches!(typed_err(&err), SnapshotLoadError::Corrupt { .. }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A snapshot written at a version NEWER than this build supports yields the
+    /// typed `SnapshotFormatMismatch` (`FormatMismatch`), never a silent rewind.
+    #[test]
+    fn future_version_yields_format_mismatch() {
+        let dir = temp_dir("envelope-future");
+        fs::create_dir_all(&dir).unwrap();
+        let covered = 5;
+        let future = SNAPSHOT_FORMAT_VERSION + 1;
+        let header = SnapshotHeader {
+            format_version: future,
+            incarnation: 1,
+            engine_fingerprint: "future-build".into(),
+        };
+        // A perfectly VALID payload — the mismatch must trip on the header alone.
+        let payload = PersistedSnapshot {
+            covered_events: covered,
+            engine: demo_snapshot(),
+        };
+        let mut file = serde_json::to_vec(&header).unwrap();
+        file.push(b'\n');
+        file.extend_from_slice(&serde_json::to_vec(&payload).unwrap());
+        fs::write(snap_path(&dir, covered), &file).unwrap();
+
+        let err = load_latest_snapshot(&dir).expect_err("mismatch is fatal");
+        match typed_err(&err) {
+            SnapshotLoadError::FormatMismatch { found, supported } => {
+                assert_eq!(*found, future);
+                assert_eq!(*supported, SNAPSHOT_FORMAT_VERSION);
+            }
+            other => panic!("expected FormatMismatch, got {other:?}"),
+        }
+        // The version is still legible.
+        assert_eq!(
+            peek_snapshot_format_version(&snap_path(&dir, covered)).unwrap(),
+            Some(future)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Legacy headerless snapshots (bare `serde_json`, no envelope) still load,
+    /// are treated as `format_version = 0`, and keep `covered_events` as the 2nd
+    /// tuple element.
+    #[test]
+    fn legacy_headerless_snapshot_still_loads() {
+        let dir = temp_dir("envelope-legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let covered = 9;
+        // Exactly the OLD on-disk format: bare compact JSON, no header line.
+        let payload = PersistedSnapshot {
+            covered_events: covered,
+            engine: demo_snapshot(),
+        };
+        fs::write(
+            snap_path(&dir, covered),
+            serde_json::to_vec(&payload).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            peek_snapshot_format_version(&snap_path(&dir, covered)).unwrap(),
+            Some(0),
+            "headerless legacy file reads as format_version 0"
+        );
+        let (loaded, loaded_covered) = load_latest_snapshot(&dir)
+            .expect("legacy load ok")
+            .expect("present");
+        assert_eq!(loaded_covered, covered);
+        assert_eq!(loaded.state.processes.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The incarnation id is generated once per data dir and stays stable across
+    /// successive snapshot writes (so a consumer can detect a reset/restore by a
+    /// CHANGE in it).
+    #[test]
+    fn incarnation_is_stable_across_writes() {
+        let dir = temp_dir("envelope-incarnation");
+        fs::create_dir_all(&dir).unwrap();
+        write_snapshot(&dir, demo_snapshot(), 1).unwrap();
+        let first = parse_envelope(&fs::read(snap_path(&dir, 1)).unwrap())
+            .unwrap()
+            .0
+            .incarnation;
+        write_snapshot(&dir, demo_snapshot(), 2).unwrap();
+        let second = parse_envelope(&fs::read(snap_path(&dir, 2)).unwrap())
+            .unwrap()
+            .0
+            .incarnation;
+        assert_eq!(first, second, "incarnation is stable for one data dir");
+        assert_ne!(first, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The multi-partition combined snapshot round-trips through the same
+    /// envelope, and a future header version is likewise a fatal mismatch.
+    #[test]
+    fn multi_envelope_round_trips_and_rejects_future_version() {
+        let dir = temp_dir("envelope-multi");
+        fs::create_dir_all(&dir).unwrap();
+        write_multi_snapshot(&dir, vec![(0, 4, demo_snapshot()), (1, 6, demo_snapshot())])
+            .expect("write multi");
+
+        let map = load_multi_snapshot(&dir)
+            .expect("load ok")
+            .expect("present");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&0).unwrap().0, 4);
+        assert_eq!(map.get(&1).unwrap().0, 6);
+        assert_eq!(
+            peek_snapshot_format_version(&dir.join(MULTI_SNAP_NAME)).unwrap(),
+            Some(SNAPSHOT_FORMAT_VERSION)
+        );
+
+        // Overwrite with a future-version header + valid payload.
+        let header = SnapshotHeader {
+            format_version: SNAPSHOT_FORMAT_VERSION + 1,
+            incarnation: 1,
+            engine_fingerprint: "future".into(),
+        };
+        let payload = MultiPersistedSnapshot {
+            entries: vec![MultiSnapshotEntry {
+                partition: 0,
+                covered: 4,
+                engine: demo_snapshot(),
+            }],
+        };
+        let mut file = serde_json::to_vec(&header).unwrap();
+        file.push(b'\n');
+        file.extend_from_slice(&serde_json::to_vec(&payload).unwrap());
+        fs::write(dir.join(MULTI_SNAP_NAME), &file).unwrap();
+
+        let err = load_multi_snapshot(&dir).expect_err("mismatch is fatal");
+        assert!(matches!(
+            typed_err(&err),
+            SnapshotLoadError::FormatMismatch { .. }
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A legacy headerless combined snapshot still loads as `format_version = 0`.
+    #[test]
+    fn legacy_headerless_multi_snapshot_still_loads() {
+        let dir = temp_dir("envelope-multi-legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let payload = MultiPersistedSnapshot {
+            entries: vec![MultiSnapshotEntry {
+                partition: 2,
+                covered: 8,
+                engine: demo_snapshot(),
+            }],
+        };
+        fs::write(
+            dir.join(MULTI_SNAP_NAME),
+            serde_json::to_vec(&payload).unwrap(),
+        )
+        .unwrap();
+
+        let map = load_multi_snapshot(&dir)
+            .expect("legacy multi load ok")
+            .expect("present");
+        assert_eq!(map.get(&2).unwrap().0, 8);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

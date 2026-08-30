@@ -90,6 +90,11 @@ mod validate;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
+/// The `engine-core` crate version, used as a coarse build-identity fingerprint
+/// (e.g. stamped into the persisted snapshot envelope header). Distinct from
+/// [`SNAPSHOT_FORMAT_VERSION`], which versions the serialized payload shape.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use agent::{
     AgentDefinition, AgentHistoryCommitStatus, AgentHistoryContent, AgentHistoryContentType,
     AgentHistoryIntent, AgentHistoryMetrics, AgentHistoryRecord, AgentHistoryRole,
@@ -105,6 +110,7 @@ pub use command::{
 };
 #[cfg(feature = "serde")]
 pub use engine::EngineSnapshot;
+pub use engine::SNAPSHOT_FORMAT_VERSION;
 pub use engine::{adhoc_inner_instance_id, ADHOC_INNER_INSTANCE_ID_POSTFIX};
 pub use engine::{ActivatedJob, DecisionEvaluation, Engine, EngineError};
 pub use engine::{BreakCondition, DebugSession};
