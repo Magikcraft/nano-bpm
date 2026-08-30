@@ -717,11 +717,32 @@ fn engine_fingerprint() -> String {
 /// how nano-workforce#622 detects a reset/restore.
 fn read_or_init_incarnation(dir: &Path) -> io::Result<u64> {
     let path = dir.join(INCARNATION_NAME);
-    if let Ok(s) = fs::read_to_string(&path)
-        && let Ok(v) = s.trim().parse::<u64>()
-        && v != 0
-    {
-        return Ok(v);
+    // Only a genuinely *missing* file seeds a fresh incarnation — that is the
+    // reset/restore signal (nano-workforce#622). A transient read failure
+    // (e.g. a permission error) or corrupt/zero contents must NOT be treated as
+    // a reset: silently regenerating would spuriously change the incarnation and
+    // contradict the stated "stable unless reset/restore" contract, surfacing a
+    // false reset to the cross-repo consumer. Fail closed (#1066) in those cases.
+    match fs::read_to_string(&path) {
+        Ok(s) => {
+            let v = s.trim().parse::<u64>().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("incarnation file {path:?} has non-numeric contents: {e}"),
+                )
+            })?;
+            if v == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("incarnation file {path:?} contains reserved value 0"),
+                ));
+            }
+            return Ok(v);
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Fall through to seed a fresh incarnation — the reset/restore case.
+        }
+        Err(e) => return Err(e),
     }
     // Seed from wall-clock nanoseconds (monotonic enough to distinguish
     // successive incarnations of the same dir); persisted so it is stable.
@@ -4361,6 +4382,41 @@ mod tests {
             .incarnation;
         assert_eq!(first, second, "incarnation is stable for one data dir");
         assert_ne!(first, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt/zero incarnation file must NOT be silently regenerated (which
+    /// would spuriously mutate the durable identity and surface a false
+    /// reset/restore to nano-workforce#622). It fails closed as `InvalidData`,
+    /// leaving the on-disk file untouched. Only a genuinely *missing* file seeds
+    /// a fresh incarnation.
+    #[test]
+    fn corrupt_incarnation_file_is_rejected_not_regenerated() {
+        let dir = temp_dir("incarnation-corrupt");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Non-numeric contents -> InvalidData, file left untouched.
+        fs::write(dir.join(INCARNATION_NAME), b"not-a-number").unwrap();
+        let err = read_or_init_incarnation(&dir).expect_err("non-numeric rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read_to_string(dir.join(INCARNATION_NAME)).unwrap(),
+            "not-a-number",
+            "corrupt file must not be overwritten"
+        );
+
+        // Reserved zero -> InvalidData.
+        fs::write(dir.join(INCARNATION_NAME), b"0").unwrap();
+        let err = read_or_init_incarnation(&dir).expect_err("zero rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // Genuinely missing -> seeds a fresh non-zero incarnation.
+        fs::remove_file(dir.join(INCARNATION_NAME)).unwrap();
+        let v = read_or_init_incarnation(&dir).expect("missing file seeds fresh id");
+        assert_ne!(v, 0);
+        // And is now stable.
+        assert_eq!(read_or_init_incarnation(&dir).unwrap(), v);
+
         let _ = fs::remove_dir_all(&dir);
     }
 
