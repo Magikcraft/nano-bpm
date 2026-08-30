@@ -1302,7 +1302,7 @@ fn inflate_all(bytes: &[u8]) -> io::Result<Vec<u8>> {
     use std::io::Read;
 
     use flate2::read::DeflateDecoder;
-    let mut out = Vec::with_capacity(bytes.len() * 2);
+    let mut out = Vec::with_capacity(bytes.len().saturating_mul(2));
     DeflateDecoder::new(bytes).read_to_end(&mut out)?;
     Ok(out)
 }
@@ -1517,7 +1517,13 @@ pub fn prune_cold_archive(dir: &Path, keep_from: u64) -> usize {
     let mut removed = 0usize;
     let cold = match list_cold(dir) {
         Ok(c) => c,
-        Err(_) => return 0,
+        Err(e) => {
+            tracing::warn!(
+                "prune_cold_archive: skipping prune, failed to list cold archive in {}: {e}",
+                dir.display()
+            );
+            return 0;
+        }
     };
     for (_, end, path) in cold {
         if end <= keep_from {
