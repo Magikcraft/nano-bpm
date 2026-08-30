@@ -23,6 +23,15 @@ serde = { version = "1", optional = true, features = ["derive", "rc"] }
 # dependency-free (std-only).
 serde_json = { version = "1", optional = true }
 
+[dev-dependencies]
+# Used by the golden serde-drift guard test (`tests/golden_serde_drift.rs`,
+# issue #1069) to (de)serialize the checked-in golden fixtures. The guard only
+# compiles/runs under `--features serde` (the `Event`/`EngineSnapshot` derives
+# are feature-gated), but a dev-dependency is unconditional, so the test crate
+# can name `serde_json` regardless. This does NOT affect the dependency-free
+# default build of the library itself.
+serde_json = "1"
+
 [features]
 serde = ["dep:serde", "dep:serde_json"]
 # Exposes the coarse C-ABI surface in `ffi.rs` (paired with the `cdylib`
