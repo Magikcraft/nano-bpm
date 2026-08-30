@@ -37,7 +37,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use nanobpmn_engine_core::{Engine, EngineSnapshot, Event, SNAPSHOT_FORMAT_VERSION, partition_of};
+use nanobpmn_engine_core::{
+    Engine, EngineSnapshot, Event, EventDecodeError, SNAPSHOT_FORMAT_VERSION, decode_event_json,
+    partition_of,
+};
 
 /// The active segment keeps the historical journal name so an existing
 /// single-file data dir is adopted unchanged.
@@ -883,10 +886,16 @@ pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
             if line.trim().is_empty() {
                 continue;
             }
-            let event: Event = match serde_json::from_str(line) {
+            let event: Event = match decode_event_json(line) {
                 Ok(ev) => ev,
-                Err(e) if torn_tail => {
-                    tracing::warn!("dropping torn journal tail in {}: {e}", path.display());
+                // A torn trailing write can leave a truncated/garbled last line;
+                // that is `Malformed` and safe to drop as an unfsynced tail. An
+                // `UnknownVariant` is a COMPLETE, well-formed record naming an
+                // event this build cannot replay (a renamed/removed variant or a
+                // newer/foreign journal) — never a torn write, so it is fatal
+                // even as the last line (routed to fail-closed / #1071, #1065).
+                Err(EventDecodeError::Malformed { detail }) if torn_tail => {
+                    tracing::warn!("dropping torn journal tail in {}: {detail}", path.display());
                     break;
                 }
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
@@ -928,10 +937,13 @@ fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<
                 Some((t, rest)) => (t.parse::<u64>().ok(), rest),
                 None => (None, line),
             };
-            let event: Event = match serde_json::from_str(json) {
+            let event: Event = match decode_event_json(json) {
                 Ok(ev) => ev,
-                Err(e) if torn_tail => {
-                    tracing::warn!("dropping torn journal tail in {}: {e}", path.display());
+                // Same torn-tail vs. unknown-frame distinction as
+                // `read_segment_events`: tolerate only a `Malformed` tail; an
+                // `UnknownVariant` is a real cross-version frame, never dropped.
+                Err(EventDecodeError::Malformed { detail }) if torn_tail => {
+                    tracing::warn!("dropping torn journal tail in {}: {detail}", path.display());
                     break;
                 }
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
@@ -3146,6 +3158,90 @@ mod tests {
             .expect("legacy multi load ok")
             .expect("present");
         assert_eq!(map.get(&2).unwrap().0, 8);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A journal whose records all name known variants replays cleanly through
+    /// the typed decode path (regression floor for the tests below).
+    #[test]
+    fn read_segment_events_decodes_a_valid_plaintext_journal() {
+        let dir = temp_dir("valid-journal");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seg.jsonl");
+        fs::write(
+            &path,
+            "{\"DeploymentCreated\":{\"deployment_key\":1}}\n\
+             {\"ProcessInstanceCompleted\":{\"instance_key\":2}}\n",
+        )
+        .unwrap();
+
+        let events = read_segment_events(&path).expect("valid journal reads");
+        assert_eq!(events.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An unknown/removed event variant in a journal must surface as the typed,
+    /// downcastable [`EventDecodeError::UnknownVariant`] on read — NOT a silent
+    /// skip and NOT an anonymous error — so #1071's replay-migrator (or the
+    /// fail-closed path, #1066) can branch on it. This is the storage-boundary
+    /// half of L4 (#1070); the engine-core `golden_replay` tests cover the
+    /// decoder itself.
+    ///
+    /// Critically, the unknown record is placed as the **last** content line to
+    /// prove it is fatal even where a genuinely torn (truncated) tail would be
+    /// tolerated: a complete, well-formed unknown frame is never a torn write.
+    #[test]
+    fn read_segment_events_rejects_unknown_variant_as_typed_error() {
+        let dir = temp_dir("unknown-variant");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seg.jsonl");
+        fs::write(
+            &path,
+            "{\"DeploymentCreated\":{\"deployment_key\":1}}\n\
+             {\"NoSuchEventFromTheFuture\":{\"instance_key\":9}}\n",
+        )
+        .unwrap();
+
+        let err = read_segment_events(&path).expect_err("unknown variant must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let decode_err = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<EventDecodeError>())
+            .expect("error downcasts to the typed EventDecodeError");
+        match decode_err {
+            EventDecodeError::UnknownVariant { variant, .. } => {
+                assert_eq!(variant, "NoSuchEventFromTheFuture")
+            }
+            other => panic!("expected UnknownVariant, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The tagged multi-partition reader applies the same discipline: an unknown
+    /// variant (here on a `<partition>\t<json>` line) is a typed rejection, not a
+    /// dropped record.
+    #[test]
+    fn read_segment_events_tagged_rejects_unknown_variant() {
+        let dir = temp_dir("unknown-variant-tagged");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seg.jsonl");
+        fs::write(
+            &path,
+            "0\t{\"DeploymentCreated\":{\"deployment_key\":1}}\n\
+             0\t{\"RetiredLegacyEvent\":{\"instance_key\":9}}\n",
+        )
+        .unwrap();
+
+        let err =
+            read_segment_events_tagged(&path, 1).expect_err("unknown variant must be rejected");
+        let decode_err = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<EventDecodeError>())
+            .expect("error downcasts to EventDecodeError");
+        assert!(matches!(
+            decode_err,
+            EventDecodeError::UnknownVariant { .. }
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 }
