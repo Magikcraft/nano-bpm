@@ -1768,7 +1768,9 @@ mod tests {
 
         let err = match crate::journal::Journal::open_segmented(&dir) {
             Ok(_) => {
-                panic!("recovery must refuse an unreadable snapshot, not rewind the key space")
+                panic!(
+                    "recovery must refuse an undeserializable snapshot, not rewind the key space"
+                )
             }
             Err(e) => e,
         };
@@ -1777,8 +1779,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// RED/GREEN for the #1066 review: a snapshot that is present but
-    /// *unreadable by the OS* (e.g. wrong permissions) must fail loud **with
+    /// RED/GREEN for the #1065 defect (raised in the #1066 review): a snapshot that is
+    /// present but *unreadable by the OS* (e.g. wrong permissions) must fail loud **with
     /// the underlying OS error kind preserved** — operators need the actionable
     /// cause (`PermissionDenied`), not a re-mapped `InvalidData` that looks
     /// like schema drift.
