@@ -92,6 +92,12 @@ artifacts (silent):**
   (regenerates `engine-wasm/pkg/`). The Bojtos framework packages that consume
   it (`@nanobpm/bojtos-kit` / `-react`) live in the separate `nanobpm/bojtos`
   repo and are element-type-agnostic, so they need no change here.
+- **"thin pass-through" applies to the `pkg/` ARTIFACT, not to
+  `engine-wasm/src/`.** If your element also introduces a new engine-core
+  `Command` or `ReadQuery` variant (many agentic / lifecycle elements do), you
+  **must** edit `engine-wasm/src/surface_parity.rs` in the SAME PR — see
+  *The wasm32 surface-parity gate* below. This is a separate axis this
+  element-centric checklist does not otherwise cover.
 
 **4. `console` — only if the element needs modeller/palette support:**
 
@@ -103,6 +109,64 @@ artifacts (silent):**
 freshly-built wasm (a Node probe against `@nanobpm/engine-wasm`'s `TestEngine`:
 `engine.deploy(xml)` → `engine.createInstance(...)`), not just the Rust unit
 tests — that is the surface the console (and Bojtos) actually consume.
+
+## The wasm32 surface-parity gate: every new `Command`/`ReadQuery` needs an arm
+
+`engine-wasm/src/surface_parity.rs` holds two **wildcard-free, exhaustive**
+matches — `classify(&Command)` over every engine-core `Command` variant and
+`classify_read(&ReadQuery)` over every `ReadQuery` variant — with **no catch-all
+arm**. They exist precisely to fail the wasm32 type-check (E0004) the instant a
+new engine capability lands. This gate is **orthogonal to the "new BPMN element"
+checklist above** — it fires for *any* new `Command`/`ReadQuery` (agentic
+lifecycle commands, new search queries, …), whether or not a new element is
+involved, and that checklist does not otherwise mention it.
+
+- **Add the arm in the SAME PR that adds the variant.** If you introduce a
+  `Command` variant, add its arm in `classify`; a `ReadQuery` variant, in
+  `classify_read`. Give each a deliberate `Surfaced` / `NotSurfaced` decision
+  (`Surfaced` if it should be reachable through the wasm `TestEngine` /
+  read-model surface; `NotSurfaced` otherwise, e.g. no `#[wasm_bindgen]` driver
+  exists yet). A missing arm turns the REQUIRED `engine-wasm-ffi (dist +
+  verify)` and `engine-wasm (read-model wasm32 type-check)` checks RED — on your
+  PR **and every later PR on the branch** — a zero-warnings violation that
+  cannot be deferred to a later slice.
+- **This edits `engine-wasm/src/` SOURCE, which is allowed — do NOT regenerate
+  the `engine-wasm/pkg/` ARTIFACT here.** "Do not touch engine-wasm" means the
+  `pkg/` compiled artifact only; the `src/surface_parity.rs` source edit is
+  required, not forbidden. In a fan-out epic, the final integration slice owns
+  the one clean `make console-wasm` regeneration + flipping arms to `Surfaced`
+  once real drivers exist.
+- **Verify before opening the PR:** `cargo check -p engine-wasm --target
+  wasm32-unknown-unknown` (or the repo `make`/CI equivalent). `classify`
+  (writes) and `classify_read` (reads) are disjoint functions, so parallel
+  write-side and read-side slices can edit each without colliding.
+
+## Wire-faithful OpenAPI schemas: prefer a flat enum-tag over a discriminated `oneOf`
+
+The rust-axum OpenAPI generator serializes a `oneOf` discriminator property as
+the schema **struct name** (e.g. `"AgentInstanceTextContent"`), **not** the
+`mapping` value (e.g. `"TEXT"`), which silently breaks request/response
+round-tripping. `scripts/postprocess-generated.py` only fixes *compilation* of
+optional discriminators — it does **not** correct the wire value. So for any
+schema whose tag must match a fixed Camunda / spec spelling, model it as a
+**flat object with an explicit enum tag field** rather than a discriminated
+`oneOf`. Add a contract test that round-trips the exact wire spelling.
+
+## Building the wasm tiers locally: two host footguns
+
+Building `engine-wasm` / the FFI dist (`make console-wasm`,
+`make engine-wasm-ffi-dist`) or running the JS/JVM client tests off a clean host
+hits two recurring, cryptic failures — guard against both up front:
+
+- **Use the rustup toolchain, not the system `cargo`.** Put `~/.cargo/bin`
+  ahead of `/usr/bin` on `PATH`; the system `/usr/bin/cargo` lacks the wasm32
+  std and fails with a misleading `can't find crate for std`.
+- **Redirect temp off a quota-limited `/tmp`.** vitest and maven write to
+  `/tmp`, which is easily exhausted (`EDQUOT` / `Unknown system error -122` /
+  `Disk quota exceeded`). Export `TMPDIR`/`TMP`/`TEMP` (and
+  `MAVEN_OPTS=-Djava.io.tmpdir=…`) to a directory under `/home`. If `wasm-opt`
+  is missing and `apt` is unavailable, install it via `npm i -g binaryen`.
+
 
 ## Claim Your Task Before You Start
 
