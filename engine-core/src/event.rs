@@ -1623,8 +1623,13 @@ pub enum EventDecodeError {
     ///
     /// [`SNAPSHOT_FORMAT_VERSION`]: crate::SNAPSHOT_FORMAT_VERSION
     UnknownVariant {
-        /// The externally-tagged variant name found in the record (its single
-        /// top-level object key), or `"?"` if it could not be extracted.
+        /// The offending variant name serde named as unknown — recovered from
+        /// serde's `unknown variant \`X\`` diagnostic. This is *not* necessarily
+        /// the record's top-level event tag: serde raises the same error for an
+        /// unknown value of an externally-tagged enum nested inside a *known*
+        /// event (e.g. `IncidentRaised.kind`), in which case this is that nested
+        /// variant, not the event name. Falls back to the record's top-level
+        /// object key, then to `"?"`, if the name cannot be extracted.
         variant: String,
         /// The underlying serde message, for operator diagnostics.
         detail: String,
@@ -1644,7 +1649,7 @@ impl std::fmt::Display for EventDecodeError {
         match self {
             EventDecodeError::UnknownVariant { variant, detail } => write!(
                 f,
-                "unknown event variant `{variant}` in journal record: this build cannot \
+                "unknown variant `{variant}` in journal record: this build cannot \
                  replay it (renamed/removed variant or a newer/foreign journal format). \
                  A breaking event-frame change requires a SNAPSHOT_FORMAT_VERSION bump \
                  (#1068) and replay-migrator handling (#1071); refusing to drop it \
@@ -1677,16 +1682,35 @@ pub fn decode_event_json(line: &str) -> Result<Event, EventDecodeError> {
             // `serde::de::Error::unknown_variant` when an externally-tagged
             // enum's tag names no known variant. That phrase is part of the
             // serde data model (not json-specific), so it is stable to key on.
-            // Recover the offending tag from the record's single top-level object
-            // key for a precise, operator-actionable message.
+            // The offending enum need not be the top-level `Event`: the same
+            // error arises for an unknown value of an externally-tagged enum
+            // nested inside a *known* event (e.g. `IncidentRaised.kind`), so
+            // recover the precise offending name from serde's own message first,
+            // and only fall back to the record's top-level object key (then
+            // `"?"`) if that fails — reporting the outer event name for a nested
+            // failure would mislead the operator.
             if detail.contains("unknown variant") {
-                let variant = event_tag_of(line).unwrap_or_else(|| "?".to_string());
+                let variant = unknown_variant_from_detail(&detail)
+                    .or_else(|| event_tag_of(line))
+                    .unwrap_or_else(|| "?".to_string());
                 Err(EventDecodeError::UnknownVariant { variant, detail })
             } else {
                 Err(EventDecodeError::Malformed { detail })
             }
         }
     }
+}
+
+/// Extract the offending variant name from serde's
+/// `unknown variant \`X\`, expected one of ...` diagnostic — the token between
+/// the first pair of backticks. Returns `None` if the message does not carry a
+/// backtick-delimited name (so the caller can fall back to another source).
+#[cfg(feature = "serde")]
+fn unknown_variant_from_detail(detail: &str) -> Option<String> {
+    let start = detail.find("unknown variant `")? + "unknown variant `".len();
+    let rest = &detail[start..];
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
 }
 
 /// Best-effort extraction of the externally-tagged variant name from a journal
@@ -1780,5 +1804,23 @@ mod event_decode_tests {
             decode_event_json(line).expect("valid record decodes"),
             Event::DeploymentCreated { deployment_key: 9 }
         );
+    }
+
+    /// Regression (defect class): serde raises the *same* "unknown variant"
+    /// error for an unknown value of an externally-tagged enum nested inside a
+    /// *known* event (here `IncidentRaised.kind`) as it does for an unknown
+    /// top-level `Event` tag. The reported `variant` must be the offending
+    /// nested name (`SomeFutureIncidentKind`), recovered from serde's message —
+    /// NOT the outer event tag (`IncidentRaised`), which would mislead the
+    /// operator into thinking the whole event type is gone.
+    #[test]
+    fn nested_unknown_variant_reports_inner_name_not_event_tag() {
+        let line = r#"{"IncidentRaised":{"incident_key":1,"instance_key":2,"element_instance_key":3,"element_id":"task","kind":"SomeFutureIncidentKind","reason":"x","job_key":null,"created_at":0}}"#;
+        match decode_event_json(line) {
+            Err(EventDecodeError::UnknownVariant { variant, .. }) => {
+                assert_eq!(variant, "SomeFutureIncidentKind")
+            }
+            other => panic!("expected UnknownVariant, got {other:?}"),
+        }
     }
 }
