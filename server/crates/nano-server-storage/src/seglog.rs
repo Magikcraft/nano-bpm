@@ -1866,8 +1866,13 @@ pub fn recover_multi(
         // unreadable snapshot.
         Ok(None) if first_index == 0 => false,
         Ok(None) => {
-            match full_cold_prefix_tagged(dir, num_partitions, first_index, total_events, tagged.len())?
-            {
+            match full_cold_prefix_tagged(
+                dir,
+                num_partitions,
+                first_index,
+                total_events,
+                tagged.len(),
+            )? {
                 Some(cold) => {
                     cold_tagged = cold;
                     tracing::warn!(
@@ -1897,8 +1902,13 @@ pub fn recover_multi(
             {
                 return Err(e);
             }
-            match full_cold_prefix_tagged(dir, num_partitions, first_index, total_events, tagged.len())?
-            {
+            match full_cold_prefix_tagged(
+                dir,
+                num_partitions,
+                first_index,
+                total_events,
+                tagged.len(),
+            )? {
                 Some(cold) => {
                     cold_tagged = cold;
                     tracing::warn!(
