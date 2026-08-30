@@ -843,20 +843,43 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
     let fresh = total_events == 0 && snapshot.is_none();
 
     // A compacted journal (`first_index > 0`) has had its event prefix deleted;
-    // the only complete source for that prefix is the snapshot. With no loadable
-    // snapshot, replaying just the surviving tail would rewind the key generator
-    // and silently drop the compacted state — refuse instead (see issue #1065;
-    // same "refuse rather than silently resume" principle as #600).
-    if snapshot.is_none() && first_index > 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "journal is compacted (first surviving event index {first_index}) but no \
-                 loadable snapshot is present; refusing to recover from a truncated tail, \
-                 which would rewind the engine key generator and drop compacted state. See \
-                 issue #1065."
-            ),
-        ));
+    // the only complete source for that prefix is the snapshot. It is not enough
+    // for *a* snapshot to load — it must actually cover the compaction floor
+    // (`covered >= first_index`). Two ways this fails, both of which would replay
+    // only the surviving tail atop an incomplete base — rewinding the key
+    // generator and silently dropping the compacted `[covered, first_index)`
+    // window (issue #1065; same "refuse rather than silently resume" principle as
+    // #600):
+    //   * no loadable snapshot at all, or
+    //   * a *stale* snapshot whose `covered < first_index` (e.g. the newest
+    //     snapshot was removed/corrupted post-compaction, leaving an older one
+    //     that `saturating_sub` would silently clamp to `skip = 0`).
+    if first_index > 0 {
+        match &snapshot {
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "journal is compacted (first surviving event index {first_index}) but no \
+                         loadable snapshot is present; refusing to recover from a truncated tail, \
+                         which would rewind the engine key generator and drop compacted state. See \
+                         issue #1065."
+                    ),
+                ));
+            }
+            Some((_, covered)) if *covered < first_index => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "journal is compacted (first surviving event index {first_index}) but the \
+                         loadable snapshot only covers up to {covered}; refusing to recover across \
+                         the compacted gap [{covered}, {first_index}), which would rewind the \
+                         engine key generator and drop compacted state. See issue #1065."
+                    ),
+                ));
+            }
+            Some(_) => {}
+        }
     }
 
     // Rebuild the engine: snapshot (if any) + replay of the events the snapshot
@@ -1228,6 +1251,40 @@ pub fn recover_multi(
                  compacted state. See issue #1065."
             ),
         ));
+    }
+
+    // Per-partition compaction invariant, enforced defensively on the read path:
+    // a partition whose prefix was compacted (`pp_base[p] > 0`) can only be
+    // rebuilt if its snapshot entry actually covers the compaction floor
+    // (`covered >= pp_base[p]`). A *missing* entry (the `None` arm would do a
+    // truncated full replay) or a *stale* one (`covered < pp_base[p]`, whose
+    // `saturating_sub` clamps `skip` to 0) would replay only that shard's
+    // surviving tail across the compacted `[covered, pp_base[p])` gap — rewinding
+    // its key generator and dropping compacted state, the same defect class as
+    // #1065 reached per-partition. Refuse loud instead. (This mirrors the
+    // compaction rule "a segment is deletable only once every partition's
+    // snapshot covers `per_partition_end[p]`".)
+    for &p in owned {
+        let base_p = pp_base.get(p as usize).copied().unwrap_or(0);
+        if base_p == 0 {
+            continue;
+        }
+        let covered = combined.as_ref().and_then(|m| m.get(&p)).map(|(c, _)| *c);
+        if covered.is_none_or(|c| c < base_p) {
+            let detail = match covered {
+                Some(c) => format!("its loadable snapshot entry only covers up to {c}"),
+                None => "no loadable snapshot entry is present for it".to_string(),
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "multi-partition journal partition {p} is compacted (first surviving index \
+                     {base_p}) but {detail}; refusing to recover from a truncated tail, which \
+                     would rewind that partition's key generator and drop compacted state. See \
+                     issue #1065."
+                ),
+            ));
+        }
     }
 
     // Rebuild each owned partition's engine: snapshot + its surviving tail, or a
@@ -1852,6 +1909,42 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// RED/GREEN for the round-2 senior finding: a compacted journal with a
+    /// *loadable but stale* snapshot — one whose `covered_events` sits **below**
+    /// the compaction floor (`covered < first_index`) — must fail loud too. This
+    /// is the same #1065 rewind reached through an older-than-floor snapshot
+    /// instead of a missing/corrupt one: the newest snapshot is lost after
+    /// compaction, an older one survives, `covered.saturating_sub(first_index)`
+    /// clamps `skip` to 0, and the compacted `[covered, first_index)` window is
+    /// silently dropped. The old `snapshot.is_none()` guard waved it straight
+    /// through.
+    #[test]
+    fn recover_rejects_a_stale_snapshot_below_the_compaction_floor() {
+        let (dir, _key1, _key2) = compacted_dir_with_two_instances("stale-snap");
+
+        // Rewrite the surviving snapshot so it still deserializes but reports a
+        // `covered_events` below the compaction floor (0 < first_index).
+        let path = snapshot_file(&dir);
+        let mut snap: PersistedSnapshot =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            snap.covered_events > 0,
+            "the compaction floor must be nonzero for this test to exercise the gap"
+        );
+        snap.covered_events = 0;
+        fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+        let err = match crate::journal::Journal::open_segmented(&dir) {
+            Ok(_) => panic!(
+                "recovery must refuse a stale snapshot below the compaction floor, not rewind the key space"
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// GREEN guard against the key rewind itself: a *valid* snapshot recovery
     /// preserves the key high-water, so the next minted instance key is strictly
     /// greater than the last one minted before the restart — never a rewound low
@@ -2064,9 +2157,82 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Multi-partition recovery fuses the combined snapshot with the surviving
-    /// tail: instances created AFTER the snapshot boundary (uncompacted) are
-    /// replayed on top of the per-partition snapshots.
+    /// RED/GREEN for the multi-partition arm of the round-2 senior finding: a
+    /// compacted shared journal whose combined snapshot loads but is *stale for
+    /// one owned partition* (`covered < pp_base[p]`) must fail loud. Reached
+    /// exactly as #1065 per shard: `covered.saturating_sub(base_p)` clamps that
+    /// partition's `skip` to 0, replaying only its surviving tail across the
+    /// compacted gap and rewinding its key generator. The old `combined.is_none()`
+    /// guard only caught a wholly-absent multi-snapshot, not a per-partition gap.
+    #[test]
+    fn recover_multi_rejects_a_stale_partition_snapshot_below_the_compaction_floor() {
+        let dir = temp_dir("multi-stale-snap");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+
+        {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
+            let seg = Arc::clone(&recovery.shared);
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+            let _ = j0.apply_command(Command::create_instance("demo")).unwrap();
+            let _ = j1.apply_command(Command::create_instance("demo")).unwrap();
+
+            let (snap0, covered0) = j0.snapshot_and_rotate().expect("snapshot p0");
+            let (snap1, covered1) = j1.snapshot_and_rotate().expect("snapshot p1");
+            write_multi_snapshot(&dir, vec![(0, covered0, snap0), (1, covered1, snap1)])
+                .expect("write combined snapshot");
+            assert_eq!(
+                compact_multi(&seg, &[covered0, covered1], &[u64::MAX; 2]),
+                1,
+                "the sealed prefix is compacted for both partitions"
+            );
+            assert!(seg.sealed.lock().unwrap().is_empty());
+        }
+
+        // Simulate the loadable-but-stale case: rewrite partition 1's entry so its
+        // `covered` sits below the compaction floor (0 < pp_base[1]).
+        let path = dir.join(MULTI_SNAP_NAME);
+        let mut snap: MultiPersistedSnapshot =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let e = snap
+            .entries
+            .iter_mut()
+            .find(|e| e.partition == 1)
+            .expect("partition 1 snapshot entry");
+        assert!(
+            e.covered > 0,
+            "partition 1's compaction floor must be nonzero for this test to exercise the gap"
+        );
+        e.covered = 0;
+        fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+        let err = recover_multi(&dir, &[0, 1], 2, None)
+            .err()
+            .expect("recovery must refuse a stale partition snapshot, not rewind the key space");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn multi_partition_recovery_fuses_snapshot_and_tail() {
         let dir = temp_dir("multi-tail");
