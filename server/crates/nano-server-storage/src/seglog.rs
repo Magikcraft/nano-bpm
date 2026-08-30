@@ -716,15 +716,21 @@ fn read_or_init_incarnation(dir: &Path) -> io::Result<u64> {
     let path = dir.join(INCARNATION_NAME);
     if let Ok(s) = fs::read_to_string(&path)
         && let Ok(v) = s.trim().parse::<u64>()
+        && v != 0
     {
         return Ok(v);
     }
     // Seed from wall-clock nanoseconds (monotonic enough to distinguish
     // successive incarnations of the same dir); persisted so it is stable.
+    // Clamp to a non-zero value: `0` is reserved for the synthetic legacy
+    // headerless envelope (`incarnation: 0` in `parse_envelope`) and the
+    // cross-repo contract (nano-workforce#622) requires a non-zero id, so a
+    // clock before UNIX_EPOCH (or a stale on-disk `0`) must not surface as `0`.
     let incarnation = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(1);
     let tmp = dir.join(format!("{INCARNATION_NAME}.tmp"));
     {
         let mut f = File::create(&tmp)?;
@@ -956,7 +962,11 @@ fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>>
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    for entry in rd.flatten() {
+    // A read_dir entry error would otherwise be silently skipped by `.flatten()`,
+    // which could return `Ok(None)` (or pick a stale snapshot) despite a present
+    // snapshot — undermining the fail-closed guarantee. Propagate it instead.
+    for entry in rd {
+        let entry = entry?;
         let name = entry.file_name();
         if let Some(covered) = is_snap_file(&name.to_string_lossy())
             && best.as_ref().map(|(c, _)| covered > *c).unwrap_or(true)
