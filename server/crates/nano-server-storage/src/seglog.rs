@@ -730,12 +730,13 @@ fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<
 /// Loads the latest persisted snapshot in `dir`.
 ///
 /// Returns `Ok(None)` **only** when no snapshot file exists. A snapshot file
-/// that is present but cannot be read or deserialized is a fatal `InvalidData`
-/// error: silently treating it as "no snapshot" would fall back to a
-/// truncated-tail replay that rewinds the engine key generator and drops the
-/// state the snapshot covered (see issue #1065). Surfacing the error lets the
-/// operator roll back to a compatible binary or migrate the snapshot rather
-/// than corrupt the key space.
+/// that is present but cannot be read is a fatal error carrying the underlying
+/// OS error kind (e.g. `PermissionDenied`), and one that cannot be
+/// deserialized is a fatal `InvalidData` error: silently treating either as
+/// "no snapshot" would fall back to a truncated-tail replay that rewinds the
+/// engine key generator and drops the state the snapshot covered (see issue
+/// #1065). Surfacing the error lets the operator roll back to a compatible
+/// binary or migrate the snapshot rather than corrupt the key space.
 fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>> {
     let mut best: Option<(u64, PathBuf)> = None;
     for entry in fs::read_dir(dir)?.flatten() {
@@ -751,7 +752,7 @@ fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>>
     };
     let bytes = fs::read(&path).map_err(|e| {
         io::Error::new(
-            io::ErrorKind::InvalidData,
+            e.kind(),
             format!(
                 "snapshot {} is present but unreadable ({e}); refusing to recover from a \
                  truncated journal, which would rewind the engine key generator and drop \
@@ -1025,9 +1026,10 @@ pub fn write_multi_snapshot(
 
 /// Loads the combined per-partition snapshot, as a map from global partition id
 /// to `(covered_count, snapshot)`. `Ok(None)` **only** when the multi-snapshot
-/// file is absent; a present-but-unreadable file is a fatal `InvalidData` error
-/// (see [`load_latest_snapshot`] and issue #1065) — treating schema drift as
-/// "no snapshot" would rewind the partition key generators.
+/// file is absent; a present-but-unreadable file is a fatal error carrying the
+/// underlying OS error kind, and an undeserializable one a fatal `InvalidData`
+/// error (see [`load_latest_snapshot`] and issue #1065) — treating schema
+/// drift as "no snapshot" would rewind the partition key generators.
 fn load_multi_snapshot(
     dir: &Path,
 ) -> io::Result<Option<std::collections::HashMap<u64, (u64, EngineSnapshot)>>> {
@@ -1037,7 +1039,7 @@ fn load_multi_snapshot(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+                e.kind(),
                 format!(
                     "multi-partition snapshot {} is present but unreadable ({e}); refusing to \
                      recover from a truncated journal, which would rewind partition key \
@@ -1565,6 +1567,8 @@ fn rebuild_from_surviving_tail(
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use nanobpmn_engine_core::{Command, ProcessBuilder};
 
     use super::*;
@@ -1767,6 +1771,55 @@ mod tests {
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// RED/GREEN for the #1066 review: a snapshot that is present but
+    /// *unreadable by the OS* (e.g. wrong permissions) must fail loud **with
+    /// the underlying OS error kind preserved** — operators need the actionable
+    /// cause (`PermissionDenied`), not a re-mapped `InvalidData` that looks
+    /// like schema drift.
+    #[test]
+    fn recover_reports_the_os_cause_for_an_unreadable_snapshot() {
+        let (dir, _key1, _key2) = compacted_dir_with_two_instances("unreadable-snap");
+        let snap = snapshot_file(&dir);
+        fs::set_permissions(&snap, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = match crate::journal::Journal::open_segmented(&dir) {
+            Ok(_) => {
+                panic!("recovery must refuse an unreadable snapshot, not rewind the key space")
+            }
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::PermissionDenied,
+            "the OS error kind must survive the fail-loud wrapping: {err}"
+        );
+
+        fs::set_permissions(&snap, fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Same guard for the multi-partition snapshot path: a present-but-unreadable
+    /// multi-snapshot must fail loud with the OS error kind preserved.
+    #[test]
+    fn load_multi_snapshot_reports_the_os_cause_for_an_unreadable_file() {
+        let dir = temp_dir("unreadable-msnap");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(MULTI_SNAP_NAME);
+        fs::write(&path, b"opaque").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = load_multi_snapshot(&dir)
+            .expect_err("an unreadable multi-snapshot must fail loud, not vanish");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::PermissionDenied,
+            "the OS error kind must survive the fail-loud wrapping: {err}"
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 
