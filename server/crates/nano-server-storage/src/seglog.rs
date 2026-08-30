@@ -731,15 +731,17 @@ fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<
 ///
 /// Returns `Ok(None)` **only** when no snapshot file exists. A snapshot file
 /// that is present but cannot be read is a fatal error carrying the underlying
-/// OS error kind (e.g. `PermissionDenied`), and one that cannot be
-/// deserialized is a fatal `InvalidData` error: silently treating either as
-/// "no snapshot" would fall back to a truncated-tail replay that rewinds the
+/// OS error kind (e.g. `PermissionDenied`), one that cannot be deserialized is
+/// a fatal `InvalidData` error, and errors listing the directory (or its
+/// individual entries) propagate as-is: silently treating any of these as "no
+/// snapshot" would fall back to a truncated-tail replay that rewinds the
 /// engine key generator and drops the state the snapshot covered (see issue
 /// #1065). Surfacing the error lets the operator roll back to a compatible
 /// binary or migrate the snapshot rather than corrupt the key space.
 fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>> {
     let mut best: Option<(u64, PathBuf)> = None;
-    for entry in fs::read_dir(dir)?.flatten() {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
         let name = entry.file_name();
         if let Some(covered) = is_snap_file(&name.to_string_lossy())
             && best.as_ref().map(|(c, _)| covered > *c).unwrap_or(true)
@@ -1567,6 +1569,7 @@ fn rebuild_from_surviving_tail(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use nanobpmn_engine_core::{Command, ProcessBuilder};
@@ -1779,6 +1782,7 @@ mod tests {
     /// the underlying OS error kind preserved** — operators need the actionable
     /// cause (`PermissionDenied`), not a re-mapped `InvalidData` that looks
     /// like schema drift.
+    #[cfg(unix)]
     #[test]
     fn recover_reports_the_os_cause_for_an_unreadable_snapshot() {
         let (dir, _key1, _key2) = compacted_dir_with_two_instances("unreadable-snap");
@@ -1803,6 +1807,7 @@ mod tests {
 
     /// Same guard for the multi-partition snapshot path: a present-but-unreadable
     /// multi-snapshot must fail loud with the OS error kind preserved.
+    #[cfg(unix)]
     #[test]
     fn load_multi_snapshot_reports_the_os_cause_for_an_unreadable_file() {
         let dir = temp_dir("unreadable-msnap");
