@@ -1526,6 +1526,25 @@ pub fn prune_cold_archive(dir: &Path, keep_from: u64) -> usize {
     removed
 }
 
+/// The cold-archive prune floor for one multi-partition maintenance tick: the
+/// minimum covered watermark across the partitions THIS node actually snapshotted
+/// (its OWNED partitions), i.e. the boundary every owned partition has folded into
+/// the fresh combined snapshot.
+///
+/// `owned_covered` must carry exactly one entry per partition snapshotted this
+/// tick — NOT a global-width vector padded with 0 for unowned partitions. A
+/// clustered node owns only a subset of the cluster's partitions
+/// (`partition_id % num_nodes == node_id`), so a global-width `covered` has
+/// 0-holes for the partitions it does not own; taking the min across those holes
+/// pins the floor at 0 forever, `prune_cold_archive` then never prunes, and the
+/// shared cold archive grows without the intended one-generation bound (#1076).
+/// Deriving the floor from the owned watermarks alone keeps the window bounded on
+/// a clustered node while staying identical to the global min on a single node
+/// that owns every partition.
+pub fn cold_prune_floor(owned_covered: &[u64]) -> u64 {
+    owned_covered.iter().copied().min().unwrap_or(0)
+}
+
 /// Rebuilds a single-partition engine from a from-scratch replay of the FULL
 /// event history — the cold archive's covered prefix + the surviving hot tail —
 /// when the on-disk snapshot cannot be loaded at its format version (the migrator
@@ -3723,6 +3742,30 @@ mod tests {
         assert_eq!(reopened.state().processes.len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1076 regression: the multi-partition maintenance loop's cold-archive prune
+    /// floor must derive from the covered watermarks of the partitions THIS node
+    /// OWNS, not from a global-width vector padded with 0 for unowned partitions. A
+    /// clustered node owns only a subset of partitions, so a global `covered` has
+    /// 0-holes; the old `covered.iter().min()` pinned the floor at 0 forever and
+    /// `prune_cold_archive` never pruned — an unbounded cold archive.
+    #[test]
+    fn cold_prune_floor_uses_owned_partitions_only() {
+        // Clustered node owns partitions 0 and 2 of a 4-partition cluster and
+        // captured covered watermarks 30 and 50 this tick. The floor is 30 (min
+        // of OWNED), not 0.
+        assert_eq!(cold_prune_floor(&[30, 50]), 30);
+
+        // Regression witness: the OLD global-width form min([30, 0, 50, 0]) == 0,
+        // which is exactly the floor that never advanced (bug #1076).
+        assert_eq!([30u64, 0, 50, 0].iter().copied().min().unwrap(), 0);
+
+        // Single node owning every partition: identical to the global min.
+        assert_eq!(cold_prune_floor(&[42, 42, 42, 42]), 42);
+
+        // A tick that snapshotted nothing yields floor 0 (prune no-op).
+        assert_eq!(cold_prune_floor(&[]), 0);
     }
 
     /// L5 core regression for #1065 (`instance 41` rewind): a snapshot written in

@@ -22181,6 +22181,14 @@ async fn main() {
                         if !ok {
                             continue;
                         }
+                        // The covered watermarks for the partitions THIS node owns
+                        // (one per snapshotted entry). Captured before `entries` is
+                        // moved into the snapshot writer so the cold-archive prune
+                        // floor derives from owned partitions only — `covered` is a
+                        // GLOBAL-width vector with 0-holes for partitions a
+                        // clustered node does not own, and its min would pin the
+                        // floor at 0 forever (unbounded cold archive, #1076).
+                        let owned_covered: Vec<u64> = entries.iter().map(|e| e.1).collect();
                         if let Err(e) = seglog::write_multi_snapshot(&shared.dir, entries) {
                             tracing::warn!("multi-partition snapshot write failed: {e}");
                             continue;
@@ -22204,15 +22212,17 @@ async fn main() {
                         // Prune the shared cold journal archive one generation back
                         // now that a fresh in-format combined snapshot is durable,
                         // then advance the window. The floor is the previous tick's
-                        // global min covered (a segment is only compacted once every
-                        // partition covers it), keeping the archive bounded.
+                        // min covered across the partitions THIS node OWNS (a
+                        // segment is only compacted once every owned partition
+                        // covers it), keeping the archive bounded even on a
+                        // clustered node that owns a subset of partitions (#1076).
                         let pruned = seglog::prune_cold_archive(&shared.dir, prev_floor);
                         if pruned > 0 {
                             tracing::debug!(
                                 "cold journal archive pruned {pruned} file(s) below {prev_floor}"
                             );
                         }
-                        prev_floor = covered.iter().copied().min().unwrap_or(0);
+                        prev_floor = seglog::cold_prune_floor(&owned_covered);
 
                         // Bound the durable var-store WAL: truncate it back to zero
                         // on its own cadence so a sustained write load can't grow it
