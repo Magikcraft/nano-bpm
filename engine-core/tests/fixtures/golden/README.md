@@ -30,7 +30,10 @@ engine's persisted shapes. They serve two jobs at once:
 derives the filename from the current `SNAPSHOT_FORMAT_VERSION`, so **bumping the
 version points the guard at a fresh `v<N>` file** you must regenerate, while the
 prior `v<N-1>` files stay checked in as the historical corpus #1071's migrator
-replays. Current version: **v1**.
+replays. The live `<N>` is always whatever [`SNAPSHOT_FORMAT_VERSION`] resolves
+to at build time — the guard reads it from the constant, so this doc deliberately
+does not restate a specific number here (which would silently drift on the next
+bump); check the constant in `engine-core/src/engine/mod.rs` for the current value.
 
 The JSON is emitted in a **canonical** form (object keys sorted, pretty-printed)
 so diffs are reviewable and stable across machines. Do not hand-edit it.

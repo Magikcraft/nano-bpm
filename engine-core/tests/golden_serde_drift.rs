@@ -291,3 +291,50 @@ fn golden_serialization_is_deterministic() {
     assert_eq!(canonical_json(&snapshot), canonical_json(&snapshot2));
     assert_eq!(canonical_json(&journal), canonical_json(&journal2));
 }
+
+/// Directly exercises the property the whole corpus relies on: `canonical_json`
+/// must be **insensitive to HashMap insertion/iteration order**, emitting object
+/// keys in sorted order. The `_is_deterministic` test above rebuilds the *same*
+/// corpus, so within one process its HashMaps share a RandomState seed and can
+/// end up in identical iteration order regardless of insertion — meaning it would
+/// still pass even if `canonical_json` stopped sorting keys. This test defeats
+/// that by inserting the *same* entries in two different orders and asserting the
+/// canonical bytes match AND are sorted, so it fails the moment canonicalization
+/// regresses (e.g. stops routing through serde_json's key-sorted `Value`).
+#[test]
+fn canonical_json_is_insensitive_to_map_insertion_order() {
+    let entries = [
+        ("zeta", Value::Int(1)),
+        ("alpha", Value::Int(2)),
+        ("mu", Value::Str("m".to_string())),
+        ("beta", Value::Bool(true)),
+    ];
+
+    let mut forward: HashMap<String, Value> = HashMap::new();
+    for (k, v) in entries.iter() {
+        forward.insert((*k).to_string(), v.clone());
+    }
+    let mut reverse: HashMap<String, Value> = HashMap::new();
+    for (k, v) in entries.iter().rev() {
+        reverse.insert((*k).to_string(), v.clone());
+    }
+
+    let forward_json = canonical_json(&forward);
+    let reverse_json = canonical_json(&reverse);
+    assert_eq!(
+        forward_json, reverse_json,
+        "canonical_json must not depend on HashMap insertion/iteration order"
+    );
+
+    // The bytes are equal *because* keys are emitted in sorted order — assert
+    // that directly so a regression to raw (unsorted) iteration order is caught
+    // even in the unlucky case where two orders happen to iterate identically.
+    let alpha = forward_json.find("\"alpha\"").expect("alpha key present");
+    let beta = forward_json.find("\"beta\"").expect("beta key present");
+    let mu = forward_json.find("\"mu\"").expect("mu key present");
+    let zeta = forward_json.find("\"zeta\"").expect("zeta key present");
+    assert!(
+        alpha < beta && beta < mu && mu < zeta,
+        "canonical_json must emit object keys in sorted order:\n{forward_json}"
+    );
+}
