@@ -32,7 +32,7 @@
 //! it is recoverable when *all* sealed segments have been compacted away).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -816,12 +816,22 @@ fn check_format_version(header: &SnapshotHeader) -> Result<(), SnapshotLoadError
 /// `Ok(None)` when the file does not exist. Used by #1071's migrator and by the
 /// envelope tests to prove the version is legible even from an unreadable payload.
 pub fn peek_snapshot_format_version(path: &Path) -> io::Result<Option<u32>> {
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
+    let file = match File::open(path) {
+        Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let (header, _) = parse_envelope(&bytes)?;
+    // We only need the envelope header — the first line (`\n`-terminated) — not
+    // the (possibly multi-GB) payload body, so read just that line instead of
+    // slurping the whole snapshot into memory. The read is capped so a legacy
+    // headerless snapshot (compact JSON, no `\n`) can't force an unbounded read
+    // either: an enveloped header is tiny, so no newline within the cap means
+    // this is a legacy file, which `parse_envelope` maps to `format_version 0`.
+    const HEADER_SCAN_CAP: u64 = 64 * 1024;
+    let mut reader = BufReader::new(file.take(HEADER_SCAN_CAP));
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line)?;
+    let (header, _) = parse_envelope(&line)?;
     Ok(Some(header.format_version))
 }
 
