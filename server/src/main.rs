@@ -22038,6 +22038,13 @@ async fn main() {
                     let mut ticker = tokio::time::interval(interval);
                     // Skip the immediate first tick.
                     ticker.tick().await;
+                    // The PREVIOUS snapshot's covered boundary. The cold journal
+                    // archive (written by compaction in place of hard deletion) is
+                    // pruned one generation back to it after each fresh SAME-format
+                    // snapshot, keeping the archive to a rolling ~one-generation
+                    // window while retaining the latest generation as the
+                    // replay-migration fallback (#1071).
+                    let mut prev_covered: u64 = 0;
                     loop {
                         ticker.tick().await;
                         let snapped = handle.with(|journal| journal.snapshot_and_rotate()).await;
@@ -22058,6 +22065,16 @@ async fn main() {
                                 "journal compaction removed {removed} sealed segment(s) (watermark {watermark})"
                             );
                         }
+                        // Prune the cold archive one generation back now that a
+                        // fresh in-format snapshot is durable, then advance the
+                        // window. Bounded disk: net cold size ≈ one generation.
+                        let pruned = seglog::prune_cold_archive(&shared.dir, prev_covered);
+                        if pruned > 0 {
+                            tracing::debug!(
+                                "cold journal archive pruned {pruned} file(s) below {prev_covered}"
+                            );
+                        }
+                        prev_covered = covered;
                     }
                 });
                 tracing::info!(
@@ -22088,6 +22105,13 @@ async fn main() {
                     // Truncate it off this maintenance thread on its own cadence.
                     let wal_interval = varstore::wal_checkpoint_interval();
                     let mut last_wal_truncate = std::time::Instant::now();
+                    // Previous tick's global compaction floor (min covered across
+                    // partitions). The shared cold journal archive is pruned one
+                    // generation back to it after each fresh combined snapshot,
+                    // keeping the archive to a rolling ~one-generation window while
+                    // retaining the latest generation as the replay-migration
+                    // fallback (#1071).
+                    let mut prev_floor: u64 = 0;
                     loop {
                         ticker.tick().await;
                         // Snapshot each owned partition; a `None` (writer gone)
@@ -22157,6 +22181,14 @@ async fn main() {
                         if !ok {
                             continue;
                         }
+                        // The covered watermarks for the partitions THIS node owns
+                        // (one per snapshotted entry). Captured before `entries` is
+                        // moved into the snapshot writer so the cold-archive prune
+                        // floor derives from owned partitions only — `covered` is a
+                        // GLOBAL-width vector with 0-holes for partitions a
+                        // clustered node does not own, and its min would pin the
+                        // floor at 0 forever (unbounded cold archive, #1076).
+                        let owned_covered: Vec<u64> = entries.iter().map(|e| e.1).collect();
                         if let Err(e) = seglog::write_multi_snapshot(&shared.dir, entries) {
                             tracing::warn!("multi-partition snapshot write failed: {e}");
                             continue;
@@ -22177,6 +22209,20 @@ async fn main() {
                                 "multi-partition journal compaction removed {removed} sealed segment(s) (exported {exported:?})"
                             );
                         }
+                        // Prune the shared cold journal archive one generation back
+                        // now that a fresh in-format combined snapshot is durable,
+                        // then advance the window. The floor is the previous tick's
+                        // min covered across the partitions THIS node OWNS (a
+                        // segment is only compacted once every owned partition
+                        // covers it), keeping the archive bounded even on a
+                        // clustered node that owns a subset of partitions (#1076).
+                        let pruned = seglog::prune_cold_archive(&shared.dir, prev_floor);
+                        if pruned > 0 {
+                            tracing::debug!(
+                                "cold journal archive pruned {pruned} file(s) below {prev_floor}"
+                            );
+                        }
+                        prev_floor = seglog::cold_prune_floor(&owned_covered);
 
                         // Bound the durable var-store WAL: truncate it back to zero
                         // on its own cadence so a sustained write load can't grow it
