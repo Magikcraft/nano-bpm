@@ -104,6 +104,44 @@ freshly-built wasm (a Node probe against `@nanobpm/engine-wasm`'s `TestEngine`:
 `engine.deploy(xml)` → `engine.createInstance(...)`), not just the Rust unit
 tests — that is the surface the console (and Bojtos) actually consume.
 
+## Adding or Changing an Event (event-frame replay-compatibility)
+
+The `Event` enum (`engine-core/src/event.rs`) is a **persisted, replayed on-disk
+shape**, not just an in-memory type. Migration-by-replay (#1071) rebuilds the
+engine by replaying an old journal under the current binary, so every historical
+record must still deserialize under new code — the property that broke in
+incident #1065. The serde derives are feature-gated (`cfg_attr(feature =
+"serde", …)`); **everything replay-related is built/tested with `--features
+serde`** (the `engine-core (clippy + test)` CI job passes it — do not add a
+second serde job). Two rules, enforced by the #1069 CI drift guard
+(`engine-core/tests/golden_serde_drift.rs`), keep the frame replay-safe:
+
+- **Additive change → safe, NO version bump.** Adding a field to an existing
+  variant is forward-compatible **only if it carries `#[serde(default)]`** (an
+  older record without the field then decodes with `None`/`0`). Adding a
+  brand-new variant is likewise additive (old journals never contain it). After
+  an additive change, refresh the golden corpus and commit the diff:
+  `UPDATE_GOLDEN=1 cargo test --features serde --test golden_serde_drift`.
+- **Breaking change → REQUIRES a version bump + migrator handling.** Renaming or
+  removing a variant, retagging, changing a field's type, or reordering in a way
+  that changes the serialized form is **not** rescued by serde defaults. It
+  requires bumping `SNAPSHOT_FORMAT_VERSION` (`engine-core/src/engine/mod.rs`,
+  #1068) — which the snapshot loader surfaces as a typed `SnapshotLoadError::
+  FormatMismatch` and #1071's replay-migrator branches on — and the migrator must
+  handle the old→new transition. The #1069 drift guard fails CI until you make
+  that decision explicitly.
+
+A **removed/renamed** variant also means an old journal may carry a variant this
+build no longer knows. Replay must **reject it explicitly**, never drop it
+silently (a silent skip is exactly the #1065 class): read journal records through
+`nanobpmn_engine_core::decode_event_json`, which classifies an unrecognized
+externally-tagged variant as the typed `EventDecodeError::UnknownVariant`
+(operator-actionable, downcastable from the `io::Error` the storage reader
+returns, routed to fail-closed #1066 / the migrator #1071). Regression coverage:
+`engine-core/tests/golden_replay.rs` (decoder + whole-journal replay parity) and
+the `read_segment_events*` rejection tests in
+`server/crates/nano-server-storage/src/seglog.rs`.
+
 ## Claim Your Task Before You Start
 
 Work here runs in **parallel worktrees across several agents** — an epic routinely
