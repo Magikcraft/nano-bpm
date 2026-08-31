@@ -23,6 +23,17 @@ on:
       - 'console/src/moddle/nanoShapes.ts'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
+  # The blessed one-liner (https://nanobpm.io/install.sh) is mirrored from the
+  # sibling nano-workforce repo's install.sh on every deploy (see the "Mirror the
+  # blessed install script" step). That source lives in ANOTHER repo, so a change
+  # to it never matches the push `paths` above — nano-workforce CI fires this
+  # event on merge-to-main touching install.sh so the mirror refreshes promptly.
+  repository_dispatch:
+    types: [install-sh-updated]
+  # Backstop for the cross-repo mirror: refresh nightly even if no dispatch fired
+  # (e.g. the dispatch token lapsed), so nanobpm.io/install.sh can't silently rot.
+  schedule:
+    - cron: '17 6 * * *'
 
 permissions:
   contents: read
@@ -75,6 +86,24 @@ jobs:
         run: node scripts/build-whitepaper.mjs
       - name: Build site
         run: node website/build.mjs
+      - name: Mirror the blessed install script (nano-workforce/install.sh)
+        # Serve https://nanobpm.io/install.sh as the ACTUAL script bytes: GitHub
+        # Pages can't 301-redirect a `curl … | sh` URL (a meta-refresh/JS redirect
+        # would pipe HTML into sh). Fetch the source of truth — nano-workforce's
+        # install.sh on main — on every deploy and write it into the artifact, so
+        # the served file is DERIVED from source, never a vendored/drifting copy
+        # (matches build.mjs's "generated from source on every deploy" contract).
+        # Kept OUT of build.mjs so that stays network-free for the offline `schemas`
+        # CI drift check. Fail the deploy rather than publish a broken/empty script.
+        run: |
+          set -euo pipefail
+          src="https://raw.githubusercontent.com/nanobpm/nano-workforce/main/install.sh"
+          out="website/_site/install.sh"
+          curl -fsSL --retry 3 --retry-delay 2 -o "$out" "$src"
+          head -n1 "$out" | grep -q '^#!/bin/sh' || { echo "::error::mirrored install.sh has no #!/bin/sh shebang"; exit 1; }
+          bytes=$(wc -c < "$out")
+          [ "$bytes" -ge 2000 ] || { echo "::error::mirrored install.sh implausibly small (${bytes} bytes)"; exit 1; }
+          echo "mirrored install.sh (${bytes} bytes) from ${src}"
       - uses: actions/upload-pages-artifact@v3
         with:
           path: website/_site
