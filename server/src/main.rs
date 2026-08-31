@@ -8042,7 +8042,12 @@ impl ServerImpl {
                 .user_tasks()
                 .iter()
                 .find(|t| t.key == key)
-                .map(|t| serde_json::to_value(user_task_result(t))),
+                .map(|t| {
+                    serde_json::to_value(user_task_result(
+                        t,
+                        &readstore::RootResolver::new(|k| self.store.process_instance(k)),
+                    ))
+                }),
             ReadKind::Variable => self
                 .store
                 .variable(key)
@@ -11760,8 +11765,14 @@ impl ServerImpl {
         let sorted: Vec<(u64, &readstore::UserTaskRow)> =
             matched.into_iter().map(|task| (task.key, task)).collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
-        let items: Vec<models::UserTaskResult> =
-            page.items.into_iter().map(user_task_result).collect();
+        // One resolver spans the whole page so tasks sharing a parent chain walk
+        // it once (mirrors the process-instance search; issue #1095).
+        let roots = readstore::RootResolver::new(|k| self.store.process_instance(k));
+        let items: Vec<models::UserTaskResult> = page
+            .items
+            .into_iter()
+            .map(|task| user_task_result(task, &roots))
+            .collect();
 
         Ok(Resp::Status200_TheUserTaskSearchResult(
             models::UserTaskSearchQueryResult::new(page.response, items),
@@ -12011,7 +12022,10 @@ impl ServerImpl {
             .find(|t| t.key == user_task_key)
         {
             Some(task) => Ok(Resp::Status200_TheUserTaskIsSuccessfullyReturned(
-                user_task_result(task),
+                user_task_result(
+                    task,
+                    &readstore::RootResolver::new(|k| self.store.process_instance(k)),
+                ),
             )),
             None => {
                 if let Some(node) = self.read_route(user_task_key) {
@@ -20004,7 +20018,16 @@ fn user_task_state_enum(state: nanobpmn_engine_core::UserTaskState) -> models::U
 
 /// Projects a [`readstore::UserTaskRow`] into the generated `UserTaskResult`. The
 /// process-definition identity is denormalized onto the row at projection time.
-fn user_task_result(task: &readstore::UserTaskRow) -> models::UserTaskResult {
+///
+/// `rootProcessInstanceKey` (issue #1095) is resolved from the task's
+/// `processInstanceKey` by walking the call-activity parent chain via `roots`
+/// (the same [`readstore::RootResolver`] the process-instance projection uses, so
+/// there is one canonical root-walk, no duplicate derivation) — a top-level
+/// (self-rooted) task reports its own `processInstanceKey`.
+fn user_task_result(
+    task: &readstore::UserTaskRow,
+    roots: &readstore::RootResolver,
+) -> models::UserTaskResult {
     let creation_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(task.created_at_ms as i64)
             .unwrap_or_else(chrono::Utc::now);
@@ -20046,7 +20069,9 @@ fn user_task_result(task: &readstore::UserTaskRow) -> models::UserTaskResult {
         types::Nullable::Null,
         models::ProcessDefinitionKey(task.process_definition_key.clone()),
         models::ProcessInstanceKey(task.instance_key.to_string()),
-        types::Nullable::Null,
+        types::Nullable::Present(models::ProcessInstanceKey(
+            roots.root_process_instance_key(task.instance_key).to_string(),
+        )),
         match task.form_key {
             Some(k) => types::Nullable::Present(models::FormKey(k.to_string())),
             None => types::Nullable::Null,
@@ -35073,6 +35098,21 @@ mod call_activity_hierarchy_read_model_tests {
             .expect("valid calling process")
     }
 
+    /// A start → userTask → end process. The native user task parks the token
+    /// (a human completes it), so the instance — and, when it is a call-activity
+    /// child, its parked ancestors — stays ACTIVE and is reliably projected,
+    /// with an open user task carrying the hierarchy's root (issue #1095).
+    fn user_task_process(process_id: &str, task_id: &str) -> ProcessDefinition {
+        ProcessBuilder::new(process_id)
+            .start_event("s")
+            .user_task(task_id)
+            .end_event("e")
+            .connect("s", task_id)
+            .connect(task_id, "e")
+            .build()
+            .expect("valid user-task process")
+    }
+
     async fn deploy(server: &ServerImpl, procs: Vec<ProcessDefinition>) {
         let mut names = std::collections::HashMap::new();
         for p in &procs {
@@ -36167,6 +36207,116 @@ mod call_activity_hierarchy_read_model_tests {
                 types::Nullable::Present(models::ProcessInstanceKey(solo_key_s.clone()))
             );
         }
+    }
+
+    /// Polls `search_user_tasks` (no filter) until a user task on `instance_key`
+    /// is projected, returning it.
+    async fn user_task_on_instance_until(
+        server: &ServerImpl,
+        instance_key: &str,
+    ) -> models::UserTaskResult {
+        use apis::user_task::SearchUserTasksResponse as Resp;
+        for _ in 0..200 {
+            let Resp::Status200_TheUserTaskSearchResult(result) = server
+                .search_user_tasks_impl(&None)
+                .await
+                .expect("user-task search returns")
+            else {
+                panic!("expected a 200 user-task search result");
+            };
+            if let Some(t) = result
+                .items
+                .into_iter()
+                .find(|t| t.process_instance_key.0 == instance_key)
+            {
+                return t;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("user task on instance {instance_key} never projected");
+    }
+
+    #[tokio::test]
+    async fn user_task_on_a_call_activity_child_surfaces_the_root_key() {
+        // Issue #1095 (mirrors #977 for user tasks): a user task parked on a
+        // call-activity child instance must carry the resolved
+        // `rootProcessInstanceKey` (the top-level parent) on both the REST search
+        // and get-by-key surfaces — never the old hard-coded null — while a
+        // top-level task self-roots. This is the correlation
+        // nanobpm/nano-workforce#646 needs to tie a child-cell escalation back to
+        // its epic. Drives the real gateway handlers end-to-end against a live
+        // engine run so the projection cannot silently regress.
+        let server = ServerImpl::default();
+        deploy(
+            &server,
+            vec![
+                user_task_process("ut-child", "review"),
+                calling_process("ut-parent", "c1", "ut-child"),
+                user_task_process("ut-solo", "solo-review"),
+            ],
+        )
+        .await;
+
+        let (parent_key, _) = server
+            .create_for_stream(
+                Some("ut-parent".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create ut-parent");
+        let (solo_key, _) = server
+            .create_for_stream(
+                Some("ut-solo".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create ut-solo");
+
+        // ut-parent spawns the ut-child instance; ut-solo is standalone.
+        let items = search_until(&server, 3).await;
+        let child_key = get_by_id(&items, "ut-child").process_instance_key.0.clone();
+        let parent_key_s = parent_key.to_string();
+        let solo_key_s = solo_key.to_string();
+        assert_ne!(child_key, parent_key_s, "child is a distinct instance");
+
+        // The child-cell task roots to the top-level parent, not null.
+        let child_task = user_task_on_instance_until(&server, &child_key).await;
+        assert_eq!(child_task.element_id, "review");
+        assert_eq!(child_task.process_instance_key.0, child_key);
+        assert_eq!(
+            child_task.root_process_instance_key,
+            types::Nullable::Present(models::ProcessInstanceKey(parent_key_s.clone())),
+            "a child-cell user task roots to the top-level parent, not null"
+        );
+
+        // No-regression guard: a top-level (self-rooted) task reports
+        // rootProcessInstanceKey == processInstanceKey.
+        let solo_task = user_task_on_instance_until(&server, &solo_key_s).await;
+        assert_eq!(
+            solo_task.root_process_instance_key,
+            types::Nullable::Present(models::ProcessInstanceKey(solo_key_s.clone())),
+            "a top-level user task roots to its own instance key, not null"
+        );
+
+        // GET by key agrees with search on the resolved root.
+        let path = models::GetUserTaskPathParams {
+            user_task_key: child_task.user_task_key.0.clone(),
+        };
+        use apis::user_task::GetUserTaskResponse as GetResp;
+        let GetResp::Status200_TheUserTaskIsSuccessfullyReturned(got) = server
+            .get_user_task_impl(&path)
+            .await
+            .expect("get returns")
+        else {
+            panic!("expected a 200 get result");
+        };
+        assert_eq!(
+            got.root_process_instance_key,
+            child_task.root_process_instance_key,
+            "GET by key resolves the same root as search"
+        );
     }
 
     #[tokio::test]

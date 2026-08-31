@@ -1047,6 +1047,9 @@ impl TestEngine {
             })?),
             None => None,
         };
+        // One resolver spans the whole search so tasks sharing a parent chain
+        // walk it once, mirroring `search_process_instances` (issues #977/#1095).
+        let roots = RootResolver::new(|k| self.read_model.process_instance(k));
         let items: Vec<serde_json::Value> = self
             .read_model
             .user_tasks()
@@ -1055,7 +1058,7 @@ impl TestEngine {
                 Some(w) => row.state == w,
                 None => true,
             })
-            .map(user_task_result)
+            .map(|row| user_task_result(row, &roots))
             .collect();
         to_json(&search_result(items))
     }
@@ -1883,10 +1886,16 @@ fn is_rfc3339_date_time(s: &str) -> bool {
 
 /// Serialise a [`UserTaskRow`] as the gateway's `UserTaskResult` JSON shape. The
 /// `state` is the Camunda v2 enum spelling; dates are ISO-8601 UTC; fields the
-/// engine does not retain (name, process name, completion date, root key) are
-/// null; `priority` is clamped to `0..=100` exactly as the gateway does.
+/// engine does not retain (name, process name, completion date) are null;
+/// `priority` is clamped to `0..=100` exactly as the gateway does.
+///
+/// `rootProcessInstanceKey` (issue #1095) is resolved by walking the task's
+/// `processInstanceKey` up the call-activity parent chain via `roots` — the same
+/// [`RootResolver`] the process-instance projection uses (issue #977), so there
+/// is one canonical root-walk and no duplicate derivation. A top-level
+/// (self-rooted) task reports its own `processInstanceKey`.
 #[cfg(feature = "read-model")]
-fn user_task_result(task: &UserTaskRow) -> serde_json::Value {
+fn user_task_result(task: &UserTaskRow, roots: &RootResolver) -> serde_json::Value {
     serde_json::json!({
         "name": serde_json::Value::Null,
         "state": user_task_state_rest(task.state),
@@ -1908,7 +1917,7 @@ fn user_task_result(task: &UserTaskRow) -> serde_json::Value {
         "processName": serde_json::Value::Null,
         "processDefinitionKey": task.process_definition_key,
         "processInstanceKey": task.instance_key.to_string(),
-        "rootProcessInstanceKey": serde_json::Value::Null,
+        "rootProcessInstanceKey": roots.root_process_instance_key(task.instance_key).to_string(),
         "formKey": task.form_key.map(|k| k.to_string()),
         "priority": task.priority.clamp(0, 100),
         "tags": Vec::<String>::new(),
@@ -4517,6 +4526,99 @@ mod read_channel_tests {
             child["rootProcessInstanceKey"],
             serde_json::json!(parent_key),
             "the child roots to the top-level parent"
+        );
+    }
+
+    /// Issue #1095 (mirrors #977 for user tasks): a `searchUserTasks` on a
+    /// call-activity child-cell run must surface the resolved
+    /// `rootProcessInstanceKey` — the top-level parent for a child-instance task,
+    /// and its own key for a self-rooted top-level task — never the old
+    /// hard-coded null. This is the engine-wasm surface the typed `urban-testkit`
+    /// seam passes through, so a null here blocks child-cell escalation → epic
+    /// correlation (nanobpm/nano-workforce#646).
+    #[test]
+    fn search_user_tasks_surfaces_call_activity_root_key() {
+        // A child process that parks a user task, called from a parent, so the
+        // child instance stays ACTIVE with an open task projected under a
+        // non-self root.
+        const UT_CHILD_XML: &str = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="ut-child">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements><zeebe:userTask /></bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        const UT_PARENT_XML: &str = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="ut-parent">
+              <bpmn:startEvent id="s" />
+              <bpmn:callActivity id="c1">
+                <bpmn:extensionElements>
+                  <zeebe:calledElement processId="ut-child" />
+                </bpmn:extensionElements>
+              </bpmn:callActivity>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="c1" />
+              <bpmn:sequenceFlow id="b" sourceRef="c1" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let mut eng = TestEngine::new();
+        eng.deploy(UT_CHILD_XML).unwrap();
+        eng.deploy(UT_PARENT_XML).unwrap();
+        let snap = parse(&eng.create_instance("ut-parent", "{}", None).unwrap());
+        let parent_key = snap["instances"]
+            .as_array()
+            .and_then(|xs| xs.iter().find(|i| i["processId"] == "ut-parent"))
+            .map(|i| i["key"].as_str().unwrap().to_string())
+            .expect("parent instance created");
+        let child_key = snap["instances"]
+            .as_array()
+            .and_then(|xs| xs.iter().find(|i| i["processId"] == "ut-child"))
+            .map(|i| i["key"].as_str().unwrap().to_string())
+            .expect("child instance created");
+        assert_ne!(parent_key, child_key, "child is a distinct instance");
+
+        let result = parse(&eng.search_user_tasks("").unwrap());
+        let items = result["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1, "exactly the child's user task is projected");
+        let task = &items[0];
+        assert_eq!(task["elementId"], "review");
+        assert_eq!(
+            task["processInstanceKey"],
+            serde_json::json!(child_key),
+            "the task lives on the child instance"
+        );
+        assert_eq!(
+            task["rootProcessInstanceKey"],
+            serde_json::json!(parent_key),
+            "the child-cell task roots to the top-level parent, not null"
+        );
+    }
+
+    /// Issue #1095 no-regression guard: a top-level (self-rooted) user task
+    /// reports `rootProcessInstanceKey == processInstanceKey`, never null.
+    #[test]
+    fn search_user_tasks_self_roots_a_top_level_task() {
+        let mut eng = TestEngine::new();
+        eng.deploy(USER_TASK_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", "{}", None).unwrap());
+        let instance_key = snap["instances"][0]["key"].as_str().unwrap().to_string();
+
+        let result = parse(&eng.search_user_tasks("").unwrap());
+        let task = &result["items"][0];
+        assert_eq!(task["processInstanceKey"], serde_json::json!(instance_key));
+        assert_eq!(
+            task["rootProcessInstanceKey"],
+            serde_json::json!(instance_key),
+            "a top-level task roots to its own key, not null"
         );
     }
 

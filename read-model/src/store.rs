@@ -8521,6 +8521,77 @@ mod read_surface_tests {
         assert_eq!(completed_only, vec![101]);
     }
 
+    /// Issue #1095 (mirrors #977 for user tasks): the root of a user task is
+    /// derived from the **single** existing resolver walking the task's
+    /// `processInstanceKey` up the call-activity parent chain — a task parked on a
+    /// call-activity child instance roots to the top-level parent, while a
+    /// top-level task self-roots. Both the gateway REST projection and the
+    /// engine-wasm `searchUserTasks` inherit their `rootProcessInstanceKey` from
+    /// exactly this walk, so there is no duplicate root derivation to drift.
+    #[test]
+    fn user_task_root_key_resolves_through_the_call_activity_hierarchy() {
+        let store = ReadStore::open(None).expect("in-memory read store opens");
+
+        // top (10, no parent) <- child (20, spawned by call activity on 10).
+        // A user task is parked on the child instance, and a second on the top.
+        let top_instance = Event::ProcessInstanceCreated {
+            instance_key: 10,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let child_instance = Event::ProcessInstanceCreated {
+            instance_key: 20,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: Some(10),
+            parent_element_instance_key: Some(111),
+        };
+        store
+            .export(&[
+                &top_instance,
+                &child_instance,
+                &user_task_created(200, 20, "child-review"),
+                &user_task_created(100, 10, "top-review"),
+            ])
+            .unwrap();
+
+        let tasks = store.user_tasks();
+        let child_task = tasks
+            .iter()
+            .find(|t| t.key == 200)
+            .expect("child user task projected");
+        let top_task = tasks
+            .iter()
+            .find(|t| t.key == 100)
+            .expect("top user task projected");
+
+        // The child-instance task roots to the top-level parent, not its own
+        // instance key — the correlation the escalation → epic proof needs.
+        assert_eq!(
+            store.root_process_instance_key(child_task.instance_key),
+            10,
+            "a task on a call-activity child roots to the top-level parent"
+        );
+        // No-regression guard: a top-level task self-roots.
+        assert_eq!(
+            store.root_process_instance_key(top_task.instance_key),
+            top_task.instance_key,
+            "a top-level task roots to its own process instance key"
+        );
+    }
+
     /// Defect-class guard: a `JobCreated` replay/repair must *refresh*
     /// `created_at_ms`, not leave it stuck at a stale value. The
     /// `/v2/jobs/statistics/*` aggregations count `created` jobs off
