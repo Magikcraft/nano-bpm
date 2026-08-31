@@ -96,7 +96,7 @@ jobs:
         # Kept OUT of build.mjs so that stays network-free for the offline `schemas`
         # CI drift check. Fail the deploy rather than publish a broken/empty script.
         run: |
-          set -eu
+          set -euo pipefail
           src="https://raw.githubusercontent.com/nanobpm/nano-workforce/main/install.sh"
           out="website/_site/install.sh"
           curl -fsSL --retry 3 --retry-delay 2 -o "$out" "$src"
