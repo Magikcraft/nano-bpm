@@ -35,8 +35,11 @@ curl -fsSL https://nanobpm.io/install.sh | sh
 It installs the Camunda 8 CLI and the `c8ctl-plugin-nano` plugin, lets you pick
 which of your installed coding harnesses to hire (and with which model and how
 many instances), composes a workforce manifest from those choices, brings the
-engine and workforce up, then installs and runs the Workforce app. It installs
-only into your user account and never runs `sudo` on your behalf.
+engine and workforce up, then installs and runs the Workforce app. It never
+runs `sudo` on your behalf — it installs the CLI with `npm i -g`, so where the
+global package lands depends on your Node/npm setup (a user-owned prefix such as
+`nvm` needs no elevation; a system-owned prefix may require you to fix your npm
+prefix first).
 
 Prefer to read the script before running it? Download, inspect, then run:
 
