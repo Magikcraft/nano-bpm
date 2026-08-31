@@ -2415,6 +2415,27 @@ pub fn apply(state: &mut State, event: &Event) {
             let terminal_pid = non_terminal_process_id(state, instance_key);
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Completed;
+                // Clear any residual runtime bookkeeping. On a normal completion
+                // these are already empty (the instance completes only with an
+                // empty `active` map); a top-level terminate end event completes
+                // the instance while sibling tokens/scopes are still recorded, so
+                // this forced teardown (mirroring `ProcessInstanceTerminated`)
+                // keeps the terminal snapshot consistent — no live scope for the
+                // dead-scope guard to read, no stranded MI/ad-hoc/join/
+                // compensation payload on the terminal shell. Incidents are NOT
+                // closed here (unlike `ProcessInstanceTerminated`): a normal
+                // completion may legitimately leave a retained incident record
+                // for later resolution, and a top-level terminate end resolves
+                // its own incidents explicitly (`IncidentResolved` events emitted
+                // ahead of this record — see `complete_terminate_end`).
+                instance.active.clear();
+                instance.scopes.clear();
+                instance.multi_instances.clear();
+                instance.adhoc_instances.clear();
+                instance.join_counts.clear();
+                instance.join_instances.clear();
+                instance.compensable.clear();
+                instance.compensation_waits.clear();
                 // A terminal instance's variables are never read from hot state
                 // again — workers are done, the exporter projects from events,
                 // and recovery replays the journal + durable store. Drop the
