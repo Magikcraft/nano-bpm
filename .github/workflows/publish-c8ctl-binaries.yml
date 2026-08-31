@@ -273,14 +273,20 @@ jobs:
         if: matrix.zig
         uses: taiki-e/install-action@v2
         with:
-          # Pinned to the last release validated against the pinned zig 0.13.0
-          # (cargo-zigbuild #256 "Test Zig 0.13.0"). Installing unpinned pulled
-          # 0.23.3, whose zig-0.14+ `-mcpu` feature string
-          # (`generic+v7a+vfp3-d32+thumb2-neon`) zig 0.13.0 rejects
-          # ("unsupported argument to option '-mcpu='"), breaking the 32-bit ARM
-          # (armv6/armv7) jemalloc-sys C build. Bump this and `setup-zig` above
-          # together so the pair stays compatible.
-          tool: cargo-zigbuild@0.19.8
+          # Pinned to 0.20.1 — the version compatible with the pinned zig 0.13.0
+          # across ALL our targets. This pairing is narrow:
+          #   * unpinned installs pulled 0.23.3, which regressed 32-bit ARM
+          #     (armv6/armv7): its jemalloc-sys C build fails with
+          #     `aeabi_unaligned.c: FileNotFound` and a zig-0.14+ `-mcpu` string
+          #     (`generic+v7a+vfp3-d32+thumb2-neon`) that zig 0.13.0 rejects.
+          #   * 0.19.8 fixes 32-bit ARM but fails the aarch64 link with
+          #     `unsupported linker arg: --fix-cortex-a53-843419` (that arg is only
+          #     filtered from 0.20.0 onward).
+          # 0.20.1 is the overlap: it filters the aarch64 cortex arg AND still
+          # builds 32-bit ARM. Verified locally (zig 0.13.0) that x86_64, aarch64
+          # and armv7 all cross-compile tikv-jemalloc-sys cleanly. Bump this and
+          # `setup-zig` above together so the pair stays compatible.
+          tool: cargo-zigbuild@0.20.1
 
       - name: Build gateway (release, zig cross-compile, glibc floor)
         if: matrix.zig
