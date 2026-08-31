@@ -20070,7 +20070,9 @@ fn user_task_result(
         models::ProcessDefinitionKey(task.process_definition_key.clone()),
         models::ProcessInstanceKey(task.instance_key.to_string()),
         types::Nullable::Present(models::ProcessInstanceKey(
-            roots.root_process_instance_key(task.instance_key).to_string(),
+            roots
+                .root_process_instance_key(task.instance_key)
+                .to_string(),
         )),
         match task.form_key {
             Some(k) => types::Nullable::Present(models::FormKey(k.to_string())),
@@ -36305,16 +36307,13 @@ mod call_activity_hierarchy_read_model_tests {
             user_task_key: child_task.user_task_key.0.clone(),
         };
         use apis::user_task::GetUserTaskResponse as GetResp;
-        let GetResp::Status200_TheUserTaskIsSuccessfullyReturned(got) = server
-            .get_user_task_impl(&path)
-            .await
-            .expect("get returns")
+        let GetResp::Status200_TheUserTaskIsSuccessfullyReturned(got) =
+            server.get_user_task_impl(&path).await.expect("get returns")
         else {
             panic!("expected a 200 get result");
         };
         assert_eq!(
-            got.root_process_instance_key,
-            child_task.root_process_instance_key,
+            got.root_process_instance_key, child_task.root_process_instance_key,
             "GET by key resolves the same root as search"
         );
     }
