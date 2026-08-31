@@ -12,6 +12,39 @@ use crate::state::{IncidentKind, IoMappingRedrive, Key, MessageSubscriptionKind,
 
 /// A fact emitted by the engine. The ordering of a command's returned events is
 /// the order in which they occurred.
+///
+/// # Adding or changing an event (event-frame replay-compatibility)
+///
+/// This enum is a **persisted, replayed on-disk shape**: migration-by-replay
+/// (#1071) rebuilds the engine by replaying an old journal under new code, so
+/// every historical record must still deserialize under the current binary
+/// (incident #1065). The serde derives are feature-gated
+/// (`cfg_attr(feature = "serde", …)`); everything replay-related is built/tested
+/// with `--features serde`. Two rules keep the frame replay-compatible — the
+/// #1069 CI drift guard (`engine-core/tests/golden_serde_drift.rs`) enforces
+/// them, failing the build on any un-versioned shape change:
+///
+/// * **Additive change (safe, no version bump).** Adding a new field to an
+///   existing variant is forward-compatible *only if* it carries
+///   `#[serde(default)]` — an older record without the field then decodes with
+///   the default (`None`/`0`). This crate already relies on that contract
+///   pervasively; a new field without `#[serde(default)]` breaks replay of every
+///   older record of that variant. Adding a brand-new variant is likewise
+///   additive (old journals simply never contain it). After an additive change,
+///   refresh the golden corpus:
+///   `UPDATE_GOLDEN=1 cargo test --features serde --test golden_serde_drift`.
+/// * **Breaking change (requires a version bump + migrator handling).** Renaming
+///   or removing a variant, retagging it, changing a field's type, or reordering
+///   in a way that changes the serialized form is NOT rescued by serde defaults.
+///   It requires bumping [`SNAPSHOT_FORMAT_VERSION`](crate::SNAPSHOT_FORMAT_VERSION)
+///   (#1068) — which the loader surfaces as a typed format mismatch and #1071's
+///   replay-migrator branches on — and the migrator must handle the old→new
+///   transition. A **removed/renamed** variant also means old journals may carry
+///   a variant this build no longer knows; replay rejects it explicitly as
+///   [`EventDecodeError::UnknownVariant`] (via [`decode_event_json`]) rather than
+///   dropping it silently.
+///
+/// See `AGENTS.md` ("Adding or Changing an Event") for the full checklist.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Event {
@@ -1555,6 +1588,144 @@ impl Event {
     }
 }
 
+/// A typed, FATAL failure to decode a persisted journal line back into an
+/// [`Event`] under the current build.
+///
+/// Migration-by-replay (#1071) rebuilds the engine by replaying the event
+/// journal under new code, which only works if every OLD record still
+/// deserializes. Additive field changes are already rescued by the
+/// `#[serde(default)]` forward-compat contract on [`Event`] (a missing field
+/// decodes as `None`/`0`). What is **not** rescued is a record naming an
+/// [`Event`] **variant this build does not know** — an event kind that was
+/// renamed or removed, or a record from a newer/foreign journal format. Left to
+/// a bare `serde_json::from_str::<Event>`, that is an anonymous, ambiguous
+/// deserialize error indistinguishable from a torn/corrupt line, so a caller
+/// cannot tell "the write was cut short" (safe to drop as a torn tail) from
+/// "this is a real event from a format I cannot replay" (must NEVER be silently
+/// dropped — incident #1065).
+///
+/// [`decode_event_json`] classifies the failure into this typed error so the
+/// storage replay path can surface an [`EventDecodeError::UnknownVariant`] as an
+/// explicit, operator-actionable rejection — routed to fail-closed (#1066) / the
+/// replay-migrator (#1071), exactly like the snapshot loader's typed
+/// `SnapshotLoadError`. When the journal reader wraps it in an
+/// [`std::io::Error`], recover it via `io::Error::get_ref()` +
+/// [`downcast_ref`](std::error::Error::downcast_ref).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventDecodeError {
+    /// The record is well-formed JSON naming an externally-tagged variant that
+    /// this build's [`Event`] enum does not define — a renamed/removed event
+    /// kind, or a record from a newer/foreign journal format. This is a
+    /// **breaking** frame change that a [`SNAPSHOT_FORMAT_VERSION`] bump (#1068)
+    /// must gate and the migrator (#1071) must handle; it is NEVER a silent drop
+    /// (not even for a torn tail — a complete, well-formed unknown record is a
+    /// real cross-version frame, not an interrupted write).
+    ///
+    /// [`SNAPSHOT_FORMAT_VERSION`]: crate::SNAPSHOT_FORMAT_VERSION
+    UnknownVariant {
+        /// The offending variant name serde named as unknown — recovered from
+        /// serde's `unknown variant \`X\`` diagnostic. This is *not* necessarily
+        /// the record's top-level event tag: serde raises the same error for an
+        /// unknown value of an externally-tagged enum nested inside a *known*
+        /// event (e.g. `IncidentRaised.kind`), in which case this is that nested
+        /// variant, not the event name. Falls back to the record's top-level
+        /// object key, then to `"?"`, if the name cannot be extracted.
+        variant: String,
+        /// The underlying serde message, for operator diagnostics.
+        detail: String,
+    },
+    /// The record could not be parsed into a known variant for a reason other
+    /// than an unknown tag: a type mismatch on a field, malformed JSON, or a
+    /// truncated/torn line from an interrupted write. Only this class is safe for
+    /// a journal reader to tolerate as a torn trailing record.
+    Malformed {
+        /// The underlying serde message.
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for EventDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventDecodeError::UnknownVariant { variant, detail } => write!(
+                f,
+                "unknown variant `{variant}` in journal record: this build cannot \
+                 replay it (renamed/removed variant or a newer/foreign journal format). \
+                 A breaking event-frame change requires a SNAPSHOT_FORMAT_VERSION bump \
+                 (#1068) and replay-migrator handling (#1071); refusing to drop it \
+                 silently (fail-closed). serde: {detail}"
+            ),
+            EventDecodeError::Malformed { detail } => {
+                write!(f, "malformed journal record: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EventDecodeError {}
+
+/// Decode a single persisted journal line into an [`Event`] under the current
+/// build, classifying any failure into a typed [`EventDecodeError`].
+///
+/// This is the replay-boundary decode discipline (#1070): use it instead of a
+/// bare `serde_json::from_str::<Event>(line)` wherever a persisted journal is
+/// read back for replay, so an unknown/removed event variant becomes an explicit
+/// [`EventDecodeError::UnknownVariant`] rejection rather than an anonymous
+/// deserialize error a caller might mistake for a torn tail and silently drop.
+#[cfg(feature = "serde")]
+pub fn decode_event_json(line: &str) -> Result<Event, EventDecodeError> {
+    match serde_json::from_str::<Event>(line) {
+        Ok(event) => Ok(event),
+        Err(err) => {
+            let detail = err.to_string();
+            // serde emits "unknown variant `X`, expected one of ..." from
+            // `serde::de::Error::unknown_variant` when an externally-tagged
+            // enum's tag names no known variant. That phrase is part of the
+            // serde data model (not json-specific), so it is stable to key on.
+            // The offending enum need not be the top-level `Event`: the same
+            // error arises for an unknown value of an externally-tagged enum
+            // nested inside a *known* event (e.g. `IncidentRaised.kind`), so
+            // recover the precise offending name from serde's own message first,
+            // and only fall back to the record's top-level object key (then
+            // `"?"`) if that fails — reporting the outer event name for a nested
+            // failure would mislead the operator.
+            if detail.contains("unknown variant") {
+                let variant = unknown_variant_from_detail(&detail)
+                    .or_else(|| event_tag_of(line))
+                    .unwrap_or_else(|| "?".to_string());
+                Err(EventDecodeError::UnknownVariant { variant, detail })
+            } else {
+                Err(EventDecodeError::Malformed { detail })
+            }
+        }
+    }
+}
+
+/// Extract the offending variant name from serde's
+/// `unknown variant \`X\`, expected one of ...` diagnostic — the token between
+/// the first pair of backticks. Returns `None` if the message does not carry a
+/// backtick-delimited name (so the caller can fall back to another source).
+#[cfg(feature = "serde")]
+fn unknown_variant_from_detail(detail: &str) -> Option<String> {
+    let start = detail.find("unknown variant `")? + "unknown variant `".len();
+    let rest = &detail[start..];
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
+}
+
+/// Best-effort extraction of the externally-tagged variant name from a journal
+/// record: the single top-level object key of `{"VariantName": { … }}`. Every
+/// [`Event`] variant is a struct variant, so a valid record is always an object;
+/// the string arm is a defensive fallback for a hypothetical unit variant.
+#[cfg(feature = "serde")]
+fn event_tag_of(line: &str) -> Option<String> {
+    match serde_json::from_str::<serde_json::Value>(line).ok()? {
+        serde_json::Value::Object(map) => map.into_iter().next().map(|(k, _)| k),
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    }
+}
+
 #[cfg(all(test, feature = "serde"))]
 mod terminal_worker_serde_compat_tests {
     use super::Event;
@@ -1585,6 +1756,71 @@ mod terminal_worker_serde_compat_tests {
         match event {
             Event::JobErrorThrown { worker, .. } => assert!(worker.is_none()),
             other => panic!("expected JobErrorThrown, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod event_decode_tests {
+    use super::{decode_event_json, Event, EventDecodeError};
+
+    /// A well-formed record naming a variant this build does not define is a
+    /// typed `UnknownVariant` rejection carrying the offending tag — the
+    /// explicit, operator-actionable outcome #1070 requires (never a silent
+    /// drop, never an anonymous error).
+    #[test]
+    fn unknown_variant_classifies_as_typed_rejection() {
+        let line = r#"{"SomeRemovedEvent":{"instance_key":1}}"#;
+        match decode_event_json(line) {
+            Err(EventDecodeError::UnknownVariant { variant, .. }) => {
+                assert_eq!(variant, "SomeRemovedEvent")
+            }
+            other => panic!("expected UnknownVariant, got {other:?}"),
+        }
+    }
+
+    /// A known variant with a malformed payload (or a torn line) is `Malformed`,
+    /// kept distinct from `UnknownVariant` so a journal reader can tolerate a
+    /// torn tail without ever tolerating a real unknown frame.
+    #[test]
+    fn malformed_payload_classifies_as_malformed() {
+        let bad_type = r#"{"DeploymentCreated":{"deployment_key":"nope"}}"#;
+        assert!(matches!(
+            decode_event_json(bad_type),
+            Err(EventDecodeError::Malformed { .. })
+        ));
+        let torn = r#"{"DeploymentCreated":{"deployment_ke"#;
+        assert!(matches!(
+            decode_event_json(torn),
+            Err(EventDecodeError::Malformed { .. })
+        ));
+    }
+
+    /// A valid record round-trips through the typed decoder unchanged.
+    #[test]
+    fn valid_record_decodes_via_typed_decoder() {
+        let line = r#"{"DeploymentCreated":{"deployment_key":9}}"#;
+        assert_eq!(
+            decode_event_json(line).expect("valid record decodes"),
+            Event::DeploymentCreated { deployment_key: 9 }
+        );
+    }
+
+    /// Regression (defect class): serde raises the *same* "unknown variant"
+    /// error for an unknown value of an externally-tagged enum nested inside a
+    /// *known* event (here `IncidentRaised.kind`) as it does for an unknown
+    /// top-level `Event` tag. The reported `variant` must be the offending
+    /// nested name (`SomeFutureIncidentKind`), recovered from serde's message —
+    /// NOT the outer event tag (`IncidentRaised`), which would mislead the
+    /// operator into thinking the whole event type is gone.
+    #[test]
+    fn nested_unknown_variant_reports_inner_name_not_event_tag() {
+        let line = r#"{"IncidentRaised":{"incident_key":1,"instance_key":2,"element_instance_key":3,"element_id":"task","kind":"SomeFutureIncidentKind","reason":"x","job_key":null,"created_at":0}}"#;
+        match decode_event_json(line) {
+            Err(EventDecodeError::UnknownVariant { variant, .. }) => {
+                assert_eq!(variant, "SomeFutureIncidentKind")
+            }
+            other => panic!("expected UnknownVariant, got {other:?}"),
         }
     }
 }

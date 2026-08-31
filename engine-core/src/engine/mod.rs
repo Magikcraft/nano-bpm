@@ -64,6 +64,28 @@ struct Paused {
     cursor: usize,
 }
 
+/// The version of the serialized snapshot/event **payload** shape (the
+/// serde-derived form of [`EngineSnapshot`] / [`State`] / [`crate::Event`]).
+///
+/// This is the single source of truth the on-disk snapshot envelope stamps into
+/// its header (`format_version`) and the number the CI drift guard (#1069) is
+/// tied to. It lives here in `engine-core` — alongside the types it versions —
+/// rather than in the storage crate, because the dependency edge is one-way
+/// (`nano-server-storage` -> `engine-core`); the storage envelope references
+/// this constant *downward*. engine-core cannot see storage, so the guard that
+/// fingerprints these types (also in engine-core) can only tie to a constant
+/// that lives here.
+///
+/// Bump this whenever a **breaking** change is made to the serialized shape of
+/// the snapshot or event payload (a rename/retag/type-change/reorder — anything
+/// serde's additive `#[serde(default)]` forward-compat does not rescue). A bump
+/// declares "old on-disk snapshots at a lower version are not payload-compatible
+/// with this build", which the loader surfaces as a typed format mismatch (and
+/// #1071's replay-migrator branches on).
+///
+/// `0` is reserved for the historical *headerless* on-disk format (bare
+/// `serde_json` with no envelope); the first versioned envelope is `1`.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 /// A compact, serializable capture of an [`Engine`]: its materialized [`State`]
 /// plus the scalar generator and clock metadata required to resume operation
 /// identically. Produced by [`Engine::snapshot`] and consumed by

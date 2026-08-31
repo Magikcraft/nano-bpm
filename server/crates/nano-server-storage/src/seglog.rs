@@ -32,12 +32,15 @@
 //! it is recoverable when *all* sealed segments have been compacted away).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use nanobpmn_engine_core::{Engine, EngineSnapshot, Event, partition_of};
+use nanobpmn_engine_core::{
+    Engine, EngineSnapshot, Event, EventDecodeError, SNAPSHOT_FORMAT_VERSION, decode_event_json,
+    partition_of,
+};
 
 /// The active segment keeps the historical journal name so an existing
 /// single-file data dir is adopted unchanged.
@@ -603,6 +606,256 @@ struct PersistedSnapshot {
     engine: EngineSnapshot,
 }
 
+// ----------------------------------------------------------------------------
+// Versioned, self-describing snapshot envelope (L2 / #1068).
+//
+// Historically a `snapshot.*.bin` / `msnapshot.bin` was bare `serde_json` of the
+// payload struct with no version marker: there was no way to tell which format a
+// file was — or that this build cannot read it — without attempting a full
+// deserialize (and a failed deserialize was silently swallowed via `.ok()?`,
+// which could rewind durable state — the #1065 incident).
+//
+// The new layout prepends an ALWAYS-parseable, minimal, single-line JSON
+// **header** terminated by `\n`, then the existing serialized payload:
+//
+//     {"format_version":1,"incarnation":<u64>,"engine_fingerprint":"<str>"}\n
+//     <payload json bytes...>
+//
+// The header shape is FIXED FOR ALL TIME (never add/rename a header field) so
+// any future build can read `format_version` without deserializing the payload
+// body. Compact `serde_json` never emits a raw `0x0A`, so the first `\n` is an
+// unambiguous header/payload delimiter and its ABSENCE marks a legacy headerless
+// file (treated as `format_version = 0`).
+// ----------------------------------------------------------------------------
+
+/// Data-dir file holding this durable lifetime's incarnation id (see
+/// [`SnapshotHeader::incarnation`]). Generated once per data dir and stamped
+/// into every snapshot header.
+const INCARNATION_NAME: &str = "journal.incarnation";
+
+/// The always-parseable envelope header prefixed to every persisted snapshot.
+///
+/// Its shape MUST never change — a reader of any future format version has to be
+/// able to parse this to learn the `format_version` before it decides whether it
+/// can read the payload at all.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotHeader {
+    /// The [`SNAPSHOT_FORMAT_VERSION`] the payload was serialized at. `0` denotes
+    /// a legacy headerless file (synthesised on read; never written).
+    format_version: u32,
+    /// Monotonic epoch id of this data directory's durable lifetime, persisted in
+    /// [`INCARNATION_NAME`] and regenerated when the data dir is reset/restored.
+    /// Consumed cross-repo by nano-workforce#622 to reconcile after reset/restore
+    /// (blackboard contract `snapshot-envelope-header-v1`).
+    incarnation: u64,
+    /// Coarse engine build identity (engine-core crate version) — diagnostic
+    /// only. The authoritative serialized-shape drift fingerprint is #1069's
+    /// concern and is a separate mechanism.
+    engine_fingerprint: String,
+}
+
+/// A typed, FATAL failure to load a present snapshot file. Distinct from
+/// `Ok(None)`, which means ONLY "no snapshot file exists". A present snapshot is
+/// never silently ignored: an incompatible or corrupt file aborts recovery
+/// (fail-closed) rather than rewinding to an earlier state.
+///
+/// Delivered to callers wrapped in an [`io::Error`] of kind
+/// [`io::ErrorKind::InvalidData`]; recover it with
+/// [`io::Error::get_ref`]/[`downcast_ref`](std::error::Error) so #1071's
+/// replay-migrator can branch on [`SnapshotLoadError::FormatMismatch`].
+#[derive(Debug)]
+pub enum SnapshotLoadError {
+    /// The snapshot's declared `format_version` is newer than this build can
+    /// read. #1071 branches on this to migration; fail-closed is the fallback.
+    /// (This is the `SnapshotFormatMismatch { found, supported }` of the epic.)
+    FormatMismatch {
+        /// The `format_version` found in the on-disk header.
+        found: u32,
+        /// The highest `format_version` this build supports
+        /// ([`SNAPSHOT_FORMAT_VERSION`]).
+        supported: u32,
+    },
+    /// The snapshot file is present but its header or payload could not be
+    /// parsed. Fatal — never a silent `None`, never a rewinding fallback.
+    Corrupt {
+        /// Human-readable reason (which stage failed and why).
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for SnapshotLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotLoadError::FormatMismatch { found, supported } => write!(
+                f,
+                "snapshot format version {found} is newer than this build supports \
+                 (max {supported}); refusing to load (fail-closed)"
+            ),
+            SnapshotLoadError::Corrupt { reason } => {
+                write!(f, "snapshot present but unreadable: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotLoadError {}
+
+impl From<SnapshotLoadError> for io::Error {
+    fn from(e: SnapshotLoadError) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, e)
+    }
+}
+
+/// The coarse engine build identity stamped into [`SnapshotHeader::engine_fingerprint`].
+fn engine_fingerprint() -> String {
+    format!("nanobpmn-engine-core@{}", nanobpmn_engine_core::VERSION)
+}
+
+/// Reads (or, on first use, generates and durably persists) this data
+/// directory's incarnation id. Stable for the lifetime of the data dir; a
+/// reset/restore that removes [`INCARNATION_NAME`] yields a fresh id, which is
+/// how nano-workforce#622 detects a reset/restore.
+fn read_or_init_incarnation(dir: &Path) -> io::Result<u64> {
+    let path = dir.join(INCARNATION_NAME);
+    // Only a genuinely *missing* file seeds a fresh incarnation — that is the
+    // reset/restore signal (nano-workforce#622). A transient read failure
+    // (e.g. a permission error) or corrupt/zero contents must NOT be treated as
+    // a reset: silently regenerating would spuriously change the incarnation and
+    // contradict the stated "stable unless reset/restore" contract, surfacing a
+    // false reset to the cross-repo consumer. Fail closed (#1066) in those cases.
+    match fs::read_to_string(&path) {
+        Ok(s) => {
+            let v = s.trim().parse::<u64>().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("incarnation file {path:?} has non-numeric contents: {e}"),
+                )
+            })?;
+            if v == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("incarnation file {path:?} contains reserved value 0"),
+                ));
+            }
+            return Ok(v);
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Fall through to seed a fresh incarnation — the reset/restore case.
+        }
+        Err(e) => return Err(e),
+    }
+    // Seed from wall-clock nanoseconds (monotonic enough to distinguish
+    // successive incarnations of the same dir); persisted so it is stable.
+    // Clamp to a non-zero value: `0` is reserved for the synthetic legacy
+    // headerless envelope (`incarnation: 0` in `parse_envelope`) and the
+    // cross-repo contract (nano-workforce#622) requires a non-zero id, so a
+    // clock before UNIX_EPOCH (or a stale on-disk `0`) must not surface as `0`.
+    let incarnation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        .max(1);
+    let tmp = dir.join(format!("{INCARNATION_NAME}.tmp"));
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(incarnation.to_string().as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    fsync_dir(dir);
+    Ok(incarnation)
+}
+
+/// Writes `payload` to `path` atomically (tmp + rename + fsync), prefixed with
+/// the versioned envelope header. `dir` is the containing data dir (source of
+/// the incarnation id). Shared by [`write_snapshot`] and [`write_multi_snapshot`].
+fn write_enveloped<T: serde::Serialize>(dir: &Path, path: &Path, payload: &T) -> io::Result<()> {
+    let header = SnapshotHeader {
+        format_version: SNAPSHOT_FORMAT_VERSION,
+        incarnation: read_or_init_incarnation(dir)?,
+        engine_fingerprint: engine_fingerprint(),
+    };
+    let tmp = path.with_extension("bin.tmp");
+    {
+        // Stream to the file (BufWriter) rather than building a full `Vec<u8>`
+        // first; under a large backlog the intermediate buffer is multi-GB (all
+        // resident variable payloads serialized at once).
+        let f = File::create(&tmp)?;
+        let mut w = BufWriter::new(f);
+        // Header first, on its own line — always parseable, fixed shape.
+        serde_json::to_writer(&mut w, &header)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        w.write_all(b"\n")?;
+        serde_json::to_writer(&mut w, payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let f = w.into_inner()?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    fsync_dir(dir);
+    Ok(())
+}
+
+/// Splits raw snapshot bytes into `(header, payload)`. A missing header line
+/// (no `\n`, i.e. legacy headerless compact JSON) yields the synthetic
+/// `format_version = 0` header and the whole file as payload. A present-but-
+/// unparseable header line is a fatal [`SnapshotLoadError::Corrupt`].
+fn parse_envelope(bytes: &[u8]) -> Result<(SnapshotHeader, &[u8]), SnapshotLoadError> {
+    match bytes.iter().position(|&b| b == b'\n') {
+        Some(nl) => {
+            let header: SnapshotHeader =
+                serde_json::from_slice(&bytes[..nl]).map_err(|e| SnapshotLoadError::Corrupt {
+                    reason: format!("unparseable envelope header: {e}"),
+                })?;
+            Ok((header, &bytes[nl + 1..]))
+        }
+        None => Ok((
+            SnapshotHeader {
+                format_version: 0,
+                incarnation: 0,
+                engine_fingerprint: String::new(),
+            },
+            bytes,
+        )),
+    }
+}
+
+/// Validates the header's `format_version` against what this build supports.
+/// A version this build cannot read is a typed [`SnapshotLoadError::FormatMismatch`].
+fn check_format_version(header: &SnapshotHeader) -> Result<(), SnapshotLoadError> {
+    if header.format_version > SNAPSHOT_FORMAT_VERSION {
+        return Err(SnapshotLoadError::FormatMismatch {
+            found: header.format_version,
+            supported: SNAPSHOT_FORMAT_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// Reads ONLY the `format_version` from a snapshot file's envelope header,
+/// without deserializing the (possibly corrupt or incompatible) payload body.
+/// `Ok(None)` when the file does not exist. Used by #1071's migrator and by the
+/// envelope tests to prove the version is legible even from an unreadable payload.
+pub fn peek_snapshot_format_version(path: &Path) -> io::Result<Option<u32>> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // We only need the envelope header — the first line (`\n`-terminated) — not
+    // the (possibly multi-GB) payload body, so read just that line instead of
+    // slurping the whole snapshot into memory. The read is capped so a legacy
+    // headerless snapshot (compact JSON, no `\n`) can't force an unbounded read
+    // either: an enveloped header is tiny, so no newline within the cap means
+    // this is a legacy file, which `parse_envelope` maps to `format_version 0`.
+    const HEADER_SCAN_CAP: u64 = 64 * 1024;
+    let mut reader = BufReader::new(file.take(HEADER_SCAN_CAP));
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line)?;
+    let (header, _) = parse_envelope(&line)?;
+    Ok(Some(header.format_version))
+}
+
 fn is_seg_file(name: &str) -> Option<u64> {
     let rest = name.strip_prefix(SEG_PREFIX)?.strip_suffix(SEG_SUFFIX)?;
     rest.parse::<u64>().ok()
@@ -664,10 +917,16 @@ pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
             if line.trim().is_empty() {
                 continue;
             }
-            let event: Event = match serde_json::from_str(line) {
+            let event: Event = match decode_event_json(line) {
                 Ok(ev) => ev,
-                Err(e) if torn_tail => {
-                    tracing::warn!("dropping torn journal tail in {}: {e}", path.display());
+                // A torn trailing write can leave a truncated/garbled last line;
+                // that is `Malformed` and safe to drop as an unfsynced tail. An
+                // `UnknownVariant` is a COMPLETE, well-formed record naming an
+                // event this build cannot replay (a renamed/removed variant or a
+                // newer/foreign journal) — never a torn write, so it is fatal
+                // even as the last line (routed to fail-closed / #1071, #1065).
+                Err(EventDecodeError::Malformed { detail }) if torn_tail => {
+                    tracing::warn!("dropping torn journal tail in {}: {detail}", path.display());
                     break;
                 }
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
@@ -709,10 +968,13 @@ fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<
                 Some((t, rest)) => (t.parse::<u64>().ok(), rest),
                 None => (None, line),
             };
-            let event: Event = match serde_json::from_str(json) {
+            let event: Event = match decode_event_json(json) {
                 Ok(ev) => ev,
-                Err(e) if torn_tail => {
-                    tracing::warn!("dropping torn journal tail in {}: {e}", path.display());
+                // Same torn-tail vs. unknown-frame distinction as
+                // `read_segment_events`: tolerate only a `Malformed` tail; an
+                // `UnknownVariant` is a real cross-version frame, never dropped.
+                Err(EventDecodeError::Malformed { detail }) if torn_tail => {
+                    tracing::warn!("dropping torn journal tail in {}: {detail}", path.display());
                     break;
                 }
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
@@ -729,18 +991,24 @@ fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<
 
 /// Loads the latest persisted snapshot in `dir`.
 ///
-/// Returns `Ok(None)` **only** when no snapshot file exists. A snapshot file
-/// that is present but cannot be read is a fatal error carrying the underlying
-/// OS error kind (e.g. `PermissionDenied`), one that cannot be deserialized is
-/// a fatal `InvalidData` error, and errors listing the directory (or its
-/// individual entries) propagate as-is: silently treating any of these as "no
-/// snapshot" would fall back to a truncated-tail replay that rewinds the
-/// engine key generator and drops the state the snapshot covered (see issue
-/// #1065). Surfacing the error lets the operator roll back to a compatible
-/// binary or migrate the snapshot rather than corrupt the key space.
+/// `Ok(None)` means ONLY "no snapshot file exists". A snapshot that is present
+/// but at an incompatible format version, or present but corrupt/unreadable, is
+/// a FATAL typed error ([`SnapshotLoadError`], surfaced as an [`io::Error`]) —
+/// never a silent `None`, never a fallback that rewinds durable state.
+///
+/// The loaded value keeps `covered_events` as the SECOND tuple element to match
+/// the callers in [`recover`].
 fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>> {
     let mut best: Option<(u64, PathBuf)> = None;
-    for entry in fs::read_dir(dir)? {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // A read_dir entry error would otherwise be silently skipped by `.flatten()`,
+    // which could return `Ok(None)` (or pick a stale snapshot) despite a present
+    // snapshot — undermining the fail-closed guarantee. Propagate it instead.
+    for entry in rd {
         let entry = entry?;
         let name = entry.file_name();
         if let Some(covered) = is_snap_file(&name.to_string_lossy())
@@ -752,31 +1020,14 @@ fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>>
     let Some((_, path)) = best else {
         return Ok(None);
     };
-    let bytes = fs::read(&path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!(
-                "snapshot {} is present but unreadable ({e}); refusing to recover from a \
-                 truncated journal, which would rewind the engine key generator and drop \
-                 covered state. Restore a compatible binary or remove the snapshot \
-                 deliberately. See issue #1065.",
-                path.display()
-            ),
-        )
-    })?;
-    let snap: PersistedSnapshot = serde_json::from_slice(&bytes).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "snapshot {} failed to deserialize ({e}); the on-disk snapshot schema is \
-                 likely incompatible with this binary (schema drift / downgrade). Refusing to \
-                 recover from a truncated journal, which would rewind the engine key generator \
-                 and drop covered state. Restore a compatible binary or migrate the snapshot. \
-                 See issue #1065.",
-                path.display()
-            ),
-        )
-    })?;
+    // A file we selected by name is PRESENT: from here on, every failure is fatal.
+    let bytes = fs::read(&path)?;
+    let (header, payload) = parse_envelope(&bytes)?;
+    check_format_version(&header)?;
+    let snap: PersistedSnapshot =
+        serde_json::from_slice(payload).map_err(|e| SnapshotLoadError::Corrupt {
+            reason: format!("snapshot payload deserialize failed: {e}"),
+        })?;
     Ok(Some((snap.engine, snap.covered_events)))
 }
 
@@ -839,62 +1090,112 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
     let first_index = first_index.unwrap_or(active_start);
     events.extend(active_events);
 
-    let snapshot = load_latest_snapshot(dir)?;
-    let fresh = total_events == 0 && snapshot.is_none();
-
-    // A compacted journal (`first_index > 0`) has had its event prefix deleted;
-    // the only complete source for that prefix is the snapshot. It is not enough
-    // for *a* snapshot to load — it must actually cover the compaction floor
-    // (`covered >= first_index`). Two ways this fails, both of which would replay
-    // only the surviving tail atop an incomplete base — rewinding the key
-    // generator and silently dropping the compacted `[covered, first_index)`
-    // window (issue #1065; same "refuse rather than silently resume" principle as
-    // #600):
-    //   * no loadable snapshot at all, or
-    //   * a *stale* snapshot whose `covered < first_index` (e.g. the newest
-    //     snapshot was removed/corrupted post-compaction, leaving an older one
-    //     that `saturating_sub` would silently clamp to `skip = 0`).
-    if first_index > 0 {
-        match &snapshot {
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "journal is compacted (first surviving event index {first_index}) but no \
-                         loadable snapshot is present; refusing to recover from a truncated tail, \
-                         which would rewind the engine key generator and drop compacted state. See \
-                         issue #1065."
-                    ),
-                ));
-            }
-            Some((_, covered)) if *covered < first_index => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "journal is compacted (first surviving event index {first_index}) but the \
-                         loadable snapshot only covers up to {covered}; refusing to recover across \
-                         the compacted gap [{covered}, {first_index}), which would rewind the \
-                         engine key generator and drop compacted state. See issue #1065."
-                    ),
-                ));
-            }
-            Some(_) => {}
+    // Load the snapshot ONCE, then rebuild the engine. A present snapshot that is
+    // at an incompatible format version — or whose payload no longer deserializes
+    // under this build — is a typed `SnapshotLoadError`. Rather than fail-closed
+    // outright (or, far worse, silently rewind), attempt the #1071 replay-migrator:
+    // rebuild from a from-scratch replay of the FULL history (cold archive +
+    // surviving tail) and rewrite a fresh NEW-format snapshot. Fail-closed only
+    // when the history cannot fully reconstruct the engine (a pruned gap, or an
+    // unreadable event frame — both snapshot AND journal gone).
+    let (engine, fresh) = match load_latest_snapshot(dir) {
+        // A readable snapshot whose `covered` is BELOW the compaction floor is
+        // stale (e.g. the newest snapshot was lost/removed post-compaction and an
+        // older one resurfaced). Trusting it would `saturating_sub`-clamp `skip`
+        // to 0 and replay only the surviving tail atop an incomplete base, silently
+        // dropping the compacted `[covered, first_index)` window and rewinding the
+        // key generator (#1065). This is a distinct signal from an unreadable /
+        // incompatible snapshot (which migrates by replay): a stale-but-valid
+        // snapshot means the durable set is inconsistent, so fail closed loud.
+        Ok(Some((_snap, covered))) if first_index > 0 && covered < first_index => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "snapshot covers only up to {covered} but the journal is compacted (first \
+                     surviving event index {first_index}); refusing to recover across the \
+                     compacted gap [{covered}, {first_index}), which would rewind the engine key \
+                     generator and drop compacted state. See issue #1065."
+                ),
+            ));
         }
-    }
-
-    // Rebuild the engine: snapshot (if any) + replay of the events the snapshot
-    // did not cover; otherwise a full replay of the surviving events.
-    let engine = match snapshot {
-        Some((snap, covered)) => {
+        Ok(Some((snap, covered))) => {
             let mut engine = Engine::from_snapshot(snap);
             // Replay only events after the snapshot boundary.
             let skip = covered.saturating_sub(first_index) as usize;
             if skip < events.len() {
                 engine.apply_replayed_events(events[skip..].iter().cloned());
             }
-            engine
+            (engine, false)
         }
-        None => Engine::replay_partition(0, events.iter().cloned()),
+        // No snapshot present. If the hot journal still starts at index 0 the
+        // surviving events ARE the whole history — replay them cheaply. But if
+        // compaction advanced `first_index` above 0, the tail alone is missing
+        // `[0, first_index)`: replaying only it would silently rewind (#1065).
+        // Route through the same cold-archive reconstruction / fail-closed gate
+        // as an unreadable snapshot.
+        Ok(None) if first_index == 0 => {
+            let fresh = total_events == 0;
+            (Engine::replay_partition(0, events.iter().cloned()), fresh)
+        }
+        Ok(None) => match migrate_by_replay(dir, 0, first_index, total_events, &events)? {
+            Some(engine) => {
+                tracing::warn!(
+                    "no snapshot but the journal starts at {first_index}; reconstructed by \
+                     replaying the cold archive + surviving tail and rewriting a fresh v{} \
+                     snapshot",
+                    SNAPSHOT_FORMAT_VERSION
+                );
+                if let Err(we) = write_snapshot(dir, engine.snapshot(), total_events) {
+                    tracing::warn!("post-reconstruction snapshot write failed: {we}");
+                } else {
+                    prune_cold_archive(dir, total_events);
+                }
+                (engine, false)
+            }
+            // The cold archive cannot rebuild `[0, first_index)`: fail closed
+            // (#1066) rather than replaying only the tail and rewinding (#1065).
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "no snapshot and the cold archive cannot reconstruct \
+                         [0, {first_index}); refusing to replay only the surviving tail \
+                         (would rewind)"
+                    ),
+                ));
+            }
+        },
+        Err(e) => {
+            // A non-typed io error (a real read failure) just propagates.
+            if e.get_ref()
+                .and_then(|r| r.downcast_ref::<SnapshotLoadError>())
+                .is_none()
+            {
+                return Err(e);
+            }
+            match migrate_by_replay(dir, 0, first_index, total_events, &events)? {
+                Some(engine) => {
+                    tracing::warn!(
+                        "snapshot unreadable ({e}); migrated by replaying the journal \
+                         (cold archive + surviving tail) and rewriting a fresh v{} snapshot",
+                        SNAPSHOT_FORMAT_VERSION
+                    );
+                    // Persist the migrated engine as a fresh new-format snapshot
+                    // covering the whole replayed history (this also deletes the
+                    // superseded incompatible snapshot), then prune the cold
+                    // archive up to it. Best-effort: a write failure just means the
+                    // next boot migrates again.
+                    if let Err(we) = write_snapshot(dir, engine.snapshot(), total_events) {
+                        tracing::warn!("post-migration snapshot write failed: {we}");
+                    } else {
+                        prune_cold_archive(dir, total_events);
+                    }
+                    (engine, false)
+                }
+                // Replay cannot reconstruct without rewinding: fail-closed (#1066).
+                None => return Err(e),
+            }
+        }
     };
 
     let shared = Arc::new(SegShared {
@@ -929,22 +1230,7 @@ pub fn write_snapshot(dir: &Path, snap: EngineSnapshot, covered_events: u64) -> 
         engine: snap,
     };
     let final_path = dir.join(format!("{SNAP_PREFIX}{covered_events:020}{SNAP_SUFFIX}"));
-    let tmp = dir.join(format!(
-        "{SNAP_PREFIX}{covered_events:020}{SNAP_SUFFIX}.tmp"
-    ));
-    {
-        // Stream to the file (BufWriter) rather than building a full `Vec<u8>`
-        // first; see `write_multi_snapshot` for why the intermediate buffer is
-        // a multi-GB transient under a large backlog.
-        let f = File::create(&tmp)?;
-        let mut w = BufWriter::new(f);
-        serde_json::to_writer(&mut w, &payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let f = w.into_inner()?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, &final_path)?;
-    fsync_dir(dir);
+    write_enveloped(dir, &final_path, &payload)?;
 
     // Drop superseded snapshots (keep only the newest covered count).
     if let Ok(rd) = fs::read_dir(dir) {
@@ -968,9 +1254,23 @@ pub fn write_snapshot(dir: &Path, snap: EngineSnapshot, covered_events: u64) -> 
 pub fn compact(shared: &SegShared, watermark: u64) -> usize {
     let mut sealed = shared.sealed.lock().expect("sealed lock");
     let mut removed = 0usize;
-    // Sealed segments are kept ascending; remove the covered prefix.
+    // Sealed segments are kept ascending; remove the covered prefix — but ARCHIVE
+    // each covered segment into the bounded cold store first, so a later snapshot
+    // format-version migration can still REPLAY it (see the cold-archive section
+    // and [`recover`]'s migrator). A segment is only removed from the hot log once
+    // its events are durably in the cold store; if archiving fails we KEEP the
+    // segment (deletion never precedes a durable archive), so we can never lose
+    // the covered prefix — the #1065 retention gap that let a snapshot-format
+    // mismatch rewind durable state.
     while let Some(seg) = sealed.first() {
         if seg.end <= watermark {
+            if let Err(e) = archive_cold_segment(&shared.dir, &seg.path, seg.start, seg.end) {
+                tracing::warn!(
+                    "cold-archiving sealed segment {} failed: {e}; keeping it (not deleting)",
+                    seg.path.display()
+                );
+                break;
+            }
             let _ = fs::remove_file(&seg.path);
             sealed.remove(0);
             removed += 1;
@@ -982,6 +1282,399 @@ pub fn compact(shared: &SegShared, watermark: u64) -> usize {
         fsync_dir(&shared.dir);
     }
     removed
+}
+
+// ----------------------------------------------------------------------------
+// Rolling cold journal archive (bounded) — L5 / #1071.
+//
+// The journal analog of the read-model's durable `terminal-archive.sqlite`
+// (#831). Before L5, `compact`/`compact_multi` HARD-DELETED a sealed segment once
+// it was covered by both the snapshot watermark and the read-model exported
+// position — so once compacted there was nothing left to replay from. If the
+// engine snapshot then turned out to be at an unreadable format version, boot had
+// only the surviving (post-compaction) tail to replay, silently REWINDING every
+// instance whose creation had been compacted away (incident #1065, "instance 41").
+//
+// The fix: at compaction, instead of deleting the covered prefix, ARCHIVE it —
+// compressed — into a cold store (`journal.cold.<start>.<end>.jsonl.z`), so the
+// full event history back to the archive floor is still replayable. The store is
+// kept BOUNDED by pruning it one snapshot generation back after a fresh
+// SAME-format snapshot is durably written ([`prune_cold_archive`]): the newest
+// generation is retained as the migration fallback, older generations are already
+// folded into the current (readable) snapshot and are dropped. Net cold-archive
+// size ~= one snapshot generation of events — the same disk profile as before.
+//
+// A cold file stores the segment's DECODED plaintext records (inner journal
+// frames already inflated by [`decode_segment_bytes`]), then deflated as a whole
+// — so the single-partition (`<json>`) and multi-partition (`<partition>\t<json>`)
+// line formats are preserved verbatim and re-read by the same decoders. Sealed
+// segments are fsynced-before-rename, so a cold file is never torn: any decode
+// failure on read is FATAL (routed to fail-closed), never tolerated as a tail.
+// ----------------------------------------------------------------------------
+
+/// Cold-archive filename prefix: `journal.cold.<start>.<end>.jsonl.z`.
+const COLD_PREFIX: &str = "journal.cold.";
+/// Cold-archive filename suffix (deflated plaintext records).
+const COLD_SUFFIX: &str = ".jsonl.z";
+
+/// The cold-archive path for the segment covering `[start, end)`.
+fn cold_name(dir: &Path, start: u64, end: u64) -> PathBuf {
+    dir.join(format!("{COLD_PREFIX}{start:020}.{end:020}{COLD_SUFFIX}"))
+}
+
+/// Parses a cold-archive filename into its `(start, end)` global event range.
+fn is_cold_file(name: &str) -> Option<(u64, u64)> {
+    let rest = name.strip_prefix(COLD_PREFIX)?.strip_suffix(COLD_SUFFIX)?;
+    let (start, end) = rest.split_once('.')?;
+    Some((start.parse::<u64>().ok()?, end.parse::<u64>().ok()?))
+}
+
+/// Deflates `bytes` (best-effort ratio; whole-buffer, not framed).
+fn deflate_all(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    use flate2::{Compression, write::DeflateEncoder};
+    let mut enc = DeflateEncoder::new(Vec::with_capacity(bytes.len() / 2), Compression::fast());
+    enc.write_all(bytes)?;
+    enc.finish()
+}
+
+/// Inflates a whole-buffer deflate stream written by [`deflate_all`].
+fn inflate_all(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    use flate2::read::DeflateDecoder;
+    let mut out = Vec::with_capacity(bytes.len().saturating_mul(2));
+    DeflateDecoder::new(bytes).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Archives the sealed segment at `seg_path` (covering `[start, end)`) into the
+/// cold store: reads its DECODED plaintext records (inflating any inner frames),
+/// deflates the whole thing, and writes it atomically (tmp + rename + fsync). The
+/// caller deletes the hot segment only after this returns `Ok` — so the covered
+/// prefix is never lost. Idempotent: an already-present cold file for the same
+/// range is left as-is (a re-run of compaction over a kept segment).
+fn archive_cold_segment(dir: &Path, seg_path: &Path, start: u64, end: u64) -> io::Result<()> {
+    let final_path = cold_name(dir, start, end);
+    if final_path.exists() {
+        return Ok(());
+    }
+    let plaintext = decode_segment_bytes(seg_path)?;
+    let compressed = deflate_all(&plaintext)?;
+    let tmp = final_path.with_extension("z.tmp");
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(&compressed)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &final_path)?;
+    fsync_dir(dir);
+    Ok(())
+}
+
+/// Lists cold-archive files in `dir`, ascending by start index, as
+/// `(start, end, path)`. Empty when there is no cold store.
+fn list_cold(dir: &Path) -> io::Result<Vec<(u64, u64, PathBuf)>> {
+    let mut cold: Vec<(u64, u64, PathBuf)> = Vec::new();
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(cold),
+        Err(e) => return Err(e),
+    };
+    for entry in rd {
+        let entry = entry?;
+        let name = entry.file_name();
+        if let Some((start, end)) = is_cold_file(&name.to_string_lossy()) {
+            cold.push((start, end, entry.path()));
+        }
+    }
+    cold.sort_by_key(|(start, _, _)| *start);
+    Ok(cold)
+}
+
+/// The global event bounds `[min_start, max_end)` the cold archive currently
+/// spans, or `None` when it is empty. This is ONLY a bounds calculation over the
+/// cold files' start/end indices — it does **not** assert the archive is a
+/// gap-free contiguous prefix (an internal gap, overlap, or mis-sized file is not
+/// detected here). The migrator uses it (together with the hot journal's
+/// `first_index`) for a cheap coverage estimate, but the actual soundness gate is
+/// [`read_cold_prefix`]'s validated `[0, cold_end)` walk.
+pub fn cold_archive_span(dir: &Path) -> io::Result<Option<(u64, u64)>> {
+    let cold = list_cold(dir)?;
+    let Some((first_start, _, _)) = cold.first() else {
+        return Ok(None);
+    };
+    let first_start = *first_start;
+    let last_end = cold
+        .iter()
+        .map(|(_, end, _)| *end)
+        .max()
+        .unwrap_or(first_start);
+    Ok(Some((first_start, last_end)))
+}
+
+/// Decodes ONE cold-archive file into its events (single-partition). A decode
+/// failure is FATAL (the cold store is fully durable, never torn): an
+/// [`EventDecodeError::UnknownVariant`] surfaces as a downcastable [`io::Error`]
+/// so the migrator routes it to fail-closed (#1066) rather than reconstructing
+/// from a partial history.
+fn parse_cold_file(path: &Path) -> io::Result<Vec<Event>> {
+    let plaintext = inflate_all(&fs::read(path)?)?;
+    let mut events = Vec::new();
+    for line in plaintext.split(|&b| b == b'\n') {
+        let line =
+            std::str::from_utf8(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event =
+            decode_event_json(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// Decodes ONE cold-archive file into `(write-tag, event)` pairs (multi-partition
+/// — the cold analog of [`read_segment_events_tagged`]). A bare (untagged) line
+/// falls back to the event's key partition, exactly as the hot tagged reader.
+/// Decode failures are FATAL (never a torn tail).
+fn parse_cold_file_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<(u64, Event)>> {
+    let plaintext = inflate_all(&fs::read(path)?)?;
+    let mut events = Vec::new();
+    for line in plaintext.split(|&b| b == b'\n') {
+        let line =
+            std::str::from_utf8(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (tag, json) = match line.split_once('\t') {
+            // A tab delimits the write-partition tag. Cold files are authoritative
+            // and never torn (decode failures are FATAL here), and event JSON
+            // never contains a literal tab (serde escapes it as `\t`), so a tab
+            // present with a NON-numeric tag is corruption — fail closed rather
+            // than silently treating it as untagged and misrouting to the key
+            // partition. A line with no tab at all is a legitimately untagged
+            // (pre-tag format) record and still falls back below.
+            Some((t, rest)) => {
+                let tag = t.parse::<u64>().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "cold archive file {} has a non-numeric write tag {t:?}: {e}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                (Some(tag), rest)
+            }
+            None => (None, line),
+        };
+        let event =
+            decode_event_json(json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tag = tag.unwrap_or_else(|| {
+            (partition_of(event.max_key()) as usize).min(num_partitions.saturating_sub(1)) as u64
+        });
+        events.push((tag, event));
+    }
+    Ok(events)
+}
+
+/// Reads the cold archive as a VALIDATED contiguous prefix starting at global
+/// index 0, returning `(events, cold_end)` — the events of `[0, cold_end)`.
+///
+/// This is the migrator's safety gate: `cold_archive_span` alone only reports the
+/// min-start / max-end and so cannot distinguish a genuine `[0, N)` prefix from a
+/// set with an internal gap, an overlap, or a mis-sized file. Here we walk the
+/// files in ascending order and accumulate ONLY while each abuts the previous
+/// (`start == expected`) and holds EXACTLY `end - start` decoded records, so a
+/// gap/overlap simply truncates `cold_end` (the caller then sees `cold_end !=
+/// first_index` and fails closed rather than replaying a hole). A per-file
+/// record-count mismatch — or an undecodable frame — is a hard `Err`
+/// (fail-closed): the journal is not trustworthy. An empty (or non-zero-starting)
+/// archive yields `(vec![], 0)`.
+fn read_cold_prefix(dir: &Path) -> io::Result<(Vec<Event>, u64)> {
+    let mut events = Vec::new();
+    let mut expected = 0u64;
+    for (start, end, path) in list_cold(dir)? {
+        if start != expected {
+            break; // gap or overlap: the contiguous prefix ends here
+        }
+        let decoded = parse_cold_file(&path)?;
+        if decoded.len() as u64 != end.saturating_sub(start) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cold archive file {} holds {} records but its range [{start}, {end}) \
+                     expects {}",
+                    path.display(),
+                    decoded.len(),
+                    end.saturating_sub(start)
+                ),
+            ));
+        }
+        events.extend(decoded);
+        expected = end;
+    }
+    Ok((events, expected))
+}
+
+/// [`read_cold_prefix`] with write-partition tags (multi-partition path).
+fn read_cold_prefix_tagged(
+    dir: &Path,
+    num_partitions: usize,
+) -> io::Result<(Vec<(u64, Event)>, u64)> {
+    let mut events = Vec::new();
+    let mut expected = 0u64;
+    for (start, end, path) in list_cold(dir)? {
+        if start != expected {
+            break;
+        }
+        let decoded = parse_cold_file_tagged(&path, num_partitions)?;
+        if decoded.len() as u64 != end.saturating_sub(start) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cold archive file {} holds {} records but its range [{start}, {end}) \
+                     expects {}",
+                    path.display(),
+                    decoded.len(),
+                    end.saturating_sub(start)
+                ),
+            ));
+        }
+        events.extend(decoded);
+        expected = end;
+    }
+    Ok((events, expected))
+}
+
+/// Prunes the rolling cold archive, removing every cold file fully below
+/// `keep_from` (i.e. `end <= keep_from`) — the events a fresh SAME-format snapshot
+/// at (or past) `keep_from` has made redundant for normal recovery. Callers pass
+/// the PREVIOUS snapshot generation's boundary so the most-recent generation is
+/// retained as the migration fallback (a rolling one-generation window). Returns
+/// the number of cold files removed.
+pub fn prune_cold_archive(dir: &Path, keep_from: u64) -> usize {
+    let mut removed = 0usize;
+    let cold = match list_cold(dir) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "prune_cold_archive: skipping prune, failed to list cold archive in {}: {e}",
+                dir.display()
+            );
+            return 0;
+        }
+    };
+    for (_, end, path) in cold {
+        if end <= keep_from {
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        } else {
+            // Ascending by start; once a file's end is past the floor, so are
+            // all later ones (segments are contiguous and non-overlapping).
+            break;
+        }
+    }
+    if removed > 0 {
+        fsync_dir(dir);
+    }
+    removed
+}
+
+/// The cold-archive prune floor for one multi-partition maintenance tick: the
+/// minimum covered watermark across the partitions THIS node actually snapshotted
+/// (its OWNED partitions), i.e. the boundary every owned partition has folded into
+/// the fresh combined snapshot.
+///
+/// `owned_covered` must carry exactly one entry per partition snapshotted this
+/// tick — NOT a global-width vector padded with 0 for unowned partitions. A
+/// clustered node owns only a subset of the cluster's partitions
+/// (`partition_id % num_nodes == node_id`), so a global-width `covered` has
+/// 0-holes for the partitions it does not own; taking the min across those holes
+/// pins the floor at 0 forever, `prune_cold_archive` then never prunes, and the
+/// shared cold archive grows without the intended one-generation bound (#1076).
+/// Deriving the floor from the owned watermarks alone keeps the window bounded on
+/// a clustered node while staying identical to the global min on a single node
+/// that owns every partition.
+pub fn cold_prune_floor(owned_covered: &[u64]) -> u64 {
+    owned_covered.iter().copied().min().unwrap_or(0)
+}
+
+/// Rebuilds a single-partition engine from a from-scratch replay of the FULL
+/// event history — the cold archive's covered prefix + the surviving hot tail —
+/// when the on-disk snapshot cannot be loaded at its format version (the migrator
+/// half of #1071). `hot_events` are the surviving events the caller already read,
+/// covering `[first_index, total_events)`.
+///
+/// Returns `Ok(Some(engine))` when the full history `[0, total_events)` is
+/// available and replays cleanly. Returns `Ok(None)` — deferring to the caller's
+/// fail-closed path — when the history has a gap below the cold-archive floor
+/// (the compacted prefix was already pruned and lives only in the unreadable
+/// snapshot): reconstructing from there would REWIND, so we refuse. A replay that
+/// hits an unreadable event frame (unknown variant) propagates as `Err`
+/// (fail-closed): both the snapshot AND the journal are unreadable.
+fn migrate_by_replay(
+    dir: &Path,
+    partition_id: u64,
+    first_index: u64,
+    total_events: u64,
+    hot_events: &[Event],
+) -> io::Result<Option<Engine>> {
+    // Assemble the full history. The cold archive holds the compacted prefix as a
+    // VALIDATED contiguous `[0, cold_end)` (gaps/overlaps/mis-sized files truncate
+    // `cold_end`); the hot tail holds `[first_index, total_events)`. A from-scratch
+    // replay is only SOUND when the two together cover `[0, total_events)` with no
+    // gap: `cold_end == first_index` (cold meets the hot tail — with no cold that
+    // requires `first_index == 0`) AND the hot tail spans exactly the rest.
+    let (cold_events, cold_end) = read_cold_prefix(dir)?;
+    let hot_covers_tail = hot_events.len() as u64 == total_events.saturating_sub(first_index);
+    let full_from_zero = cold_end == first_index && hot_covers_tail;
+    if !full_from_zero {
+        tracing::error!(
+            "snapshot-format migration cannot reconstruct partition {partition_id}: validated \
+             cold prefix [0, {cold_end}) + hot tail [{first_index}, {total_events}) does not \
+             contiguously cover [0, {total_events}); refusing to replay (would rewind) — failing \
+             closed"
+        );
+        return Ok(None);
+    }
+
+    // Replay cold prefix then hot tail, in global order, from an empty engine.
+    let engine = Engine::replay_partition(
+        partition_id,
+        cold_events.into_iter().chain(hot_events.iter().cloned()),
+    );
+    Ok(Some(engine))
+}
+
+/// The multi-partition migrator's shared "can we soundly replay the FULL
+/// history?" gate. A from-scratch replay is only SOUND when the VALIDATED
+/// contiguous cold prefix `[0, cold_end)` + hot tail `[first_index,
+/// total_events)` together cover `[0, total_events)` with no gap: `cold_end ==
+/// first_index` (with no cold that requires `first_index == 0`) AND the hot tail
+/// spans exactly the rest. Returns the cold prefix's tagged events when that
+/// holds, or `Ok(None)` when it does not (a pruned gap) — which every caller
+/// turns into a fail-closed boot rather than a rewind. A real read/decode error
+/// while walking the cold archive propagates as `Err`.
+fn full_cold_prefix_tagged(
+    dir: &Path,
+    num_partitions: usize,
+    first_index: u64,
+    total_events: u64,
+    hot_len: usize,
+) -> io::Result<Option<Vec<(u64, Event)>>> {
+    let (cold, cold_end) = read_cold_prefix_tagged(dir, num_partitions)?;
+    let hot_covers_tail = hot_len as u64 == total_events.saturating_sub(first_index);
+    if cold_end != first_index || !hot_covers_tail {
+        tracing::error!(
+            "multi-partition history cannot reconstruct: validated cold prefix [0, {cold_end}) \
+             + hot tail [{first_index}, {total_events}) does not contiguously cover \
+             [0, {total_events}); refusing to replay (would rewind) — failing closed"
+        );
+        return Ok(None);
+    }
+    Ok(Some(cold))
 }
 
 // ----------------------------------------------------------------------------
@@ -1028,64 +1721,36 @@ pub fn write_multi_snapshot(
             .collect(),
     };
     let final_path = dir.join(MULTI_SNAP_NAME);
-    let tmp = dir.join(format!("{MULTI_SNAP_NAME}.tmp"));
-    {
-        // Stream the JSON straight to the file through a BufWriter instead of
-        // materialising the whole snapshot into a `Vec<u8>` first: under a large
-        // active backlog that intermediate buffer is multi-GB (all resident
-        // variable payloads serialized at once) and was a major driver of the
-        // transient RSS balloon during the 60s snapshot tick. The snapshots
-        // share the live variables by Arc, so only this serialization ever
-        // duplicated them.
-        let f = File::create(&tmp)?;
-        let mut w = BufWriter::new(f);
-        serde_json::to_writer(&mut w, &payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let f = w.into_inner()?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, &final_path)?;
-    fsync_dir(dir);
+    // Stream the JSON straight to the file through a BufWriter instead of
+    // materialising the whole snapshot into a `Vec<u8>` first: under a large
+    // active backlog that intermediate buffer is multi-GB (all resident variable
+    // payloads serialized at once) and was a major driver of the transient RSS
+    // balloon during the 60s snapshot tick. The snapshots share the live
+    // variables by Arc, so only this serialization ever duplicated them.
+    write_enveloped(dir, &final_path, &payload)?;
     Ok(())
 }
 
 /// Loads the combined per-partition snapshot, as a map from global partition id
-/// to `(covered_count, snapshot)`. `Ok(None)` **only** when the multi-snapshot
-/// file is absent; a present-but-unreadable file is a fatal error carrying the
-/// underlying OS error kind, and an undeserializable one a fatal `InvalidData`
-/// error (see [`load_latest_snapshot`] and issue #1065) — treating schema
-/// drift as "no snapshot" would rewind the partition key generators.
+/// to `(covered_count, snapshot)`.
+///
+/// `Ok(None)` means ONLY "no combined snapshot file exists". A present-but-
+/// incompatible or corrupt file is a FATAL typed error ([`SnapshotLoadError`],
+/// surfaced as an [`io::Error`]) — never a silent `None`, never a rewind.
 fn load_multi_snapshot(
     dir: &Path,
 ) -> io::Result<Option<std::collections::HashMap<u64, (u64, EngineSnapshot)>>> {
-    let path = dir.join(MULTI_SNAP_NAME);
-    let bytes = match fs::read(&path) {
+    let bytes = match fs::read(dir.join(MULTI_SNAP_NAME)) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(io::Error::new(
-                e.kind(),
-                format!(
-                    "multi-partition snapshot {} is present but unreadable ({e}); refusing to \
-                     recover from a truncated journal, which would rewind partition key \
-                     generators. Restore a compatible binary. See issue #1065.",
-                    path.display()
-                ),
-            ));
-        }
+        Err(e) => return Err(e),
     };
-    let snap: MultiPersistedSnapshot = serde_json::from_slice(&bytes).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "multi-partition snapshot {} failed to deserialize ({e}); the on-disk snapshot \
-                 schema is likely incompatible with this binary (schema drift / downgrade). \
-                 Refusing to recover from a truncated journal, which would rewind partition key \
-                 generators and drop covered state. See issue #1065.",
-                path.display()
-            ),
-        )
-    })?;
+    let (header, payload) = parse_envelope(&bytes)?;
+    check_format_version(&header)?;
+    let snap: MultiPersistedSnapshot =
+        serde_json::from_slice(payload).map_err(|e| SnapshotLoadError::Corrupt {
+            reason: format!("multi-snapshot payload deserialize failed: {e}"),
+        })?;
     Ok(Some(
         snap.entries
             .into_iter()
@@ -1234,14 +1899,117 @@ pub fn recover_multi(
         .cloned()
         .collect();
 
-    let combined = load_multi_snapshot(dir)?;
-    let fresh = total_events == 0 && combined.is_none();
+    // Load the combined snapshot, or fall into the #1071 replay-migrator when it
+    // is present but unreadable (incompatible format version, or a payload that no
+    // longer deserializes). Migration rebuilds EVERY owned partition from a
+    // from-scratch replay of the full history (cold archive + surviving tail),
+    // demuxed by write tag — never a rewind — and fail-closes when the history
+    // cannot fully reconstruct (a pruned gap, or an unreadable event frame).
+    let mut combined = None;
+    // The full tagged history for a migration replay (cold-archived prefix +
+    // surviving tail), populated only when we fall into the migrator below.
+    let mut cold_tagged: Vec<(u64, Event)> = Vec::new();
+    let migrate = match load_multi_snapshot(dir) {
+        Ok(Some(c)) => {
+            combined = Some(c);
+            false
+        }
+        // No combined snapshot. If the journal still starts at index 0 the
+        // surviving tail IS the whole history. But if compaction advanced
+        // `first_index` above 0, replaying only each partition's surviving tail
+        // would silently drop `[0, first_index)` and rewind (#1065): reconstruct
+        // from the cold archive + tail through the same fail-closed gate as an
+        // unreadable snapshot.
+        Ok(None) if first_index == 0 => false,
+        Ok(None) => {
+            match full_cold_prefix_tagged(
+                dir,
+                num_partitions,
+                first_index,
+                total_events,
+                tagged.len(),
+            )? {
+                Some(cold) => {
+                    cold_tagged = cold;
+                    tracing::warn!(
+                        "no multi snapshot but the journal starts at {first_index}; \
+                         reconstructing by replaying the cold archive + surviving tail and \
+                         writing a fresh v{} snapshot",
+                        SNAPSHOT_FORMAT_VERSION
+                    );
+                    true
+                }
+                // A pruned gap: fail closed rather than replaying only the tail
+                // and rewinding (#1065 / #1066).
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "no multi snapshot and the cold archive cannot reconstruct \
+                         [0, first_index): refusing to replay only the surviving tail \
+                         (would rewind)",
+                    ));
+                }
+            }
+        }
+        Err(e) => {
+            if e.get_ref()
+                .and_then(|r| r.downcast_ref::<SnapshotLoadError>())
+                .is_none()
+            {
+                return Err(e);
+            }
+            match full_cold_prefix_tagged(
+                dir,
+                num_partitions,
+                first_index,
+                total_events,
+                tagged.len(),
+            )? {
+                Some(cold) => {
+                    cold_tagged = cold;
+                    tracing::warn!(
+                        "multi snapshot unreadable ({e}); migrating by replaying the journal \
+                         (cold archive + surviving tail) and rewriting a fresh v{} snapshot",
+                        SNAPSHOT_FORMAT_VERSION
+                    );
+                    true
+                }
+                // A pruned gap (or unreadable frame): fail closed with the
+                // original typed snapshot error.
+                None => return Err(e),
+            }
+        }
+    };
+
+    // When migrating, the replicated-deployment broadcast set must also consider
+    // the cold-archived prefix (a cross-partition `ProcessDeployed` may have been
+    // compacted out of the hot tail).
+    let broadcast: Vec<(u64, Event)> = if migrate {
+        cold_tagged
+            .iter()
+            .chain(tagged.iter())
+            .filter(|(tag, e)| {
+                matches!(e, Event::ProcessDeployed { .. })
+                    && *tag
+                        != (partition_of(e.max_key()) as usize)
+                            .min(num_partitions.saturating_sub(1)) as u64
+            })
+            .cloned()
+            .collect()
+    } else {
+        broadcast
+    };
+
+    let fresh = total_events == 0 && combined.is_none() && !migrate;
 
     // A compacted journal (`first_index > 0`) has had its event prefix deleted;
     // with no loadable multi-snapshot, replaying just the surviving tail would
     // rewind the partition key generators and silently drop compacted state —
-    // refuse instead (see issue #1065).
-    if combined.is_none() && first_index > 0 {
+    // refuse instead (see issue #1065). Skipped while `migrate` is set: migration
+    // legitimately runs with `combined == None`, reconstructing the compacted
+    // prefix from the cold archive (already validated by `full_cold_prefix_tagged`
+    // to cover `[0, first_index)`), so it is not a truncated-tail replay.
+    if !migrate && combined.is_none() && first_index > 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -1261,10 +2029,15 @@ pub fn recover_multi(
     // `saturating_sub` clamps `skip` to 0) would replay only that shard's
     // surviving tail across the compacted `[covered, pp_base[p])` gap — rewinding
     // its key generator and dropping compacted state, the same defect class as
-    // #1065 reached per-partition. Refuse loud instead. (This mirrors the
+    // #1065. Refuse loud instead. (This mirrors the
     // compaction rule "a segment is deletable only once every partition's
-    // snapshot covers `per_partition_end[p]`".)
+    // snapshot covers `per_partition_end[p]`".) Skipped while `migrate` is set:
+    // migration rebuilds every owned partition from its FULL tagged history (cold
+    // prefix + surviving tail), so no partition is replayed across a compacted gap.
     for &p in owned {
+        if migrate {
+            break;
+        }
         let base_p = pp_base.get(p as usize).copied().unwrap_or(0);
         if base_p == 0 {
             continue;
@@ -1300,6 +2073,11 @@ pub fn recover_multi(
     // (installing after the tail would regress instances the tail updated). The
     // full-replay branch needs no install — it reconstructs variables from the
     // surviving `ProcessInstanceCreated`/`VariablesUpdated` events directly.
+    //
+    // Migration branch: rebuild the partition from a from-scratch replay of its
+    // FULL tagged history (cold prefix + surviving tail), ignoring the unreadable
+    // snapshot — same reconstruction as an unsnapshotted partition, but over the
+    // complete history rather than only the tail.
     let stored_vars = varstore.map(|vs| vs.load_all());
     let engines: Vec<(u64, Engine)> = owned
         .iter()
@@ -1310,23 +2088,33 @@ pub fn recover_multi(
                 .map(|(_, e)| e.clone())
                 .collect();
             let base_p = pp_base.get(p as usize).copied().unwrap_or(0);
-            let mut engine = match combined.as_ref().and_then(|m| m.get(&p)) {
-                Some((covered, snap)) => {
-                    let mut engine = Engine::from_snapshot(snap.clone());
-                    if let Some(all) = stored_vars.as_ref() {
-                        for (key, vars) in all {
-                            if partition_of(*key) == p {
-                                engine.install_variables(*key, vars.clone());
+            let mut engine = if migrate {
+                let p_full: Vec<Event> = cold_tagged
+                    .iter()
+                    .chain(tagged.iter())
+                    .filter(|(tag, _)| *tag == p)
+                    .map(|(_, e)| e.clone())
+                    .collect();
+                Engine::replay_partition(p, p_full)
+            } else {
+                match combined.as_ref().and_then(|m| m.get(&p)) {
+                    Some((covered, snap)) => {
+                        let mut engine = Engine::from_snapshot(snap.clone());
+                        if let Some(all) = stored_vars.as_ref() {
+                            for (key, vars) in all {
+                                if partition_of(*key) == p {
+                                    engine.install_variables(*key, vars.clone());
+                                }
                             }
                         }
+                        let skip = covered.saturating_sub(base_p) as usize;
+                        if skip < p_events.len() {
+                            engine.apply_replayed_events(p_events[skip..].iter().cloned());
+                        }
+                        engine
                     }
-                    let skip = covered.saturating_sub(base_p) as usize;
-                    if skip < p_events.len() {
-                        engine.apply_replayed_events(p_events[skip..].iter().cloned());
-                    }
-                    engine
+                    None => Engine::replay_partition(p, p_events),
                 }
-                None => Engine::replay_partition(p, p_events),
             };
             // Install partition-agnostic replicated deployments produced under
             // another partition (skips those this partition already replayed as
@@ -1342,6 +2130,39 @@ pub fn recover_multi(
             (p, engine)
         })
         .collect();
+
+    // Persist the migrated engines as a fresh new-format combined snapshot (each
+    // partition covering its full per-partition history), then prune the cold
+    // archive up to it. Best-effort: a write failure just means the next boot
+    // migrates again.
+    //
+    // Only in the NON-lean path. A lean (var-store-backed) deployment keeps a
+    // control-only snapshot in lockstep with the authoritative var store's
+    // position: recovery does `from_snapshot` + `install_variables(store)` +
+    // replay-tail. Writing a full/self-contained migration snapshot at
+    // `total_events` here would leave the store lagging behind it, so the next
+    // boot's `install_variables` would overwrite the freshly-migrated variables
+    // with the store's older map (a rewind of exactly the kind #1065 is about).
+    // Rather than reach into the engine to also rewrite the store, we leave the
+    // incompatible snapshot in place (this boot already returns the correctly
+    // migrated engines) and let the normal maintenance loop write the next
+    // in-format lean snapshot + prune — idempotent, and the cold archive stays
+    // bounded via that same loop. The migration simply re-runs on any crash-boot
+    // before then, which is safe because we did not prune.
+    if migrate && varstore.is_none() {
+        let entries: Vec<(u64, u64, EngineSnapshot)> = engines
+            .iter()
+            .map(|(p, eng)| {
+                let covered = per_partition_total.get(*p as usize).copied().unwrap_or(0);
+                (*p, covered, eng.snapshot())
+            })
+            .collect();
+        if let Err(we) = write_multi_snapshot(dir, entries) {
+            tracing::warn!("post-migration multi snapshot write failed: {we}");
+        } else {
+            prune_cold_archive(dir, total_events);
+        }
+    }
 
     let shared = Arc::new(SegShared {
         dir: dir.to_path_buf(),
@@ -1404,6 +2225,18 @@ pub fn compact_multi(shared: &SegShared, covered: &[u64], exported: &[u64]) -> u
                 .enumerate()
                 .all(|(p, end)| covered.get(p).copied().unwrap_or(0) >= *end);
         if export_ok && snap_ok {
+            // Archive the covered prefix into the cold store instead of hard-
+            // deleting it (same rolling-window retention as the single-partition
+            // `compact`), so a snapshot-format migration can still replay it. The
+            // segment is removed only after its events are durably in the cold
+            // store; if archiving fails we KEEP it rather than lose it.
+            if let Err(e) = archive_cold_segment(&shared.dir, &seg.path, seg.start, seg.end) {
+                tracing::warn!(
+                    "cold-archiving sealed segment {} failed: {e}; keeping it (not deleting)",
+                    seg.path.display()
+                );
+                break;
+            }
             let _ = fs::remove_file(&seg.path);
             let _ = fs::remove_file(shared.pp_meta_path(seg.start));
             sealed.remove(0);
@@ -1809,32 +2642,16 @@ mod tests {
             .expect("a snapshot file exists")
     }
 
-    /// RED/GREEN for issue #1065: a snapshot file that is *present but
-    /// undeserializable* (schema drift after a binary upgrade) must abort
-    /// recovery, not be silently swallowed. Swallowing it fell through to a
-    /// replay of only the compacted tail, which rewound the engine key generator
-    /// (minting a fresh low `instance 41` while live keys were ~70000) and
-    /// dropped the state the snapshot covered.
-    #[test]
-    fn recover_rejects_a_present_but_undeserializable_snapshot() {
-        let (dir, _key1, _key2) = compacted_dir_with_two_instances("corrupt-snap");
-
-        // Simulate schema drift: the snapshot file is still there, but this
-        // binary can no longer deserialize it.
-        fs::write(snapshot_file(&dir), b"{\"not\":\"a valid snapshot\"}").unwrap();
-
-        let err = match crate::journal::Journal::open_segmented(&dir) {
-            Ok(_) => {
-                panic!(
-                    "recovery must refuse an undeserializable snapshot, not rewind the key space"
-                )
-            }
-            Err(e) => e,
-        };
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
+    // NOTE (merge of epic/snapshot-durability → main): the former
+    // `recover_rejects_a_present_but_undeserializable_snapshot` test was removed
+    // here. It asserted the pre-epic contract (an undeserializable snapshot must
+    // ABORT recovery). This epic supersedes that contract: a present-but-
+    // undeserializable snapshot (schema drift) is now MIGRATED by replaying the
+    // full history (cold archive + surviving tail) and rewriting a fresh in-format
+    // snapshot, failing closed only on a genuine gap. That behaviour — including
+    // the #1065 no-rewind guarantee — is owned by
+    // `incompatible_snapshot_migrates_by_replay_preserving_key_high_water` and
+    // `migration_fails_closed_on_pruned_gap`.
 
     /// RED/GREEN for the #1065 defect (raised in the #1066 review): a snapshot that is
     /// present but *unreadable by the OS* (e.g. wrong permissions) must fail loud **with
@@ -1887,27 +2704,14 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A compacted journal (`first_index > 0`) with no snapshot at all is
-    /// unrecoverable: replaying only the surviving tail would rewind the key
-    /// generator and drop the compacted prefix. Recovery must refuse rather than
-    /// silently resume (issue #1065; same principle as issue #600 for the read
-    /// store).
-    #[test]
-    fn recover_rejects_a_compacted_journal_with_no_snapshot() {
-        let (dir, _key1, _key2) = compacted_dir_with_two_instances("missing-snap");
-
-        fs::remove_file(snapshot_file(&dir)).unwrap();
-
-        let err = match crate::journal::Journal::open_segmented(&dir) {
-            Ok(_) => panic!(
-                "recovery must refuse a compacted journal with no snapshot, not rewind the key space"
-            ),
-            Err(e) => e,
-        };
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
+    // NOTE (merge of epic/snapshot-durability → main): the former
+    // `recover_rejects_a_compacted_journal_with_no_snapshot` test was removed
+    // here. It asserted the pre-epic contract (a compacted journal with no
+    // snapshot must ABORT). This epic supersedes it: with no snapshot over a
+    // compacted journal, recovery RECONSTRUCTS from the cold archive (+ surviving
+    // tail), failing closed only when the cold archive cannot cover the gap. That
+    // split contract is owned by `no_snapshot_over_compacted_journal_reconstructs_from_cold`
+    // (reconstructs) and `no_snapshot_over_pruned_journal_fails_closed` (fails closed).
 
     /// RED/GREEN for the round-2 senior finding: a compacted journal with a
     /// *loadable but stale* snapshot — one whose `covered_events` sits **below**
@@ -1923,16 +2727,25 @@ mod tests {
         let (dir, _key1, _key2) = compacted_dir_with_two_instances("stale-snap");
 
         // Rewrite the surviving snapshot so it still deserializes but reports a
-        // `covered_events` below the compaction floor (0 < first_index).
+        // `covered_events` below the compaction floor (0 < first_index). Preserve
+        // the envelope header line so `parse_envelope` + `check_format_version`
+        // still admit the payload — the stale-floor guard, not a decode failure,
+        // is what must reject it.
         let path = snapshot_file(&dir);
-        let mut snap: PersistedSnapshot =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let raw = fs::read(&path).unwrap();
+        let nl = raw
+            .iter()
+            .position(|&b| b == b'\n')
+            .expect("an enveloped snapshot carries a header line");
+        let mut snap: PersistedSnapshot = serde_json::from_slice(&raw[nl + 1..]).unwrap();
         assert!(
             snap.covered_events > 0,
             "the compaction floor must be nonzero for this test to exercise the gap"
         );
         snap.covered_events = 0;
-        fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+        let mut out = raw[..=nl].to_vec(); // header line + '\n'
+        out.extend_from_slice(&serde_json::to_vec(&snap).unwrap());
+        fs::write(&path, out).unwrap();
 
         let err = match crate::journal::Journal::open_segmented(&dir) {
             Ok(_) => panic!(
@@ -2209,10 +3022,16 @@ mod tests {
         }
 
         // Simulate the loadable-but-stale case: rewrite partition 1's entry so its
-        // `covered` sits below the compaction floor (0 < pp_base[1]).
+        // `covered` sits below the compaction floor (0 < pp_base[1]). Preserve the
+        // envelope header line so the payload still parses — the per-partition
+        // stale-floor guard is what must reject it.
         let path = dir.join(MULTI_SNAP_NAME);
-        let mut snap: MultiPersistedSnapshot =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let raw = fs::read(&path).unwrap();
+        let nl = raw
+            .iter()
+            .position(|&b| b == b'\n')
+            .expect("an enveloped multi-snapshot carries a header line");
+        let mut snap: MultiPersistedSnapshot = serde_json::from_slice(&raw[nl + 1..]).unwrap();
         let e = snap
             .entries
             .iter_mut()
@@ -2223,7 +3042,9 @@ mod tests {
             "partition 1's compaction floor must be nonzero for this test to exercise the gap"
         );
         e.covered = 0;
-        fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+        let mut out = raw[..=nl].to_vec(); // header line + '\n'
+        out.extend_from_slice(&serde_json::to_vec(&snap).unwrap());
+        fs::write(&path, out).unwrap();
 
         let err = recover_multi(&dir, &[0, 1], 2, None)
             .err()
@@ -3088,5 +3909,1029 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&empty_dir);
+    }
+
+    // ------------------------------------------------------------------------
+    // Versioned self-describing snapshot envelope (L2 / #1068).
+    // ------------------------------------------------------------------------
+
+    /// Builds a small, deploy-only engine snapshot for envelope tests.
+    fn demo_snapshot() -> EngineSnapshot {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(demo()))
+            .expect("deploy");
+        engine.snapshot()
+    }
+
+    fn snap_path(dir: &Path, covered: u64) -> PathBuf {
+        dir.join(format!("{SNAP_PREFIX}{covered:020}{SNAP_SUFFIX}"))
+    }
+
+    /// Extracts the typed [`SnapshotLoadError`] from a loader's [`io::Error`].
+    fn typed_err(e: &io::Error) -> &SnapshotLoadError {
+        e.get_ref()
+            .and_then(|e| e.downcast_ref::<SnapshotLoadError>())
+            .expect("loader error must carry a typed SnapshotLoadError")
+    }
+
+    /// GREEN: a snapshot round-trips through the envelope, and the header stamps
+    /// the current format version, a non-zero incarnation, and a build
+    /// fingerprint — all readable without touching the payload body.
+    #[test]
+    fn envelope_round_trips_and_stamps_header() {
+        let dir = temp_dir("envelope-roundtrip");
+        fs::create_dir_all(&dir).unwrap();
+        let covered = 7;
+        write_snapshot(&dir, demo_snapshot(), covered).expect("write");
+
+        // The on-disk file is `header-line \n payload`.
+        let bytes = fs::read(snap_path(&dir, covered)).unwrap();
+        let (header, payload) = parse_envelope(&bytes).expect("parse header");
+        assert_eq!(header.format_version, SNAPSHOT_FORMAT_VERSION);
+        assert_ne!(header.incarnation, 0, "incarnation must be populated");
+        assert!(
+            header
+                .engine_fingerprint
+                .starts_with("nanobpmn-engine-core@"),
+            "fingerprint = {}",
+            header.engine_fingerprint
+        );
+        // The payload after the header is the real PersistedSnapshot.
+        let _: PersistedSnapshot = serde_json::from_slice(payload).expect("payload decodes");
+
+        // The loader returns the engine plus `covered_events` as the 2ND tuple
+        // element (caller contract).
+        let (loaded, loaded_covered) = load_latest_snapshot(&dir)
+            .expect("load ok")
+            .expect("snapshot present");
+        assert_eq!(loaded_covered, covered);
+        assert_eq!(
+            loaded.state.processes.len(),
+            1,
+            "round-tripped snapshot carries the deployed process"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `Ok(None)` is returned ONLY when no snapshot file exists.
+    #[test]
+    fn absent_snapshot_is_ok_none() {
+        let dir = temp_dir("envelope-absent");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(load_latest_snapshot(&dir).expect("ok").is_none());
+        assert!(load_multi_snapshot(&dir).expect("ok").is_none());
+        assert!(
+            peek_snapshot_format_version(&snap_path(&dir, 1))
+                .expect("ok")
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The format version is readable even when the PAYLOAD is corrupt, and a
+    /// corrupt payload is a FATAL typed error — never a silent `None`.
+    #[test]
+    fn version_readable_from_corrupt_payload_and_load_is_fatal() {
+        let dir = temp_dir("envelope-corrupt");
+        fs::create_dir_all(&dir).unwrap();
+        let covered = 3;
+        let header = SnapshotHeader {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            incarnation: 42,
+            engine_fingerprint: "test".into(),
+        };
+        let mut file = serde_json::to_vec(&header).unwrap();
+        file.push(b'\n');
+        file.extend_from_slice(b"this is not valid snapshot json }{");
+        fs::write(snap_path(&dir, covered), &file).unwrap();
+
+        // Version legible without decoding the (garbage) payload.
+        assert_eq!(
+            peek_snapshot_format_version(&snap_path(&dir, covered)).unwrap(),
+            Some(SNAPSHOT_FORMAT_VERSION)
+        );
+
+        // Loading it is a fatal typed Corrupt error, NOT Ok(None).
+        let err = load_latest_snapshot(&dir).expect_err("must be fatal, not None");
+        assert!(matches!(typed_err(&err), SnapshotLoadError::Corrupt { .. }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A snapshot written at a version NEWER than this build supports yields the
+    /// typed `SnapshotFormatMismatch` (`FormatMismatch`), never a silent rewind.
+    #[test]
+    fn future_version_yields_format_mismatch() {
+        let dir = temp_dir("envelope-future");
+        fs::create_dir_all(&dir).unwrap();
+        let covered = 5;
+        let future = SNAPSHOT_FORMAT_VERSION + 1;
+        let header = SnapshotHeader {
+            format_version: future,
+            incarnation: 1,
+            engine_fingerprint: "future-build".into(),
+        };
+        // A perfectly VALID payload — the mismatch must trip on the header alone.
+        let payload = PersistedSnapshot {
+            covered_events: covered,
+            engine: demo_snapshot(),
+        };
+        let mut file = serde_json::to_vec(&header).unwrap();
+        file.push(b'\n');
+        file.extend_from_slice(&serde_json::to_vec(&payload).unwrap());
+        fs::write(snap_path(&dir, covered), &file).unwrap();
+
+        let err = load_latest_snapshot(&dir).expect_err("mismatch is fatal");
+        match typed_err(&err) {
+            SnapshotLoadError::FormatMismatch { found, supported } => {
+                assert_eq!(*found, future);
+                assert_eq!(*supported, SNAPSHOT_FORMAT_VERSION);
+            }
+            other => panic!("expected FormatMismatch, got {other:?}"),
+        }
+        // The version is still legible.
+        assert_eq!(
+            peek_snapshot_format_version(&snap_path(&dir, covered)).unwrap(),
+            Some(future)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Rewrites the snapshot file at `path` so its envelope header advertises an
+    /// INCOMPATIBLE (future) format version, leaving the payload bytes untouched.
+    /// The next boot then sees a typed `FormatMismatch` from the loader — the
+    /// #1071 migration trigger — without any real corruption.
+    fn bump_snapshot_header_to_future(path: &Path) {
+        let bytes = fs::read(path).expect("snapshot exists");
+        let nl = bytes.iter().position(|&b| b == b'\n').expect("header line");
+        let payload = &bytes[nl + 1..];
+        let header = SnapshotHeader {
+            format_version: SNAPSHOT_FORMAT_VERSION + 1,
+            incarnation: 99,
+            engine_fingerprint: "future-build".into(),
+        };
+        let mut out = serde_json::to_vec(&header).unwrap();
+        out.push(b'\n');
+        out.extend_from_slice(payload);
+        fs::write(path, &out).expect("rewrite header");
+    }
+
+    /// [`bump_snapshot_header_to_future`] for the single-partition snapshot
+    /// covering `covered`.
+    fn bump_snapshot_to_future(dir: &Path, covered: u64) {
+        bump_snapshot_header_to_future(&snap_path(dir, covered));
+    }
+
+    /// L5: compaction ARCHIVES the covered prefix into the cold store instead of
+    /// hard-deleting it, and `prune_cold_archive` keeps only the most-recent
+    /// generation — so the cold store stays bounded to ~one snapshot generation
+    /// (the journal analog of the read model's durable terminal archive).
+    #[test]
+    fn compaction_archives_cold_prefix_and_prune_bounds_it() {
+        let dir = temp_dir("cold-archive-bounds");
+
+        let (mut journal, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+        let shared = Arc::clone(&recovery.shared);
+
+        // Generation 1: deploy + instance, snapshot, compact -> archived, not gone.
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (snap1, covered1) = journal.snapshot_and_rotate().expect("snapshot 1");
+        write_snapshot(&dir, snap1, covered1).expect("write snapshot 1");
+        assert_eq!(compact(&shared, covered1), 1, "sealed prefix compacted");
+        assert!(list_sealed(&dir).unwrap().is_empty(), "hot segment removed");
+
+        // The covered prefix survives in the cold store, spanning [0, covered1).
+        assert_eq!(
+            cold_archive_span(&dir).unwrap(),
+            Some((0, covered1)),
+            "compaction archived the covered prefix instead of deleting it"
+        );
+
+        // Generation 2: another instance, snapshot, compact -> a second cold gen.
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let (snap2, covered2) = journal.snapshot_and_rotate().expect("snapshot 2");
+        write_snapshot(&dir, snap2, covered2).expect("write snapshot 2");
+        assert_eq!(compact(&shared, covered2), 1);
+        assert!(covered2 > covered1);
+        assert_eq!(
+            cold_archive_span(&dir).unwrap(),
+            Some((0, covered2)),
+            "both generations are archived before pruning"
+        );
+
+        // After a fresh SAME-format snapshot at covered2, prune one generation
+        // back (to covered1): the first generation goes, the latest is retained —
+        // a bounded rolling window (~one generation of events).
+        let removed = prune_cold_archive(&dir, covered1);
+        assert_eq!(removed, 1, "the superseded generation is pruned");
+        assert_eq!(
+            cold_archive_span(&dir).unwrap(),
+            Some((covered1, covered2)),
+            "the cold store stays bounded to the latest generation"
+        );
+
+        drop(shared);
+        // Normal recovery is unaffected (the snapshot is in-format).
+        let (reopened, recovery) = crate::journal::Journal::open_segmented(&dir).expect("reopen");
+        assert!(!recovery.fresh);
+        assert_eq!(reopened.state().processes.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1076 regression: the multi-partition maintenance loop's cold-archive prune
+    /// floor must derive from the covered watermarks of the partitions THIS node
+    /// OWNS, not from a global-width vector padded with 0 for unowned partitions. A
+    /// clustered node owns only a subset of partitions, so a global `covered` has
+    /// 0-holes; the old `covered.iter().min()` pinned the floor at 0 forever and
+    /// `prune_cold_archive` never pruned — an unbounded cold archive.
+    #[test]
+    fn cold_prune_floor_uses_owned_partitions_only() {
+        // Clustered node owns partitions 0 and 2 of a 4-partition cluster and
+        // captured covered watermarks 30 and 50 this tick. The floor is 30 (min
+        // of OWNED), not 0.
+        assert_eq!(cold_prune_floor(&[30, 50]), 30);
+
+        // Regression witness: the OLD global-width form min([30, 0, 50, 0]) == 0,
+        // which is exactly the floor that never advanced (bug #1076).
+        assert_eq!([30u64, 0, 50, 0].iter().copied().min().unwrap(), 0);
+
+        // Single node owning every partition: identical to the global min.
+        assert_eq!(cold_prune_floor(&[42, 42, 42, 42]), 42);
+
+        // A tick that snapshotted nothing yields floor 0 (prune no-op).
+        assert_eq!(cold_prune_floor(&[]), 0);
+    }
+
+    /// L5 core regression for #1065 (`instance 41` rewind): a snapshot written in
+    /// an INCOMPATIBLE format is transparently migrated by REPLAYING the journal
+    /// (cold archive prefix + surviving hot tail) under the new code on the next
+    /// boot — engine state, definitions, AND the key high-water are preserved, so
+    /// a freshly created instance never collides with a pre-migration key.
+    #[test]
+    fn incompatible_snapshot_migrates_by_replay_preserving_key_high_water() {
+        let dir = temp_dir("migrate-replay");
+
+        let (key1, key2) = {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (e1, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+
+            // Snapshot + compact so key1's events live ONLY in the cold archive.
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1);
+            assert_eq!(cold_archive_span(&dir).unwrap(), Some((0, covered)));
+
+            // key2 lands in the surviving hot tail (after the cold prefix).
+            let (e2, commit) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key2 = e2.iter().find_map(|e| e.instance_key()).unwrap();
+            commit.blocking_wait();
+
+            // The persisted snapshot is now unreadable (incompatible version).
+            bump_snapshot_to_future(&dir, covered);
+            (key1, key2)
+        };
+
+        // Boot: the mismatch triggers replay-migration (cold prefix + hot tail).
+        let (mut reopened, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("migrating reopen");
+        assert!(!recovery.fresh);
+        assert!(
+            reopened.instance(key1).is_some(),
+            "the compacted (cold-archived) instance is rebuilt by replay"
+        );
+        assert!(
+            reopened.instance(key2).is_some(),
+            "the hot-tail instance is preserved across migration"
+        );
+        assert_eq!(reopened.state().processes.len(), 1, "definitions preserved");
+
+        // KEY HIGH-WATER: a new instance must advance PAST every pre-migration
+        // key — the exact #1065 `instance 41` rewind guard.
+        let (e3, _) = reopened
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let key3 = e3.iter().find_map(|e| e.instance_key()).unwrap();
+        use nanobpmn_engine_core::local_of;
+        assert!(
+            local_of(key3) > local_of(key2) && local_of(key3) > local_of(key1),
+            "post-migration key {key3} must not rewind onto a used key ({key1}, {key2})"
+        );
+
+        // A fresh in-format snapshot was written and is loadable again.
+        assert!(
+            load_latest_snapshot(&dir).expect("in-format now").is_some(),
+            "migration rewrote a loadable NEW-format snapshot"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1065 guard (no-snapshot variant): when the snapshot file is ABSENT but
+    /// compaction advanced the journal past 0, boot must reconstruct the full
+    /// history from the cold archive + surviving tail — NOT replay only the tail
+    /// and silently rewind everything below `first_index`.
+    #[test]
+    fn no_snapshot_over_compacted_journal_reconstructs_from_cold() {
+        let dir = temp_dir("no-snap-reconstruct");
+
+        let (key1, key2, covered) = {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (e1, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+
+            // Snapshot + compact so key1 lives ONLY in the cold archive.
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1);
+            assert_eq!(cold_archive_span(&dir).unwrap(), Some((0, covered)));
+
+            // key2 lands in the surviving hot tail (first_index == covered > 0).
+            let (e2, commit) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key2 = e2.iter().find_map(|e| e.instance_key()).unwrap();
+            commit.blocking_wait();
+
+            // The snapshot is GONE (lost/never-flushed) while the journal stayed
+            // compacted — the exact partial-loss shape that must not rewind.
+            fs::remove_file(snap_path(&dir, covered)).expect("remove snapshot");
+            assert!(load_latest_snapshot(&dir).expect("ok").is_none());
+            (key1, key2, covered)
+        };
+
+        let (mut reopened, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("reconstructing reopen");
+        assert!(!recovery.fresh);
+        assert!(
+            reopened.instance(key1).is_some(),
+            "the compacted (cold-archived) instance is rebuilt, not rewound"
+        );
+        assert!(
+            reopened.instance(key2).is_some(),
+            "the hot-tail instance is preserved"
+        );
+
+        // No key rewind: a fresh instance advances past every prior key.
+        let (e3, _) = reopened
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let key3 = e3.iter().find_map(|e| e.instance_key()).unwrap();
+        use nanobpmn_engine_core::local_of;
+        assert!(
+            local_of(key3) > local_of(key2) && local_of(key3) > local_of(key1),
+            "post-reconstruction key {key3} must not rewind onto ({key1}, {key2})"
+        );
+
+        // Reconstruction rewrote a fresh loadable snapshot covering the history.
+        assert!(
+            load_latest_snapshot(&dir).expect("in-format now").is_some(),
+            "reconstruction rewrote a loadable snapshot"
+        );
+        let _ = covered;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1066 fail-closed (no-snapshot variant): snapshot ABSENT, the cold prefix
+    /// pruned away, and the journal compacted past 0 — the history cannot be
+    /// reconstructed, so boot must FAIL rather than replay only the tail and
+    /// rewind.
+    #[test]
+    fn no_snapshot_over_pruned_journal_fails_closed() {
+        let dir = temp_dir("no-snap-gap");
+
+        {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1);
+
+            let (_e, commit) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            commit.blocking_wait();
+
+            // Prune the cold prefix AND drop the snapshot: [0, covered) is gone.
+            assert_eq!(prune_cold_archive(&dir, covered), 1);
+            assert_eq!(cold_archive_span(&dir).unwrap(), None);
+            fs::remove_file(snap_path(&dir, covered)).expect("remove snapshot");
+        }
+
+        match recover(&dir) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Ok(_) => panic!("must fail closed, never rewind"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L5 fail-closed guard: when the migration cannot reconstruct the full
+    /// history (the cold archive's covered prefix was pruned away, so it survives
+    /// only inside the unreadable snapshot), boot fails LOUD rather than replaying
+    /// a partial history and rewinding.
+    #[test]
+    fn migration_fails_closed_on_pruned_gap() {
+        let dir = temp_dir("migrate-gap");
+
+        let covered = {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1);
+
+            // A surviving hot-tail event so the tail starts ABOVE 0.
+            let (_e, commit) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            commit.blocking_wait();
+
+            // Prune the cold prefix away: [0, covered) now lives only in the
+            // (about-to-be-unreadable) snapshot — a genuine gap.
+            assert_eq!(prune_cold_archive(&dir, covered), 1);
+            assert_eq!(cold_archive_span(&dir).unwrap(), None);
+
+            bump_snapshot_to_future(&dir, covered);
+            covered
+        };
+
+        // Boot must FAIL (typed mismatch) rather than replay [covered, total) and
+        // rewind everything below `covered`.
+        let err = match recover(&dir) {
+            Err(e) => e,
+            Ok(_) => panic!("must fail closed, never rewind"),
+        };
+        assert!(
+            matches!(typed_err(&err), SnapshotLoadError::FormatMismatch { .. }),
+            "a pruned-gap migration fails closed with the typed snapshot error"
+        );
+        let _ = covered;
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L5 fail-closed guard: when the event journal itself is unreadable (an
+    /// unknown-variant frame — the #1070 discipline was violated) the migration
+    /// replay surfaces the typed decode error as a hard failure. Both snapshot AND
+    /// journal are unreadable, so boot fails loud rather than corrupting.
+    #[test]
+    fn migration_fails_closed_on_unreadable_event_frame() {
+        let dir = temp_dir("migrate-badframe");
+
+        let covered = {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1);
+            assert_eq!(cold_archive_span(&dir).unwrap(), Some((0, covered)));
+            covered
+        };
+
+        // Corrupt the cold archive's contents to an unknown event variant while
+        // keeping its [0, covered) range name (so the contiguity check passes and
+        // the replay is attempted, then hits the undecodable frame).
+        let (_, _, cold_path) = list_cold(&dir).unwrap().into_iter().next().unwrap();
+        let bad = deflate_all(b"{\"NosuchEvent\":{}}\n").unwrap();
+        fs::write(&cold_path, &bad).unwrap();
+
+        bump_snapshot_to_future(&dir, covered);
+
+        // Migration replay hits the unknown-variant frame -> hard error (never a
+        // silent partial rebuild).
+        let err = match recover(&dir) {
+            Err(e) => e,
+            Ok(_) => panic!("unreadable frame must fail closed"),
+        };
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "the undecodable event frame surfaces as a fatal error"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L5 fail-closed guard: a cold-archive file whose decoded record count does
+    /// not match its named `[start, end)` range (a truncated / mis-sized frame) is
+    /// a hard failure — `cold_archive_span` alone could not distinguish it from a
+    /// sound prefix, so the migrator's per-file count validation is what refuses
+    /// to reconstruct from a silently-short history.
+    #[test]
+    fn migration_fails_closed_on_mis_sized_cold_file() {
+        let dir = temp_dir("migrate-shortcold");
+
+        let covered = {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1);
+            // A real, multi-record archived prefix.
+            assert!(
+                covered > 1,
+                "need >1 event to drop some and still stay valid"
+            );
+            covered
+        };
+
+        // Rewrite the cold file with only its FIRST (valid) record while keeping
+        // its [0, covered) name: every line still DECODES, but the count is short.
+        let (_, _, cold_path) = list_cold(&dir).unwrap().into_iter().next().unwrap();
+        let full = inflate_all(&fs::read(&cold_path).unwrap()).unwrap();
+        let first_line_end = full.iter().position(|&b| b == b'\n').unwrap() + 1;
+        let short = deflate_all(&full[..first_line_end]).unwrap();
+        fs::write(&cold_path, &short).unwrap();
+
+        bump_snapshot_to_future(&dir, covered);
+
+        // The count mismatch is fatal — never a silent short replay / rewind.
+        let err = match recover(&dir) {
+            Err(e) => e,
+            Ok(_) => panic!("mis-sized cold file must fail closed"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L5 multi-partition path: an incompatible COMBINED snapshot is migrated by
+    /// replaying every owned partition's full tagged history (cold archive +
+    /// surviving tail), demuxed by write tag — engine state and per-partition key
+    /// high-water preserved across `compact_multi` + `recover_multi`.
+    #[test]
+    fn incompatible_multi_snapshot_migrates_by_replay() {
+        let dir = temp_dir("migrate-multi");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+
+        let (key0, key1, covered0, covered1) = {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
+            let seg = Arc::clone(&recovery.shared);
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+
+            let (e0, _) = j0.apply_command(Command::create_instance("demo")).unwrap();
+            let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
+            let (e1, c1) = j1.apply_command(Command::create_instance("demo")).unwrap();
+            let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+            c1.blocking_wait();
+
+            let (snap0, covered0) = j0.snapshot_and_rotate().expect("snapshot p0");
+            let (snap1, covered1) = j1.snapshot_and_rotate().expect("snapshot p1");
+            write_multi_snapshot(&dir, vec![(0, covered0, snap0), (1, covered1, snap1)])
+                .expect("write combined snapshot");
+
+            // Compact: the sealed prefix is archived (not deleted) for every
+            // partition, then removed from hot storage.
+            let covered = [covered0, covered1];
+            assert_eq!(compact_multi(&seg, &covered, &[u64::MAX; 2]), 1);
+            assert!(seg.sealed.lock().unwrap().is_empty());
+            assert!(
+                cold_archive_span(&dir).unwrap().is_some(),
+                "compact_multi archived the covered prefix"
+            );
+
+            // The combined snapshot is now unreadable at its format version.
+            bump_snapshot_header_to_future(&dir.join(MULTI_SNAP_NAME));
+            (key0, key1, covered0, covered1)
+        };
+        let _ = (covered0, covered1);
+
+        // Boot: replay-migrate every owned partition from the cold archive.
+        let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("migrating reopen multi");
+        assert!(!recovery.fresh);
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        assert!(
+            engines[&0].instance(key0).is_some(),
+            "partition 0 rebuilt by replay across migration"
+        );
+        assert!(
+            engines[&1].instance(key1).is_some(),
+            "partition 1 rebuilt by replay across migration"
+        );
+        assert_eq!(engines[&0].state().processes.len(), 1, "definitions kept");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1065 guard (multi, no-snapshot variant): the combined snapshot is ABSENT
+    /// but compaction advanced the journal past 0 — `recover_multi` must rebuild
+    /// every owned partition from the cold archive + surviving tail rather than
+    /// replaying only each tail and silently rewinding.
+    #[test]
+    fn no_multi_snapshot_over_compacted_journal_reconstructs_from_cold() {
+        let dir = temp_dir("no-msnap-reconstruct");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+
+        let (key0, key1) = {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
+            let seg = Arc::clone(&recovery.shared);
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+
+            let (e0, _) = j0.apply_command(Command::create_instance("demo")).unwrap();
+            let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
+            let (e1, c1) = j1.apply_command(Command::create_instance("demo")).unwrap();
+            let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+            c1.blocking_wait();
+
+            let (snap0, covered0) = j0.snapshot_and_rotate().expect("snapshot p0");
+            let (snap1, covered1) = j1.snapshot_and_rotate().expect("snapshot p1");
+            write_multi_snapshot(&dir, vec![(0, covered0, snap0), (1, covered1, snap1)])
+                .expect("write combined snapshot");
+
+            let covered = [covered0, covered1];
+            assert_eq!(compact_multi(&seg, &covered, &[u64::MAX; 2]), 1);
+            assert!(
+                cold_archive_span(&dir).unwrap().is_some(),
+                "compact_multi archived the covered prefix"
+            );
+
+            // The combined snapshot is GONE while the journal stayed compacted.
+            fs::remove_file(dir.join(MULTI_SNAP_NAME)).expect("remove combined snapshot");
+            assert!(load_multi_snapshot(&dir).expect("ok").is_none());
+            (key0, key1)
+        };
+
+        let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("reconstructing reopen multi");
+        assert!(!recovery.fresh);
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        assert!(
+            engines[&0].instance(key0).is_some(),
+            "partition 0 rebuilt from the cold archive, not rewound"
+        );
+        assert!(
+            engines[&1].instance(key1).is_some(),
+            "partition 1 rebuilt from the cold archive, not rewound"
+        );
+        assert_eq!(engines[&0].state().processes.len(), 1, "definitions kept");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The tagged cold reader fails closed on a corrupt (non-numeric) write tag
+    /// rather than silently treating the line as untagged and misrouting the
+    /// event to its key partition — the cold archive is authoritative and never
+    /// torn, so a malformed tag is fatal, not a fallback.
+    #[test]
+    fn parse_cold_file_tagged_rejects_non_numeric_tag() {
+        let dir = temp_dir("cold-bad-tag");
+        fs::create_dir_all(&dir).unwrap();
+        let path = cold_name(&dir, 0, 1);
+        let plaintext = b"xx\t{\"DeploymentCreated\":{\"deployment_key\":1}}\n".to_vec();
+        fs::write(&path, deflate_all(&plaintext).unwrap()).unwrap();
+
+        let err = parse_cold_file_tagged(&path, 2)
+            .expect_err("a non-numeric write tag must be rejected, not defaulted");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Legacy headerless snapshots (bare `serde_json`, no envelope) still load,
+    /// are treated as `format_version = 0`, and keep `covered_events` as the 2nd
+    /// tuple element.
+    #[test]
+    fn legacy_headerless_snapshot_still_loads() {
+        let dir = temp_dir("envelope-legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let covered = 9;
+        // Exactly the OLD on-disk format: bare compact JSON, no header line.
+        let payload = PersistedSnapshot {
+            covered_events: covered,
+            engine: demo_snapshot(),
+        };
+        fs::write(
+            snap_path(&dir, covered),
+            serde_json::to_vec(&payload).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            peek_snapshot_format_version(&snap_path(&dir, covered)).unwrap(),
+            Some(0),
+            "headerless legacy file reads as format_version 0"
+        );
+        let (loaded, loaded_covered) = load_latest_snapshot(&dir)
+            .expect("legacy load ok")
+            .expect("present");
+        assert_eq!(loaded_covered, covered);
+        assert_eq!(loaded.state.processes.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The incarnation id is generated once per data dir and stays stable across
+    /// successive snapshot writes (so a consumer can detect a reset/restore by a
+    /// CHANGE in it).
+    #[test]
+    fn incarnation_is_stable_across_writes() {
+        let dir = temp_dir("envelope-incarnation");
+        fs::create_dir_all(&dir).unwrap();
+        write_snapshot(&dir, demo_snapshot(), 1).unwrap();
+        let first = parse_envelope(&fs::read(snap_path(&dir, 1)).unwrap())
+            .unwrap()
+            .0
+            .incarnation;
+        write_snapshot(&dir, demo_snapshot(), 2).unwrap();
+        let second = parse_envelope(&fs::read(snap_path(&dir, 2)).unwrap())
+            .unwrap()
+            .0
+            .incarnation;
+        assert_eq!(first, second, "incarnation is stable for one data dir");
+        assert_ne!(first, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt/zero incarnation file must NOT be silently regenerated (which
+    /// would spuriously mutate the durable identity and surface a false
+    /// reset/restore to nano-workforce#622). It fails closed as `InvalidData`,
+    /// leaving the on-disk file untouched. Only a genuinely *missing* file seeds
+    /// a fresh incarnation.
+    #[test]
+    fn corrupt_incarnation_file_is_rejected_not_regenerated() {
+        let dir = temp_dir("incarnation-corrupt");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Non-numeric contents -> InvalidData, file left untouched.
+        fs::write(dir.join(INCARNATION_NAME), b"not-a-number").unwrap();
+        let err = read_or_init_incarnation(&dir).expect_err("non-numeric rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read_to_string(dir.join(INCARNATION_NAME)).unwrap(),
+            "not-a-number",
+            "corrupt file must not be overwritten"
+        );
+
+        // Reserved zero -> InvalidData.
+        fs::write(dir.join(INCARNATION_NAME), b"0").unwrap();
+        let err = read_or_init_incarnation(&dir).expect_err("zero rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // Genuinely missing -> seeds a fresh non-zero incarnation.
+        fs::remove_file(dir.join(INCARNATION_NAME)).unwrap();
+        let v = read_or_init_incarnation(&dir).expect("missing file seeds fresh id");
+        assert_ne!(v, 0);
+        // And is now stable.
+        assert_eq!(read_or_init_incarnation(&dir).unwrap(), v);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The multi-partition combined snapshot round-trips through the same
+    /// envelope, and a future header version is likewise a fatal mismatch.
+    #[test]
+    fn multi_envelope_round_trips_and_rejects_future_version() {
+        let dir = temp_dir("envelope-multi");
+        fs::create_dir_all(&dir).unwrap();
+        write_multi_snapshot(&dir, vec![(0, 4, demo_snapshot()), (1, 6, demo_snapshot())])
+            .expect("write multi");
+
+        let map = load_multi_snapshot(&dir)
+            .expect("load ok")
+            .expect("present");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&0).unwrap().0, 4);
+        assert_eq!(map.get(&1).unwrap().0, 6);
+        assert_eq!(
+            peek_snapshot_format_version(&dir.join(MULTI_SNAP_NAME)).unwrap(),
+            Some(SNAPSHOT_FORMAT_VERSION)
+        );
+
+        // Overwrite with a future-version header + valid payload.
+        let header = SnapshotHeader {
+            format_version: SNAPSHOT_FORMAT_VERSION + 1,
+            incarnation: 1,
+            engine_fingerprint: "future".into(),
+        };
+        let payload = MultiPersistedSnapshot {
+            entries: vec![MultiSnapshotEntry {
+                partition: 0,
+                covered: 4,
+                engine: demo_snapshot(),
+            }],
+        };
+        let mut file = serde_json::to_vec(&header).unwrap();
+        file.push(b'\n');
+        file.extend_from_slice(&serde_json::to_vec(&payload).unwrap());
+        fs::write(dir.join(MULTI_SNAP_NAME), &file).unwrap();
+
+        let err = load_multi_snapshot(&dir).expect_err("mismatch is fatal");
+        assert!(matches!(
+            typed_err(&err),
+            SnapshotLoadError::FormatMismatch { .. }
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A legacy headerless combined snapshot still loads as `format_version = 0`.
+    #[test]
+    fn legacy_headerless_multi_snapshot_still_loads() {
+        let dir = temp_dir("envelope-multi-legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let payload = MultiPersistedSnapshot {
+            entries: vec![MultiSnapshotEntry {
+                partition: 2,
+                covered: 8,
+                engine: demo_snapshot(),
+            }],
+        };
+        fs::write(
+            dir.join(MULTI_SNAP_NAME),
+            serde_json::to_vec(&payload).unwrap(),
+        )
+        .unwrap();
+
+        let map = load_multi_snapshot(&dir)
+            .expect("legacy multi load ok")
+            .expect("present");
+        assert_eq!(map.get(&2).unwrap().0, 8);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A journal whose records all name known variants replays cleanly through
+    /// the typed decode path (regression floor for the tests below).
+    #[test]
+    fn read_segment_events_decodes_a_valid_plaintext_journal() {
+        let dir = temp_dir("valid-journal");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seg.jsonl");
+        fs::write(
+            &path,
+            "{\"DeploymentCreated\":{\"deployment_key\":1}}\n\
+             {\"ProcessInstanceCompleted\":{\"instance_key\":2}}\n",
+        )
+        .unwrap();
+
+        let events = read_segment_events(&path).expect("valid journal reads");
+        assert_eq!(events.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An unknown/removed event variant in a journal must surface as the typed,
+    /// downcastable [`EventDecodeError::UnknownVariant`] on read — NOT a silent
+    /// skip and NOT an anonymous error — so #1071's replay-migrator (or the
+    /// fail-closed path, #1066) can branch on it. This is the storage-boundary
+    /// half of L4 (#1070); the engine-core `golden_replay` tests cover the
+    /// decoder itself.
+    ///
+    /// Critically, the unknown record is placed as the **last** content line to
+    /// prove it is fatal even where a genuinely torn (truncated) tail would be
+    /// tolerated: a complete, well-formed unknown frame is never a torn write.
+    #[test]
+    fn read_segment_events_rejects_unknown_variant_as_typed_error() {
+        let dir = temp_dir("unknown-variant");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seg.jsonl");
+        fs::write(
+            &path,
+            "{\"DeploymentCreated\":{\"deployment_key\":1}}\n\
+             {\"NoSuchEventFromTheFuture\":{\"instance_key\":9}}\n",
+        )
+        .unwrap();
+
+        let err = read_segment_events(&path).expect_err("unknown variant must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let decode_err = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<EventDecodeError>())
+            .expect("error downcasts to the typed EventDecodeError");
+        match decode_err {
+            EventDecodeError::UnknownVariant { variant, .. } => {
+                assert_eq!(variant, "NoSuchEventFromTheFuture")
+            }
+            other => panic!("expected UnknownVariant, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The tagged multi-partition reader applies the same discipline: an unknown
+    /// variant (here on a `<partition>\t<json>` line) is a typed rejection, not a
+    /// dropped record.
+    #[test]
+    fn read_segment_events_tagged_rejects_unknown_variant() {
+        let dir = temp_dir("unknown-variant-tagged");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seg.jsonl");
+        fs::write(
+            &path,
+            "0\t{\"DeploymentCreated\":{\"deployment_key\":1}}\n\
+             0\t{\"RetiredLegacyEvent\":{\"instance_key\":9}}\n",
+        )
+        .unwrap();
+
+        let err =
+            read_segment_events_tagged(&path, 1).expect_err("unknown variant must be rejected");
+        let decode_err = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<EventDecodeError>())
+            .expect("error downcasts to EventDecodeError");
+        assert!(matches!(
+            decode_err,
+            EventDecodeError::UnknownVariant { .. }
+        ));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

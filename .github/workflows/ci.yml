@@ -213,16 +213,27 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Clippy
         working-directory: engine-core
-        run: cargo clippy --all-targets -- -D warnings
+        # `--features serde` is REQUIRED, not optional: the snapshot/event serde
+        # derives (`cfg_attr(feature = "serde", ...)`) — and therefore the
+        # `golden_serde_drift` CI drift guard (#1069) that fingerprints them — only
+        # exist under this feature. Without it the guard test compiles to nothing
+        # and silently passes, letting an incompatible on-disk format ship
+        # unnoticed (incident #1065). Linting `--all-targets --features serde` also
+        # keeps the guard test itself under `-D warnings`. Downstream tasks
+        # (#1070/#1071) reuse this job; they do not re-add the flag.
+        run: cargo clippy --all-targets --features serde -- -D warnings
       - name: Test
         working-directory: engine-core
         # nextest for the unit/integration suite (process isolation,
         # consistent with the server job). nextest CANNOT run doctests, so the
         # crate's `///` examples (ProcessBuilder, parse_bpmn) run separately.
-        run: cargo nextest run
+        # `--features serde` runs the snapshot/event drift guard (#1069) and the
+        # serde-gated snapshot round-trip tests; see the Clippy step above for why
+        # it must not be dropped.
+        run: cargo nextest run --features serde
       - name: Doctests
         working-directory: engine-core
-        run: cargo test --doc
+        run: cargo test --doc --features serde
 
   engine-wasm-ffi-dist:
     name: engine-wasm-ffi (dist + verify)
