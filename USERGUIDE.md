@@ -22,6 +22,38 @@ the **[c8ctl](https://github.com/camunda/c8ctl)** CLI with the
 plugin ships a prebuilt Nano binary for your platform and installs it for you, so
 there is nothing to compile.
 
+### The one-liner (recommended)
+
+The fastest way to go from zero to a running **Nano Workforce** — the engine, a
+supervised workforce of hired coding agents, and the Workforce app — is the
+one-command installer:
+
+```bash
+curl -fsSL https://nanobpm.io/install.sh | sh
+```
+
+It installs the Camunda 8 CLI and the `c8ctl-plugin-nano` plugin, lets you pick
+which of your installed coding harnesses to hire (and with which model and how
+many instances), composes a workforce manifest from those choices, brings the
+engine and workforce up, then installs and runs the Workforce app. It installs
+only into your user account and never runs `sudo` on your behalf.
+
+Prefer to read the script before running it? Download, inspect, then run:
+
+```bash
+curl -fsSL https://nanobpm.io/install.sh -o install.sh
+less install.sh
+sh install.sh
+```
+
+`https://nanobpm.io/install.sh` always mirrors the script on `main` in the
+[nano-workforce](https://github.com/nanobpm/nano-workforce/blob/main/install.sh)
+repository — the single source of truth.
+
+The rest of this section sets up **just the engine**, by hand. Use it when you
+want a single node or a cluster without the workforce, or to understand exactly
+what the installer automates for you.
+
 ### Prerequisites
 
 Install these tools before you start.

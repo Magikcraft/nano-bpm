@@ -332,11 +332,21 @@ function homeHtml() {
     <a class="btn primary" href="#try">See it live ↓</a>
     <a class="btn ghost" href="/demo/">Open the browser demo →</a>
   </div>
-  <div class="install multi" aria-label="Install and start Nano">
-    <code>npm i -g @camunda8/cli</code>
-    <code>c8ctl load plugin c8ctl-plugin-nano</code>
-    <code>c8ctl nano start</code>
+  <div class="install multi" aria-label="Install a Nano Workforce">
+    <code>curl -fsSL https://nanobpm.io/install.sh | sh</code>
   </div>
+  <p class="install-note">One command: installs the CLI, hires your coding agents,
+  and brings up a Nano engine, a workforce, and the app.</p>
+  <details class="install-manual">
+    <summary>Or set it up by hand</summary>
+    <div class="install multi" aria-label="Install and start the Nano engine by hand">
+      <code>npm i -g @camunda8/cli</code>
+      <code>c8ctl load plugin c8ctl-plugin-nano</code>
+      <code>c8ctl nano start</code>
+    </div>
+    <p class="install-note">Just the engine. See the full manual sequence in
+    <a href="/docs/get-started-with-c8ctl">Get started with c8ctl →</a></p>
+  </details>
 </section>
 
 <section id="try" class="demo-tabs wrap">
@@ -454,12 +464,12 @@ ${compareHtml()}
   <div class="wrap">
     <h2>RAAD.<br><span class="grad">Rapid Agent Application Development.</span></h2>
     <p class="raad-sub">An Advanced Research Prototype for agent graph orchestration on the developer
-    workstation. Start in three lines.</p>
+    workstation. Start in one line.</p>
     <div class="install multi center" aria-label="Get started">
-      <code>npm i -g @camunda8/cli</code>
-      <code>c8ctl load plugin c8ctl-plugin-nano</code>
-      <code>c8ctl nano start</code>
+      <code>curl -fsSL https://nanobpm.io/install.sh | sh</code>
     </div>
+    <p class="install-note center">Prefer to do it by hand?
+    <a href="/docs/get-started-with-c8ctl">Manual setup →</a></p>
     <div class="cta">
       <a class="btn primary" href="/demo/">Try it in your browser →</a>
     </div>
@@ -1543,6 +1553,11 @@ function homePage(title, body) {
   .install.multi { display: flex; flex-direction: column; gap: .5rem; align-items: flex-start; max-width: max-content; margin-inline: auto; }
   .install.multi.center { align-items: center; }
   .install.multi code { text-align: left; }
+  .install-note { margin: .6rem auto 0; color: var(--muted); font-size: .9rem; max-width: 52ch; }
+  .install-note.center { text-align: center; }
+  .install-manual { margin: .9rem auto 0; max-width: max-content; }
+  .install-manual > summary { cursor: pointer; color: var(--muted); font-size: .9rem; list-style: revert; }
+  .install-manual[open] > summary { margin-bottom: .6rem; }
 
   .arp {
     display: inline-block; border: 1px solid rgba(56,189,248,.4); border-radius: 999px;
