@@ -273,7 +273,14 @@ jobs:
         if: matrix.zig
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild
+          # Pinned to the last release validated against the pinned zig 0.13.0
+          # (cargo-zigbuild #256 "Test Zig 0.13.0"). Installing unpinned pulled
+          # 0.23.3, whose zig-0.14+ `-mcpu` feature string
+          # (`generic+v7a+vfp3-d32+thumb2-neon`) zig 0.13.0 rejects
+          # ("unsupported argument to option '-mcpu='"), breaking the 32-bit ARM
+          # (armv6/armv7) jemalloc-sys C build. Bump this and `setup-zig` above
+          # together so the pair stays compatible.
+          tool: cargo-zigbuild@0.19.8
 
       - name: Build gateway (release, zig cross-compile, glibc floor)
         if: matrix.zig
