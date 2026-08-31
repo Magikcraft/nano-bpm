@@ -10077,7 +10077,7 @@ impl Engine {
     ///   instance while its sibling call-activity children are still live and
     ///   must be terminated here.
     fn cascade_cancel_children(&mut self, log: &mut Vec<Event>) {
-        let mut terminated: HashSet<Key> = log
+        let mut ended: HashSet<Key> = log
             .iter()
             .filter_map(|e| match e {
                 Event::ProcessInstanceTerminated { instance_key }
@@ -10085,7 +10085,7 @@ impl Engine {
                 _ => None,
             })
             .collect();
-        if terminated.is_empty() {
+        if ended.is_empty() {
             return;
         }
         loop {
@@ -10105,7 +10105,7 @@ impl Engine {
                         ProcessInstanceState::Active | ProcessInstanceState::Terminating
                     ) && i
                         .parent_process_instance_key
-                        .map(|p| terminated.contains(&p))
+                        .map(|p| ended.contains(&p))
                         .unwrap_or(false)
                 })
                 .map(|i| i.key)
@@ -10116,7 +10116,7 @@ impl Engine {
             children.sort_unstable();
             for child in children {
                 self.discard_and_terminate_instance(log, child);
-                terminated.insert(child);
+                ended.insert(child);
             }
         }
     }
@@ -10268,11 +10268,20 @@ impl Engine {
     /// guard then leaves the cancelled job terminal. Returns the events (does not
     /// emit) so it composes inside a decide-only `process_step` result.
     fn resolve_instance_incidents(&self, instance_key: Key) -> Vec<Event> {
-        let mut incidents: Vec<&state::Incident> = self
-            .state
+        // Use the instance's own `incidents` index (keys of its currently active
+        // incidents) rather than scanning the global `state.incidents` map — that
+        // scan is O(total incidents) and grows with unrelated concurrent
+        // instances. The index is kept to only open incidents by the reducer, so
+        // the `Active` filter below is belt-and-braces; the sort keeps the
+        // `IncidentResolved` order deterministic regardless of index order.
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return Vec::new();
+        };
+        let mut incidents: Vec<&state::Incident> = instance
             .incidents
-            .values()
-            .filter(|i| i.instance_key == instance_key && i.state == state::IncidentState::Active)
+            .iter()
+            .filter_map(|k| self.state.incidents.get(k))
+            .filter(|i| i.state == state::IncidentState::Active)
             .collect();
         incidents.sort_unstable_by_key(|i| i.key);
         incidents
