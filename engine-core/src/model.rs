@@ -428,6 +428,16 @@ pub struct UserTaskProps {
     pub external_form_reference: Option<String>,
 }
 
+/// serde default for the `CallActivity` propagation flags: `true`, matching the
+/// Zeebe default and the BPMN parser's default for an absent
+/// `propagateAll{Parent,Child}Variables` attribute. Used so a pre-#1057 snapshot
+/// (whose `CallActivity` predates these fields) deserializes with the same
+/// semantics a fresh redeploy would produce.
+#[cfg(feature = "serde")]
+fn default_propagate() -> bool {
+    true
+}
+
 /// The kind of a BPMN flow node.
 ///
 /// The set is intentionally small. New element types plug in here and gain
@@ -686,6 +696,14 @@ pub enum ElementKind {
         /// variables visible in the call activity's scope are copied into the
         /// child instance at spawn; when `false`, only the call activity's local
         /// variables — the results of its input mappings — cross the boundary.
+        ///
+        /// Defaults to `true` when absent from a persisted snapshot: this field
+        /// was added after the CallActivity variant first shipped (#1057), so a
+        /// pre-#1057 snapshot lacks it. Deserializing to `true` matches both the
+        /// Zeebe default and what a fresh redeploy of the same BPMN produces
+        /// (the parser defaults the absent attribute to `true`), keeping the
+        /// change additive-safe for migration-by-replay.
+        #[cfg_attr(feature = "serde", serde(default = "default_propagate"))]
         propagate_all_parent_variables: bool,
         /// Zeebe `propagateAllChildVariables` (`zeebe:calledElement`). When
         /// `true` (the Zeebe default when the attribute is absent), the child's
@@ -693,6 +711,10 @@ pub enum ElementKind {
         /// (the child's value wins on a name collision); when `false`, only the
         /// call activity's output mappings cross back (nothing crosses if there
         /// are none).
+        ///
+        /// Defaults to `true` when absent from a persisted snapshot — same
+        /// forward-compat rationale as `propagate_all_parent_variables`.
+        #[cfg_attr(feature = "serde", serde(default = "default_propagate"))]
         propagate_all_child_variables: bool,
     },
     /// A signal intermediate catch event. On activation it opens a signal
