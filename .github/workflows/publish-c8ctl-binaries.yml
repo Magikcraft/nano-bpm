@@ -275,10 +275,10 @@ jobs:
         with:
           # Pinned to 0.20.1 — the version compatible with the pinned zig 0.13.0
           # across ALL our targets. This pairing is narrow:
-          #   * unpinned/latest 0.23.3 regressed 32-bit ARM (armv6/armv7): its
-          #     jemalloc-sys C build fails with `aeabi_unaligned.c: FileNotFound`
-          #     and a zig-0.14+ `-mcpu` string (`generic+v7a+vfp3-d32+thumb2-neon`)
-          #     that zig 0.13.0 rejects.
+          #   * unpinned installs pulled 0.23.3, which regressed 32-bit ARM
+          #     (armv6/armv7): its jemalloc-sys C build fails with
+          #     `aeabi_unaligned.c: FileNotFound` and a zig-0.14+ `-mcpu` string
+          #     (`generic+v7a+vfp3-d32+thumb2-neon`) that zig 0.13.0 rejects.
           #   * 0.19.8 fixes 32-bit ARM but fails the aarch64 link with
           #     `unsupported linker arg: --fix-cortex-a53-843419` (that arg is only
           #     filtered from 0.20.0 onward).
