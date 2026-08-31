@@ -2974,13 +2974,17 @@ fn should_run_parallel_split_and_join() {
 }
 
 #[test]
-fn terminate_end_kills_sibling_branch_and_terminates_the_instance() {
+fn terminate_end_kills_sibling_branch_and_completes_the_instance() {
     // s -> split =< work (service task), trigger (service task) -> stop (terminate end) >
     //
     // A parallel split forks two branches: `work` parks on a job while
     // `trigger` reaches a terminate end. Completing `trigger` must kill the
-    // still-active `work` token (cancelling its job) and terminate the whole
-    // top-level instance — not degrade to a plain end that leaves `work` running.
+    // still-active `work` token (cancelling its job) and COMPLETE the whole
+    // top-level instance — Zeebe parity (#1085): the terminate end kills every
+    // inner token, but the process instance's own terminal record is
+    // `ProcessInstanceCompleted` (`PROCESS -> ELEMENT_COMPLETED`), not
+    // `ProcessInstanceTerminated`. It must still not degrade to a plain end that
+    // leaves `work` running.
     let def = ProcessBuilder::new("term")
         .start_event("s")
         .parallel_gateway("split")
@@ -3010,19 +3014,23 @@ fn terminate_end_kills_sibling_branch_and_terminates_the_instance() {
     let events = complete_one(&mut engine, "trigger-job");
 
     // The terminate end kills the sibling `work` token (its job cancelled) and
-    // terminates the whole instance.
+    // completes the whole instance — the instance's terminal record is
+    // COMPLETED (Zeebe parity), not TERMINATED.
     assert!(events.contains(&Event::JobCanceled {
         job_key: work_job,
         instance_key,
     }));
-    assert!(events.contains(&Event::ProcessInstanceTerminated { instance_key }));
+    assert!(events.contains(&Event::ProcessInstanceCompleted { instance_key }));
     assert!(!events
         .iter()
-        .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
+        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+    assert!(engine.is_completed(instance_key));
     assert_eq!(
         engine.instance(instance_key).unwrap().state,
-        crate::state::ProcessInstanceState::Terminated
+        crate::state::ProcessInstanceState::Completed
     );
+    // No token survives: the instance holds no active elements after completion.
+    assert!(engine.instance(instance_key).unwrap().active.is_empty());
     // The cancelled sibling job can no longer be completed.
     let err = engine
         .apply_command(Command::complete_job(work_job))
@@ -3205,9 +3213,12 @@ fn subprocess_terminate_end_terminates_a_call_activity_child_in_its_scope() {
 #[test]
 fn top_level_terminate_end_in_a_called_process_completes_the_parent_call_activity() {
     // A terminate end in a CALLED process ends only that child instance (Zeebe/
-    // BPMN: terminate never propagates out of its own process). The parent's call
-    // activity then completes normally and the parent continues on its outgoing
-    // flow — the parent must not be left parked forever, nor terminated.
+    // BPMN: terminate never propagates out of its own process). The child is the
+    // root scope of its own instance, so a top-level terminate end COMPLETES it
+    // (#1085 — `PROCESS -> ELEMENT_COMPLETED`, only inner tokens TERMINATED). The
+    // parent's call activity then completes normally and the parent continues on
+    // its outgoing flow — the parent must not be left parked forever, nor
+    // terminated.
     //
     //  phase (called): ps -> psplit =< work(svc), trg(svc) -> stop(terminate) >
     //  orch:           start -> c1(call "phase") -> end
@@ -3251,12 +3262,17 @@ fn top_level_terminate_end_in_a_called_process_completes_the_parent_call_activit
     // terminate end of the called process.
     let events = complete_one(&mut engine, "trg-job");
 
-    // The child terminates (its sibling work token cancelled)...
+    // The child completes (its sibling work token cancelled), and its terminal
+    // record is COMPLETED, not TERMINATED (#1085)...
     assert!(events.iter().any(|e| matches!(
+        e,
+        Event::ProcessInstanceCompleted { instance_key: ik } if *ik == child_key
+    )));
+    assert!(!events.iter().any(|e| matches!(
         e,
         Event::ProcessInstanceTerminated { instance_key: ik } if *ik == child_key
     )));
-    // ...but the terminate does NOT propagate to the parent: the call activity
+    // ...and the terminate does NOT propagate to the parent: the call activity
     // completes and the parent runs to ordinary completion.
     assert!(!events.iter().any(|e| matches!(
         e,
@@ -3267,9 +3283,10 @@ fn top_level_terminate_end_in_a_called_process_completes_the_parent_call_activit
         Event::SequenceFlowTaken { from, to, .. } if from == "c1" && to == "end"
     )));
     assert!(engine.is_completed(parent_key));
+    assert!(engine.is_completed(child_key));
     assert_eq!(
         engine.instance(child_key).unwrap().state,
-        crate::state::ProcessInstanceState::Terminated
+        crate::state::ProcessInstanceState::Completed
     );
 }
 
@@ -3913,7 +3930,7 @@ fn terminate_clears_open_parallel_join_bookkeeping() {
     let instance = engine.instance(key).unwrap();
     assert_eq!(
         instance.state,
-        crate::state::ProcessInstanceState::Terminated
+        crate::state::ProcessInstanceState::Completed
     );
     assert!(
         instance.join_counts.is_empty() && instance.join_instances.is_empty(),
@@ -3923,9 +3940,10 @@ fn terminate_clears_open_parallel_join_bookkeeping() {
 
 #[test]
 fn top_level_terminate_end_clears_a_multi_instance_body() {
-    // A top-level terminate ends the whole instance; its `ProcessInstanceTerminated`
-    // reducer must also drop the multi-instance runtime record, or a large in-flight
-    // loop keeps its item/output payload on the terminal instance until eviction.
+    // A top-level terminate ends the whole instance as COMPLETED (#1085); its
+    // `ProcessInstanceCompleted` reducer must also drop the multi-instance runtime
+    // record, or a large in-flight loop keeps its item/output payload on the
+    // terminal instance until eviction.
     //
     //  start -> split =< each(MI svc "handle") -> each_end,
     //                    trigger(svc) -> stop(terminate) >
@@ -3969,7 +3987,7 @@ fn top_level_terminate_end_clears_a_multi_instance_body() {
     let events = complete_one(&mut engine, "trigger-job");
     assert!(events
         .iter()
-        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+        .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
     assert!(
         engine.instance(key).unwrap().multi_instances.is_empty(),
         "terminal teardown must clear the multi-instance runtime record"
@@ -3979,7 +3997,7 @@ fn top_level_terminate_end_clears_a_multi_instance_body() {
 #[test]
 fn top_level_terminate_end_clears_an_adhoc_container() {
     // The ad-hoc analogue of the multi-instance case: a top-level terminate must
-    // drop the ad-hoc container runtime record on the terminal transition.
+    // drop the ad-hoc container runtime record on the terminal (COMPLETED) transition.
     //
     //  s -> split =< agent(adhoc, resting) , trigger(svc) -> stop(terminate) >
     let xml = r#"
@@ -4026,11 +4044,76 @@ fn top_level_terminate_end_clears_an_adhoc_container() {
     let events = complete_one(&mut engine, "trigger-job");
     assert!(events
         .iter()
-        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+        .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
     assert!(
         engine.instance(key).unwrap().adhoc_instances.is_empty(),
         "terminal teardown must clear the ad-hoc container runtime record"
     );
+}
+
+#[test]
+fn top_level_terminate_end_resolves_a_root_scope_incident_and_completes() {
+    // #1085: a top-level terminate end completes the instance (COMPLETED, not
+    // TERMINATED). Its `ProcessInstanceCompleted` reducer deliberately does NOT
+    // close incidents (a normal completion may retain one), so the terminate end
+    // must resolve any incident open on the instance itself — otherwise the
+    // dead, completed instance keeps a stale `hasIncident`. The cancelled job's
+    // incident resolution must also not resurrect the job.
+    //
+    //  start -> split =< work(svc, failed w/ incident), trigger(svc) -> stop(terminate) >
+    let proc = ProcessBuilder::new("term-incident")
+        .start_event("start")
+        .parallel_gateway("split")
+        .service_task("work", "work-job")
+        .service_task("trigger", "trigger-job")
+        .terminate_end_event("stop")
+        .connect("start", "split")
+        .connect("split", "work")
+        .connect("split", "trigger")
+        .connect("trigger", "stop")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(proc)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term-incident"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Fail the work job with no retries to park an incident on its element.
+    let work_job = engine.activate_jobs("work-job", "W", 10, 60_000, 0)[0].key;
+    engine
+        .apply_command(Command::fail_job(work_job, 0, "boom"))
+        .unwrap();
+    assert_eq!(engine.active_incidents().len(), 1);
+
+    // The sibling terminate fires when `trigger` completes: it cancels the failed
+    // job, resolves its incident, and completes the whole instance.
+    let events = complete_one(&mut engine, "trigger-job");
+    assert!(events.contains(&Event::JobCanceled {
+        job_key: work_job,
+        instance_key: key,
+    }));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::IncidentResolved { .. })));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
+
+    // The instance is COMPLETED with no lingering active incident, and the
+    // cancelled job was not resurrected by the incident resolution.
+    assert!(engine.is_completed(key));
+    assert!(engine.active_incidents().is_empty());
+    assert!(engine.instance(key).unwrap().incidents.is_empty());
+    assert_eq!(
+        engine.state().jobs.get(&work_job).unwrap().state,
+        state::JobState::Canceled
+    );
+    assert!(engine
+        .activate_jobs("work-job", "W2", 10, 60_000, 0)
+        .is_empty());
 }
 
 fn approval_process() -> ProcessDefinition {

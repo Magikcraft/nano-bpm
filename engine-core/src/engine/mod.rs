@@ -8791,8 +8791,10 @@ impl Engine {
     /// * Top-level (`scope == 0`): the terminate-end completes, every other token
     ///   in the instance is discarded (its jobs/timers/subscriptions/user tasks
     ///   cancelled, its call-activity children terminated) and the whole instance
-    ///   ends via `ProcessInstanceTerminated`. If this instance is itself a called
-    ///   process (spawned by a call activity), its termination ends **only** this
+    ///   ends via `ProcessInstanceCompleted` (Zeebe parity, #1085: only the inner
+    ///   element instances record TERMINATED; the process instance's own terminal
+    ///   record is `ELEMENT_COMPLETED`). If this instance is itself a called
+    ///   process (spawned by a call activity), its completion ends **only** this
     ///   instance — the parent's call activity completes normally and the parent
     ///   continues on its outgoing flow (Zeebe/BPMN: a terminate end never
     ///   propagates out of the process it fires in).
@@ -8820,7 +8822,13 @@ impl Engine {
     ) -> (Vec<Event>, Vec<Step>) {
         if scope == 0 {
             // Top-level terminate end: complete the terminate-end itself, then
-            // discard every remaining token and terminate the whole instance.
+            // discard every remaining token and COMPLETE the whole instance.
+            // Zeebe parity (#1085): the terminate end kills every inner element
+            // instance (its jobs/timers/subscriptions/user tasks cancelled, its
+            // call-activity children terminated by the post-drain cascade) — only
+            // those inner scopes record TERMINATED — but the process instance's
+            // own terminal record is `ProcessInstanceCompleted`, matching Zeebe's
+            // `PROCESS -> ELEMENT_COMPLETED`.
             // Capture the parent-release step (if this is a called process) now,
             // while the child's variables and the parent's call-activity token
             // are still live — the events below are decided, not yet applied.
@@ -8837,7 +8845,17 @@ impl Engine {
                     element_id,
                 },
             ];
-            events.extend(self.discard_instance_events(instance_key));
+            events.extend(self.discard_instance_token_events(instance_key));
+            // Resolve every incident still open on the instance before the
+            // terminal record. The `ProcessInstanceTerminated` reducer used to
+            // close these implicitly; the parity switch to `ProcessInstanceCompleted`
+            // (whose reducer must NOT close incidents — a normal completion may
+            // retain one for later resolution) means the terminate end must resolve
+            // them itself. Emitted after the `JobCanceled`s above so a failed
+            // job's `IncidentResolved` cannot resurrect the just-cancelled job
+            // (the reducer only re-pools a still-`Failed` job).
+            events.extend(self.resolve_instance_incidents(instance_key));
+            events.push(Event::ProcessInstanceCompleted { instance_key });
             return (events, release_parent.into_iter().collect());
         }
 
@@ -10044,21 +10062,30 @@ impl Engine {
         (events, followups)
     }
 
-    /// Cancels the in-flight call-activity children of every instance terminated
-    /// by the current command (Zeebe parity: cancelling the parent cancels the
-    /// child), transitively down the parent-child tree. Called after the command
-    /// drains, so it sees every `ProcessInstanceTerminated` the command produced
-    /// (a direct `CancelInstance`, a terminate end event, or a scope
-    /// interruption).
+    /// Cancels the in-flight call-activity children of every instance ended by
+    /// the current command that leaves its parent's call-activity token behind
+    /// (Zeebe parity: cancelling the parent cancels the child), transitively down
+    /// the parent-child tree. Called after the command drains, so it sees every
+    /// terminal instance record the command produced. Two events seed the sweep:
+    ///
+    /// * `ProcessInstanceTerminated` — a direct `CancelInstance`, a scope
+    ///   interruption, or a cascaded parent cancel.
+    /// * `ProcessInstanceCompleted` — normally a completion has no live children
+    ///   (an instance only completes with an empty `active` map, so no
+    ///   call-activity token is parked), making the scan a no-op; the exception
+    ///   is a **top-level terminate end event** (#1085), which completes the
+    ///   instance while its sibling call-activity children are still live and
+    ///   must be terminated here.
     fn cascade_cancel_children(&mut self, log: &mut Vec<Event>) {
-        let mut terminated: HashSet<Key> = log
+        let mut ended: HashSet<Key> = log
             .iter()
             .filter_map(|e| match e {
-                Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
+                Event::ProcessInstanceTerminated { instance_key }
+                | Event::ProcessInstanceCompleted { instance_key } => Some(*instance_key),
                 _ => None,
             })
             .collect();
-        if terminated.is_empty() {
+        if ended.is_empty() {
             return;
         }
         loop {
@@ -10078,7 +10105,7 @@ impl Engine {
                         ProcessInstanceState::Active | ProcessInstanceState::Terminating
                     ) && i
                         .parent_process_instance_key
-                        .map(|p| terminated.contains(&p))
+                        .map(|p| ended.contains(&p))
                         .unwrap_or(false)
                 })
                 .map(|i| i.key)
@@ -10089,7 +10116,7 @@ impl Engine {
             children.sort_unstable();
             for child in children {
                 self.discard_and_terminate_instance(log, child);
-                terminated.insert(child);
+                ended.insert(child);
             }
         }
     }
@@ -10109,11 +10136,24 @@ impl Engine {
     /// cancellations of every in-play job, armed timer, open message/signal/
     /// conditional subscription and created user task on the instance, followed
     /// by `ProcessInstanceTerminated` (whose reducer clears the remaining active
-    /// tokens and scopes). Returns the events (does not emit) so it composes both
-    /// inside an emit-driven command tail ([`discard_and_terminate_instance`])
-    /// and inside a decide-only `process_step` result (a top-level terminate end
-    /// event's completion).
+    /// tokens and scopes). Returns the events (does not emit) so it composes
+    /// inside an emit-driven command tail ([`discard_and_terminate_instance`]).
     fn discard_instance_events(&self, instance_key: Key) -> Vec<Event> {
+        let mut cancels = self.discard_instance_token_events(instance_key);
+        cancels.push(Event::ProcessInstanceTerminated { instance_key });
+        cancels
+    }
+
+    /// The cancellations of every in-play token of `instance_key` — its created/
+    /// activated/failed jobs, armed timers, open message/signal/conditional
+    /// subscriptions and created user tasks — **without** the terminal instance
+    /// record. The caller appends the terminal event: `ProcessInstanceTerminated`
+    /// for a cancel/cascade teardown ([`discard_instance_events`]), or
+    /// `ProcessInstanceCompleted` for a top-level terminate end event (Zeebe
+    /// parity: the terminate end kills every inner token yet the process instance
+    /// itself ends COMPLETED — see [`complete_terminate_end`]). Returns the events
+    /// (does not emit) so it composes inside a decide-only `process_step` result.
+    fn discard_instance_token_events(&self, instance_key: Key) -> Vec<Event> {
         let mut cancels: Vec<Event> = Vec::new();
 
         let mut jobs: Vec<&state::Job> = self
@@ -10214,8 +10254,46 @@ impl Engine {
             instance_key,
         }));
 
-        cancels.push(Event::ProcessInstanceTerminated { instance_key });
         cancels
+    }
+
+    /// `IncidentResolved` events for every incident still `Active` anywhere on
+    /// `instance_key` (deterministic by incident key). Used by the top-level
+    /// terminate end event, which completes the instance via
+    /// `ProcessInstanceCompleted` — whose reducer, unlike `ProcessInstanceTerminated`,
+    /// deliberately leaves incident records untouched — so the terminate end must
+    /// close its own open incidents. The caller emits these **after** the token
+    /// cancellations ([`discard_instance_token_events`]) so a failed job's
+    /// `JobCanceled` precedes its `IncidentResolved`; the reducer's job-resurrection
+    /// guard then leaves the cancelled job terminal. Returns the events (does not
+    /// emit) so it composes inside a decide-only `process_step` result.
+    fn resolve_instance_incidents(&self, instance_key: Key) -> Vec<Event> {
+        // Use the instance's own `incidents` index (keys of its currently active
+        // incidents) rather than scanning the global `state.incidents` map — that
+        // scan is O(total incidents) and grows with unrelated concurrent
+        // instances. The index is kept to only open incidents by the reducer, so
+        // the `Active` filter below is belt-and-braces; the sort keeps the
+        // `IncidentResolved` order deterministic regardless of index order.
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return Vec::new();
+        };
+        let mut incidents: Vec<&state::Incident> = instance
+            .incidents
+            .iter()
+            .filter_map(|k| self.state.incidents.get(k))
+            .filter(|i| i.state == state::IncidentState::Active)
+            .collect();
+        incidents.sort_unstable_by_key(|i| i.key);
+        incidents
+            .into_iter()
+            .map(|i| Event::IncidentResolved {
+                incident_key: i.key,
+                instance_key,
+                job_key: i.job_key,
+                resolved_at: self.now,
+                operation_reference: None,
+            })
+            .collect()
     }
     fn emit(&mut self, log: &mut Vec<Event>, event: Event) {
         if self.track_dirty_vars {
