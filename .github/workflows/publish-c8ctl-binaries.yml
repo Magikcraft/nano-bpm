@@ -116,6 +116,18 @@ jobs:
           set -euo pipefail
           uv sync
           make generate
+          # Fail fast HERE (not 6 confusing cross-compile legs later) if a
+          # git-ignored generated source the gateway bin `include_str!`s is
+          # missing from prepare's output — the exact failure mode that shipped a
+          # broken v0.0.17 (issue #1083: response_contract_schema.json was
+          # generated but never uploaded). Each file listed here must also be in
+          # the prebuilt-sources `path:` below. A per-file check (not
+          # upload-artifact's `if-no-files-found`, whose aggregate semantics pass
+          # as long as *any* listed path matches) is what actually catches a
+          # single missing sibling.
+          for f in server/src/stub_impls.rs server/src/response_contract_schema.json; do
+            test -f "$f" || { echo "::error::'make generate' did not produce $f (required git-ignored gateway bin input)"; exit 1; }
+          done
 
       # Rebuild μ-nano (wasm-pack --release) BEFORE the SPA build so the fresh
       # wasm is bundled into console/dist. `make console-wasm` fails the job if
@@ -142,10 +154,16 @@ jobs:
           name: prebuilt-sources
           include-hidden-files: true
           retention-days: 1
+          # `make generate` (above) produces these git-ignored sources; list each
+          # one the gateway bin needs so the cross-compile legs restore them.
+          # server/src/response_contract_schema.json is `include_str!`d by the bin
+          # (issue #1011) exactly like stub_impls.rs — omitting it fails every
+          # build leg with "couldn't read response_contract_schema.json".
           path: |
             generated/
             generated-console/
             server/src/stub_impls.rs
+            server/src/response_contract_schema.json
             console/dist/
 
   build:
@@ -226,9 +244,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Restore generated/, generated-console/, server/src/stub_impls.rs and
-      # console/dist into the workspace (all git-ignored, so no conflict with
-      # the checkout).
+      # Restore generated/, generated-console/, server/src/stub_impls.rs,
+      # server/src/response_contract_schema.json and console/dist into the
+      # workspace (all git-ignored, so no conflict with the checkout).
       - name: Download prebuilt sources
         uses: actions/download-artifact@v7
         with:
