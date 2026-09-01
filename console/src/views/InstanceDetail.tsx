@@ -8,6 +8,7 @@ import {
   resolveIncident,
   setInstanceVariables,
   type InstanceTrace,
+  type Variable,
 } from "../gen";
 import { fetchProcessXml } from "../lib/api";
 import { isCancellable, cancelConfirmMessage } from "../lib/instanceActions";
@@ -28,8 +29,14 @@ import {
   Input,
   NavCard,
   SectionLabel,
+  inputClass,
   useIsNarrow,
 } from "../components/ui";
+import {
+  VALUE_JSON_ERROR,
+  scopeKeyOptions,
+  validateNewVariable,
+} from "./newVariableForm";
 
 export default function InstanceDetail({
   instanceKey,
@@ -133,7 +140,26 @@ export default function InstanceDetail({
       .finally(() => setBusy(false));
   };
 
-  // Destructive: discard every token and terminate the instance. Confirmed
+  // Creating a NEW variable is the same PUT as inline edit, but with
+  // `local: true` so the value lands on EXACTLY the chosen scope. Without it the
+  // engine's default merge would push a name matching an ancestor upward instead
+  // of creating it here (Zeebe local semantics). Mirrors `onSetVariable`'s
+  // busy/error/refresh flow so the new row appears via `refresh()`.
+  const onCreateVariable = (scopeKey: string, name: string, value: unknown) => {
+    setBusy(true);
+    setActionError(null);
+    return setInstanceVariables({
+      path: { key: instanceKey },
+      body: { scopeKey, variables: { [name]: value }, local: true },
+      throwOnError: true,
+    })
+      .then(refresh)
+      .catch((e) => {
+        setActionError(String(e));
+        throw e;
+      })
+      .finally(() => setBusy(false));
+  };
   // first because it cannot be undone; refreshes the detail so the state badge
   // flips to Terminated and the overlay clears.
   const onCancelInstance = (processId: string) => {
@@ -214,25 +240,15 @@ export default function InstanceDetail({
     </div>
   );
 
-  const variablesBody =
-    variables.length === 0 ? (
-      <Empty>No variables.</Empty>
-    ) : (
-      <ScrollX>
-        <Table head={["Name", "Value", "Scope", ""]}>
-          {variables.map((v) => (
-            <VariableRow
-              key={`${v.scope_key}:${v.name}`}
-              name={v.name}
-              value={v.value}
-              scopeKey={v.scope_key}
-              busy={busy}
-              onSave={(parsed) => onSetVariable(v.scope_key, v.name, parsed)}
-            />
-          ))}
-        </Table>
-      </ScrollX>
-    );
+  const variablesBody = (
+    <VariablesPanel
+      instanceKey={instance.key}
+      variables={variables}
+      busy={busy}
+      onCreate={onCreateVariable}
+      onSetVariable={onSetVariable}
+    />
+  );
 
   const traceBody = (
     <TraceContent trace={trace} isLoading={traceLoading} error={traceError} />
@@ -492,6 +508,209 @@ function FullScreenPanel({
   );
 }
 
+/** The Variables section: an "Add variable" affordance, an optional inline
+ * create form, and the existing-variables table (or an empty state that itself
+ * offers the add affordance, so a scope with zero variables can still get one).
+ * Creating merges through `onCreate` (a `local: true` PUT); editing an existing
+ * row goes through `onSetVariable`, exactly as before. */
+function VariablesPanel({
+  instanceKey,
+  variables,
+  busy,
+  onCreate,
+  onSetVariable,
+}: {
+  instanceKey: string;
+  variables: Variable[];
+  busy: boolean;
+  onCreate: (
+    scopeKey: string,
+    name: string,
+    value: unknown,
+  ) => Promise<unknown>;
+  onSetVariable: (
+    scopeKey: string,
+    name: string,
+    value: unknown,
+  ) => Promise<unknown>;
+}) {
+  const [adding, setAdding] = useState(false);
+  const scopes = scopeKeyOptions(instanceKey, variables);
+
+  const addButton = (
+    <Button
+      size="sm"
+      variant="secondary"
+      disabled={busy}
+      onClick={() => setAdding(true)}
+    >
+      Add variable
+    </Button>
+  );
+
+  const form = adding && (
+    <NewVariableForm
+      instanceKey={instanceKey}
+      scopes={scopes}
+      variables={variables}
+      busy={busy}
+      onCreate={onCreate}
+      onDone={() => setAdding(false)}
+    />
+  );
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-end">
+        {!adding && addButton}
+      </div>
+      {form}
+      {variables.length === 0 ? (
+        !adding && (
+          <Empty>No variables. Use “Add variable” to create one.</Empty>
+        )
+      ) : (
+        <ScrollX>
+          <Table head={["Name", "Value", "Scope", ""]}>
+            {variables.map((v) => (
+              <VariableRow
+                key={`${v.scope_key}:${v.name}`}
+                name={v.name}
+                value={v.value}
+                scopeKey={v.scope_key}
+                busy={busy}
+                onSave={(parsed) => onSetVariable(v.scope_key, v.name, parsed)}
+              />
+            ))}
+          </Table>
+        </ScrollX>
+      )}
+    </div>
+  );
+}
+
+/** Inline form to create a NEW variable: name (text), value (JSON, parsed and
+ * validated exactly like inline edit) and a scope selector (defaulting to the
+ * process-instance scope). Validation — blank name, duplicate-on-scope, invalid
+ * JSON — runs client-side before the request; on success the parent's
+ * `refresh()` surfaces the new row and the form closes. */
+function NewVariableForm({
+  instanceKey,
+  scopes,
+  variables,
+  busy,
+  onCreate,
+  onDone,
+}: {
+  instanceKey: string;
+  scopes: string[];
+  variables: Variable[];
+  busy: boolean;
+  onCreate: (
+    scopeKey: string,
+    name: string,
+    value: unknown,
+  ) => Promise<unknown>;
+  onDone: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [valueDraft, setValueDraft] = useState("");
+  const [scopeKey, setScopeKey] = useState(instanceKey);
+  const [error, setError] = useState<string | null>(null);
+  const nameId = useId();
+  const valueId = useId();
+  const scopeId = useId();
+
+  const submit = () => {
+    if (busy) return;
+    const result = validateNewVariable({
+      name,
+      valueDraft,
+      scopeKey,
+      variables,
+    });
+    if (!result.ok) {
+      setError(result.error);
+      return;
+    }
+    setError(null);
+    onCreate(result.scopeKey, result.name, result.value)
+      .then(onDone)
+      .catch(() => {
+        /* surfaced by the parent's action error banner */
+      });
+  };
+
+  return (
+    <div className="rounded-md border border-edge bg-inset/40 p-3">
+      <div className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
+        <label className="flex flex-col gap-1">
+          <span className="text-xs font-medium text-fg-faint" id={nameId}>
+            Name
+          </span>
+          <Input
+            aria-labelledby={nameId}
+            value={name}
+            autoFocus
+            placeholder="myVariable"
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submit();
+              if (e.key === "Escape") onDone();
+            }}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-xs font-medium text-fg-faint" id={valueId}>
+            Value (JSON)
+          </span>
+          <Input
+            aria-labelledby={valueId}
+            className="font-mono text-xs"
+            value={valueDraft}
+            placeholder='42, true, "text"'
+            onChange={(e) => setValueDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submit();
+              if (e.key === "Escape") onDone();
+            }}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-xs font-medium text-fg-faint" id={scopeId}>
+            Scope
+          </span>
+          <select
+            aria-labelledby={scopeId}
+            className={`${inputClass} font-mono text-xs`}
+            value={scopeKey}
+            onChange={(e) => setScopeKey(e.target.value)}
+          >
+            {scopes.map((s) => (
+              <option key={s} value={s}>
+                {s === instanceKey ? `${s} (instance)` : s}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {error && <span className="mt-2 block text-xs text-danger">{error}</span>}
+      <p className="mt-2 text-xs text-fg-faint">
+        Created on exactly the chosen scope (<code>local: true</code>), so a
+        name matching an ancestor is not merged upward.
+      </p>
+      <div className="mt-3 flex justify-end gap-2">
+        <Button size="sm" disabled={busy} onClick={submit}>
+          Add
+        </Button>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={onDone}>
+          Cancel
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 /** One variable row with inline edit. The stored `value` is a serialized-JSON
  * string (e.g. `"text"`, `42`, `true`); the editor is seeded with it and the
  * input is parsed as JSON on save so the engine receives a typed value. */
@@ -546,7 +765,7 @@ function VariableRow({
     try {
       parsed = JSON.parse(draft);
     } catch {
-      setParseError('Value must be valid JSON (e.g. 42, true, "text").');
+      setParseError(VALUE_JSON_ERROR);
       return;
     }
     onSave(parsed)
