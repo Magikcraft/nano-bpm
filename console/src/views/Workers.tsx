@@ -109,9 +109,7 @@ function fmtUptime(ms: number): string {
 
 export default function Workers() {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<"editor" | "running">(
-    IS_STUDIO ? "editor" : "running",
-  );
+  const [tab, setTab] = useState<"editor" | "running">("running");
   const [selected, setSelected] = useState<string | null>(null);
   // When true, the editor pane shows the shared `@lib/` library instead of a worker.
   const [showLib, setShowLib] = useState(false);
@@ -250,7 +248,7 @@ export default function Workers() {
           actions={
             <div className="flex gap-1 rounded-lg bg-inset p-1 text-sm">
               {(IS_STUDIO
-                ? (["editor", "running"] as const)
+                ? (["running", "editor"] as const)
                 : (["running"] as const)
               ).map((t) => (
                 <button
