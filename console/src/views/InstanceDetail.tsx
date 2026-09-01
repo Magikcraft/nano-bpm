@@ -562,12 +562,15 @@ function VariablesPanel({
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-end">
-        {!adding && addButton}
+        {!adding && variables.length > 0 && addButton}
       </div>
       {form}
       {variables.length === 0 ? (
         !adding && (
-          <Empty>No variables. Use “Add variable” to create one.</Empty>
+          <div className="flex flex-col items-start gap-2">
+            <Empty>No variables yet.</Empty>
+            {addButton}
+          </div>
         )
       ) : (
         <ScrollX>

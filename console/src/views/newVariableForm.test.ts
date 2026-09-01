@@ -52,6 +52,18 @@ test("scopeKeyOptions appends distinct non-instance scopes, sorted", () => {
   assert.deepEqual(options, ["100", "200", "300"]);
 });
 
+test("scopeKeyOptions orders non-instance scopes numerically, not lexically", () => {
+  const options = scopeKeyOptions(
+    "100",
+    vars([
+      ["a", "2"],
+      ["b", "10"],
+      ["c", "30"],
+    ]),
+  );
+  assert.deepEqual(options, ["100", "2", "10", "30"]);
+});
+
 test("variableExists is scope-qualified", () => {
   const v = vars([
     ["greeting", "100"],

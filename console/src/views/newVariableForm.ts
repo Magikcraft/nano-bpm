@@ -39,7 +39,9 @@ export function parseVariableJson(
  * first: the process-instance scope (the passed `instanceKey`, always offered
  * even when it currently holds no variables) followed by every other scope key
  * that already appears among the instance's variables (element-instance /
- * subprocess scopes), de-duplicated and stably sorted.
+ * subprocess scopes), de-duplicated and sorted with numeric collation (scope
+ * keys are numeric strings, so a lexicographic sort would place "10" before
+ * "2").
  *
  * Active elements are intentionally *not* a source here: `ActiveElement` carries
  * no scope key (only `element_id` / `element_type`), so the addressable nested
@@ -53,7 +55,12 @@ export function scopeKeyOptions(
   for (const v of variables) {
     if (v.scope_key !== instanceKey) others.add(v.scope_key);
   }
-  return [instanceKey, ...Array.from(others).sort()];
+  return [
+    instanceKey,
+    ...Array.from(others).sort((a, b) =>
+      a.localeCompare(b, undefined, { numeric: true }),
+    ),
+  ];
 }
 
 /**
