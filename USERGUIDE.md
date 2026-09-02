@@ -116,6 +116,99 @@ Once a cluster is up:
 A demo process (`processDefinitionId: "demo"`) is pre-deployed at startup, so you
 have something to run immediately.
 
+### Compose and run a workforce by hand
+
+The [one-liner installer](#the-one-liner-recommended) composes a **workforce
+manifest** for you. To build one by hand — or to curate a fleet you can diff,
+edit, and copy between machines — use the `hire` → `workforce` commands. A
+*workforce* is a fleet of supervised **coding-agent** workers (each running a
+harness such as `copilot`, `claude`, or `qwen` on your `PATH`) described by a
+single manifest file. This needs a running engine (above) and at least one agent
+harness installed.
+
+**1. Hire agent profiles.** A profile is a reusable definition — a rank, the
+harness command, a model, and any launch args:
+
+```bash
+# Create a "copilot" senior profile that runs `copilot --allow-all`
+c8ctl nano hire --name copilot --rank senior --command copilot --arg --allow-all
+c8ctl nano hire --list
+```
+
+**2. Compose the manifest** with `workforce add`. `--instances N` spawns N copies
+of a profile; `--auto` serves every deployed agent job type, or `--roles a,b`
+scopes it to specific roles:
+
+```bash
+c8ctl nano workforce add copilot --instances 5 --auto
+c8ctl nano workforce add qwen --instances 2 --roles pr-review,feature
+```
+
+The manifest is a portable JSON document at
+`<stateHome>/workforce/<name>.json` (`default.json` unless you pass
+`--manifest <name>`). It is meant to be read, hand-edited, diffed, and copied
+between machines:
+
+```json
+{
+  "version": 1,
+  "name": "default",
+  "workers": [
+    { "profile": "copilot", "instances": 5, "roles": "auto" },
+    { "profile": "qwen", "instances": 2, "roles": ["pr-review", "feature"] }
+  ]
+}
+```
+
+Each entry references a hired `profile` and sets `instances` (how many copies)
+and `roles` — either `"auto"` (serve every agent job type, no capability gate) or
+a list, each mapped to a `<rank>:<role>` job type. Optional fields: `autoScope`
+(narrow `--auto` to a single `bpmn:process` id prefix — one app/network) and
+`args` (verbatim flags appended to each worker).
+
+**3. Bring the whole fleet up** under a supervisor with one command:
+
+```bash
+c8ctl nano workforce start                      # the default manifest
+c8ctl nano workforce start --manifest review-only
+```
+
+`start` reconciles the running supervisor to the manifest using deterministic
+`wf-<manifest>-<profile>-<index>` worker names, so re-running an unchanged
+manifest starts, stops, and restarts nothing (it is idempotent).
+
+**4. Inspect and manage** the fleet:
+
+```bash
+c8ctl nano workforce status --json   # desired (manifest) joined with actual (live supervisor)
+c8ctl nano workforce list
+c8ctl nano workforce stop            # bring the fleet down
+```
+
+The supervisor is a fleet runner, so you can also adjust individual workers
+without editing the manifest:
+
+```bash
+c8ctl nano supervisor add copilot --instances 3
+c8ctl nano supervisor restart copilot
+c8ctl nano supervisor status
+c8ctl nano supervisor stop            # stop the daemon and all its workers
+```
+
+> **GitHub authentication.** Agent workers clone each task's repository over
+> HTTPS, so every worker needs *non-interactive* GitHub credentials. Without
+> them a job fails to provision with
+> `fatal: could not read Username for 'https://github.com': terminal prompts disabled`.
+> Two ways to provide them:
+>
+> - **Recommended — `gh` credential helper.** Run `gh auth login` and enable the
+>   git integration (`gh auth setup-git`). This writes a credential helper into
+>   your global `~/.gitconfig`, which every worker's `git clone` picks up
+>   automatically — nothing to export. Verify with `gh auth status`.
+> - **Or a token in the environment.** Export a token in the shell that runs
+>   `workforce start`; the supervisor and all its workers inherit it:
+>   `export GITHUB_TOKEN="$(gh auth token)"` (or any PAT with `repo` scope).
+
 ## Run the binary directly
 
 You can also run the binary yourself (the same one the plugin installs),
