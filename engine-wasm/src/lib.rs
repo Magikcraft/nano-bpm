@@ -933,9 +933,11 @@ impl TestEngine {
         // coerced to 0 (mirroring the gateway's 400): for an `external` agent 0
         // fails the lease gate, and for the engine-native variants it is unused.
         let job_key =
-            parse_job_attribution("jobKey", req.job_key.as_deref()).map_err(|m| js_err(&m))?;
+            parse_job_attribution("createAgentInstance", "jobKey", req.job_key.as_deref())
+                .map_err(|m| js_err(&m))?;
         let job_lease =
-            parse_job_attribution("jobLease", req.job_lease.as_deref()).map_err(|m| js_err(&m))?;
+            parse_job_attribution("createAgentInstance", "jobLease", req.job_lease.as_deref())
+                .map_err(|m| js_err(&m))?;
         let history = agent_turns_from(req.history, job_key, job_lease)?;
         self.apply(Command::CreateAgentInstance {
             element_instance_key,
@@ -989,9 +991,11 @@ impl TestEngine {
         // coerced to 0 (which would change attribution and defeat dedupe),
         // mirroring the gateway's 400. Absent = 0 (no attribution).
         let job_key =
-            parse_job_attribution("jobKey", req.job_key.as_deref()).map_err(|m| js_err(&m))?;
+            parse_job_attribution("updateAgentInstance", "jobKey", req.job_key.as_deref())
+                .map_err(|m| js_err(&m))?;
         let job_lease =
-            parse_job_attribution("jobLease", req.job_lease.as_deref()).map_err(|m| js_err(&m))?;
+            parse_job_attribution("updateAgentInstance", "jobLease", req.job_lease.as_deref())
+                .map_err(|m| js_err(&m))?;
         let history = agent_turns_from(req.history, job_key, job_lease)?;
         self.apply(Command::UpdateAgentInstance {
             agent_instance_key,
@@ -2583,13 +2587,13 @@ fn parse_key(s: &str) -> Result<u64, JsValue> {
 /// Returns the `&str`-typed error so the reject path is natively testable (the
 /// `JsValue` wrapper aborts off the wasm target); the caller lifts it via
 /// [`js_err`].
-fn parse_job_attribution(field: &str, value: Option<&str>) -> Result<u64, String> {
+fn parse_job_attribution(op: &str, field: &str, value: Option<&str>) -> Result<u64, String> {
     match value {
         None => Ok(0),
         Some(s) => s
             .trim()
             .parse::<u64>()
-            .map_err(|_| format!("updateAgentInstance: invalid {field}: {s}")),
+            .map_err(|_| format!("{op}: invalid {field}: {s}")),
     }
 }
 
@@ -5130,17 +5134,33 @@ mod read_channel_tests {
     #[test]
     fn update_agent_instance_rejects_malformed_job_attribution() {
         // Absent = 0 (no attribution); a well-formed decimal parses.
-        assert_eq!(parse_job_attribution("jobKey", None).unwrap(), 0);
-        assert_eq!(parse_job_attribution("jobKey", Some(" 42 ")).unwrap(), 42);
-        // A malformed value is rejected with a message naming the offending field.
-        let key_err = parse_job_attribution("jobKey", Some("not-a-number"))
+        assert_eq!(
+            parse_job_attribution("updateAgentInstance", "jobKey", None).unwrap(),
+            0
+        );
+        assert_eq!(
+            parse_job_attribution("updateAgentInstance", "jobKey", Some(" 42 ")).unwrap(),
+            42
+        );
+        // A malformed value is rejected with a message naming the offending field
+        // and the originating operation (so a create-side error reads
+        // `createAgentInstance:`, not a misleading `updateAgentInstance:`).
+        let key_err = parse_job_attribution("createAgentInstance", "jobKey", Some("not-a-number"))
             .expect_err("a malformed jobKey is rejected");
         assert!(key_err.contains("jobKey"), "names the field: {key_err}");
-        let lease_err = parse_job_attribution("jobLease", Some("nope"))
+        assert!(
+            key_err.contains("createAgentInstance"),
+            "names the operation: {key_err}"
+        );
+        let lease_err = parse_job_attribution("updateAgentInstance", "jobLease", Some("nope"))
             .expect_err("a malformed jobLease is rejected");
         assert!(
             lease_err.contains("jobLease"),
             "names the field: {lease_err}"
+        );
+        assert!(
+            lease_err.contains("updateAgentInstance"),
+            "names the operation: {lease_err}"
         );
     }
 

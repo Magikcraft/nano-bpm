@@ -812,8 +812,22 @@ impl Engine {
                 .as_ref()
                 .map(|ai| ai.tools.clone())
                 .unwrap_or_default(),
-            job_key: existing.as_ref().map(|ai| ai.job_key).unwrap_or(job_key),
-            job_lease: existing.as_ref().map(|ai| ai.job_lease).unwrap_or(job_lease),
+            // For an `external` agent the CREATE was just lease-validated
+            // (step 2a), so record the freshly-proven attribution — a repeat
+            // CREATE after re-activation must refresh, not preserve, a stale
+            // lease token (else later history-bearing updates keyed off the
+            // snapshot's lease are wrongly rejected). Engine-native variants
+            // carry no job, so keep the existing (0) attribution.
+            job_key: if agent_type == crate::agent::AgentType::External {
+                job_key
+            } else {
+                existing.as_ref().map(|ai| ai.job_key).unwrap_or(job_key)
+            },
+            job_lease: if agent_type == crate::agent::AgentType::External {
+                job_lease
+            } else {
+                existing.as_ref().map(|ai| ai.job_lease).unwrap_or(job_lease)
+            },
             created_at: existing
                 .as_ref()
                 .map(|ai| ai.created_at)
@@ -941,6 +955,14 @@ impl Engine {
         updated.metrics = new_metrics;
         if let Some(new_tools) = tools {
             updated.tools = new_tools;
+        }
+        // A history-bearing `external` UPDATE was lease-validated (step 1a), so
+        // record the freshly-proven attribution on the snapshot rather than
+        // leaving a stale lease token — a later update keyed off the snapshot's
+        // lease would otherwise be wrongly rejected by `validate_agent_job_context`.
+        if updated.agent_type == crate::agent::AgentType::External && !history.is_empty() {
+            updated.job_key = job_key;
+            updated.job_lease = job_lease;
         }
         if !updated
             .element_instance_keys
@@ -5854,9 +5876,9 @@ impl Engine {
                     // auto-mint an AgentInstance. The worker self-registers the
                     // AgentInstance lazily via a lease-gated
                     // `CreateAgentInstance` (`process_create_agent_instance`),
-                    // gated on this job's ACTIVATED lease. The job type defaults
-                    // to the element id (the engine's standard fallback when no
-                    // `zeebe:taskDefinition type` is declared), so a worker has a
+                    // gated on this job's ACTIVATED lease. The job type is the
+                    // element id — an `AgentTask` carries no
+                    // `zeebe:taskDefinition`, so the element id is the worker's
                     // deterministic type to subscribe to.
                     let job_key = self.mint_key();
                     events.push(Event::JobCreated {

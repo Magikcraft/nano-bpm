@@ -19179,8 +19179,97 @@ fn external_agent_history_bearing_update_is_lease_gated() {
     );
 }
 
-// --- AgentHistory turn log (Camunda 8.10 parity, Stage 3 / slice S2) --------
+#[test]
+fn external_agent_refreshes_job_lease_across_reactivation() {
+    use crate::agent::{AgentDefinition, AgentHistoryRole};
+    let (mut engine, pi, eik) = external_agent_instance();
 
+    // First activation → lease token L1; a lease-gated CREATE records it.
+    let job1 = engine
+        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .pop()
+        .expect("activatable");
+    let created = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: job1.key,
+            job_lease: job1.deadline,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap();
+    let aik = created
+        .iter()
+        .find_map(|e| match e {
+            Event::AgentInstanceCreated { agent_instance, .. } => {
+                Some(agent_instance.agent_instance_key)
+            }
+            _ => None,
+        })
+        .expect("CREATE mints");
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aik).job_lease,
+        job1.deadline
+    );
+
+    // The lease expires and the worker re-activates the SAME job, learning a
+    // NEW lease token L2 (a different deadline).
+    engine
+        .apply_command(Command::ExpireJobs {
+            now: job1.deadline,
+        })
+        .unwrap();
+    let job2 = engine
+        .activate_jobs("agent", "W", 1, 1_000, 5_000)
+        .pop()
+        .expect("re-activatable after lease expiry");
+    assert_eq!(job2.key, job1.key, "same job, fresh lease");
+    assert_ne!(job2.deadline, job1.deadline, "the lease token changed");
+
+    // A repeat CREATE under L2 must REFRESH the recorded lease, not preserve the
+    // stale L1 (else a later lease check keyed off the snapshot's token wrongly
+    // rejects a valid update).
+    engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: job2.key,
+            job_lease: job2.deadline,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aik).job_lease,
+        job2.deadline,
+        "a repeat CREATE refreshes the snapshot's stale lease token"
+    );
+
+    // A history-bearing UPDATE under L2 is accepted AND likewise records the
+    // freshly-validated lease token onto the snapshot.
+    engine
+        .apply_command(Command::UpdateAgentInstance {
+            agent_instance_key: aik,
+            element_instance_key: eik,
+            element_id: "agent".to_string(),
+            process_instance_key: pi,
+            job_key: job2.key,
+            job_lease: job2.deadline,
+            status: None,
+            metrics: Default::default(),
+            tools: None,
+            history: vec![history_turn(0, 200, AgentHistoryRole::Assistant)],
+        })
+        .expect("a history-bearing UPDATE under the fresh lease is accepted");
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aik).job_lease,
+        job2.deadline,
+        "a history-bearing UPDATE records the validated lease token"
+    );
+}
+
+// --- AgentHistory turn log (Camunda 8.10 parity, Stage 3 / slice S2) --------
 
 /// Deploy an `aiAgentTask` service task, start an instance, and return the
 /// engine together with the owning process-instance key and the minted
