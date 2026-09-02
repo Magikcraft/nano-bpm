@@ -132,6 +132,8 @@ harness command, a model, and any launch args:
 ```bash
 # Create a "copilot" senior profile that runs `copilot --allow-all`
 c8ctl nano hire --name copilot --rank senior --command copilot --arg --allow-all
+# Create a "qwen" profile that runs the `qwen` harness
+c8ctl nano hire --name qwen --rank senior --command qwen
 c8ctl nano hire --list
 ```
 
@@ -146,8 +148,9 @@ c8ctl nano workforce add qwen --instances 2 --roles pr-review,feature
 
 The manifest is a portable JSON document at
 `<stateHome>/workforce/<name>.json` (`default.json` unless you pass
-`--manifest <name>`). It is meant to be read, hand-edited, diffed, and copied
-between machines:
+`--manifest <name>`), where `<stateHome>` is c8ctl's OS-dependent state
+directory (e.g. `~/.local/share/c8ctl-nano` on Linux). It is meant to be read,
+hand-edited, diffed, and copied between machines:
 
 ```json
 {
