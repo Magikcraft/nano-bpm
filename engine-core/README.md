@@ -325,10 +325,14 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > strings, lists and contexts) evaluated by an in-house FEEL engine ([`feel`])
 > for gateway conditions, job types and message correlation. It also supports
 > **engine-native AI agent tasks** (Camunda stable/8.10 AgentInstance parity): a
-> `serviceTask` bearing a `zeebe:agentDefinition agentType="aiAgentTask"` (or
-> `"external"`) marker activates into a first-class **`AgentInstance`** — keyed by
-> its own dedicated key, linked to the element instance, in status `INITIALIZING`
-> — that the engine holds as the system-of-record, rather than creating a job.
+> `serviceTask` bearing a `zeebe:agentDefinition agentType="aiAgentTask"` marker
+> activates into a first-class **`AgentInstance`** — keyed by its own dedicated
+> key, linked to the element instance, in status `INITIALIZING` — that the engine
+> holds as the system-of-record, rather than creating a job. An
+> `agentType="external"` agent instead activates as a **normal job** (no
+> AgentInstance is auto-minted); a worker activates that job and self-registers
+> the `AgentInstance` via a **lease-gated** create/update that must reference the
+> element's ACTIVATED job with the matching lease token and element-instance key.
 > Placement mirrors Camunda's `AgentDefinitionValidator` (`aiAgentTask` only on a
 > `serviceTask`, `aiAgentSubProcess` only on an `adHocSubProcess`); the wrong
 > placement is rejected at deploy. Processes can be

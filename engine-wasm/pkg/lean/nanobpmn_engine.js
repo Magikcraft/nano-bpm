@@ -393,11 +393,16 @@ export class TestEngine {
     }
     /**
      * Reconcile / create an AgentInstance for an already-activated agent task.
-     * `request_json` is `{ elementInstanceKey, definition?, limits?, history? }`
-     * where `definition` is `{ model?, provider?, systemPrompt? }`, `limits` is
-     * `{ maxTokens?, maxModelCalls?, maxToolCalls? }` (omitted limits default to
-     * unlimited), and `history` is an initial batch of turns (see the turn shape
-     * on `updateAgentInstance`). Returns the snapshot.
+     * `request_json` is `{ elementInstanceKey, jobKey?, jobLease?, definition?,
+     * limits?, history? }` where `definition` is `{ model?, provider?,
+     * systemPrompt? }`, `limits` is `{ maxTokens?, maxModelCalls?, maxToolCalls? }`
+     * (omitted limits default to unlimited), and `history` is an initial batch of
+     * turns (see the turn shape on `updateAgentInstance`). `jobKey`/`jobLease`
+     * are the activation's job attribution: **required** for an `external`
+     * (job-backed) agent element, where the CREATE is rejected unless they
+     * reference that element's ACTIVATED job with a matching lease token and
+     * `elementInstanceKey` (#1099); unused for the engine-native
+     * `aiAgentTask`/`aiAgentSubProcess` variants. Returns the snapshot.
      * @param {string} request_json
      * @returns {string}
      */

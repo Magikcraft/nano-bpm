@@ -802,15 +802,26 @@ pub enum ElementKind {
     CompensationThrowEvent,
     /// An AI agent element (Camunda `zeebe:agentDefinition`, stable/8.10). Built
     /// from a `bpmn:serviceTask` bearing `<zeebe:agentDefinition
-    /// agentType="aiAgentTask"/>` (or `agentType="external"`). On activation the
-    /// engine creates a first-class [`crate::AgentInstance`] (status
-    /// `INITIALIZING`) keyed by its own dedicated key and linked to the active
-    /// element instance — the engine becomes the system-of-record for the agent
-    /// state. LLM calls / prompt assembly / tool dispatch stay in the worker
-    /// layer; the token parks on the element while the agent runs, exactly like
-    /// a job-bearing service task. The `agentType="aiAgentSubProcess"` variant
-    /// (on a `bpmn:adHocSubProcess`) reuses the existing ad-hoc container
-    /// machinery and is not modelled as this kind.
+    /// agentType="aiAgentTask"/>` (or `agentType="external"`). Behaviour splits
+    /// by `agent_type`:
+    ///
+    /// * `aiAgentTask` (engine-native, no external worker): on activation the
+    ///   engine creates a first-class [`crate::AgentInstance`] (status
+    ///   `INITIALIZING`) keyed by its own dedicated key and linked to the active
+    ///   element instance — the engine becomes the system-of-record for the agent
+    ///   state. LLM calls / prompt assembly / tool dispatch stay in the worker
+    ///   layer; the token parks on the element while the agent runs, exactly like
+    ///   a job-bearing service task, but **no job** is created.
+    /// * `external` (job-backed, Camunda parity #1099): there is no agent element
+    ///   type in Camunda — an `external` agent is an ordinary service-task job. So
+    ///   on activation it creates a **normal job** (activatable through the
+    ///   standard job loop) and parks the token; it does **not** auto-mint an
+    ///   AgentInstance. The worker self-registers the AgentInstance lazily via a
+    ///   lease-gated `CreateAgentInstance`, gated on that job's ACTIVATED lease.
+    ///
+    /// The `agentType="aiAgentSubProcess"` variant (on a `bpmn:adHocSubProcess`)
+    /// reuses the existing ad-hoc container machinery and is not modelled as this
+    /// kind.
     AgentTask {
         /// The `agentType` marker this element was built from.
         agent_type: crate::agent::AgentType,

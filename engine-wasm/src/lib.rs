@@ -913,20 +913,36 @@ impl TestEngine {
     // read-model surface), which serialise the same REST shapes.
 
     /// Reconcile / create an AgentInstance for an already-activated agent task.
-    /// `request_json` is `{ elementInstanceKey, definition?, limits?, history? }`
-    /// where `definition` is `{ model?, provider?, systemPrompt? }`, `limits` is
-    /// `{ maxTokens?, maxModelCalls?, maxToolCalls? }` (omitted limits default to
-    /// unlimited), and `history` is an initial batch of turns (see the turn shape
-    /// on `updateAgentInstance`). Returns the snapshot.
+    /// `request_json` is `{ elementInstanceKey, jobKey?, jobLease?, definition?,
+    /// limits?, history? }` where `definition` is `{ model?, provider?,
+    /// systemPrompt? }`, `limits` is `{ maxTokens?, maxModelCalls?, maxToolCalls? }`
+    /// (omitted limits default to unlimited), and `history` is an initial batch of
+    /// turns (see the turn shape on `updateAgentInstance`). `jobKey`/`jobLease`
+    /// are the activation's job attribution: **required** for an `external`
+    /// (job-backed) agent element, where the CREATE is rejected unless they
+    /// reference that element's ACTIVATED job with a matching lease token and
+    /// `elementInstanceKey` (#1099); unused for the engine-native
+    /// `aiAgentTask`/`aiAgentSubProcess` variants. Returns the snapshot.
     #[wasm_bindgen(js_name = createAgentInstance)]
     pub fn create_agent_instance(&mut self, request_json: &str) -> Result<String, JsValue> {
         self.guard_paused()?;
         let req: CreateAgentInstanceReq = serde_json::from_str(request_json)
             .map_err(|e| js_err(&format!("createAgentInstance: invalid request JSON: {e}")))?;
         let element_instance_key = parse_key(&req.element_instance_key)?;
-        let history = agent_turns_from(req.history, 0, 0)?;
+        // A present-but-unparsable jobKey/jobLease is rejected rather than
+        // coerced to 0 (mirroring the gateway's 400): for an `external` agent 0
+        // fails the lease gate, and for the engine-native variants it is unused.
+        let job_key =
+            parse_job_attribution("createAgentInstance", "jobKey", req.job_key.as_deref())
+                .map_err(|m| js_err(&m))?;
+        let job_lease =
+            parse_job_attribution("createAgentInstance", "jobLease", req.job_lease.as_deref())
+                .map_err(|m| js_err(&m))?;
+        let history = agent_turns_from(req.history, job_key, job_lease)?;
         self.apply(Command::CreateAgentInstance {
             element_instance_key,
+            job_key,
+            job_lease,
             definition: req.definition.into(),
             limits: req.limits.map(Into::into),
             history,
@@ -975,15 +991,19 @@ impl TestEngine {
         // coerced to 0 (which would change attribution and defeat dedupe),
         // mirroring the gateway's 400. Absent = 0 (no attribution).
         let job_key =
-            parse_job_attribution("jobKey", req.job_key.as_deref()).map_err(|m| js_err(&m))?;
+            parse_job_attribution("updateAgentInstance", "jobKey", req.job_key.as_deref())
+                .map_err(|m| js_err(&m))?;
         let job_lease =
-            parse_job_attribution("jobLease", req.job_lease.as_deref()).map_err(|m| js_err(&m))?;
+            parse_job_attribution("updateAgentInstance", "jobLease", req.job_lease.as_deref())
+                .map_err(|m| js_err(&m))?;
         let history = agent_turns_from(req.history, job_key, job_lease)?;
         self.apply(Command::UpdateAgentInstance {
             agent_instance_key,
             element_instance_key,
             element_id: req.element_id,
             process_instance_key,
+            job_key,
+            job_lease,
             status,
             metrics: req.metrics.into(),
             tools,
@@ -2567,13 +2587,13 @@ fn parse_key(s: &str) -> Result<u64, JsValue> {
 /// Returns the `&str`-typed error so the reject path is natively testable (the
 /// `JsValue` wrapper aborts off the wasm target); the caller lifts it via
 /// [`js_err`].
-fn parse_job_attribution(field: &str, value: Option<&str>) -> Result<u64, String> {
+fn parse_job_attribution(op: &str, field: &str, value: Option<&str>) -> Result<u64, String> {
     match value {
         None => Ok(0),
         Some(s) => s
             .trim()
             .parse::<u64>()
-            .map_err(|_| format!("updateAgentInstance: invalid {field}: {s}")),
+            .map_err(|_| format!("{op}: invalid {field}: {s}")),
     }
 }
 
@@ -2892,6 +2912,15 @@ struct AgentTurnReq {
 #[serde(rename_all = "camelCase")]
 struct CreateAgentInstanceReq {
     element_instance_key: String,
+    /// The agent job whose ACTIVATED lease authorizes this create. Required for
+    /// an `external` (job-backed) agent element (#1099); absent/`0` for the
+    /// engine-native `aiAgentTask`/`aiAgentSubProcess` variants. Also stamped on
+    /// any initial `history` turns.
+    #[serde(default)]
+    job_key: Option<String>,
+    /// The activation lease deadline (the "lease token") of `jobKey`.
+    #[serde(default)]
+    job_lease: Option<String>,
     #[serde(default)]
     definition: AgentDefinitionReq,
     #[serde(default)]
@@ -5105,17 +5134,33 @@ mod read_channel_tests {
     #[test]
     fn update_agent_instance_rejects_malformed_job_attribution() {
         // Absent = 0 (no attribution); a well-formed decimal parses.
-        assert_eq!(parse_job_attribution("jobKey", None).unwrap(), 0);
-        assert_eq!(parse_job_attribution("jobKey", Some(" 42 ")).unwrap(), 42);
-        // A malformed value is rejected with a message naming the offending field.
-        let key_err = parse_job_attribution("jobKey", Some("not-a-number"))
+        assert_eq!(
+            parse_job_attribution("updateAgentInstance", "jobKey", None).unwrap(),
+            0
+        );
+        assert_eq!(
+            parse_job_attribution("updateAgentInstance", "jobKey", Some(" 42 ")).unwrap(),
+            42
+        );
+        // A malformed value is rejected with a message naming the offending field
+        // and the originating operation (so a create-side error reads
+        // `createAgentInstance:`, not a misleading `updateAgentInstance:`).
+        let key_err = parse_job_attribution("createAgentInstance", "jobKey", Some("not-a-number"))
             .expect_err("a malformed jobKey is rejected");
         assert!(key_err.contains("jobKey"), "names the field: {key_err}");
-        let lease_err = parse_job_attribution("jobLease", Some("nope"))
+        assert!(
+            key_err.contains("createAgentInstance"),
+            "names the operation: {key_err}"
+        );
+        let lease_err = parse_job_attribution("updateAgentInstance", "jobLease", Some("nope"))
             .expect_err("a malformed jobLease is rejected");
         assert!(
             lease_err.contains("jobLease"),
             "names the field: {lease_err}"
+        );
+        assert!(
+            lease_err.contains("updateAgentInstance"),
+            "names the operation: {lease_err}"
         );
     }
 

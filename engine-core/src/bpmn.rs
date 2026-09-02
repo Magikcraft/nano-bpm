@@ -63,13 +63,16 @@
 //!   evaluate to a boolean raises an `ExpressionEvaluation` incident.
 //! * A `serviceTask` bearing a `zeebe:agentDefinition agentType="aiAgentTask"`
 //!   (or `"external"`) extension marker becomes an engine-native
-//!   [`AgentTask`](crate::model::ElementKind::AgentTask): on activation the
+//!   [`AgentTask`](crate::model::ElementKind::AgentTask). For `aiAgentTask` the
 //!   engine mints a first-class `AgentInstance` (dedicated key, linked to the
-//!   element instance) in status `INITIALIZING`, rather than creating a job.
-//!   Placement mirrors Camunda's `AgentDefinitionValidator`: `aiAgentTask` is
-//!   only valid on a `serviceTask` and `aiAgentSubProcess` only on an
-//!   `adHocSubProcess`; the wrong placement (or an unknown `agentType`) is
-//!   rejected at parse time.
+//!   element instance) in status `INITIALIZING` on activation, rather than
+//!   creating a job. An `"external"` agent is job-backed (Camunda parity #1099):
+//!   on activation it creates a **normal job** (activatable through the standard
+//!   job loop) and its `AgentInstance` is minted lazily by the worker via a
+//!   lease-gated `CreateAgentInstance`. Placement mirrors Camunda's
+//!   `AgentDefinitionValidator`: `aiAgentTask` is only valid on a `serviceTask`
+//!   and `aiAgentSubProcess` only on an `adHocSubProcess`; the wrong placement
+//!   (or an unknown `agentType`) is rejected at parse time.
 
 use std::collections::HashMap;
 
