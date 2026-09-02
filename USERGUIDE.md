@@ -127,7 +127,8 @@ single manifest file. This needs a running engine (above) and at least one agent
 harness installed.
 
 **1. Hire agent profiles.** A profile is a reusable definition — a rank, the
-harness command, a model, and any launch args:
+harness command, an optional model, and any launch args (the examples below set
+no model, so the harness uses its own default):
 
 ```bash
 # Create a "copilot" senior profile that runs `copilot --allow-all`
