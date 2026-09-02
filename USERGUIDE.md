@@ -193,7 +193,7 @@ The supervisor is a fleet runner, so you can also adjust individual workers
 without editing the manifest:
 
 ```bash
-c8ctl nano supervisor add copilot --instances 3
+c8ctl nano supervisor add copilot --instances 3 --auto   # or --roles pr-review,feature
 c8ctl nano supervisor restart copilot
 c8ctl nano supervisor status
 c8ctl nano supervisor stop            # stop the daemon and all its workers
