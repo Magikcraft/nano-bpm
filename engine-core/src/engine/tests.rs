@@ -18829,7 +18829,10 @@ fn external_agent_activation_creates_a_job_and_no_agent_instance() {
     let job_created = events
         .iter()
         .any(|e| matches!(e, Event::JobCreated { element_id, .. } if element_id == "agent"));
-    assert!(job_created, "an external agent must create a job on activation");
+    assert!(
+        job_created,
+        "an external agent must create a job on activation"
+    );
 
     // NO AgentInstance was auto-minted.
     assert!(
@@ -18841,7 +18844,11 @@ fn external_agent_activation_creates_a_job_and_no_agent_instance() {
 
     // The job is activatable through the standard job loop (job type = element id).
     let activated = engine.activate_jobs("agent", "W", 10, 1_000, 0);
-    assert_eq!(activated.len(), 1, "the external agent's job is activatable");
+    assert_eq!(
+        activated.len(),
+        1,
+        "the external agent's job is activatable"
+    );
     assert_eq!(activated[0].element_id, "agent");
 }
 
@@ -19080,15 +19087,15 @@ fn external_agent_job_completion_advances_the_token() {
         .apply_command(Command::complete_job(job.key))
         .unwrap();
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id == "agent")),
+        events.iter().any(
+            |e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id == "agent")
+        ),
         "the agent element completes when its job completes"
     );
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "end")),
+        events.iter().any(
+            |e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "end")
+        ),
         "the token advances to the end event"
     );
 }
@@ -19216,9 +19223,7 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
     // The lease expires and the worker re-activates the SAME job, learning a
     // NEW lease token L2 (a different deadline).
     engine
-        .apply_command(Command::ExpireJobs {
-            now: job1.deadline,
-        })
+        .apply_command(Command::ExpireJobs { now: job1.deadline })
         .unwrap();
     let job2 = engine
         .activate_jobs("agent", "W", 1, 1_000, 5_000)
