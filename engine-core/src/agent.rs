@@ -32,7 +32,10 @@ pub enum AgentType {
     AiAgentTask,
     /// `aiAgentSubProcess` — an AI agent backed by a `bpmn:adHocSubProcess`.
     AiAgentSubProcess,
-    /// `external` — an externally-managed agent.
+    /// `external` — an externally-managed, **job-backed** agent (Camunda parity
+    /// #1099). It activates as a normal service-task job and its
+    /// [`AgentInstance`] is minted lazily by the worker (a lease-gated
+    /// `CreateAgentInstance`), not auto-minted at activation.
     External,
 }
 

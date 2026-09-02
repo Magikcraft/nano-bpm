@@ -11303,8 +11303,42 @@ impl ServerImpl {
                 max_model_calls: l.max_model_calls as i64,
                 max_tool_calls: l.max_tool_calls as i64,
             });
+        // A present-but-unparsable jobKey/jobLease must be rejected rather than
+        // silently coerced to 0: 0 changes ownership/attribution, so a malformed
+        // value is a 400, not a default. An `external` (job-backed) agent's create
+        // is lease-gated on these against the element's ACTIVATED job; the native
+        // aiAgentTask / aiAgentSubProcess variants leave them absent (0) and are
+        // auto-minted, so the engine skips the lease check for them.
+        let job_key: Key = match body.job_key.as_ref() {
+            None => 0,
+            Some(k) => match k.0.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid job key",
+                        400,
+                        format!("Job key '{}' is not a valid key.", k.0),
+                    )));
+                }
+            },
+        };
+        let job_lease: u64 = match body.job_lease.as_ref() {
+            None => 0,
+            Some(l) => match l.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid job lease",
+                        400,
+                        format!("Job lease '{l}' is not a valid value."),
+                    )));
+                }
+            },
+        };
         let command = Command::CreateAgentInstance {
             element_instance_key,
+            job_key,
+            job_lease,
             definition,
             limits,
             history: Vec::new(),
@@ -11486,6 +11520,8 @@ impl ServerImpl {
                     element_instance_key,
                     element_id,
                     process_instance_key,
+                    job_key,
+                    job_lease,
                     status,
                     metrics,
                     tools,
@@ -19852,6 +19888,13 @@ fn agent_create_error_response(
         EngineError::AgentInstanceConflict { .. } => Resp::Status400_TheProvidedDataIsNotValid(
             problem("Agent instance conflict", 400, e.to_string()),
         ),
+        EngineError::AgentInstanceJobLeaseInvalid { .. } => {
+            Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Agent job lease invalid",
+                400,
+                e.to_string(),
+            ))
+        }
         other => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
             "Agent instance creation failed",
             500,

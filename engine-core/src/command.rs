@@ -390,6 +390,21 @@ pub enum Command {
     CreateAgentInstance {
         /// The key of the AI Agent Sub-process / AI Agent Task element instance.
         element_instance_key: Key,
+        /// The agent job whose ACTIVATED lease authorizes this create. Required
+        /// for an `external` (job-backed) agent element (#1099): the referenced
+        /// job must be `ACTIVATED`, its `element_instance_key` must match, and
+        /// its lease deadline must equal `job_lease` — mirroring Camunda's
+        /// `AgentHistoryBatchBehavior.validateJobContext`. Ignored (`0`) for the
+        /// engine-native `aiAgentTask`/`aiAgentSubProcess` variants, which have
+        /// no external worker and whose AgentInstance is auto-minted at
+        /// activation.
+        #[cfg_attr(feature = "serde", serde(default))]
+        job_key: Key,
+        /// The activation lease deadline (the "lease token") of `job_key`. Must
+        /// equal the referenced job's current lease deadline for an `external`
+        /// agent; ignored (`0`) otherwise.
+        #[cfg_attr(feature = "serde", serde(default))]
+        job_lease: u64,
         /// Static definition set once at creation (model/provider/systemPrompt).
         definition: crate::agent::AgentDefinition,
         /// Limits for the agent execution; `None` = all limits default to `-1`.
@@ -431,6 +446,19 @@ pub enum Command {
         /// instance; must match the stored instance.
         #[cfg_attr(feature = "serde", serde(default))]
         process_instance_key: Key,
+        /// The agent job whose ACTIVATED lease authorizes an appended history
+        /// batch for an `external` (job-backed) agent element (#1099). When this
+        /// update carries `history` for an `external` agent, the referenced job
+        /// must be `ACTIVATED`, match `element_instance_key`, and its lease
+        /// deadline must equal `job_lease` (parity with Camunda's
+        /// `validateJobContext`). Ignored (`0`) for the engine-native variants
+        /// and for history-free updates.
+        #[cfg_attr(feature = "serde", serde(default))]
+        job_key: Key,
+        /// The activation lease deadline (the "lease token") of `job_key`; see
+        /// `job_key`.
+        #[cfg_attr(feature = "serde", serde(default))]
+        job_lease: u64,
         /// The target status; must be one of the *active* states (`COMPLETED`
         /// is not settable via UPDATE — it is reached only via COMPLETE).
         #[cfg_attr(
@@ -1131,6 +1159,8 @@ mod kind_tests {
         // build an oversized log entry that fails to replicate).
         let create = Command::CreateAgentInstance {
             element_instance_key: 1,
+            job_key: 0,
+            job_lease: 0,
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![turn.clone()],
@@ -1147,6 +1177,8 @@ mod kind_tests {
             element_instance_key: 2,
             element_id: String::new(),
             process_instance_key: 3,
+            job_key: 0,
+            job_lease: 0,
             status: None,
             metrics: Default::default(),
             tools: Some(vec![AgentTool {

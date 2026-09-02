@@ -305,6 +305,98 @@ assert(
   "a completed instance carries a completionDate",
 );
 
+// 7. external (job-backed) agent parity (#1099): unlike aiAgentTask, an
+//    `external` agent auto-mints NO AgentInstance — it activates as a normal
+//    job. A worker activates that job (standard job loop), learns its lease
+//    deadline (the "lease token"), and self-registers the AgentInstance via a
+//    lease-gated createAgentInstance. A CREATE without a valid job lease is
+//    rejected. This is the surface nano-workforce consumes.
+const EXTERNAL_PROC = `
+  <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+    <bpmn:process id="ext-proc" isExecutable="true">
+      <bpmn:startEvent id="start" />
+      <bpmn:serviceTask id="ext-agent">
+        <bpmn:extensionElements>
+          <zeebe:agentDefinition agentType="external" />
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="end" />
+      <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ext-agent" />
+      <bpmn:sequenceFlow id="f2" sourceRef="ext-agent" targetRef="end" />
+    </bpmn:process>
+  </bpmn:definitions>`;
+
+const ext = new TestEngine();
+ext.deploy(EXTERNAL_PROC);
+ext.createInstance("ext-proc", "{}");
+
+// Activation mints NO AgentInstance for an external agent.
+assert(
+  JSON.parse(ext.searchAgentInstances("{}")).items.length === 0,
+  "an external agent auto-mints no AgentInstance on activation",
+);
+
+// The agent element created a normal, activatable job (type = element id).
+const extJobs = JSON.parse(ext.activateJobs("ext-agent", 1, 1000, "W"));
+assert(
+  extJobs.length === 1 && extJobs[0].elementId === "ext-agent",
+  "an external agent activates as a normal job through the standard job loop",
+);
+const extJob = extJobs[0];
+const extEik = extJob.elementInstanceKey;
+const extLease = String(extJob.deadline);
+
+// A CREATE with a stale lease token is rejected (no AgentInstance minted).
+let extRejected = false;
+try {
+  ext.createAgentInstance(
+    JSON.stringify({
+      elementInstanceKey: extEik,
+      jobKey: extJob.key,
+      jobLease: String(extJob.deadline + 1),
+      definition: { model: "gpt-4o" },
+    }),
+  );
+} catch (e) {
+  extRejected = true;
+}
+assert(
+  extRejected,
+  "an external CREATE with a stale lease token is rejected",
+);
+assert(
+  JSON.parse(ext.searchAgentInstances("{}")).items.length === 0,
+  "the rejected external CREATE minted nothing",
+);
+
+// A CREATE referencing the ACTIVATED job with the matching lease mints it.
+ext.createAgentInstance(
+  JSON.stringify({
+    elementInstanceKey: extEik,
+    jobKey: extJob.key,
+    jobLease: extLease,
+    definition: { model: "gpt-4o", provider: "openai" },
+  }),
+);
+const extInstances = JSON.parse(ext.searchAgentInstances("{}")).items;
+assert(
+  extInstances.length === 1,
+  "a lease-gated external CREATE mints exactly one AgentInstance",
+);
+assert(
+  extInstances[0].status === "INITIALIZING" &&
+    extInstances[0].elementInstanceKey === extEik,
+  "the external AgentInstance is INITIALIZING and linked to the job's element instance",
+);
+
+// The job completes through the standard loop, advancing the token to the end.
+ext.completeJob(extJob.key, "{}");
+assert(
+  JSON.parse(ext.searchAgentInstances("{}")).items.length === 1,
+  "completing the external agent job leaves its AgentInstance intact",
+);
+
 if (failed) {
   console.error("\nagent-instance e2e probe FAILED");
   process.exit(1);

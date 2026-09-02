@@ -18753,7 +18753,434 @@ fn agent_task_activation_mints_an_agent_instance_in_initializing() {
     );
 }
 
+// --- external (job-backed) agent parity (Camunda 8.10, #1099) ---------------
+
+/// Deploy an `external` agent (a `serviceTask` bearing
+/// `zeebe:agentDefinition agentType="external"`), start an instance, and return
+/// the engine, the process-instance key and the agent element's active
+/// element-instance key. Unlike `aiAgentTask`, an `external` agent auto-mints
+/// **no** AgentInstance — it is job-backed — so the element-instance key is read
+/// from the `ElementActivated` event, not from a minted record.
+fn external_agent_instance() -> (Engine, Key, Key) {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="agent-proc" isExecutable="true">
+          <bpmn:startEvent id="start" />
+          <bpmn:serviceTask id="agent">
+            <bpmn:extensionElements>
+              <zeebe:agentDefinition agentType="external" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="end" />
+          <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="end" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("agent-proc"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    let eik = events
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivated {
+                element_instance_key,
+                element_id,
+                ..
+            } if element_id == "agent" => Some(*element_instance_key),
+            _ => None,
+        })
+        .expect("the agent element should activate");
+    (engine, instance_key, eik)
+}
+
+#[test]
+fn external_agent_activation_creates_a_job_and_no_agent_instance() {
+    // Camunda parity (#1099): an `external` agent is job-backed. On activation it
+    // creates a normal job (activatable through the standard job loop) and does
+    // NOT auto-mint an AgentInstance — the worker mints it via CREATE.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="agent-proc" isExecutable="true">
+          <bpmn:startEvent id="start" />
+          <bpmn:serviceTask id="agent">
+            <bpmn:extensionElements>
+              <zeebe:agentDefinition agentType="external" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="end" />
+          <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="end" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("agent-proc"))
+        .unwrap();
+
+    // A job was created on activation.
+    let job_created = events
+        .iter()
+        .any(|e| matches!(e, Event::JobCreated { element_id, .. } if element_id == "agent"));
+    assert!(job_created, "an external agent must create a job on activation");
+
+    // NO AgentInstance was auto-minted.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::AgentInstanceCreated { .. })),
+        "an external agent must not auto-mint an AgentInstance"
+    );
+
+    // The job is activatable through the standard job loop (job type = element id).
+    let activated = engine.activate_jobs("agent", "W", 10, 1_000, 0);
+    assert_eq!(activated.len(), 1, "the external agent's job is activatable");
+    assert_eq!(activated[0].element_id, "agent");
+}
+
+#[test]
+fn external_agent_lease_gated_create_mints_on_a_valid_job_lease() {
+    use crate::agent::{AgentDefinition, AgentInstanceStatus};
+    let (mut engine, pi, eik) = external_agent_instance();
+
+    // The worker activates the agent job (standard job loop) and learns its
+    // lease deadline — the lease "token".
+    let job = engine
+        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .pop()
+        .expect("the external agent's job is activatable");
+
+    // A lease-gated CREATE that references the ACTIVATED job with the matching
+    // lease and elementInstanceKey mints the AgentInstance (INITIALIZING).
+    let events = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: job.key,
+            job_lease: job.deadline,
+            definition: AgentDefinition {
+                model: Some("gpt-4o".to_string()),
+                ..Default::default()
+            },
+            limits: None,
+            history: vec![],
+        })
+        .unwrap();
+    let created = events
+        .iter()
+        .find_map(|e| match e {
+            Event::AgentInstanceCreated { agent_instance, .. } => Some(agent_instance.clone()),
+            _ => None,
+        })
+        .expect("a valid lease-gated CREATE mints the AgentInstance");
+    assert_eq!(created.status, AgentInstanceStatus::Initializing);
+    assert_eq!(created.element_instance_key, eik);
+    assert_eq!(created.agent_type, crate::agent::AgentType::External);
+    // The validated job lease is recorded on the AgentInstance.
+    assert_eq!(created.job_key, job.key);
+    assert_eq!(created.job_lease, job.deadline);
+    assert_eq!(
+        stored_agent_instance(&engine, pi, created.agent_instance_key).status,
+        AgentInstanceStatus::Initializing
+    );
+}
+
+#[test]
+fn external_agent_create_without_an_activated_job_is_rejected() {
+    use crate::agent::AgentDefinition;
+    let (mut engine, _pi, eik) = external_agent_instance();
+
+    // The job exists but has NOT been activated: no lease to gate on → reject.
+    let job_key = engine
+        .state
+        .jobs
+        .values()
+        .find(|j| j.element_instance_key == eik)
+        .map(|j| j.key)
+        .expect("the external agent has a job");
+    let err = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key,
+            job_lease: 12_345,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::AgentInstanceJobLeaseInvalid { .. }),
+        "CREATE on a non-activated job must be rejected, got {err:?}"
+    );
+    assert!(
+        engine
+            .state
+            .instances
+            .get(&_pi)
+            .map(|pi| pi.agent_instances.is_empty())
+            .unwrap_or(true),
+        "a rejected CREATE mints nothing"
+    );
+}
+
+#[test]
+fn external_agent_create_with_a_stale_lease_token_is_rejected() {
+    use crate::agent::AgentDefinition;
+    let (mut engine, _pi, eik) = external_agent_instance();
+    let job = engine
+        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .pop()
+        .expect("activatable");
+
+    // Right job, right element, but a lease token (deadline) that does not match.
+    let err = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: job.key,
+            job_lease: job.deadline + 1,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::AgentInstanceJobLeaseInvalid { .. }),
+        "a mismatched lease token must be rejected, got {err:?}"
+    );
+}
+
+#[test]
+fn external_agent_create_with_a_foreign_element_instance_is_rejected() {
+    use crate::agent::AgentDefinition;
+    let (mut engine, _pi, eik) = external_agent_instance();
+    let job = engine
+        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .pop()
+        .expect("activatable");
+
+    // The job's element instance must match the CREATE's element_instance_key.
+    // Assert with a different (inactive) element instance key → rejected as
+    // inactive before it can borrow this job's lease.
+    let err = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik + 777,
+            job_key: job.key,
+            job_lease: job.deadline,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EngineError::AgentInstanceElementInstanceInactive { .. }
+                | EngineError::AgentInstanceJobLeaseInvalid { .. }
+        ),
+        "a foreign element instance must be rejected, got {err:?}"
+    );
+    let _ = eik;
+}
+
+#[test]
+fn external_agent_reactivation_reconciles_into_one_agent_instance() {
+    use crate::agent::AgentDefinition;
+    let (mut engine, pi, eik) = external_agent_instance();
+    let job = engine
+        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .pop()
+        .expect("activatable");
+
+    // First CREATE mints the AgentInstance.
+    let first = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: job.key,
+            job_lease: job.deadline,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap();
+    let aik = first
+        .iter()
+        .find_map(|e| match e {
+            Event::AgentInstanceCreated { agent_instance, .. } => {
+                Some(agent_instance.agent_instance_key)
+            }
+            _ => None,
+        })
+        .expect("first CREATE mints");
+
+    // A second CREATE for the same element instance reconciles (idempotent
+    // upsert on element_instance_key) rather than minting a duplicate.
+    let second = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: job.key,
+            job_lease: job.deadline,
+            definition: AgentDefinition {
+                model: Some("gpt-4o".to_string()),
+                ..Default::default()
+            },
+            limits: None,
+            history: vec![],
+        })
+        .unwrap();
+    let aik2 = second
+        .iter()
+        .find_map(|e| match e {
+            Event::AgentInstanceCreated { agent_instance, .. } => {
+                Some(agent_instance.agent_instance_key)
+            }
+            _ => None,
+        })
+        .expect("second CREATE re-emits");
+    assert_eq!(aik, aik2, "reconciles into one AgentInstance, no duplicate");
+    assert_eq!(
+        engine
+            .state
+            .instances
+            .get(&pi)
+            .map(|pi| pi.agent_instances.len())
+            .unwrap_or(0),
+        1,
+        "exactly one AgentInstance for the element"
+    );
+}
+
+#[test]
+fn external_agent_job_completion_advances_the_token() {
+    use crate::agent::AgentDefinition;
+    let (mut engine, _pi, eik) = external_agent_instance();
+    let job = engine
+        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .pop()
+        .expect("activatable");
+    engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: job.key,
+            job_lease: job.deadline,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap();
+
+    // Completing the agent job resumes the parked token and routes the outgoing
+    // flow, exactly like a service task — the harness drives the standard loop.
+    let events = engine
+        .apply_command(Command::complete_job(job.key))
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id == "agent")),
+        "the agent element completes when its job completes"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "end")),
+        "the token advances to the end event"
+    );
+}
+
+#[test]
+fn external_agent_history_bearing_update_is_lease_gated() {
+    use crate::agent::{AgentDefinition, AgentHistoryRole};
+    let (mut engine, pi, eik) = external_agent_instance();
+    let job = engine
+        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .pop()
+        .expect("activatable");
+    let created = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: job.key,
+            job_lease: job.deadline,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap();
+    let aik = created
+        .iter()
+        .find_map(|e| match e {
+            Event::AgentInstanceCreated { agent_instance, .. } => {
+                Some(agent_instance.agent_instance_key)
+            }
+            _ => None,
+        })
+        .expect("CREATE mints");
+
+    // A history-bearing UPDATE with a stale lease token is rejected.
+    let err = engine
+        .apply_command(Command::UpdateAgentInstance {
+            agent_instance_key: aik,
+            element_instance_key: eik,
+            element_id: "agent".to_string(),
+            process_instance_key: pi,
+            job_key: job.key,
+            job_lease: job.deadline + 1,
+            status: None,
+            metrics: Default::default(),
+            tools: None,
+            history: vec![history_turn(0, 200, AgentHistoryRole::Assistant)],
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::AgentInstanceJobLeaseInvalid { .. }),
+        "a history-bearing UPDATE with a bad lease is rejected, got {err:?}"
+    );
+
+    // A history-free UPDATE (pure status advance) is NOT gated.
+    engine
+        .apply_command(Command::UpdateAgentInstance {
+            agent_instance_key: aik,
+            element_instance_key: eik,
+            element_id: "agent".to_string(),
+            process_instance_key: pi,
+            job_key: 0,
+            job_lease: 0,
+            status: Some(crate::agent::AgentInstanceStatus::Thinking),
+            metrics: Default::default(),
+            tools: None,
+            history: vec![],
+        })
+        .expect("a history-free UPDATE is not lease-gated");
+
+    // A history-bearing UPDATE with the valid lease is accepted and appends.
+    let ok = engine
+        .apply_command(Command::UpdateAgentInstance {
+            agent_instance_key: aik,
+            element_instance_key: eik,
+            element_id: "agent".to_string(),
+            process_instance_key: pi,
+            job_key: job.key,
+            job_lease: job.deadline,
+            status: None,
+            metrics: Default::default(),
+            tools: None,
+            history: vec![history_turn(1, 300, AgentHistoryRole::Assistant)],
+        })
+        .expect("a history-bearing UPDATE with a valid lease is accepted");
+    assert!(
+        ok.iter()
+            .any(|e| matches!(e, Event::AgentHistoryCreated { .. })),
+        "the valid-lease UPDATE appends a history record"
+    );
+}
+
 // --- AgentHistory turn log (Camunda 8.10 parity, Stage 3 / slice S2) --------
+
 
 /// Deploy an `aiAgentTask` service task, start an instance, and return the
 /// engine together with the owning process-instance key and the minted
@@ -19231,6 +19658,8 @@ fn agent_instance_create_from_active_agent_element_reconciles_to_initializing() 
     let events = engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
+            job_key: 0,
+            job_lease: 0,
             definition: AgentDefinition {
                 model: Some("gpt-4o".to_string()),
                 ..Default::default()
@@ -19276,6 +19705,8 @@ fn agent_instance_create_without_explicit_limits_defaults_to_unlimited() {
     engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
+            job_key: 0,
+            job_lease: 0,
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19304,6 +19735,8 @@ fn agent_instance_create_takes_limits_from_configuration_history_item() {
     engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
+            job_key: 0,
+            job_lease: 0,
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![cfg_turn],
@@ -19334,6 +19767,8 @@ fn agent_instance_create_ignores_limits_from_non_configuration_history_item() {
     engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
+            job_key: 0,
+            job_lease: 0,
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![assistant_turn],
@@ -19370,6 +19805,8 @@ fn agent_instance_create_takes_limits_from_last_configuration_not_later_turn() {
     engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
+            job_key: 0,
+            job_lease: 0,
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![cfg_turn, later_assistant],
@@ -19389,6 +19826,8 @@ fn agent_instance_create_on_inactive_element_instance_is_rejected() {
     let err = engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: 999_999_999,
+            job_key: 0,
+            job_lease: 0,
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19441,6 +19880,8 @@ fn agent_instance_create_on_plain_service_task_missing_agent_definition_is_rejec
     let err = engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
+            job_key: 0,
+            job_lease: 0,
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19492,6 +19933,8 @@ fn agent_instance_create_on_non_eligible_element_is_rejected() {
     let err = engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
+            job_key: 0,
+            job_lease: 0,
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19518,6 +19961,8 @@ fn update_agent(
         element_instance_key: eik,
         element_id: "agent".to_string(),
         process_instance_key: pi,
+        job_key: 0,
+        job_lease: 0,
         status: Some(status),
         metrics,
         tools: None,
@@ -19599,6 +20044,8 @@ fn agent_instance_update_replaces_tools() {
             element_instance_key: eik,
             element_id: "agent".to_string(),
             process_instance_key: pi,
+            job_key: 0,
+            job_lease: 0,
             status: Some(AgentInstanceStatus::ToolDiscovery),
             metrics: AgentInstanceMetricsDelta::default(),
             tools: Some(vec![tool.clone()]),
@@ -19641,6 +20088,8 @@ fn agent_instance_update_with_wrong_element_id_or_process_instance_is_rejected()
             element_instance_key: eik,
             element_id: "not-agent".to_string(),
             process_instance_key: pi,
+            job_key: 0,
+            job_lease: 0,
             status: Some(AgentInstanceStatus::Thinking),
             metrics: AgentInstanceMetricsDelta::default(),
             tools: None,
@@ -19658,6 +20107,8 @@ fn agent_instance_update_with_wrong_element_id_or_process_instance_is_rejected()
             element_instance_key: eik,
             element_id: "agent".to_string(),
             process_instance_key: 424_242,
+            job_key: 0,
+            job_lease: 0,
             status: Some(AgentInstanceStatus::Thinking),
             metrics: AgentInstanceMetricsDelta::default(),
             tools: None,
@@ -19718,6 +20169,8 @@ fn agent_instance_update_with_conflicting_instance_is_rejected() {
             element_instance_key: eik_b,
             element_id: "agent".to_string(),
             process_instance_key: pi_a,
+            job_key: 0,
+            job_lease: 0,
             status: Some(AgentInstanceStatus::Thinking),
             metrics: AgentInstanceMetricsDelta::default(),
             tools: None,
@@ -19777,6 +20230,8 @@ fn agent_instance_update_with_foreign_process_element_instance_is_rejected() {
             element_instance_key: foreign_eik,
             element_id: "agent".to_string(),
             process_instance_key: pi,
+            job_key: 0,
+            job_lease: 0,
             status: Some(AgentInstanceStatus::Thinking),
             metrics: AgentInstanceMetricsDelta::default(),
             tools: None,
@@ -19891,6 +20346,8 @@ fn agent_instance_update_over_budget_batch_is_rejected_but_unlimited_passes() {
     engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
+            job_key: 0,
+            job_lease: 0,
             definition: AgentDefinition::default(),
             limits: Some(AgentInstanceLimits {
                 max_tokens: 50,
