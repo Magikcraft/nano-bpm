@@ -35288,6 +35288,8 @@ mod call_activity_hierarchy_read_model_tests {
                 "be helpful".to_string(),
             ),
             limits: None,
+            job_key: None,
+            job_lease: None,
         };
         let CResp::Status200_TheAgentInstanceWasCreated(created) = srv
             .create_agent_instance_impl(&create_body)
@@ -35518,6 +35520,8 @@ mod call_activity_hierarchy_read_model_tests {
                 "be helpful".to_string(),
             ),
             limits: None,
+            job_key: None,
+            job_lease: None,
         };
         assert!(
             matches!(
