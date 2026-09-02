@@ -817,16 +817,19 @@ impl Engine {
             // CREATE after re-activation must refresh, not preserve, a stale
             // lease token (else later history-bearing updates keyed off the
             // snapshot's lease are wrongly rejected). Engine-native variants
-            // carry no job, so keep the existing (0) attribution.
+            // carry no job: the docs on `CreateAgentInstance` declare their
+            // `job_key`/`job_lease` ignored, so hard-ignore any caller-supplied
+            // values and default to 0 when no prior record exists (only ever
+            // preserve an existing snapshot's attribution).
             job_key: if agent_type == crate::agent::AgentType::External {
                 job_key
             } else {
-                existing.as_ref().map(|ai| ai.job_key).unwrap_or(job_key)
+                existing.as_ref().map(|ai| ai.job_key).unwrap_or(0)
             },
             job_lease: if agent_type == crate::agent::AgentType::External {
                 job_lease
             } else {
-                existing.as_ref().map(|ai| ai.job_lease).unwrap_or(job_lease)
+                existing.as_ref().map(|ai| ai.job_lease).unwrap_or(0)
             },
             created_at: existing
                 .as_ref()

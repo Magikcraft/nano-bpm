@@ -19786,6 +19786,47 @@ fn agent_instance_create_from_active_agent_element_reconciles_to_initializing() 
 }
 
 #[test]
+fn agent_instance_create_hard_ignores_caller_supplied_attribution_for_engine_native() {
+    use crate::agent::{AgentDefinition, AgentHistoryRole, AgentInstanceLimits};
+    let (mut engine, pi, aik) = agent_instance_for_history();
+    let eik = agent_element_instance_key(&engine, pi, aik);
+
+    // An engine-native agent carries no job: the docs on `CreateAgentInstance`
+    // declare its `job_key`/`job_lease` ignored. A CREATE that reconciles a
+    // fresh auto-minted record (no prior snapshot to preserve) must hard-ignore
+    // any caller-supplied attribution and keep it 0, never persist the request
+    // values.
+    let created = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: 999_999,
+            job_lease: 888_888,
+            definition: AgentDefinition::default(),
+            limits: Some(AgentInstanceLimits::default()),
+            history: vec![history_turn(0, 10, AgentHistoryRole::Configuration)],
+        })
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            Event::AgentInstanceCreated { agent_instance, .. } => Some(agent_instance.clone()),
+            _ => None,
+        })
+        .expect("CREATE emits AgentInstanceCreated");
+
+    assert_eq!(
+        created.job_key, 0,
+        "engine-native CREATE must not persist caller-supplied job_key"
+    );
+    assert_eq!(
+        created.job_lease, 0,
+        "engine-native CREATE must not persist caller-supplied job_lease"
+    );
+    let stored = stored_agent_instance(&engine, pi, aik);
+    assert_eq!(stored.job_key, 0);
+    assert_eq!(stored.job_lease, 0);
+}
+
+#[test]
 fn agent_instance_create_without_explicit_limits_defaults_to_unlimited() {
     use crate::agent::{AgentDefinition, AgentInstanceLimits};
     let (mut engine, pi, aik) = agent_instance_for_history();
