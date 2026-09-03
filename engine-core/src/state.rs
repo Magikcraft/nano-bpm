@@ -189,6 +189,23 @@ pub struct Job {
     /// `None` when not activated or for pre-field records.
     #[cfg_attr(feature = "serde", serde(default))]
     pub activation_timeout: Option<u64>,
+    /// The **per-activation lease token** minted when this job was
+    /// activated *with a lease*, distinct from [`Job::deadline`] (Camunda's
+    /// `JobRecord.leaseToken`, ADR 0005-810-job-lease). A staleness handle
+    /// (monotonic key, not a cryptographically unguessable secret) that only
+    /// fences a command against a superseded activation; caller
+    /// forgery-resistance is the gateway auth layer's job (ADR-0028). It is
+    /// regenerated on each
+    /// activation-with-lease and is the value an `external`, job-backed agent
+    /// worker echoes back as `jobLease` when it registers an AgentInstance / a
+    /// history batch — gated by [`crate::Engine::validate_agent_job_context`]
+    /// (#1099/#1106). `None` for a *lease-less* activation (Camunda
+    /// `!hasLeaseToken()`), which skips the lease comparison entirely: ordinary
+    /// service-task / listener jobs and digest-recovered leases carry none.
+    /// Cleared whenever the lock is released; `None` for records serialized
+    /// before this field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub lease_token: Option<u64>,
     /// Whether this job has ever been activated. Completion is permitted for any
     /// job that has been activated at least once and is not yet completed —
     /// regardless of which worker currently holds (or held) the lock. This is
@@ -1905,6 +1922,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     deadline: None,
                     activated_at: None,
                     activation_timeout: None,
+                    lease_token: None,
                     activated: false,
                     retries: *retries,
                     priority: *priority,
@@ -2039,6 +2057,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     deadline: None,
                     activated_at: None,
                     activation_timeout: None,
+                    lease_token: None,
                     activated: false,
                     retries: *retries,
                     priority: DEFAULT_JOB_PRIORITY,
@@ -2083,6 +2102,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     deadline: None,
                     activated_at: None,
                     activation_timeout: None,
+                    lease_token: None,
                     activated: false,
                     retries: *retries,
                     priority: DEFAULT_JOB_PRIORITY,
@@ -2135,6 +2155,7 @@ pub fn apply(state: &mut State, event: &Event) {
             worker,
             deadline,
             activated_at,
+            lease_token,
             ..
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
@@ -2146,6 +2167,11 @@ pub fn apply(state: &mut State, event: &Event) {
                 // instants the event carries (deadline = activated_at + timeout).
                 // Immune to later UpdateJobTimeout extensions that move `deadline`.
                 job.activation_timeout = activated_at.map(|a| deadline.saturating_sub(a));
+                // Restore the opaque per-activation lease token from the event
+                // (minted once at command-processing, ADR 0005-810-job-lease D2):
+                // replay reads it here rather than regenerating it. `None` for a
+                // lease-less activation.
+                job.lease_token = *lease_token;
                 job.activated = true;
             }
             resync_job_index(state, *job_key);
@@ -2159,6 +2185,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     job.deadline = None;
                     job.activated_at = None;
                     job.activation_timeout = None;
+                    job.lease_token = None;
                 }
             }
             resync_job_index(state, *job_key);
@@ -2175,6 +2202,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.deadline = None;
                 job.activated_at = None;
                 job.activation_timeout = None;
+                job.lease_token = None;
                 // With retries left the job returns to the activatable pool; with
                 // none it parks (an incident is raised alongside this event).
                 if *retries > 0 {
@@ -2208,6 +2236,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.deadline = None;
                 job.activated_at = None;
                 job.activation_timeout = None;
+                job.lease_token = None;
                 // Terminal, incident-bearing transition: retain the activating
                 // `worker` for attribution (Zeebe parity — throwError retains the
                 // record incl. `worker`). Carried on the event so it survives a
@@ -2226,6 +2255,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.deadline = None;
                 job.activated_at = None;
                 job.activation_timeout = None;
+                job.lease_token = None;
             }
             resync_job_index(state, *job_key);
         }
@@ -2405,6 +2435,7 @@ pub fn apply(state: &mut State, event: &Event) {
                         job.deadline = None;
                         job.activated_at = None;
                         job.activation_timeout = None;
+                        job.lease_token = None;
                     }
                     resync_job_index(state, *job_key);
                 }
@@ -2671,6 +2702,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.deadline = None;
                 job.activated_at = None;
                 job.activation_timeout = None;
+                job.lease_token = None;
             }
             resync_job_index(state, *job_key);
         }

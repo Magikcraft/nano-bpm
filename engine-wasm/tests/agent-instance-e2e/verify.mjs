@@ -307,9 +307,10 @@ assert(
 
 // 7. external (job-backed) agent parity (#1099): unlike aiAgentTask, an
 //    `external` agent auto-mints NO AgentInstance — it activates as a normal
-//    job. A worker activates that job (standard job loop), learns its lease
-//    deadline (the "lease token"), and self-registers the AgentInstance via a
-//    lease-gated createAgentInstance. A CREATE without a valid job lease is
+//    job. A worker activates that job (standard job loop), learns its opaque
+//    lease token (distinct from the job's deadline, #1106), and self-registers
+//    the AgentInstance via a lease-gated createAgentInstance. A CREATE that
+//    references the job with a stale/mismatched (jobKey, jobLease) pair is
 //    rejected. This is the surface nano-workforce consumes.
 const EXTERNAL_PROC = `
   <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
@@ -337,6 +338,14 @@ assert(
   "an external agent auto-mints no AgentInstance on activation",
 );
 
+// Advance the WASM engine clock to a large wall-time before activation so the
+// activated job's `deadline` (now + timeout_ms) is a large value. `jobLease` is
+// a monotonic key, small at first; without advancing the clock a small deadline
+// (~timeout_ms) could coincidentally equal it and make the distinctness
+// assertion below pass (or fail) by accident. A large deadline removes the
+// coincidence and keeps the assertion meaningful (#1106).
+ext.tickNow(1_000_000_000_000);
+
 // The agent element created a normal, activatable job (type = element id).
 const extJobs = JSON.parse(ext.activateJobs("ext-agent", 1, 1000, "W"));
 assert(
@@ -345,7 +354,19 @@ assert(
 );
 const extJob = extJobs[0];
 const extEik = extJob.elementInstanceKey;
-const extLease = String(extJob.deadline);
+// The lease token is a real opaque per-activation token surfaced as `jobLease`,
+// distinct from the job's `deadline` (#1106 — Camunda `hasLeaseToken()` parity).
+assert(
+  typeof extJob.jobLease === "string" &&
+    extJob.jobLease !== String(extJob.deadline),
+  "an external agent job carries an opaque lease token distinct from its deadline",
+);
+const extLease = extJob.jobLease;
+
+// Perturb the lease OUTSIDE the try/catch: parsing must fail loudly if the
+// token ever stops being a decimal u64 string, rather than being swallowed by
+// the rejection catch below and passing the test without exercising the path.
+const extStaleLease = String(BigInt(extLease) + 1n);
 
 // A CREATE with a stale lease token is rejected (no AgentInstance minted).
 let extRejected = false;
@@ -354,7 +375,7 @@ try {
     JSON.stringify({
       elementInstanceKey: extEik,
       jobKey: extJob.key,
-      jobLease: String(extJob.deadline + 1),
+      jobLease: extStaleLease,
       definition: { model: "gpt-4o" },
     }),
   );

@@ -310,6 +310,7 @@ mod tests {
             activated_at: None,
             activation_timeout: None,
             activated: false,
+            lease_token: None,
             retries: 3,
             priority: nanobpmn_engine_core::DEFAULT_JOB_PRIORITY,
             created_at: 0,

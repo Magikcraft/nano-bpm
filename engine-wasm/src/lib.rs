@@ -605,7 +605,7 @@ impl TestEngine {
             .iter()
             .filter_map(|k| self.engine.activated_job(*k))
             .map(|j| {
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "key": j.key.to_string(),
                     "type": j.job_type,
                     "instanceKey": j.instance_key.to_string(),
@@ -622,7 +622,15 @@ impl TestEngine {
                     "tags": j.tags,
                     "businessId": j.business_id,
                     "variables": vars_to_json(&j.variables),
-                })
+                });
+                // Only external-agent jobs carry a lease token; omit `jobLease`
+                // entirely for lease-less activations (matching the FFI JSON and
+                // the generated `jobLease?: string` type) rather than emitting a
+                // JSON `null`.
+                if let Some(lease) = j.lease_token {
+                    obj["jobLease"] = serde_json::Value::String(lease.to_string());
+                }
+                obj
             })
             .collect();
         to_json(&serde_json::Value::Array(out))
@@ -2918,7 +2926,9 @@ struct CreateAgentInstanceReq {
     /// any initial `history` turns.
     #[serde(default)]
     job_key: Option<String>,
-    /// The activation lease deadline (the "lease token") of `jobKey`.
+    /// The per-activation lease token (a staleness handle, not a
+    /// cryptographically unguessable secret) of `jobKey`, distinct from the
+    /// job's deadline (#1106).
     #[serde(default)]
     job_lease: Option<String>,
     #[serde(default)]
@@ -2964,8 +2974,9 @@ struct UpdateAgentInstanceReq {
     /// gateway attributes it to every appended turn (`0`/absent = none).
     #[serde(default)]
     job_key: Option<String>,
-    /// The agent job's lease deadline for this batch; attributed to every
-    /// appended turn alongside `jobKey` (`0`/absent = none).
+    /// The agent job's per-activation lease token (a staleness handle) for this
+    /// batch; attributed to every appended turn alongside `jobKey`
+    /// (`0`/absent = none).
     #[serde(default)]
     job_lease: Option<String>,
     #[serde(default)]
