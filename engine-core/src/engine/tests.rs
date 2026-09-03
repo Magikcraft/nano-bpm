@@ -18870,7 +18870,7 @@ fn external_agent_lease_gated_create_mints_on_a_valid_job_lease() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job.key,
-            job_lease: job.deadline,
+            job_lease: job.lease_token.expect("external agent job carries a lease"),
             definition: AgentDefinition {
                 model: Some("gpt-4o".to_string()),
                 ..Default::default()
@@ -18891,7 +18891,7 @@ fn external_agent_lease_gated_create_mints_on_a_valid_job_lease() {
     assert_eq!(created.agent_type, crate::agent::AgentType::External);
     // The validated job lease is recorded on the AgentInstance.
     assert_eq!(created.job_key, job.key);
-    assert_eq!(created.job_lease, job.deadline);
+    assert_eq!(created.job_lease, job.lease_token.expect("external agent job carries a lease"));
     assert_eq!(
         stored_agent_instance(&engine, pi, created.agent_instance_key).status,
         AgentInstanceStatus::Initializing
@@ -18922,7 +18922,7 @@ fn external_agent_create_without_an_activated_job_is_rejected() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, EngineError::AgentInstanceJobLeaseInvalid { .. }),
+        matches!(err, EngineError::AgentInstanceJobNotActive { .. }),
         "CREATE on a non-activated job must be rejected, got {err:?}"
     );
     assert!(
@@ -18950,14 +18950,14 @@ fn external_agent_create_with_a_stale_lease_token_is_rejected() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job.key,
-            job_lease: job.deadline + 1,
+            job_lease: job.lease_token.expect("external agent job carries a lease") + 1,
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
         })
         .unwrap_err();
     assert!(
-        matches!(err, EngineError::AgentInstanceJobLeaseInvalid { .. }),
+        matches!(err, EngineError::AgentInstanceJobLeaseMismatch { .. }),
         "a mismatched lease token must be rejected, got {err:?}"
     );
 }
@@ -18978,7 +18978,7 @@ fn external_agent_create_with_a_foreign_element_instance_is_rejected() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik + 777,
             job_key: job.key,
-            job_lease: job.deadline,
+            job_lease: job.lease_token.expect("external agent job carries a lease"),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -18988,7 +18988,7 @@ fn external_agent_create_with_a_foreign_element_instance_is_rejected() {
         matches!(
             err,
             EngineError::AgentInstanceElementInstanceInactive { .. }
-                | EngineError::AgentInstanceJobLeaseInvalid { .. }
+                | EngineError::AgentInstanceJobElementMismatch { .. }
         ),
         "a foreign element instance must be rejected, got {err:?}"
     );
@@ -19009,7 +19009,7 @@ fn external_agent_reactivation_reconciles_into_one_agent_instance() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job.key,
-            job_lease: job.deadline,
+            job_lease: job.lease_token.expect("external agent job carries a lease"),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19031,7 +19031,7 @@ fn external_agent_reactivation_reconciles_into_one_agent_instance() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job.key,
-            job_lease: job.deadline,
+            job_lease: job.lease_token.expect("external agent job carries a lease"),
             definition: AgentDefinition {
                 model: Some("gpt-4o".to_string()),
                 ..Default::default()
@@ -19074,7 +19074,7 @@ fn external_agent_job_completion_advances_the_token() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job.key,
-            job_lease: job.deadline,
+            job_lease: job.lease_token.expect("external agent job carries a lease"),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19112,7 +19112,7 @@ fn external_agent_history_bearing_update_is_lease_gated() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job.key,
-            job_lease: job.deadline,
+            job_lease: job.lease_token.expect("external agent job carries a lease"),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19136,7 +19136,7 @@ fn external_agent_history_bearing_update_is_lease_gated() {
             element_id: "agent".to_string(),
             process_instance_key: pi,
             job_key: job.key,
-            job_lease: job.deadline + 1,
+            job_lease: job.lease_token.expect("external agent job carries a lease") + 1,
             status: None,
             metrics: Default::default(),
             tools: None,
@@ -19144,7 +19144,7 @@ fn external_agent_history_bearing_update_is_lease_gated() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, EngineError::AgentInstanceJobLeaseInvalid { .. }),
+        matches!(err, EngineError::AgentInstanceJobLeaseMismatch { .. }),
         "a history-bearing UPDATE with a bad lease is rejected, got {err:?}"
     );
 
@@ -19172,7 +19172,7 @@ fn external_agent_history_bearing_update_is_lease_gated() {
             element_id: "agent".to_string(),
             process_instance_key: pi,
             job_key: job.key,
-            job_lease: job.deadline,
+            job_lease: job.lease_token.expect("external agent job carries a lease"),
             status: None,
             metrics: Default::default(),
             tools: None,
@@ -19200,7 +19200,7 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job1.key,
-            job_lease: job1.deadline,
+            job_lease: job1.lease_token.expect("first activation carries a lease"),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19217,11 +19217,12 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
         .expect("CREATE mints");
     assert_eq!(
         stored_agent_instance(&engine, pi, aik).job_lease,
-        job1.deadline
+        job1.lease_token.expect("first activation carries a lease")
     );
 
     // The lease expires and the worker re-activates the SAME job, learning a
-    // NEW lease token L2 (a different deadline).
+    // NEW lease token L2 (an opaque token, distinct from the deadline and from
+    // the previous activation's token).
     engine
         .apply_command(Command::ExpireJobs { now: job1.deadline })
         .unwrap();
@@ -19230,7 +19231,10 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
         .pop()
         .expect("re-activatable after lease expiry");
     assert_eq!(job2.key, job1.key, "same job, fresh lease");
-    assert_ne!(job2.deadline, job1.deadline, "the lease token changed");
+    assert_ne!(
+        job2.lease_token, job1.lease_token,
+        "re-activation mints a fresh lease token"
+    );
 
     // A repeat CREATE under L2 must REFRESH the recorded lease, not preserve the
     // stale L1 (else a later lease check keyed off the snapshot's token wrongly
@@ -19239,7 +19243,7 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job2.key,
-            job_lease: job2.deadline,
+            job_lease: job2.lease_token.expect("second activation carries a lease"),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19247,7 +19251,7 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
         .unwrap();
     assert_eq!(
         stored_agent_instance(&engine, pi, aik).job_lease,
-        job2.deadline,
+        job2.lease_token.expect("second activation carries a lease"),
         "a repeat CREATE refreshes the snapshot's stale lease token"
     );
 
@@ -19260,7 +19264,7 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
             element_id: "agent".to_string(),
             process_instance_key: pi,
             job_key: job2.key,
-            job_lease: job2.deadline,
+            job_lease: job2.lease_token.expect("second activation carries a lease"),
             status: None,
             metrics: Default::default(),
             tools: None,
@@ -19269,8 +19273,218 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
         .expect("a history-bearing UPDATE under the fresh lease is accepted");
     assert_eq!(
         stored_agent_instance(&engine, pi, aik).job_lease,
-        job2.deadline,
+        job2.lease_token.expect("second activation carries a lease"),
         "a history-bearing UPDATE records the validated lease token"
+    );
+}
+
+/// #1106 divergence 1 — the lease token is a distinct **opaque per-activation**
+/// value, NOT the job's `deadline`. The pre-#1106 engine reused `deadline` as
+/// the token; a distinct token is what lets a lease survive a `deadline`-moving
+/// lock extension (see the next test).
+#[test]
+fn external_agent_lease_token_is_distinct_from_the_deadline() {
+    let (mut engine, _pi, _eik) = external_agent_instance();
+    let job = engine
+        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .pop()
+        .expect("activatable");
+    let token = job
+        .lease_token
+        .expect("an external agent job activates with a lease token");
+    assert_ne!(
+        token, job.deadline,
+        "the opaque lease token must not be the activation deadline"
+    );
+}
+
+/// #1106 divergence 1 — because the lease token is independent of `deadline`, a
+/// lock extension (`UpdateJobTimeout`, which moves `deadline` but is NOT a
+/// re-activation) leaves the lease valid. The pre-#1106 engine, keying the lease
+/// off `deadline`, would have spuriously rejected the worker's still-live lease
+/// after any timeout extension.
+#[test]
+fn external_agent_lease_survives_a_job_timeout_extension() {
+    use crate::agent::AgentDefinition;
+    let (mut engine, _pi, eik) = external_agent_instance();
+    let job = engine
+        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .pop()
+        .expect("activatable");
+    let lease = job.lease_token.expect("lease token");
+
+    // Extend the lock — this moves the deadline but must NOT change the token.
+    engine
+        .apply_command_at(Command::update_job_timeout(job.key, 50_000), 200)
+        .expect("a lock extension on an activated job succeeds");
+    let moved_deadline = engine.job(job.key).and_then(|j| j.deadline);
+    assert_ne!(
+        moved_deadline,
+        Some(job.deadline),
+        "the timeout extension moved the deadline"
+    );
+
+    // The worker's original lease token still validates.
+    engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: job.key,
+            job_lease: lease,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .expect("the lease survives a deadline-moving lock extension");
+}
+
+/// #1106 divergence 2 — an `external` CREATE is allowed to be **jobless**
+/// (`job_key == 0`) when it carries no history batch (Camunda's `jobKey == -1`
+/// short-circuit), but the job becomes required the moment a batch is attached.
+#[test]
+fn external_agent_create_is_jobless_only_without_history() {
+    use crate::agent::{AgentDefinition, AgentHistoryRole};
+    let (mut engine, _pi, eik) = external_agent_instance();
+
+    // Jobless CREATE + no history → mints (no live job required yet).
+    let ok = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: 0,
+            job_lease: 0,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .expect("a jobless, history-free CREATE is allowed");
+    assert!(
+        ok.iter()
+            .any(|e| matches!(e, Event::AgentInstanceCreated { .. })),
+        "the jobless CREATE mints the AgentInstance"
+    );
+
+    // Jobless CREATE + a history batch → rejected: a batch must be attributed to
+    // the active job that produced it.
+    let err = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: 0,
+            job_lease: 0,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![history_turn(0, 200, AgentHistoryRole::Assistant)],
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::AgentInstanceJobRequiredForHistory { .. }),
+        "a jobless CREATE carrying history must be rejected, got {err:?}"
+    );
+}
+
+/// #1106 divergence 3 — a **history-free** UPDATE that nonetheless supplies a
+/// `job_key` must still validate it (active + matching lease + element). Only a
+/// fully job-optional UPDATE (no job AND no history) skips the gate. The
+/// pre-#1106 engine skipped validation whenever history was empty, silently
+/// accepting a stale/foreign job.
+#[test]
+fn external_agent_history_free_update_validates_a_supplied_job() {
+    use crate::agent::AgentDefinition;
+    let (mut engine, pi, eik) = external_agent_instance();
+    let job = engine
+        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .pop()
+        .expect("activatable");
+    let lease = job.lease_token.expect("lease token");
+    let created = engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key: eik,
+            job_key: job.key,
+            job_lease: lease,
+            definition: AgentDefinition::default(),
+            limits: None,
+            history: vec![],
+        })
+        .unwrap();
+    let aik = created
+        .iter()
+        .find_map(|e| match e {
+            Event::AgentInstanceCreated { agent_instance, .. } => {
+                Some(agent_instance.agent_instance_key)
+            }
+            _ => None,
+        })
+        .expect("CREATE mints");
+
+    // A history-free UPDATE that supplies a STALE lease token is rejected.
+    let err = engine
+        .apply_command(Command::UpdateAgentInstance {
+            agent_instance_key: aik,
+            element_instance_key: eik,
+            element_id: "agent".to_string(),
+            process_instance_key: pi,
+            job_key: job.key,
+            job_lease: lease + 1,
+            status: Some(crate::agent::AgentInstanceStatus::Thinking),
+            metrics: Default::default(),
+            tools: None,
+            history: vec![],
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::AgentInstanceJobLeaseMismatch { .. }),
+        "a history-free UPDATE with a supplied-but-stale job must be rejected, got {err:?}"
+    );
+
+    // A fully job-optional UPDATE (no job, no history) remains ungated.
+    engine
+        .apply_command(Command::UpdateAgentInstance {
+            agent_instance_key: aik,
+            element_instance_key: eik,
+            element_id: "agent".to_string(),
+            process_instance_key: pi,
+            job_key: 0,
+            job_lease: 0,
+            status: Some(crate::agent::AgentInstanceStatus::Thinking),
+            metrics: Default::default(),
+            tools: None,
+            history: vec![],
+        })
+        .expect("a job-optional, history-free UPDATE is not gated");
+}
+
+/// #1106 divergence 4 — an ordinary (non-agent) job activates **lease-less**
+/// (`lease_token == None`, Camunda's `!hasLeaseToken()`), so the lease
+/// comparison is skipped for it. This is what makes the token-carrying gate on
+/// `validate_agent_job_context` conditional rather than unconditional.
+#[test]
+fn ordinary_job_activates_lease_less() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p" isExecutable="true">
+          <bpmn:startEvent id="start" />
+          <bpmn:serviceTask id="svc">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="work" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="end" />
+          <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="svc" />
+          <bpmn:sequenceFlow id="f2" sourceRef="svc" targetRef="end" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("p"))
+        .unwrap();
+    let job = engine
+        .activate_jobs("work", "W", 1, 1_000, 100)
+        .pop()
+        .expect("the service task job is activatable");
+    assert_eq!(
+        job.lease_token, None,
+        "an ordinary (non-agent) job must activate lease-less"
     );
 }
 
@@ -20722,11 +20936,16 @@ fn declaration_free_job_activated_is_byte_identical() {
         deadline: 60_000,
         activated_at: Some(1),
         fetch_variables: Vec::new(),
+        lease_token: None,
     };
     let json = serde_json::to_string(&undeclared).unwrap();
     assert!(
         !json.contains("fetch_variables"),
         "an empty read-set must be omitted from the serialized event: {json}"
+    );
+    assert!(
+        !json.contains("lease_token"),
+        "a lease-less activation must omit the lease token from the serialized event: {json}"
     );
 
     // A declared read-set IS serialized, and round-trips.
@@ -20737,6 +20956,7 @@ fn declaration_free_job_activated_is_byte_identical() {
         deadline: 60_000,
         activated_at: Some(1),
         fetch_variables: vec!["a".to_string(), "c".to_string()],
+        lease_token: None,
     };
     let json = serde_json::to_string(&declared).unwrap();
     assert!(json.contains("fetch_variables"));

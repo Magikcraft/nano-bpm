@@ -631,40 +631,74 @@ impl Engine {
         })
     }
 
-    /// Validate that `job_key` names an **ACTIVATED** job backing
-    /// `element_instance_key` whose activation lease deadline equals `job_lease`
-    /// — the nano-bpm analog of Camunda's
-    /// `AgentHistoryBatchBehavior.validateJobContext` (#1099). An `external`,
-    /// job-backed agent's worker-issued `CreateAgentInstance` and its
-    /// history-bearing `UpdateAgentInstance` are gated on this: an AgentInstance
-    /// / its history cannot be attached without a live, matching job lease. The
-    /// lease "token" is the job's current lease deadline (the value an activation
-    /// response returns to the worker), the same value stored on the
-    /// AgentInstance / history turn as `job_lease`.
+    /// Validate the job context an `external`, job-backed agent's
+    /// `CreateAgentInstance` / `UpdateAgentInstance` carries — the nano-bpm analog
+    /// of Camunda's `AgentHistoryBatchBehavior.validateJobContext`
+    /// (#1099/#1106), reproducing its exact rule order and rejection kinds:
+    ///
+    /// - **No job supplied** (`job_key == 0`, nano's sentinel for the absent
+    ///   `jobKey`): allowed only when there is **no** history (`!has_history`);
+    ///   once a batch is attached the job becomes required
+    ///   ([`EngineError::AgentInstanceJobRequiredForHistory`], 400 —
+    ///   `jobKey == -1` short-circuit in Camunda).
+    /// - The job must be **ACTIVATED** (unknown or non-activated →
+    ///   [`EngineError::AgentInstanceJobNotActive`], 404).
+    /// - **Conditional lease check** (Camunda's `hasLeaseToken()` gate): a job
+    ///   carrying a lease token must match `job_lease`
+    ///   ([`EngineError::AgentInstanceJobLeaseMismatch`], 404); a *lease-less*
+    ///   job (`lease_token == None`) skips the comparison entirely.
+    /// - The job must belong to `element_instance_key`
+    ///   ([`EngineError::AgentInstanceJobElementMismatch`], 400).
+    ///
+    /// The lease "token" is the job's opaque per-activation
+    /// [`state::Job::lease_token`] — distinct from `deadline` — the value an
+    /// activation response returns to the worker and which it echoes back as
+    /// `job_lease`.
     fn validate_agent_job_context(
         &self,
         element_instance_key: Key,
         job_key: Key,
         job_lease: u64,
+        has_history: bool,
     ) -> Result<(), EngineError> {
-        let valid = self
-            .state
-            .jobs
-            .get(&job_key)
-            .map(|job| {
-                job.state == state::JobState::Activated
-                    && job.element_instance_key == element_instance_key
-                    && job.deadline == Some(job_lease)
-            })
-            .unwrap_or(false);
-        if valid {
-            Ok(())
-        } else {
-            Err(EngineError::AgentInstanceJobLeaseInvalid {
-                element_instance_key,
-                job_key,
-            })
+        // No job supplied: only permitted when no history batch is attached.
+        if job_key == 0 {
+            if has_history {
+                return Err(EngineError::AgentInstanceJobRequiredForHistory {
+                    element_instance_key,
+                });
+            }
+            return Ok(());
         }
+        // The job must be a currently-activated job.
+        let job = match self.state.jobs.get(&job_key) {
+            Some(job) if job.state == state::JobState::Activated => job,
+            _ => {
+                return Err(EngineError::AgentInstanceJobNotActive {
+                    element_instance_key,
+                    job_key,
+                });
+            }
+        };
+        // Conditional lease comparison (Camunda `hasLeaseToken()`): a lease-less
+        // activation carries no token and skips this check.
+        if let Some(token) = job.lease_token {
+            if token != job_lease {
+                return Err(EngineError::AgentInstanceJobLeaseMismatch {
+                    element_instance_key,
+                    job_key,
+                });
+            }
+        }
+        // The job must belong to the requested element instance.
+        if job.element_instance_key != element_instance_key {
+            return Err(EngineError::AgentInstanceJobElementMismatch {
+                job_key,
+                job_element_instance_key: job.element_instance_key,
+                element_instance_key,
+            });
+        }
+        Ok(())
     }
 
     /// Process a `Command::CreateAgentInstance` (Camunda `AgentInstanceIntent.CREATE`,
@@ -725,11 +759,18 @@ impl Engine {
         };
         // 2a. An `external` agent is job-backed and worker-registered: its CREATE
         // must reference the element's ACTIVATED job with a matching lease token
-        // and elementInstanceKey (Camunda `validateJobContext`, #1099). The
-        // engine-native `aiAgentTask`/`aiAgentSubProcess` variants have no job
-        // and are not gated.
+        // and elementInstanceKey (Camunda `validateJobContext`, #1099/#1106) —
+        // but a *jobless* CREATE is allowed when it carries **no** history batch
+        // (Camunda's `jobKey == -1` short-circuit): the job is only required once
+        // a history batch is attached. The engine-native
+        // `aiAgentTask`/`aiAgentSubProcess` variants have no job and are not gated.
         if agent_type == crate::agent::AgentType::External {
-            self.validate_agent_job_context(element_instance_key, job_key, job_lease)?;
+            self.validate_agent_job_context(
+                element_instance_key,
+                job_key,
+                job_lease,
+                !history.is_empty(),
+            )?;
         }
         // 3. Reconcile with the auto-created instance (slice S1), if any.
         let existing = self
@@ -883,13 +924,21 @@ impl Engine {
             .find_agent_instance(agent_instance_key)
             .cloned()
             .ok_or(EngineError::AgentInstanceNotFound { agent_instance_key })?;
-        // 1a. An `external` agent is job-backed: a history-bearing UPDATE must
-        // reference the element's ACTIVATED job with a matching lease token and
-        // elementInstanceKey (Camunda `validateJobContext`, #1099). A
-        // history-free UPDATE (a pure status/metrics advance) and the
-        // engine-native variants are not gated.
-        if updated.agent_type == crate::agent::AgentType::External && !history.is_empty() {
-            self.validate_agent_job_context(element_instance_key, job_key, job_lease)?;
+        // 1a. An `external` agent is job-backed: a supplied job is always
+        // validated — active + matching lease token + elementInstanceKey (Camunda
+        // `validateJobContext`, #1099/#1106) — whether or not this UPDATE carries
+        // a history batch. Only a fully job-optional UPDATE (no `job_key` *and* no
+        // history — a pure status/metrics advance) skips the gate; a history-free
+        // UPDATE that still supplies a `job_key` must prove it, and a
+        // history-bearing UPDATE requires one. The engine-native variants are not
+        // gated.
+        if updated.agent_type == crate::agent::AgentType::External {
+            self.validate_agent_job_context(
+                element_instance_key,
+                job_key,
+                job_lease,
+                !history.is_empty(),
+            )?;
         }
         // 2. The asserted ownership (element id + process instance) must match.
         if updated.element_id != element_id || updated.process_instance_key != process_instance_key
@@ -2438,6 +2487,20 @@ impl Engine {
                 };
                 for job_key in keys {
                     let instance_key = self.state.jobs[&job_key].instance_key;
+                    // Mint a fresh opaque lease token for a job that backs an
+                    // `external`, job-backed agent task — the "activate with
+                    // lease" path (Camunda `BpmnJobActivationBehavior`, ADR
+                    // 0005-810-job-lease). It is minted once here at
+                    // command-processing (a monotonic key, distinct from
+                    // `deadline`) and carried on the event so replay restores it.
+                    // Ordinary jobs activate lease-less (`None`) — the agent lease
+                    // gate then skips the lease comparison for them (Camunda's
+                    // `!hasLeaseToken()`).
+                    let lease_token = if self.is_external_agent_job(job_key) {
+                        Some(self.mint_key())
+                    } else {
+                        None
+                    };
                     self.emit(
                         &mut log,
                         Event::JobActivated {
@@ -2451,6 +2514,7 @@ impl Engine {
                             // independently carries its provenance; empty for a
                             // fetch-all activation (byte-identical, no field).
                             fetch_variables: fetch_variables.clone(),
+                            lease_token,
                         },
                     );
                 }
@@ -10464,6 +10528,27 @@ impl Engine {
             .map(|e| e.kind.clone())
     }
 
+    /// Whether `job_key` backs an `external`, job-backed agent task — the jobs
+    /// that activate *with a lease* (Camunda `withLease()`), and so are minted an
+    /// opaque per-activation lease token in the `ActivateJobs` handler. Ordinary
+    /// service-task / listener jobs (and the engine-native `aiAgentTask`
+    /// variants, which carry no job) activate lease-less.
+    fn is_external_agent_job(&self, job_key: Key) -> bool {
+        self.state
+            .jobs
+            .get(&job_key)
+            .and_then(|job| self.element_kind(job.instance_key, &job.element_id))
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    ElementKind::AgentTask {
+                        agent_type: crate::agent::AgentType::External,
+                        ..
+                    }
+                )
+            })
+    }
+
     /// The multi-instance loop characteristics declared on `element_id`, if any.
     fn multi_instance_of(
         &self,
@@ -10710,14 +10795,33 @@ pub enum EngineError {
     /// ad-hoc sub-process) that carries no `agentDefinition` (`agentDefinitionKey`).
     AgentInstanceMissingAgentDefinition { element_instance_key: Key },
     /// A worker-issued CREATE (or history-bearing UPDATE) for an `external`,
-    /// job-backed agent element did not reference that element's **ACTIVATED**
-    /// job with a matching lease token and `elementInstanceKey` (#1099, parity
-    /// with Camunda's `AgentHistoryBatchBehavior.validateJobContext`). The
-    /// AgentInstance / history batch is rejected: an `external` agent's history
-    /// may only be attached under a live, matching job lease.
-    AgentInstanceJobLeaseInvalid {
+    /// job-backed agent element attached a history batch but supplied **no**
+    /// `jobKey` (`job_key == 0`). Maps to Camunda's `JOB_REQUIRED_FOR_HISTORY`
+    /// (`INVALID_ARGUMENT`, HTTP **400**): a history batch must be attributed to
+    /// the active job that produced it.
+    AgentInstanceJobRequiredForHistory { element_instance_key: Key },
+    /// A CREATE/UPDATE for an `external` agent referenced a `job_key` that is not
+    /// a currently-**ACTIVATED** job (unknown, expired, completed, …). Maps to
+    /// Camunda's `JOB_NOT_ACTIVE` (`NOT_FOUND`, HTTP **404**).
+    AgentInstanceJobNotActive {
         element_instance_key: Key,
         job_key: Key,
+    },
+    /// A CREATE/UPDATE for an `external` agent referenced an ACTIVATED job whose
+    /// opaque lease token does not match the supplied `job_lease` — the job was
+    /// re-activated since the lease was issued. Maps to Camunda's
+    /// `JOB_LEASE_MISMATCH` (`NOT_FOUND`, HTTP **404**).
+    AgentInstanceJobLeaseMismatch {
+        element_instance_key: Key,
+        job_key: Key,
+    },
+    /// A CREATE/UPDATE for an `external` agent referenced an ACTIVATED job that
+    /// belongs to a *different* element instance than the one requested. Maps to
+    /// Camunda's `JOB_ELEMENT_MISMATCH` (`INVALID_ARGUMENT`, HTTP **400**).
+    AgentInstanceJobElementMismatch {
+        job_key: Key,
+        job_element_instance_key: Key,
+        element_instance_key: Key,
     },
     /// An UPDATE command's asserted `element_id` / `process_instance_key` do not
     /// match the stored agent instance (a stale or misrouted update).
@@ -10998,13 +11102,40 @@ impl std::fmt::Display for EngineError {
                     "element instance {element_instance_key} has no agentDefinition (agentDefinitionKey)"
                 )
             }
-            EngineError::AgentInstanceJobLeaseInvalid {
+            EngineError::AgentInstanceJobRequiredForHistory {
+                element_instance_key,
+            } => {
+                write!(
+                    f,
+                    "agent-instance command for element instance {element_instance_key} attached a history batch but supplied no jobKey; a history batch must be attributed to the active job that produced it"
+                )
+            }
+            EngineError::AgentInstanceJobNotActive {
                 element_instance_key,
                 job_key,
             } => {
                 write!(
                     f,
-                    "agent-instance command for element instance {element_instance_key} does not reference an activated job {job_key} with a matching lease and element instance"
+                    "agent-instance command for element instance {element_instance_key} references job {job_key}, but that job is not active"
+                )
+            }
+            EngineError::AgentInstanceJobLeaseMismatch {
+                element_instance_key,
+                job_key,
+            } => {
+                write!(
+                    f,
+                    "agent-instance command for element instance {element_instance_key} references job {job_key}, but the job did not hold the supplied lease (it may have been re-activated)"
+                )
+            }
+            EngineError::AgentInstanceJobElementMismatch {
+                job_key,
+                job_element_instance_key,
+                element_instance_key,
+            } => {
+                write!(
+                    f,
+                    "agent-instance command references job {job_key}, but that job belongs to element instance {job_element_instance_key} instead of the requested element instance {element_instance_key}"
                 )
             }
             EngineError::AgentInstanceOwnershipMismatch { agent_instance_key } => {
@@ -11077,6 +11208,12 @@ pub struct ActivatedJob {
     pub worker: String,
     /// Logical instant at which the activation lock expires.
     pub deadline: u64,
+    /// The opaque per-activation **lease token** for a job activated *with a
+    /// lease* (an `external`, job-backed agent task's job), distinct from
+    /// `deadline`. `None` for a lease-less activation. An `external` agent worker
+    /// echoes this back as `jobLease` when it registers its AgentInstance /
+    /// history batch (#1099/#1106).
+    pub lease_token: Option<u64>,
     /// Remaining retries for this job.
     pub retries: i32,
     /// Activation priority (higher is activated first; Zeebe

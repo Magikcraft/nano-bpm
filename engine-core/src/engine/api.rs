@@ -243,6 +243,7 @@ impl Engine {
             process_definition_version,
             worker,
             deadline,
+            lease_token: job.lease_token,
             retries: job.retries,
             priority: job.priority,
             custom_headers,

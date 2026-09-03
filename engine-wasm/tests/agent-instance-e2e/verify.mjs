@@ -307,9 +307,9 @@ assert(
 
 // 7. external (job-backed) agent parity (#1099): unlike aiAgentTask, an
 //    `external` agent auto-mints NO AgentInstance — it activates as a normal
-//    job. A worker activates that job (standard job loop), learns its lease
-//    deadline (the "lease token"), and self-registers the AgentInstance via a
-//    lease-gated createAgentInstance. A CREATE without a valid job lease is
+//    job. A worker activates that job (standard job loop), learns its opaque
+//    lease token (distinct from the job's deadline, #1106), and self-registers
+//    the AgentInstance via a lease-gated createAgentInstance. A CREATE without a valid job lease is
 //    rejected. This is the surface nano-workforce consumes.
 const EXTERNAL_PROC = `
   <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
@@ -345,7 +345,14 @@ assert(
 );
 const extJob = extJobs[0];
 const extEik = extJob.elementInstanceKey;
-const extLease = String(extJob.deadline);
+// The lease token is a real opaque per-activation token surfaced as `jobLease`,
+// distinct from the job's `deadline` (#1106 — Camunda `hasLeaseToken()` parity).
+assert(
+  typeof extJob.jobLease === "string" &&
+    extJob.jobLease !== String(extJob.deadline),
+  "an external agent job carries an opaque lease token distinct from its deadline",
+);
+const extLease = extJob.jobLease;
 
 // A CREATE with a stale lease token is rejected (no AgentInstance minted).
 let extRejected = false;
@@ -354,7 +361,7 @@ try {
     JSON.stringify({
       elementInstanceKey: extEik,
       jobKey: extJob.key,
-      jobLease: String(extJob.deadline + 1),
+      jobLease: String(Number(extJob.jobLease) + 1),
       definition: { model: "gpt-4o" },
     }),
   );

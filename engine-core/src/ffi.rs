@@ -330,6 +330,7 @@ unsafe fn emit_owned(bytes: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) {
 /// [
 ///   { "key": "…", "type": "…", "instanceKey": "…", "elementInstanceKey": "…",
 ///     "elementId": "…", "worker": "…", "deadline": 12345, "retries": 3,
+///     "jobLease": "…" (only for external-agent jobs, #1106),
 ///     "variables": { … } }
 /// ]
 /// ```
@@ -398,6 +399,11 @@ pub unsafe extern "C" fn nbpmn_activate_jobs(
         {
             use core::fmt::Write as _;
             let _ = write!(json, "{}", job.deadline);
+        }
+        if let Some(lease) = job.lease_token {
+            json.push_str(",\"jobLease\":\"");
+            push_u64(&mut json, lease);
+            json.push('"');
         }
         json.push_str(",\"retries\":");
         {

@@ -11590,6 +11590,16 @@ impl ServerImpl {
                     format!("No agent instance with key {agent_instance_key}."),
                 )),
             ),
+            // Split rejection status codes to match Camunda's `validateJobContext`
+            // (#1106): a not-active or lease-mismatched job is a 404; everything
+            // else (element-mismatch, job-required-for-history, ownership, …) is a
+            // 400.
+            Err(
+                e @ (EngineError::AgentInstanceJobNotActive { .. }
+                | EngineError::AgentInstanceJobLeaseMismatch { .. }),
+            ) => Ok(Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(
+                problem("Agent job lease invalid", 404, e.to_string()),
+            )),
             Err(e) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                 "Agent instance update rejected",
                 400,
@@ -19888,7 +19898,17 @@ fn agent_create_error_response(
         EngineError::AgentInstanceConflict { .. } => Resp::Status400_TheProvidedDataIsNotValid(
             problem("Agent instance conflict", 400, e.to_string()),
         ),
-        EngineError::AgentInstanceJobLeaseInvalid { .. } => {
+        // Split rejection status codes to match Camunda's
+        // `validateJobContext` (#1106): a not-active or lease-mismatched job is a
+        // 404, an element-mismatch / job-required-for-history is a 400.
+        EngineError::AgentInstanceJobNotActive { .. }
+        | EngineError::AgentInstanceJobLeaseMismatch { .. } => {
+            Resp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(
+                problem("Agent job lease invalid", 404, e.to_string()),
+            )
+        }
+        EngineError::AgentInstanceJobElementMismatch { .. }
+        | EngineError::AgentInstanceJobRequiredForHistory { .. } => {
             Resp::Status400_TheProvidedDataIsNotValid(problem(
                 "Agent job lease invalid",
                 400,

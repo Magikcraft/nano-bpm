@@ -617,6 +617,7 @@ impl TestEngine {
                     "worker": j.worker,
                     "retries": j.retries,
                     "deadline": j.deadline,
+                    "jobLease": j.lease_token.map(|t| t.to_string()),
                     "priority": j.priority,
                     "customHeaders": j.custom_headers,
                     "tags": j.tags,
@@ -2918,7 +2919,8 @@ struct CreateAgentInstanceReq {
     /// any initial `history` turns.
     #[serde(default)]
     job_key: Option<String>,
-    /// The activation lease deadline (the "lease token") of `jobKey`.
+    /// The opaque activation lease token (the "lease token") of `jobKey`,
+    /// distinct from the job's deadline (#1106).
     #[serde(default)]
     job_lease: Option<String>,
     #[serde(default)]
@@ -2964,7 +2966,7 @@ struct UpdateAgentInstanceReq {
     /// gateway attributes it to every appended turn (`0`/absent = none).
     #[serde(default)]
     job_key: Option<String>,
-    /// The agent job's lease deadline for this batch; attributed to every
+    /// The agent job's opaque lease token for this batch; attributed to every
     /// appended turn alongside `jobKey` (`0`/absent = none).
     #[serde(default)]
     job_lease: Option<String>,
