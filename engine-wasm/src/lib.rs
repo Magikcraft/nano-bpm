@@ -2926,8 +2926,9 @@ struct CreateAgentInstanceReq {
     /// any initial `history` turns.
     #[serde(default)]
     job_key: Option<String>,
-    /// The opaque activation lease token (the "lease token") of `jobKey`,
-    /// distinct from the job's deadline (#1106).
+    /// The per-activation lease token (a staleness handle, not a
+    /// cryptographically unguessable secret) of `jobKey`, distinct from the
+    /// job's deadline (#1106).
     #[serde(default)]
     job_lease: Option<String>,
     #[serde(default)]
@@ -2973,8 +2974,9 @@ struct UpdateAgentInstanceReq {
     /// gateway attributes it to every appended turn (`0`/absent = none).
     #[serde(default)]
     job_key: Option<String>,
-    /// The agent job's opaque lease token for this batch; attributed to every
-    /// appended turn alongside `jobKey` (`0`/absent = none).
+    /// The agent job's per-activation lease token (a staleness handle) for this
+    /// batch; attributed to every appended turn alongside `jobKey`
+    /// (`0`/absent = none).
     #[serde(default)]
     job_lease: Option<String>,
     #[serde(default)]

@@ -380,13 +380,16 @@ pub enum Event {
             serde(default, skip_serializing_if = "Vec::is_empty")
         )]
         fetch_variables: Vec<String>,
-        /// The **opaque per-activation lease token** minted for this activation
+        /// The **per-activation lease token** minted for this activation
         /// when it was activated *with a lease* (an `external`, job-backed agent
         /// task's job), distinct from `deadline` (Camunda `JobRecord.leaseToken`,
-        /// ADR 0005-810-job-lease). Generated exactly once at command-processing
-        /// and carried here so replay restores it verbatim rather than
-        /// regenerating it (D2). `None` for a *lease-less* activation (ordinary
-        /// service-task / listener jobs), which the agent lease gate
+        /// ADR 0005-810-job-lease). A staleness handle (monotonic key, not a
+        /// cryptographically unguessable secret) that only fences a command
+        /// against a superseded activation; caller forgery-resistance is the
+        /// gateway auth layer's job (ADR-0028). Generated exactly once at
+        /// command-processing and carried here so replay restores it verbatim
+        /// rather than regenerating it (D2). `None` for a *lease-less* activation
+        /// (ordinary service-task / listener jobs), which the agent lease gate
         /// (`validate_agent_job_context`) treats as Camunda's `!hasLeaseToken()`
         /// — the lease comparison is skipped. Serialized only when present, so
         /// lease-less activations stay byte-identical in the journal.

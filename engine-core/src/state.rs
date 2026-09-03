@@ -189,9 +189,13 @@ pub struct Job {
     /// `None` when not activated or for pre-field records.
     #[cfg_attr(feature = "serde", serde(default))]
     pub activation_timeout: Option<u64>,
-    /// The **opaque per-activation lease token** minted when this job was
+    /// The **per-activation lease token** minted when this job was
     /// activated *with a lease*, distinct from [`Job::deadline`] (Camunda's
-    /// `JobRecord.leaseToken`, ADR 0005-810-job-lease). It is regenerated on each
+    /// `JobRecord.leaseToken`, ADR 0005-810-job-lease). A staleness handle
+    /// (monotonic key, not a cryptographically unguessable secret) that only
+    /// fences a command against a superseded activation; caller
+    /// forgery-resistance is the gateway auth layer's job (ADR-0028). It is
+    /// regenerated on each
     /// activation-with-lease and is the value an `external`, job-backed agent
     /// worker echoes back as `jobLease` when it registers an AgentInstance / a
     /// history batch — gated by [`crate::Engine::validate_agent_job_context`]

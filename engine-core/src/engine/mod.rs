@@ -650,10 +650,14 @@ impl Engine {
     /// - The job must belong to `element_instance_key`
     ///   ([`EngineError::AgentInstanceJobElementMismatch`], 400).
     ///
-    /// The lease "token" is the job's opaque per-activation
-    /// [`state::Job::lease_token`] — distinct from `deadline` — the value an
+    /// The lease "token" is the job's per-activation **staleness handle**
+    /// ([`state::Job::lease_token`], distinct from `deadline`) — the value an
     /// activation response returns to the worker and which it echoes back as
-    /// `job_lease`.
+    /// `job_lease`. It is a monotonic key, *not* a cryptographically unguessable
+    /// secret: it only fences a command against a **superseded** activation of
+    /// the same job (Camunda's `hasLeaseToken()` gate), so a predictable value
+    /// suffices. Forgery-resistance of external callers is the gateway auth
+    /// layer's responsibility (ADR-0028), not this token's.
     fn validate_agent_job_context(
         &self,
         element_instance_key: Key,
@@ -2487,15 +2491,21 @@ impl Engine {
                 };
                 for job_key in keys {
                     let instance_key = self.state.jobs[&job_key].instance_key;
-                    // Mint a fresh opaque lease token for a job that backs an
+                    // Mint a fresh lease token for a job that backs an
                     // `external`, job-backed agent task — the "activate with
                     // lease" path (Camunda `BpmnJobActivationBehavior`, ADR
                     // 0005-810-job-lease). It is minted once here at
                     // command-processing (a monotonic key, distinct from
                     // `deadline`) and carried on the event so replay restores it.
-                    // Ordinary jobs activate lease-less (`None`) — the agent lease
-                    // gate then skips the lease comparison for them (Camunda's
-                    // `!hasLeaseToken()`).
+                    // The token is a per-activation **staleness handle**, not a
+                    // cryptographically unguessable secret: it only fences a
+                    // command against a *superseded* activation of the same job
+                    // (Camunda's `hasLeaseToken()` gate), so a predictable
+                    // monotonic value suffices — forgery-resistance of external
+                    // callers is the gateway auth layer's job (ADR-0028), not
+                    // this token's. Ordinary jobs activate lease-less (`None`) —
+                    // the agent lease gate then skips the lease comparison for
+                    // them (Camunda's `!hasLeaseToken()`).
                     let lease_token = if self.is_external_agent_job(job_key) {
                         Some(self.mint_key())
                     } else {
@@ -11208,9 +11218,12 @@ pub struct ActivatedJob {
     pub worker: String,
     /// Logical instant at which the activation lock expires.
     pub deadline: u64,
-    /// The opaque per-activation **lease token** for a job activated *with a
-    /// lease* (an `external`, job-backed agent task's job), distinct from
-    /// `deadline`. `None` for a lease-less activation. An `external` agent worker
+    /// The per-activation **lease token** for a job activated *with a lease* (an
+    /// `external`, job-backed agent task's job), distinct from `deadline`. A
+    /// staleness handle (monotonic key, *not* a cryptographically unguessable
+    /// secret) that only fences a command against a superseded activation;
+    /// caller forgery-resistance is the gateway auth layer's job (ADR-0028).
+    /// `None` for a lease-less activation. An `external` agent worker
     /// echoes this back as `jobLease` when it registers its AgentInstance /
     /// history batch (#1099/#1106).
     pub lease_token: Option<u64>,
