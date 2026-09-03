@@ -136,10 +136,11 @@ export type AgentInstanceCreationRequest = {
     jobKey?: JobKey;
     /**
      * Lease token received from the job activation response, disambiguating this
-     * activation from any other of the same job. It is the activation's lease
-     * deadline serialized as a decimal string (an unsigned 64-bit integer), so
-     * the server rejects any non-numeric value with 400. Required alongside `jobKey`
-     * for an `external` agent.
+     * activation from any other of the same job. A per-activation staleness handle
+     * (a monotonic value distinct from the job's lease deadline, not a
+     * cryptographically unguessable secret), serialized as a decimal string (an
+     * unsigned 64-bit integer), so the server rejects any non-numeric value with 400.
+     * Required alongside `jobKey` for an `external` agent.
      *
      */
     jobLease?: string;
@@ -734,9 +735,10 @@ export type AgentInstanceUpdateRequest = {
     jobKey?: JobKey;
     /**
      * Lease token received from the job activation response, disambiguating this
-     * activation from any other of the same job. It is the activation's lease
-     * deadline serialized as a decimal string (an unsigned 64-bit integer), so
-     * the server rejects any non-numeric value with 400.
+     * activation from any other of the same job. A per-activation staleness handle
+     * (a monotonic value distinct from the job's lease deadline, not a
+     * cryptographically unguessable secret), serialized as a decimal string (an
+     * unsigned 64-bit integer), so the server rejects any non-numeric value with 400.
      *
      */
     jobLease?: string;
