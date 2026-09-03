@@ -126,11 +126,14 @@ export type AgentInstanceCreationRequest = {
      */
     limits?: AgentInstanceLimits;
     /**
-     * The key of the agent job whose activation authorizes this create. Required
-     * for an `external` (job-backed) agent element: the server rejects the create
-     * unless it references that element's ACTIVATED job with a matching lease token
-     * and elementInstanceKey. Omit (or `0`) for the engine-native `aiAgentTask` /
-     * `aiAgentSubProcess` variants, whose AgentInstance is auto-minted at activation.
+     * The key of the agent job whose activation authorizes this create. Optional:
+     * supply it for an `external` (job-backed) agent element to lease-gate the
+     * create, and the server then rejects the create unless it references that
+     * element's ACTIVATED job with a matching lease token and elementInstanceKey.
+     * A jobless create (omit, or `0`) is allowed when the request carries no history
+     * batch; when supplied it is always validated. Omit (or `0`) for the engine-native
+     * `aiAgentTask` / `aiAgentSubProcess` variants, whose AgentInstance is auto-minted
+     * at activation.
      *
      */
     jobKey?: JobKey;
@@ -140,7 +143,7 @@ export type AgentInstanceCreationRequest = {
      * (a monotonic value distinct from the job's lease deadline, not a
      * cryptographically unguessable secret), serialized as a decimal string (an
      * unsigned 64-bit integer), so the server rejects any non-numeric value with 400.
-     * Required alongside `jobKey` for an `external` agent.
+     * Required alongside `jobKey` whenever a `jobKey` is supplied.
      *
      */
     jobLease?: string;
@@ -730,6 +733,10 @@ export type AgentInstanceUpdateRequest = {
     /**
      * The key of the job activation during which this update is being made. Attributed
      * to each appended history item so a later retry can supersede in-flight items.
+     * Required when the request carries a history batch (a history-bearing update needs
+     * a job context); may be omitted for a history-free update (a pure status/metrics
+     * advance). When supplied it is always validated against the element's ACTIVATED
+     * job and matching lease token.
      *
      */
     jobKey?: JobKey;
@@ -739,6 +746,7 @@ export type AgentInstanceUpdateRequest = {
      * (a monotonic value distinct from the job's lease deadline, not a
      * cryptographically unguessable secret), serialized as a decimal string (an
      * unsigned 64-bit integer), so the server rejects any non-numeric value with 400.
+     * Required alongside `jobKey` whenever a `jobKey` is supplied, and validated then.
      *
      */
     jobLease?: string;
@@ -10057,8 +10065,9 @@ export type CreateAgentInstanceErrors = {
      */
     403: ProblemDetail;
     /**
-     * The elementInstanceKey does not correspond to an active element instance.
-     * More details are provided in the response body.
+     * The elementInstanceKey does not correspond to an active element instance, or —
+     * for a lease-gated `external` create — the referenced job is not active or its
+     * lease token does not match. More details are provided in the response body.
      *
      */
     404: ProblemDetail;
@@ -10163,8 +10172,9 @@ export type UpdateAgentInstanceErrors = {
      */
     403: ProblemDetail;
     /**
-     * The agent instance with the given key was not found.
-     * More details are provided in the response body.
+     * The agent instance with the given key was not found, or the job context
+     * supplied with the update references a job that is not active or whose lease
+     * token does not match. More details are provided in the response body.
      *
      */
     404: ProblemDetail;

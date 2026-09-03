@@ -338,6 +338,14 @@ assert(
   "an external agent auto-mints no AgentInstance on activation",
 );
 
+// Advance the WASM engine clock to a large wall-time before activation so the
+// activated job's `deadline` (now + timeout_ms) is a large value. `jobLease` is
+// a monotonic key, small at first; without advancing the clock a small deadline
+// (~timeout_ms) could coincidentally equal it and make the distinctness
+// assertion below pass (or fail) by accident. A large deadline removes the
+// coincidence and keeps the assertion meaningful (#1106).
+ext.tickNow(1_000_000_000_000);
+
 // The agent element created a normal, activatable job (type = element id).
 const extJobs = JSON.parse(ext.activateJobs("ext-agent", 1, 1000, "W"));
 assert(
