@@ -130,8 +130,8 @@ export type AgentInstanceCreationRequest = {
      * supply it for an `external` (job-backed) agent element to lease-gate the
      * create, and the server then rejects the create unless it references that
      * element's ACTIVATED job with a matching lease token and elementInstanceKey.
-     * A jobless create (omit, or `0`) is allowed when the request carries no history
-     * batch; when supplied it is always validated. Omit (or `0`) for the engine-native
+     * A jobless create (omit, or `0`) is always allowed on this REST create surface,
+     * which carries no history batch; when supplied it is always validated. Omit (or `0`) for the engine-native
      * `aiAgentTask` / `aiAgentSubProcess` variants, whose AgentInstance is auto-minted
      * at activation.
      *
