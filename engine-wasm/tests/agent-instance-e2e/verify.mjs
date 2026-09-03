@@ -309,7 +309,8 @@ assert(
 //    `external` agent auto-mints NO AgentInstance — it activates as a normal
 //    job. A worker activates that job (standard job loop), learns its opaque
 //    lease token (distinct from the job's deadline, #1106), and self-registers
-//    the AgentInstance via a lease-gated createAgentInstance. A CREATE without a valid job lease is
+//    the AgentInstance via a lease-gated createAgentInstance. A CREATE that
+//    references the job with a stale/mismatched (jobKey, jobLease) pair is
 //    rejected. This is the surface nano-workforce consumes.
 const EXTERNAL_PROC = `
   <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
@@ -354,6 +355,11 @@ assert(
 );
 const extLease = extJob.jobLease;
 
+// Perturb the lease OUTSIDE the try/catch: parsing must fail loudly if the
+// token ever stops being a decimal u64 string, rather than being swallowed by
+// the rejection catch below and passing the test without exercising the path.
+const extStaleLease = String(BigInt(extLease) + 1n);
+
 // A CREATE with a stale lease token is rejected (no AgentInstance minted).
 let extRejected = false;
 try {
@@ -361,7 +367,7 @@ try {
     JSON.stringify({
       elementInstanceKey: extEik,
       jobKey: extJob.key,
-      jobLease: String(BigInt(extJob.jobLease) + 1n),
+      jobLease: extStaleLease,
       definition: { model: "gpt-4o" },
     }),
   );
