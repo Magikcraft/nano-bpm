@@ -18891,7 +18891,10 @@ fn external_agent_lease_gated_create_mints_on_a_valid_job_lease() {
     assert_eq!(created.agent_type, crate::agent::AgentType::External);
     // The validated job lease is recorded on the AgentInstance.
     assert_eq!(created.job_key, job.key);
-    assert_eq!(created.job_lease, job.lease_token.expect("external agent job carries a lease"));
+    assert_eq!(
+        created.job_lease,
+        job.lease_token.expect("external agent job carries a lease")
+    );
     assert_eq!(
         stored_agent_instance(&engine, pi, created.agent_instance_key).status,
         AgentInstanceStatus::Initializing
@@ -19285,8 +19288,12 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
 #[test]
 fn external_agent_lease_token_is_distinct_from_the_deadline() {
     let (mut engine, _pi, _eik) = external_agent_instance();
+    // Use a deliberately large deadline (`now + timeout`) so that the monotonic
+    // lease token (minted from `mint_key()`, i.e. small keys) cannot accidentally
+    // equal it — the assertion below checks semantic distinctness, not a value
+    // collision.
     let job = engine
-        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .activate_jobs("agent", "W", 1, 1_000_000_000, 100)
         .pop()
         .expect("activatable");
     let token = job
@@ -19475,9 +19482,7 @@ fn ordinary_job_activates_lease_less() {
     let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    engine
-        .apply_command(Command::create_instance("p"))
-        .unwrap();
+    engine.apply_command(Command::create_instance("p")).unwrap();
     let job = engine
         .activate_jobs("work", "W", 1, 1_000, 100)
         .pop()

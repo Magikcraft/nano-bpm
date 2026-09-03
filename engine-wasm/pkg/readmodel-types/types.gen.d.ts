@@ -125,6 +125,24 @@ export type AgentInstanceCreationRequest = {
      *
      */
     limits?: AgentInstanceLimits;
+    /**
+     * The key of the agent job whose activation authorizes this create. Required
+     * for an `external` (job-backed) agent element: the server rejects the create
+     * unless it references that element's ACTIVATED job with a matching lease token
+     * and elementInstanceKey. Omit (or `0`) for the engine-native `aiAgentTask` /
+     * `aiAgentSubProcess` variants, whose AgentInstance is auto-minted at activation.
+     *
+     */
+    jobKey?: JobKey;
+    /**
+     * Lease token received from the job activation response, disambiguating this
+     * activation from any other of the same job. It is the activation's lease
+     * deadline serialized as a decimal string (an unsigned 64-bit integer), so
+     * the server rejects any non-numeric value with 400. Required alongside `jobKey`
+     * for an `external` agent.
+     *
+     */
+    jobLease?: string;
 };
 
 /**

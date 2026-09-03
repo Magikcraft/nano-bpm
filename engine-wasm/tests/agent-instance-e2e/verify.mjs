@@ -361,7 +361,7 @@ try {
     JSON.stringify({
       elementInstanceKey: extEik,
       jobKey: extJob.key,
-      jobLease: String(Number(extJob.jobLease) + 1),
+      jobLease: String(BigInt(extJob.jobLease) + 1n),
       definition: { model: "gpt-4o" },
     }),
   );

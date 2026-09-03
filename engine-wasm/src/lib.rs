@@ -605,7 +605,7 @@ impl TestEngine {
             .iter()
             .filter_map(|k| self.engine.activated_job(*k))
             .map(|j| {
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "key": j.key.to_string(),
                     "type": j.job_type,
                     "instanceKey": j.instance_key.to_string(),
@@ -617,13 +617,20 @@ impl TestEngine {
                     "worker": j.worker,
                     "retries": j.retries,
                     "deadline": j.deadline,
-                    "jobLease": j.lease_token.map(|t| t.to_string()),
                     "priority": j.priority,
                     "customHeaders": j.custom_headers,
                     "tags": j.tags,
                     "businessId": j.business_id,
                     "variables": vars_to_json(&j.variables),
-                })
+                });
+                // Only external-agent jobs carry a lease token; omit `jobLease`
+                // entirely for lease-less activations (matching the FFI JSON and
+                // the generated `jobLease?: string` type) rather than emitting a
+                // JSON `null`.
+                if let Some(lease) = j.lease_token {
+                    obj["jobLease"] = serde_json::Value::String(lease.to_string());
+                }
+                obj
             })
             .collect();
         to_json(&serde_json::Value::Array(out))
