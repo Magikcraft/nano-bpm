@@ -2457,6 +2457,75 @@ pub struct InstanceDetailDto {
     jobs: Vec<JobDto>,
     incidents: Vec<IncidentDto>,
     active_elements: Vec<ActiveElementDto>,
+    /// The child process instances this instance spawned via call activities
+    /// (parent -> child navigation, #1115). Empty when it has no call activities
+    /// (or none have spawned a child yet).
+    called_instances: Vec<CalledInstanceDto>,
+}
+
+/// One child process instance spawned by a call activity in this (parent)
+/// instance — the parent -> child navigation surface (#1115). Mirrors Operate's
+/// Details-tab "Called Process Instance" row; a multi-instance call activity
+/// yields N entries that all share one `calling_element_id`.
+#[derive(Serialize)]
+struct CalledInstanceDto {
+    /// u64 child instance key rendered as a string.
+    key: String,
+    process_id: String,
+    version: i32,
+    /// `Active` | `Completed` | `Terminated`.
+    state: String,
+    has_incident: bool,
+    start_date_ms: u64,
+    /// BPMN id of the call-activity cell in the parent that spawned the child,
+    /// resolved from the child's `parent_element_instance_key` via the parent's
+    /// element-instance rows. Resolution does not depend on the cell still being
+    /// active (a COMPLETED call activity resolves too). `None` when the calling
+    /// element instance is no longer resolvable (e.g. evicted).
+    calling_element_id: Option<String>,
+    /// The call-activity cell's BPMN name, when the model carries one.
+    calling_element_name: Option<String>,
+}
+
+/// Builds the `called_instances` list for a parent instance: for each child row
+/// (already filtered to `parent_process_instance_key == parent`), resolves the
+/// child's `parent_element_instance_key` back to the calling call-activity's
+/// BPMN element id (and name) via `resolve_calling_element`.
+///
+/// Pure over the resolver so the single / multi / none cases are unit-testable
+/// without a store. The resolver is expected to read a single element instance
+/// by key **without** a state filter (see [`readstore::ReadModel::element_instance`]),
+/// so a COMPLETED call-activity cell still resolves — satisfying the contract
+/// that resolution must not depend on the cell being currently active. A
+/// multi-instance call activity's children each carry their own inner
+/// `parent_element_instance_key`, but all resolve to the same BPMN
+/// `element_id`, so the N entries share one `calling_element_id`.
+fn build_called_instances(
+    children: &[nano_server_storage::readstore::ProcessInstanceRow],
+    mut resolve_calling_element: impl FnMut(
+        nanobpmn_engine_core::Key,
+    ) -> Option<
+        nano_server_storage::readstore::ElementInstanceRow,
+    >,
+) -> Vec<CalledInstanceDto> {
+    children
+        .iter()
+        .map(|child| {
+            let calling = child
+                .parent_element_instance_key
+                .and_then(&mut resolve_calling_element);
+            CalledInstanceDto {
+                key: child.key.to_string(),
+                process_id: child.process_id.clone(),
+                version: child.version,
+                state: format!("{:?}", child.state),
+                has_incident: child.has_incident,
+                start_date_ms: child.start_date_ms,
+                calling_element_id: calling.as_ref().map(|e| e.element_id.clone()),
+                calling_element_name: calling.and_then(|e| e.element_name),
+            }
+        })
+        .collect()
 }
 
 /// An element instance currently in the `Active` state — a live token position.
@@ -2666,13 +2735,168 @@ pub async fn instance_detail(server: &dyn ConsoleServer, key: &str) -> Option<In
         })
         .collect();
 
+    // Parent -> child call-activity navigation (#1115): the child instances this
+    // instance spawned via call activities, each tagged with the calling
+    // call-activity cell. Children are found by the same parent-linkage scan the
+    // v2 API uses (`parent_process_instance_key == key`); the calling element id
+    // is resolved from the child's `parent_element_instance_key` via a point
+    // lookup that ignores element state, so a COMPLETED call activity still
+    // resolves. Empty when this instance spawned no children.
+    let store = server.store();
+    let children: Vec<nano_server_storage::readstore::ProcessInstanceRow> = store
+        .process_instances()
+        .into_iter()
+        .filter(|r| r.parent_process_instance_key == Some(key))
+        .collect();
+    let called_instances = build_called_instances(&children, |eik| store.element_instance(eik));
+
     Some(InstanceDetailDto {
         instance: InstanceDto::from(&row),
         variables,
         jobs,
         incidents,
         active_elements,
+        called_instances,
     })
+}
+
+#[cfg(test)]
+mod called_instances_tests {
+    use std::collections::HashMap;
+
+    use nano_server_storage::readstore::{
+        ElementInstanceRow, ElementInstanceState, ProcessInstanceRow,
+    };
+    use nanobpmn_engine_core::{Key, ProcessInstanceState};
+
+    use super::*;
+
+    fn child(key: Key, parent_pi: Key, parent_ei: Option<Key>) -> ProcessInstanceRow {
+        ProcessInstanceRow {
+            key,
+            process_id: "child-proc".to_string(),
+            process_definition_id: "child-proc".to_string(),
+            process_definition_key: "9".to_string(),
+            version: 3,
+            state: ProcessInstanceState::Active,
+            start_date_ms: 1_700_000_000_000,
+            has_incident: false,
+            tags: vec![],
+            business_id: None,
+            parent_process_instance_key: Some(parent_pi),
+            parent_element_instance_key: parent_ei,
+        }
+    }
+
+    /// A COMPLETED call-activity element instance — resolution must not depend on
+    /// the cell still being active, so the tests deliberately build it Completed.
+    fn call_activity_element(
+        eik: Key,
+        parent_instance: Key,
+        id: &str,
+        name: Option<&str>,
+    ) -> ElementInstanceRow {
+        ElementInstanceRow {
+            element_instance_key: eik,
+            instance_key: parent_instance,
+            process_definition_id: "parent-proc".to_string(),
+            process_definition_key: "7".to_string(),
+            element_id: id.to_string(),
+            element_name: name.map(str::to_string),
+            element_type: "CALL_ACTIVITY".to_string(),
+            state: ElementInstanceState::Completed,
+            start_date_ms: 1_600_000_000_000,
+            end_date_ms: Some(1_600_000_001_000),
+            scope_key: 0,
+            incident_key: None,
+            has_incident: false,
+            tenant_id: "<default>".to_string(),
+        }
+    }
+
+    #[test]
+    fn single_child_resolves_calling_element_even_when_completed() {
+        // Parent instance 42; its (COMPLETED) call-activity element instance 500
+        // spawned child instance 100.
+        let children = vec![child(100, 42, Some(500))];
+        let elems: HashMap<Key, (&str, Option<&str>)> =
+            HashMap::from([(500u64, ("CallChild", Some("Call the child")))]);
+
+        let out = build_called_instances(&children, |eik| {
+            elems
+                .get(&eik)
+                .map(|(id, name)| call_activity_element(eik, 42, id, *name))
+        });
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].key, "100");
+        assert_eq!(out[0].process_id, "child-proc");
+        assert_eq!(out[0].state, "Active");
+        assert!(!out[0].has_incident);
+        assert_eq!(out[0].calling_element_id.as_deref(), Some("CallChild"));
+        assert_eq!(
+            out[0].calling_element_name.as_deref(),
+            Some("Call the child")
+        );
+
+        // Wire shape carries snake_case fields (console `Instance` convention).
+        let json = serde_json::to_value(&out[0]).unwrap();
+        assert_eq!(json["key"], "100");
+        assert_eq!(json["calling_element_id"], "CallChild");
+        assert_eq!(json["calling_element_name"], "Call the child");
+    }
+
+    #[test]
+    fn multi_instance_children_share_one_calling_element_id() {
+        // A multi-instance call activity `Fanout`: each inner instance is its own
+        // element-instance key (600/601/602) but all resolve to the same BPMN id.
+        let children = vec![
+            child(100, 42, Some(600)),
+            child(101, 42, Some(601)),
+            child(102, 42, Some(602)),
+        ];
+        let elems: HashMap<Key, (&str, Option<&str>)> = HashMap::from([
+            (600u64, ("Fanout", None)),
+            (601u64, ("Fanout", None)),
+            (602u64, ("Fanout", None)),
+        ]);
+
+        let out = build_called_instances(&children, |eik| {
+            elems
+                .get(&eik)
+                .map(|(id, name)| call_activity_element(eik, 42, id, *name))
+        });
+
+        assert_eq!(out.len(), 3);
+        assert!(
+            out.iter()
+                .all(|c| c.calling_element_id.as_deref() == Some("Fanout"))
+        );
+        let mut keys: Vec<&str> = out.iter().map(|c| c.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["100", "101", "102"]);
+    }
+
+    #[test]
+    fn no_children_yields_empty_called_instances() {
+        let children: Vec<ProcessInstanceRow> = vec![];
+        let out = build_called_instances(&children, |_eik| {
+            panic!("resolver must not be called when there are no children")
+        });
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn unresolvable_calling_element_leaves_ids_null() {
+        // The child exists but its calling element instance was evicted — the
+        // entry is still returned, with a null calling element id/name.
+        let children = vec![child(100, 42, Some(999))];
+        let out = build_called_instances(&children, |_eik| None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].key, "100");
+        assert!(out[0].calling_element_id.is_none());
+        assert!(out[0].calling_element_name.is_none());
+    }
 }
 
 #[cfg(test)]

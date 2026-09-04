@@ -137,6 +137,33 @@ export type InstanceDetail = {
      * Element instances currently in the Active state for this instance — the live token positions. Unlike jobs (service tasks only), this also covers wait states with no job: intermediate catch events, receive tasks, timers, event-based gateways and active (sub)process bodies. Drives the Process Explorer token overlay so a waiting instance still shows where it is parked.
      */
     active_elements: Array<ActiveElement>;
+    /**
+     * The child process instances this instance spawned via call activities (parent -> child navigation). Mirrors Operate's Details-tab "Called Process Instance" row — and "View all" for a multi-instance call activity, which yields one entry per spawned child, all sharing the same `calling_element_id`. Each entry names the call-activity cell (`calling_element_id`) that spawned the child, resolved from the child's `parent_element_instance_key`, so the Explorer can jump from a call-activity cell to its called instance. Empty when this instance has no call activities or none have spawned a child yet.
+     */
+    called_instances: Array<CalledInstance>;
+};
+
+export type CalledInstance = {
+    /**
+     * The child process instance key.
+     */
+    key: string;
+    process_id: string;
+    version: number;
+    /**
+     * `Active` | `Completed` | `Terminated`.
+     */
+    state: string;
+    has_incident: boolean;
+    start_date_ms: number;
+    /**
+     * BPMN id of the call-activity cell in this (parent) instance that spawned the child, resolved from the child's `parent_element_instance_key` via the parent's element-instance rows. Resolution does not depend on the cell still being active — a COMPLETED call activity resolves too. `null` when the calling element instance is no longer resolvable (e.g. evicted).
+     */
+    calling_element_id: string | null;
+    /**
+     * The call-activity cell's BPMN name, when the model carries one.
+     */
+    calling_element_name: string | null;
 };
 
 export type ActiveElement = {
