@@ -12056,9 +12056,14 @@ mod tests {
         // raw serde EOF error. The reply opens a JSON string (`{"a":"`) then runs
         // 65530 'a' bytes with no closing quote: an unterminated string that
         // serde reports as an EOF-style error, totalling exactly 65536 bytes.
+        //
+        // `tr '\000' 'a'` uses an octal NUL escape rather than `\0`: on BSD/macOS
+        // `tr`, `\0` is not a reliable spelling for NUL and can leave the bytes
+        // unchanged, which flips the failure mode to an invalid-control-character
+        // error instead of EOF. The octal form is portable across GNU and BSD tr.
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
-            .arg("printf '{\"a\":\"'; head -c 65530 /dev/zero | tr '\\0' 'a'");
+            .arg("printf '{\"a\":\"'; head -c 65530 /dev/zero | tr '\\000' 'a'");
         let err = pipe_data_gateway(cmd, &serde_json::json!({ "op": "schema" }))
             .await
             .expect_err("unparseable output must be an error");
