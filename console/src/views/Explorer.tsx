@@ -455,7 +455,10 @@ export default function Explorer() {
             </Button>
           </header>
           <div className="min-h-0 flex-1 overflow-auto">
-            <InstanceDetail instanceKey={selected} />
+            <InstanceDetail
+              instanceKey={selected}
+              onNavigateInstance={setSelected}
+            />
           </div>
         </div>
       );
@@ -510,7 +513,10 @@ export default function Explorer() {
 
       <div className="min-w-0 flex-1 overflow-auto">
         {selected ? (
-          <InstanceDetail instanceKey={selected} />
+          <InstanceDetail
+            instanceKey={selected}
+            onNavigateInstance={setSelected}
+          />
         ) : (
           <div className="flex h-full items-center justify-center text-sm text-fg-faint">
             Select an instance to inspect it.
