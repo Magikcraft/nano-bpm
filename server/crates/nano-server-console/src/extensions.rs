@@ -710,11 +710,28 @@ pub fn extensions_root() -> PathBuf {
 /// "first-pack-wins" resolver ([`all_extensions`], [`trigger_driver`],
 /// [`worker_driver`], …) nondeterministic; sorting gives one stable resolution
 /// order. Returns empty when the root is missing or unreadable.
+///
+/// Dot-prefixed entries are skipped: [`install_atomic`] builds a new pack in a
+/// dot-prefixed `.<leaf>.staging.*` sibling and parks the old copy in a
+/// `.<leaf>.backup.*` sibling during the swap. An installed pack dir is always
+/// the `scope__name` mapping from [`safe_pkg_dir`], which never starts with a
+/// dot, so filtering the leading-dot scratch dirs here means an in-flight
+/// install can NEVER be observed as a pack — its readable manifest (and, since
+/// `.` sorts first, its would-be precedence) is invisible to the scan until the
+/// atomic rename lands it under its real, non-dot name.
 fn pack_dirs() -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(extensions_root()) else {
         return Vec::new();
     };
-    let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    let mut dirs: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| !n.starts_with('.'))
+        })
+        .collect();
     dirs.sort();
     dirs
 }
@@ -1487,7 +1504,8 @@ pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
 ///
 /// The staging/backup names are dot-prefixed and carry pid + a nanosecond stamp
 /// so concurrent installs of the same pack can't collide on the scratch dirs and
-/// the marketplace scan (which reads pack manifests) ignores them in flight.
+/// the marketplace scan ([`pack_dirs`], which skips leading-dot entries) ignores
+/// them in flight.
 fn install_atomic<T>(
     dest: &Path,
     build: impl FnOnce(&Path) -> Result<T, String>,
@@ -1531,10 +1549,19 @@ fn install_atomic<T>(
     }
     if let Err(e) = std::fs::rename(&staging, dest) {
         // Roll back to the previous install so a failed swap never empties `dest`.
-        if had_prev {
-            let _ = std::fs::rename(&backup, dest);
-        }
+        // Surface whether the rollback itself succeeded: if restoring `backup →
+        // dest` also fails, `dest` is now MISSING and the prior install is
+        // stranded in `backup` — the operator must recover it, so we keep
+        // `backup` on disk and name it in the error rather than swallowing the
+        // second failure and reporting a bare, misleading commit error.
         let _ = std::fs::remove_dir_all(&staging);
+        if had_prev && let Err(re) = std::fs::rename(&backup, dest) {
+            return Err(format!(
+                "commit install: {e}; rollback failed: {re}; prior install \
+                 preserved at {}",
+                backup.display()
+            ));
+        }
         return Err(format!("commit install: {e}"));
     }
     let _ = std::fs::remove_dir_all(&backup);
@@ -2962,6 +2989,55 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Defect-class guard (issue #1108 review): an in-flight [`install_atomic`]
+    /// staging dir is a dot-prefixed sibling of the real pack dir and carries a
+    /// readable `nano-ide.ext.json` the moment the extract lands. Because its
+    /// leading `.` sorts first, if the scan enumerated it, it would *shadow* the
+    /// real installed pack of the same id mid-install. [`pack_dirs`] must skip
+    /// every leading-dot entry so neither staging nor backup scratch dirs are
+    /// ever observable as packs.
+    #[test]
+    fn pack_dirs_ignores_dot_prefixed_scratch_dirs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("nano-ext-scratch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+
+        // The real, committed pack.
+        let real = root.join("nanobpm__nano-workforce");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(
+            real.join(manifest_name()),
+            r#"{"id":"nano-workforce","kind":"lang"}"#,
+        )
+        .unwrap();
+
+        // A mid-install staging sibling of the SAME leaf, dot-prefixed, already
+        // carrying a manifest — the exact shadowing hazard.
+        let staging = root.join(".nanobpm__nano-workforce.staging.123.456");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join(manifest_name()),
+            r#"{"id":"nano-workforce","kind":"lang"}"#,
+        )
+        .unwrap();
+        let backup = root.join(".nanobpm__nano-workforce.backup.123.456");
+        std::fs::create_dir_all(&backup).unwrap();
+
+        let dirs = pack_dirs();
+        assert!(
+            dirs.contains(&real),
+            "the real committed pack must be scanned: {dirs:?}"
+        );
+        assert!(
+            !dirs.iter().any(|p| p == &staging || p == &backup),
+            "dot-prefixed scratch dirs must never be scanned as packs: {dirs:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
     }
 
     #[test]
