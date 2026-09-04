@@ -256,9 +256,11 @@ export default function InstanceDetail({
 
   // Operate-style call-activity breadcrumb: root → … → current. Rendered only
   // for a child instance (a resolved chain of more than one hop); a top-level
-  // instance shows nothing. Every ancestor hop is a button that navigates the
-  // detail pane to that instance via `onNavigateInstance`; the current instance
-  // is inert (`aria-current`).
+  // instance shows nothing. When navigation is wired, every ancestor hop is a
+  // button that navigates the detail pane to that instance via
+  // `onNavigateInstance`; without a handler the hops render as plain text (no
+  // focusable no-op controls). The current instance is inert (`aria-current`).
+  const canNavigate = typeof onNavigateInstance === "function";
   const breadcrumbBar = crumbs.length > 0 && (
     <nav
       aria-label="Call chain"
@@ -273,10 +275,10 @@ export default function InstanceDetail({
               </span>
             )}
             {hop.isCurrent ? (
-              <span aria-current="step" className="font-medium text-fg">
+              <span aria-current="page" className="font-medium text-fg">
                 {hop.label}
               </span>
-            ) : (
+            ) : canNavigate ? (
               <button
                 type="button"
                 title={`Instance ${hop.key}`}
@@ -285,6 +287,10 @@ export default function InstanceDetail({
               >
                 {hop.label}
               </button>
+            ) : (
+              <span title={`Instance ${hop.key}`} className="text-fg-muted">
+                {hop.label}
+              </span>
             )}
           </li>
         ))}
