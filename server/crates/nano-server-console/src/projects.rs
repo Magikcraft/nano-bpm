@@ -3640,9 +3640,18 @@ fn gateway_output_snippet(s: &str) -> std::borrow::Cow<'_, str> {
 /// malformed reply that happens to be exactly 64 KiB yields a *syntax* error
 /// (e.g. "expected value"), not EOF, so it keeps its raw detail rather than being
 /// misattributed to the flush bug. `trimmed` is the text we attempted to parse
-/// (echoed capped to a bounded snippet — see [`gateway_output_snippet`]).
+/// (echoed capped to a bounded snippet — see [`gateway_output_snippet`]); it must
+/// be non-empty for the flush-truncation hint, because a genuine flush-truncated
+/// reply is a valid JSON *prefix* cut off at the boundary. Whitespace-only stdout
+/// that happens to be a 64 KiB multiple also trims to empty and yields an EOF
+/// error, but is not a truncated JSON value, so the `!trimmed.is_empty()` guard
+/// keeps it on the raw-error path instead of misattributing it to the flush bug.
 fn gateway_output_parse_error(err: &serde_json::Error, raw_len: usize, trimmed: &str) -> String {
-    if raw_len > 0 && raw_len.is_multiple_of(PIPE_BUFFER_BYTES) && err.is_eof() {
+    if !trimmed.is_empty()
+        && raw_len > 0
+        && raw_len.is_multiple_of(PIPE_BUFFER_BYTES)
+        && err.is_eof()
+    {
         return format!(
             "bad gateway output: reply truncated at a {PIPE_BUFFER_BYTES}-byte pipe boundary \
              ({raw_len} bytes) — the data gateway almost certainly called process.exit() before \
@@ -11957,7 +11966,7 @@ mod tests {
         );
 
         // A larger multiple (two full buffers) is the same signature.
-        let msg2 = gateway_output_parse_error(&parse_err, PIPE_BUFFER_BYTES * 2, "");
+        let msg2 = gateway_output_parse_error(&parse_err, PIPE_BUFFER_BYTES * 2, "{\"a\":");
         assert!(
             msg2.contains("pipe boundary"),
             "any positive multiple of the pipe buffer is a truncation, got: {msg2}"
@@ -12001,6 +12010,20 @@ mod tests {
         assert!(
             !boundary_syntax_msg.contains("pipe boundary"),
             "non-EOF error at a 64 KiB boundary must not claim truncation, got: {boundary_syntax_msg}"
+        );
+
+        // Defect-class guard: whitespace-only stdout that happens to be a 64 KiB
+        // multiple trims to empty and yields an EOF error, but is NOT a truncated
+        // JSON prefix (real flush-truncation leaves a valid, non-empty JSON
+        // prefix). The `!trimmed.is_empty()` guard must keep it on the raw-error
+        // path rather than misattributing it to the flush bug.
+        let empty_eof = serde_json::from_str::<serde_json::Value>("").unwrap_err();
+        assert!(empty_eof.is_eof(), "sanity: empty input is an EOF error");
+        let whitespace_boundary_msg =
+            gateway_output_parse_error(&empty_eof, PIPE_BUFFER_BYTES, "");
+        assert!(
+            !whitespace_boundary_msg.contains("pipe boundary"),
+            "whitespace-only output at a 64 KiB boundary must not claim truncation, got: {whitespace_boundary_msg}"
         );
     }
 
