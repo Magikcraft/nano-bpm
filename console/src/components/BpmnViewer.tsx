@@ -2,6 +2,10 @@ import { useEffect, useRef } from "react";
 import NavigatedViewer from "bpmn-js/lib/NavigatedViewer";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
+import {
+  selectedElementId,
+  type SelectableElement,
+} from "./bpmnViewerSelection.ts";
 
 interface Canvas {
   /// diagram-js canvas zoom: no arg reads the current scale, a number sets it
@@ -12,6 +16,19 @@ interface Canvas {
   scroll(delta: { dx: number; dy: number }): void;
   addMarker(elementId: string, marker: string): void;
   removeMarker(elementId: string, marker: string): void;
+}
+
+/// diagram-js's event bus. We only subscribe to `element.click` to surface a
+/// selection to the caller, so this is deliberately the minimal shape.
+interface EventBus {
+  on(
+    event: string,
+    callback: (event: { element?: SelectableElement }) => void,
+  ): void;
+  off(
+    event: string,
+    callback: (event: { element?: SelectableElement }) => void,
+  ): void;
 }
 
 // Pinch-zoom clamp. Matches diagram-js's own zoom range so a pinch can never
@@ -52,6 +69,11 @@ interface BpmnViewerProps {
   /// Called after the XML imports cleanly (pairs with onImportError so a caller
   /// can clear a previous error when a later, valid document loads).
   onImportSuccess?: () => void;
+  /// Called with a clicked element's BPMN id when the operator selects an
+  /// element on the diagram. Clicks on empty canvas / the diagram root are
+  /// ignored (never fired). Optional; omitting it leaves the viewer's existing
+  /// read-only behaviour completely unchanged.
+  onElementSelect?: (elementId: string) => void;
 }
 
 /// Renders a deployed BPMN definition with diagram-js (read-only), overlaying
@@ -64,6 +86,7 @@ export default function BpmnViewer({
   fitOnResize = false,
   onImportError,
   onImportSuccess,
+  onElementSelect,
 }: BpmnViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<NavigatedViewer | null>(null);
@@ -74,6 +97,11 @@ export default function BpmnViewer({
   onImportErrorRef.current = onImportError;
   const onImportSuccessRef = useRef(onImportSuccess);
   onImportSuccessRef.current = onImportSuccess;
+  // Same rationale for the element-select callback: keep the latest in a ref so
+  // the (deps-`[]`) mount effect's eventBus listener always calls the current
+  // callback without re-subscribing on every render.
+  const onElementSelectRef = useRef(onElementSelect);
+  onElementSelectRef.current = onElementSelect;
   // Set once the viewer has been destroyed, so async work already in flight (an
   // importXML, a marker pass) doesn't touch a dead instance.
   const disposedRef = useRef(false);
@@ -163,8 +191,19 @@ export default function BpmnViewer({
     container.addEventListener("touchend", onTouchEnd, { passive: true });
     container.addEventListener("touchcancel", onTouchEnd, { passive: true });
 
+    // Surface element selection to the caller. Clicks on empty canvas / the
+    // diagram root resolve to `null` and are ignored (see bpmnViewerSelection).
+    const eventBus = viewer.get<EventBus>("eventBus");
+    const onElementClick = (event: { element?: SelectableElement }) => {
+      if (disposedRef.current) return;
+      const id = selectedElementId(event.element);
+      if (id) onElementSelectRef.current?.(id);
+    };
+    eventBus.on("element.click", onElementClick);
+
     return () => {
       disposedRef.current = true;
+      eventBus.off("element.click", onElementClick);
       container.removeEventListener("touchstart", onTouchStart);
       container.removeEventListener("touchmove", onTouchMove);
       container.removeEventListener("touchend", onTouchEnd);
