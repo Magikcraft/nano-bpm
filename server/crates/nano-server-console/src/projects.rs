@@ -3607,10 +3607,12 @@ const PIPE_BUFFER_BYTES: usize = 64 * 1024;
 /// large enough to show the offending prefix.
 const GATEWAY_OUTPUT_SNIPPET_BYTES: usize = 512;
 
-/// Bound `s` to at most [`GATEWAY_OUTPUT_SNIPPET_BYTES`] bytes for echoing in an
-/// error message, cutting on a UTF-8 char boundary and appending an elision
-/// marker (with the original length) when truncated so the message stays honest
-/// about there being more.
+/// Bound `s` for echoing in an error message by capping the echoed *prefix* to
+/// at most [`GATEWAY_OUTPUT_SNIPPET_BYTES`] bytes, cutting on a UTF-8 char
+/// boundary and appending an elision marker (with the original length) when
+/// truncated so the message stays honest about there being more. Note the
+/// returned string can exceed [`GATEWAY_OUTPUT_SNIPPET_BYTES`] by the length of
+/// that suffix — only the prefix taken from `s` is capped, not the whole result.
 fn gateway_output_snippet(s: &str) -> std::borrow::Cow<'_, str> {
     if s.len() <= GATEWAY_OUTPUT_SNIPPET_BYTES {
         return std::borrow::Cow::Borrowed(s);
