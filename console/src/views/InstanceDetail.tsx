@@ -37,11 +37,23 @@ import {
   scopeKeyOptions,
   validateNewVariable,
 } from "./newVariableForm";
+import {
+  buildAncestorChain,
+  breadcrumbHops,
+  activateHop,
+} from "./instanceBreadcrumb";
 
 export default function InstanceDetail({
   instanceKey,
+  onNavigateInstance,
 }: {
   instanceKey: string;
+  /// Navigate the Explorer's detail pane to another instance. Optional so a
+  /// caller that doesn't wire it still compiles and renders (no navigation
+  /// offered — e.g. the call-activity breadcrumb hops become inert). Owned by
+  /// this slice (#1116); the parent->child "Called Process Instances" slice
+  /// (#1117) consumes the same seam.
+  onNavigateInstance?: (instanceKey: string) => void;
 }) {
   // Detail refetches on the same live signal as the list; the trace is folded
   // from the same event stream, so refresh it on the same signal too.
@@ -83,6 +95,29 @@ export default function InstanceDetail({
     enabled: !!defKey,
     staleTime: Infinity,
   });
+
+  // Call-activity child->parent breadcrumb: when this instance was spawned by a
+  // call activity (`parent_process_instance_key` is non-null — the snake_case
+  // wire field from #1113), climb the parent linkage hop-by-hop to the root and
+  // render a clickable path. Each parent's summary comes from the same
+  // `["instance", key]` query the detail pane uses, so the climb reuses cache
+  // and dedupes. Gated on the current instance having a parent so a top-level
+  // instance issues no extra request.
+  const hasParent = data?.instance.parent_process_instance_key != null;
+  const { data: ancestors } = useQuery({
+    queryKey: ["ancestor-chain", instanceKey],
+    queryFn: () =>
+      buildAncestorChain(instanceKey, async (key) => {
+        const detail = await qc.fetchQuery({
+          queryKey: ["instance", key],
+          queryFn: async () =>
+            (await getInstance({ path: { key }, throwOnError: true })).data,
+        });
+        return detail?.instance ?? null;
+      }),
+    enabled: !!instanceKey && hasParent,
+  });
+  const crumbs = breadcrumbHops(ancestors ?? []);
 
   // The execution trace is folded from a bounded in-memory ring, so it may be
   // absent (never traced, or evicted). Only a 404 means "no trace" — surfaced as
@@ -219,6 +254,44 @@ export default function InstanceDetail({
     </header>
   );
 
+  // Operate-style call-activity breadcrumb: root → … → current. Rendered only
+  // for a child instance (a resolved chain of more than one hop); a top-level
+  // instance shows nothing. Every ancestor hop is a button that navigates the
+  // detail pane to that instance via `onNavigateInstance`; the current instance
+  // is inert (`aria-current`).
+  const breadcrumbBar = crumbs.length > 0 && (
+    <nav
+      aria-label="Call chain"
+      className="border-b border-edge px-4 py-2 sm:px-8"
+    >
+      <ol className="flex flex-wrap items-center gap-x-1 gap-y-1 text-xs">
+        {crumbs.map((hop, i) => (
+          <li key={hop.key} className="flex items-center gap-x-1">
+            {i > 0 && (
+              <span aria-hidden className="text-fg-faint">
+                ›
+              </span>
+            )}
+            {hop.isCurrent ? (
+              <span aria-current="step" className="font-medium text-fg">
+                {hop.label}
+              </span>
+            ) : (
+              <button
+                type="button"
+                title={`Instance ${hop.key}`}
+                onClick={() => activateHop(hop, onNavigateInstance)}
+                className="rounded text-accent-strong hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              >
+                {hop.label}
+              </button>
+            )}
+          </li>
+        ))}
+      </ol>
+    </nav>
+  );
+
   const actionBanner = actionError && (
     <p className="mb-4 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
       {actionError}
@@ -341,6 +414,7 @@ export default function InstanceDetail({
     return (
       <div className="flex h-full flex-col">
         {header}
+        {breadcrumbBar}
         <div className="nano-safe-x min-h-0 flex-1 overflow-auto p-4">
           {actionBanner}
           <CardGrid className="mb-6">
@@ -385,6 +459,7 @@ export default function InstanceDetail({
   return (
     <div className="flex h-full flex-col">
       {header}
+      {breadcrumbBar}
 
       <div style={{ height: modelResize.size }} className="shrink-0 bg-white">
         <BpmnViewer
