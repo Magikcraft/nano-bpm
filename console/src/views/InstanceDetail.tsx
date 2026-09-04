@@ -56,6 +56,7 @@ import {
   resolveCallActivitySelection,
   type CalledInstanceGroup,
 } from "./calledInstances";
+import { stateTone } from "./stateTone";
 
 export default function InstanceDetail({
   instanceKey,
@@ -1099,22 +1100,6 @@ function Empty({ children }: { children: ReactNode }) {
   return <p className="text-sm text-fg-faint">{children}</p>;
 }
 
-/** Badge tone for a called instance's state (mirrors the Explorer list). */
-function calledStateTone(
-  state: string,
-  hasIncident: boolean,
-): "danger" | "info" | "ok" | "neutral" {
-  if (hasIncident) return "danger";
-  switch (state) {
-    case "Active":
-      return "info";
-    case "Completed":
-      return "ok";
-    default:
-      return "neutral";
-  }
-}
-
 /**
  * The "Called Process Instances" section: the child instances this parent
  * spawned through its call activities, grouped by the calling cell. Each row is
@@ -1169,28 +1154,11 @@ function CalledInstancesSection({
         <ScrollX>
           <Table head={["Called from", "Process", "Instance", "State", ""]}>
             {rows.map(({ group, c }) => {
-              const navigate = () => canNavigate && onNavigate?.(c.key);
               return (
                 <tr
                   key={c.key}
-                  role={canNavigate ? "button" : undefined}
-                  tabIndex={canNavigate ? 0 : undefined}
-                  aria-label={
-                    canNavigate
-                      ? `Open called instance ${c.process_id} ${c.key}`
-                      : undefined
-                  }
-                  onClick={navigate}
-                  onKeyDown={(e) => {
-                    if (canNavigate && (e.key === "Enter" || e.key === " ")) {
-                      e.preventDefault();
-                      navigate();
-                    }
-                  }}
                   className={`border-b border-edge ${
-                    canNavigate
-                      ? "cursor-pointer hover:bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
-                      : ""
+                    canNavigate ? "hover:bg-hover" : ""
                   }`}
                 >
                   <Td title={group.elementId ?? undefined}>
@@ -1200,9 +1168,22 @@ function CalledInstancesSection({
                     {c.process_id}
                     <span className="text-fg-faint"> · v{c.version}</span>
                   </Td>
-                  <Td className="font-mono text-fg-faint">{c.key}</Td>
+                  <Td className="font-mono text-fg-faint">
+                    {canNavigate ? (
+                      <button
+                        type="button"
+                        onClick={() => onNavigate?.(c.key)}
+                        aria-label={`Open called instance ${c.process_id} ${c.key}`}
+                        className="rounded font-mono text-accent-strong hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+                      >
+                        {c.key}
+                      </button>
+                    ) : (
+                      c.key
+                    )}
+                  </Td>
                   <Td>
-                    <Badge tone={calledStateTone(c.state, c.has_incident)}>
+                    <Badge tone={stateTone(c.state, c.has_incident)}>
                       {c.state}
                     </Badge>
                   </Td>

@@ -77,7 +77,8 @@ export interface CalledInstanceGroup {
  * first-seen order (both of the groups and of the rows within each group). A
  * multi-instance call activity yields one group with N instances; distinct call
  * activities yield distinct groups. Unresolved-cell entries (`calling_element_id`
- * === null) fall into a single trailing `null` group.
+ * === null) are collected under a single `null` group, positioned by first-seen
+ * order like any other group (not forced to the end).
  */
 export function groupCalledInstances(
   called: readonly CalledInstance[],
