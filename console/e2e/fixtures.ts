@@ -371,8 +371,19 @@ export function makeInstance(overrides: Partial<Instance> = {}): Instance {
   };
 }
 
-/** A full `InstanceDetail` around a list instance, with one trace-linked task. */
-function makeInstanceDetail(inst: Instance): InstanceDetail {
+/**
+ * A full `InstanceDetail` around a list instance, with one trace-linked task.
+ *
+ * `overrides` shallow-merges over the derived detail so a scenario can supply its
+ * own `called_instances` (the parent->child surface, #1115) or `active_elements`
+ * (e.g. a call-activity token) without re-deriving the common shape — the
+ * call-activity navigation guard (#1118) uses this to describe a parent whose
+ * call activity spawned a child.
+ */
+export function makeInstanceDetail(
+  inst: Instance,
+  overrides: Partial<Omit<InstanceDetail, "instance">> = {},
+): InstanceDetail {
   return {
     instance: inst,
     variables: [
@@ -401,6 +412,7 @@ function makeInstanceDetail(inst: Instance): InstanceDetail {
     ],
     // No call activities in this fixture's model, so no children were spawned.
     called_instances: [],
+    ...overrides,
   };
 }
 
@@ -602,4 +614,129 @@ export async function stubApp(
         body: opts.appViewHtml ?? APP_VIEW_HTML,
       }),
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Call-activity parent↔child navigation fixtures (issue #1118)
+//
+// The parent/child navigation guard needs a deterministic two-process graph: a
+// PARENT model that carries a `callActivity` cell (so the diagram renders a
+// clickable cell the BpmnViewer's `onElementSelect` fires on), and a CHILD whose
+// `parent_process_instance_key` climbs back to the parent (so the breadcrumb
+// resolves) and which the parent lists in its `called_instances`. These are the
+// stub equivalents of "deploy parent+child, run an instance so the child spawns":
+// the console API never talks to a real gateway here, so the spawned graph is
+// expressed as shaped fixtures rather than a live deployment — which is what
+// keeps the guard deterministic (fixed keys, no timing) under the no-retries rule.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * A laid-out PARENT model whose flow runs start → `callActivity` (`Call_Child`,
+ * named "Fulfil order") → end. The `BPMNShape` DI is mandatory: without it
+ * bpmn-js imports the semantics but paints no shape, so the call-activity cell
+ * would not be clickable and the `onElementSelect` navigation assertion could
+ * never fire. The `Call_Child` id is what the child's `calling_element_id`
+ * points back at, so selecting the cell resolves to the one spawned child.
+ */
+export const CALL_ACTIVITY_PARENT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+  id="Definitions_parent" targetNamespace="http://nano/e2e">
+  <bpmn:process id="order-orchestrator" isExecutable="true">
+    <bpmn:startEvent id="Start_1">
+      <bpmn:outgoing>Flow_1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:callActivity id="Call_Child" name="Fulfil order" calledElement="fulfilment">
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+      <bpmn:outgoing>Flow_2</bpmn:outgoing>
+    </bpmn:callActivity>
+    <bpmn:endEvent id="End_1">
+      <bpmn:incoming>Flow_2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Call_Child" />
+    <bpmn:sequenceFlow id="Flow_2" sourceRef="Call_Child" targetRef="End_1" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="Diagram_1">
+    <bpmndi:BPMNPlane id="Plane_1" bpmnElement="order-orchestrator">
+      <bpmndi:BPMNShape id="Start_1_di" bpmnElement="Start_1">
+        <dc:Bounds x="150" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Call_Child_di" bpmnElement="Call_Child">
+        <dc:Bounds x="240" y="78" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_1_di" bpmnElement="End_1">
+        <dc:Bounds x="400" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1">
+        <di:waypoint x="186" y="118" />
+        <di:waypoint x="240" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_2_di" bpmnElement="Flow_2">
+        <di:waypoint x="340" y="118" />
+        <di:waypoint x="400" y="118" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>`;
+
+/**
+ * Layer an explicit instance GRAPH over `stubConsoleApi`: unlike `stubInstances`
+ * (which derives every detail from a list `Instance` and serves one shared XML),
+ * this serves caller-supplied `InstanceDetail`s verbatim — so a scenario controls
+ * each instance's `called_instances` and `parent_process_instance_key` — and
+ * resolves the diagram XML per `process_definition_key` from `xmlByDefKey`
+ * (falling back to `MINIMAL_BPMN`). The list endpoint returns each detail's
+ * `instance`; `/traces/{key}` 404s (the component treats that as "no trace",
+ * exactly as the real bounded ring does for an untraced instance). Everything
+ * else falls through to the base stubs. Register AFTER `stubConsoleApi`.
+ */
+export async function stubInstanceGraph(
+  page: Page,
+  details: InstanceDetail[],
+  xmlByDefKey: Record<string, string> = {},
+): Promise<void> {
+  const byKey = new Map(details.map((d) => [d.instance.key, d]));
+  const items = details.map((d) => d.instance);
+
+  await page.route("**/console/api/**", async (route) => {
+    const url = new URL(route.request().url()).pathname;
+    const json = (body: unknown) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(body),
+      });
+
+    const detailMatch = url.match(/\/console\/api\/instances\/([^/]+)$/);
+    if (detailMatch) {
+      const detail = byKey.get(decodeURIComponent(detailMatch[1]));
+      if (!detail)
+        return route.fulfill({ status: 404, body: "no such instance" });
+      return json(detail);
+    }
+    if (url.endsWith("/console/api/instances")) {
+      return json({ items, total: items.length, page: 0, pageSize: 50 });
+    }
+    // An untraced instance: 404 is the only "no trace" signal the component
+    // accepts (a shaped-but-empty trace would render a misleading timeline).
+    if (/\/console\/api\/traces\/[^/]+$/.test(url)) {
+      return route.fulfill({ status: 404, body: "no trace" });
+    }
+    return route.fallback();
+  });
+
+  // The BPMN XML is fetched from the gateway's v2 endpoint (outside /console/api),
+  // keyed by process-definition key — resolve each parent/child model by its key.
+  await page.route("**/v2/process-definitions/*/xml", (route) => {
+    const path = new URL(route.request().url()).pathname;
+    const m = path.match(/\/v2\/process-definitions\/([^/]+)\/xml$/);
+    const key = m ? decodeURIComponent(m[1]) : "";
+    route.fulfill({
+      status: 200,
+      contentType: "application/xml",
+      body: xmlByDefKey[key] ?? MINIMAL_BPMN,
+    });
+  });
 }
