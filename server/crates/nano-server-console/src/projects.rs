@@ -3621,11 +3621,7 @@ fn gateway_output_snippet(s: &str) -> std::borrow::Cow<'_, str> {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    std::borrow::Cow::Owned(format!(
-        "{}… ({} bytes total)",
-        &s[..end],
-        s.len()
-    ))
+    std::borrow::Cow::Owned(format!("{}… ({} bytes total)", &s[..end], s.len()))
 }
 
 /// Build the `bad gateway output` error message for a gateway reply that failed
@@ -3659,7 +3655,10 @@ fn gateway_output_parse_error(err: &serde_json::Error, raw_len: usize, trimmed: 
              datasource reply; underlying parse error: {err}"
         );
     }
-    format!("bad gateway output: {err}: {}", gateway_output_snippet(trimmed))
+    format!(
+        "bad gateway output: {err}: {}",
+        gateway_output_snippet(trimmed)
+    )
 }
 
 async fn pipe_data_gateway(
@@ -12004,7 +12003,10 @@ mod tests {
         // ordinary garbage yields a *syntax* error ("expected value"), so the
         // boundary length alone is not the signature — `is_eof()` must gate it.
         let syntax_err = serde_json::from_str::<serde_json::Value>("nope").unwrap_err();
-        assert!(!syntax_err.is_eof(), "sanity: 'nope' is a syntax error, not EOF");
+        assert!(
+            !syntax_err.is_eof(),
+            "sanity: 'nope' is a syntax error, not EOF"
+        );
         let boundary_syntax_msg =
             gateway_output_parse_error(&syntax_err, PIPE_BUFFER_BYTES, "nope");
         assert!(
@@ -12019,8 +12021,7 @@ mod tests {
         // path rather than misattributing it to the flush bug.
         let empty_eof = serde_json::from_str::<serde_json::Value>("").unwrap_err();
         assert!(empty_eof.is_eof(), "sanity: empty input is an EOF error");
-        let whitespace_boundary_msg =
-            gateway_output_parse_error(&empty_eof, PIPE_BUFFER_BYTES, "");
+        let whitespace_boundary_msg = gateway_output_parse_error(&empty_eof, PIPE_BUFFER_BYTES, "");
         assert!(
             !whitespace_boundary_msg.contains("pipe boundary"),
             "whitespace-only output at a 64 KiB boundary must not claim truncation, got: {whitespace_boundary_msg}"
@@ -12063,11 +12064,17 @@ mod tests {
         // A multibyte char straddling the cap must not panic or split mid-char.
         let s = format!("{}€", "a".repeat(GATEWAY_OUTPUT_SNIPPET_BYTES - 1));
         let snippet = gateway_output_snippet(&s);
-        assert!(snippet.ends_with("bytes total)"), "long input must be elided");
+        assert!(
+            snippet.ends_with("bytes total)"),
+            "long input must be elided"
+        );
         // A string exactly at the cap is returned untouched (borrowed).
         let exact = "a".repeat(GATEWAY_OUTPUT_SNIPPET_BYTES);
         assert!(
-            matches!(gateway_output_snippet(&exact), std::borrow::Cow::Borrowed(_)),
+            matches!(
+                gateway_output_snippet(&exact),
+                std::borrow::Cow::Borrowed(_)
+            ),
             "input at the cap must be borrowed unchanged"
         );
     }
