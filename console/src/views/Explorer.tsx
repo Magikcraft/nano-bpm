@@ -6,6 +6,7 @@ import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import { usePaneResize } from "../lib/usePaneResize";
 import { ResizeHandle } from "../components/ResizeHandle";
 import InstanceDetail from "./InstanceDetail";
+import { stateTone } from "./stateTone";
 import { Badge, Button, useIsNarrow } from "../components/ui";
 import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
 import {
@@ -27,23 +28,6 @@ import {
 } from "../lib/tour/journeys/localdev";
 
 const PAGE_SIZE = 50;
-
-function stateTone(
-  state: string,
-  hasIncident: boolean,
-): "danger" | "info" | "ok" | "neutral" {
-  if (hasIncident) return "danger";
-  switch (state) {
-    case "Active":
-      return "info";
-    case "Completed":
-      return "ok";
-    case "Terminated":
-      return "neutral";
-    default:
-      return "neutral";
-  }
-}
 
 /**
  * One instance row in the list. `rowRef` is forwarded only for the selected
