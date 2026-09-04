@@ -2357,11 +2357,11 @@ impl From<&nano_server_storage::readstore::ProcessInstanceRow> for InstanceDto {
 #[cfg(test)]
 mod instance_dto_parent_linkage_tests {
     use nano_server_storage::readstore::ProcessInstanceRow;
-    use nanobpmn_engine_core::ProcessInstanceState;
+    use nanobpmn_engine_core::{Key, ProcessInstanceState};
 
     use super::*;
 
-    fn row(parent_pi: Option<u64>, parent_ei: Option<u64>) -> ProcessInstanceRow {
+    fn row(parent_pi: Option<Key>, parent_ei: Option<Key>) -> ProcessInstanceRow {
         ProcessInstanceRow {
             key: 100,
             process_id: "child".to_string(),

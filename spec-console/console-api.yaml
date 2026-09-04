@@ -1525,7 +1525,7 @@ components:
     # ---- Instances (snake_case wire fields) ------------------------------
     Instance:
       type: object
-      required: [key, process_id, process_definition_key, version, state, start_date_ms, has_incident, business_id, tags]
+      required: [key, process_id, process_definition_key, version, state, start_date_ms, has_incident, business_id, tags, parent_process_instance_key, parent_element_instance_key]
       properties:
         key: { type: string }
         process_id: { type: string }
