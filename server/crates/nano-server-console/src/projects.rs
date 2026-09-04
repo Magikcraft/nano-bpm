@@ -3601,19 +3601,23 @@ const PIPE_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Build the `bad gateway output` error message for a gateway reply that failed
 /// to parse as JSON. When the raw (untrimmed) stdout byte length `raw_len` is a
-/// positive multiple of [`PIPE_BUFFER_BYTES`], the parse almost certainly failed
-/// because the gateway child was truncated at a 64 KiB pipe boundary (an
-/// unflushed `process.exit()`), not because the datasource produced bad JSON —
-/// so surface that hint instead of the raw serde error (which reads as a
-/// confusing "EOF while parsing a string at line 1 column 65536"). `trimmed` is
-/// the text we attempted to parse.
+/// positive multiple of [`PIPE_BUFFER_BYTES`] *and* the parse failed with an
+/// EOF-style error (serde ran out of input mid-value — the signature of a valid
+/// JSON prefix cut off at the boundary), the reply was almost certainly
+/// truncated because the gateway child called `process.exit()` before flushing
+/// stdout, not because the datasource produced bad JSON — so surface that hint
+/// instead of the raw serde error (which reads as a confusing "EOF while parsing
+/// a string at line 1 column 65536"). Both conditions are required: an ordinary
+/// malformed reply that happens to be exactly 64 KiB yields a *syntax* error
+/// (e.g. "expected value"), not EOF, so it keeps its raw detail rather than being
+/// misattributed to the flush bug. `trimmed` is the text we attempted to parse.
 fn gateway_output_parse_error(err: &serde_json::Error, raw_len: usize, trimmed: &str) -> String {
-    if raw_len > 0 && raw_len.is_multiple_of(PIPE_BUFFER_BYTES) {
+    if raw_len > 0 && raw_len.is_multiple_of(PIPE_BUFFER_BYTES) && err.is_eof() {
         return format!(
             "bad gateway output: reply truncated at a {PIPE_BUFFER_BYTES}-byte pipe boundary \
              ({raw_len} bytes) — the data gateway almost certainly called process.exit() before \
-             flushing stdout (a gateway flush bug; see nano-ide#549), not a malformed datasource \
-             reply; underlying parse error: {err}"
+             flushing stdout (a gateway flush bug; see nanobpm/nano-ide#549), not a malformed \
+             datasource reply; underlying parse error: {err}"
         );
     }
     format!("bad gateway output: {err}: {trimmed}")
@@ -11909,8 +11913,8 @@ mod tests {
     fn gateway_parse_error_hints_at_flush_bug_on_pipe_boundary_truncation() {
         // A reply whose raw byte length is a positive multiple of the 64 KiB
         // pipe buffer (65536, 131072, …) is the truncated-gateway signature
-        // (#1110 / nano-ide#549): the message must point at the flush bug, not
-        // just echo the raw serde "EOF ... column 65536" error.
+        // (#1110 / nanobpm/nano-ide#549): the message must point at the flush
+        // bug, not just echo the raw serde "EOF ... column 65536" error.
         let parse_err = serde_json::from_str::<serde_json::Value>("{\"a\":").unwrap_err();
         let msg = gateway_output_parse_error(&parse_err, PIPE_BUFFER_BYTES, "{\"a\":");
         assert!(
@@ -11954,16 +11958,34 @@ mod tests {
             !empty_msg.contains("pipe boundary"),
             "empty output must not be treated as boundary truncation, got: {empty_msg}"
         );
+
+        // Defect-class guard: a genuinely malformed reply that happens to be
+        // *exactly* a 64 KiB multiple must NOT be misattributed to the flush bug.
+        // Truncation leaves a valid JSON prefix (an EOF-style parse error);
+        // ordinary garbage yields a *syntax* error ("expected value"), so the
+        // boundary length alone is not the signature — `is_eof()` must gate it.
+        let syntax_err = serde_json::from_str::<serde_json::Value>("nope").unwrap_err();
+        assert!(!syntax_err.is_eof(), "sanity: 'nope' is a syntax error, not EOF");
+        let boundary_syntax_msg =
+            gateway_output_parse_error(&syntax_err, PIPE_BUFFER_BYTES, "nope");
+        assert!(
+            !boundary_syntax_msg.contains("pipe boundary"),
+            "non-EOF error at a 64 KiB boundary must not claim truncation, got: {boundary_syntax_msg}"
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn pipe_data_gateway_flags_truncated_reply_at_pipe_boundary() {
-        // End-to-end: a gateway that writes exactly one 64 KiB pipe buffer of
-        // unparseable output (the truncation signature) and exits 0 must yield
-        // the flush-bug hint, not the raw serde EOF error.
+        // End-to-end: a gateway whose stdout is a *valid JSON prefix* cut off at
+        // exactly one 64 KiB pipe buffer — the real truncation signature in
+        // #1110 / nanobpm/nano-ide#549 — must yield the flush-bug hint, not the
+        // raw serde EOF error. The reply opens a JSON string (`{"a":"`) then runs
+        // 65530 'a' bytes with no closing quote: an unterminated string that
+        // serde reports as an EOF-style error, totalling exactly 65536 bytes.
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("head -c 65536 /dev/zero | tr '\\0' 'a'");
+        cmd.arg("-c")
+            .arg("printf '{\"a\":\"'; head -c 65530 /dev/zero | tr '\\0' 'a'");
         let err = pipe_data_gateway(cmd, &serde_json::json!({ "op": "schema" }))
             .await
             .expect_err("unparseable output must be an error");
