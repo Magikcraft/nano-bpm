@@ -239,9 +239,9 @@ test.describe("call-activity parent↔child navigation", () => {
     // bpmn-js paints the call-activity as a `.djs-element` group tagged with the
     // BPMN id. A single spawned child resolves to a direct navigation (Operate
     // double-click parity), so clicking the shape lands on the child.
-    const cell = page.locator(
-      `.djs-element[data-element-id="${CALL_CELL_ID}"]`,
-    );
+    const cell = page
+      .locator(`.djs-element[data-element-id="${CALL_CELL_ID}"]`)
+      .first();
     await expect(cell).toBeVisible();
     await cell.click();
 

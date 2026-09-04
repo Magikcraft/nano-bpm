@@ -382,7 +382,7 @@ export function makeInstance(overrides: Partial<Instance> = {}): Instance {
  */
 export function makeInstanceDetail(
   inst: Instance,
-  overrides: Partial<InstanceDetail> = {},
+  overrides: Partial<Omit<InstanceDetail, "instance">> = {},
 ): InstanceDetail {
   return {
     instance: inst,
