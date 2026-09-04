@@ -108,11 +108,21 @@ export default function InstanceDetail({
     queryKey: ["ancestor-chain", instanceKey],
     queryFn: () =>
       buildAncestorChain(instanceKey, async (key) => {
-        const detail = await qc.fetchQuery({
-          queryKey: ["instance", key],
-          queryFn: async () =>
-            (await getInstance({ path: { key }, throwOnError: true })).data,
-        });
+        // Reuse the detail-pane cache: the base `["instance", key]` query has
+        // no `staleTime`, so `fetchQuery` would treat every cached entry as
+        // stale and refetch each hop (including the currently viewed
+        // instance). Read the cache first and only hit the network for hops we
+        // haven't loaded yet, so the climb dedupes as intended.
+        const cached = qc.getQueryData<
+          Awaited<ReturnType<typeof getInstance>>["data"]
+        >(["instance", key]);
+        const detail =
+          cached ??
+          (await qc.fetchQuery({
+            queryKey: ["instance", key],
+            queryFn: async () =>
+              (await getInstance({ path: { key }, throwOnError: true })).data,
+          }));
         return detail?.instance ?? null;
       }),
     enabled: !!instanceKey && hasParent,
