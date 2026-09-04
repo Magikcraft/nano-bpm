@@ -1633,7 +1633,7 @@ components:
         pageSize: { type: integer, format: int32 }
     InstanceDetail:
       type: object
-      required: [instance, variables, jobs, incidents, active_elements]
+      required: [instance, variables, jobs, incidents, active_elements, called_instances]
       properties:
         instance: { $ref: '#/components/schemas/Instance' }
         variables:
@@ -1655,6 +1655,49 @@ components:
             shows where it is parked.
           type: array
           items: { $ref: '#/components/schemas/ActiveElement' }
+        called_instances:
+          description: >-
+            The child process instances this instance spawned via call
+            activities (parent -> child navigation). Mirrors Operate's
+            Details-tab "Called Process Instance" row — and "View all" for a
+            multi-instance call activity, which yields one entry per spawned
+            child, all sharing the same `calling_element_id`. Each entry names
+            the call-activity cell (`calling_element_id`) that spawned the child,
+            resolved from the child's `parent_element_instance_key`, so the
+            Explorer can jump from a call-activity cell to its called instance.
+            Empty when this instance has no call activities or none have spawned
+            a child yet.
+          type: array
+          items: { $ref: '#/components/schemas/CalledInstance' }
+
+    CalledInstance:
+      type: object
+      required: [key, process_id, version, state, has_incident, start_date_ms, calling_element_id, calling_element_name]
+      properties:
+        key:
+          type: string
+          description: The child process instance key.
+        process_id: { type: string }
+        version: { type: integer, format: int32 }
+        state:
+          type: string
+          description: '`Active` | `Completed` | `Terminated`.'
+        has_incident: { type: boolean }
+        start_date_ms: { type: integer, format: int64 }
+        calling_element_id:
+          type: string
+          nullable: true
+          description: >-
+            BPMN id of the call-activity cell in this (parent) instance that
+            spawned the child, resolved from the child's
+            `parent_element_instance_key` via the parent's element-instance rows.
+            Resolution does not depend on the cell still being active — a
+            COMPLETED call activity resolves too. `null` when the calling element
+            instance is no longer resolvable (e.g. evicted).
+        calling_element_name:
+          type: string
+          nullable: true
+          description: The call-activity cell's BPMN name, when the model carries one.
 
     ActiveElement:
       type: object
