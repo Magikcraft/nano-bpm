@@ -399,6 +399,8 @@ function makeInstanceDetail(inst: Instance): InstanceDetail {
         element_name: "Do the thing",
       },
     ],
+    // No call activities in this fixture's model, so no children were spawned.
+    called_instances: [],
   };
 }
 

@@ -1,4 +1,12 @@
-import { useEffect, useId, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { createPortal } from "react-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -42,6 +50,12 @@ import {
   breadcrumbHops,
   activateHop,
 } from "./instanceBreadcrumb";
+import {
+  callActivityElementIds,
+  groupCalledInstances,
+  resolveCallActivitySelection,
+  type CalledInstanceGroup,
+} from "./calledInstances";
 
 export default function InstanceDetail({
   instanceKey,
@@ -66,6 +80,17 @@ export default function InstanceDetail({
   );
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+
+  // Parent->child "Called Process Instances" navigation state. Selecting a
+  // multi-instance call-activity cell filters the section to that cell's
+  // children ("View all" parity); `calledFilter` holds the calling element id
+  // (null = show every called instance). Selecting a call activity that has not
+  // spawned a child yet surfaces `noCalledNotice` (the cell's id) as a clear
+  // "no called instance" affordance. The section is scrolled into view via
+  // `calledSectionRef`.
+  const [calledFilter, setCalledFilter] = useState<string | null>(null);
+  const [noCalledNotice, setNoCalledNotice] = useState<string | null>(null);
+  const calledSectionRef = useRef<HTMLElement>(null);
 
   // Resizable, reload-persistent model space. Dragging the divider below the
   // BPMN diagram taller gives the model more room and shrinks the variables/
@@ -128,6 +153,12 @@ export default function InstanceDetail({
     enabled: !!instanceKey && hasParent,
   });
   const crumbs = breadcrumbHops(ancestors ?? []);
+
+  // The BPMN ids of the call-activity cells in this model. `onElementSelect`
+  // (from #1114) only reports an element id, not its type, so this set lets us
+  // tell a call activity that simply hasn't spawned a child yet apart from an
+  // ordinary element (which must never attempt navigation). Parsed once per XML.
+  const callActivityIds = useMemo(() => callActivityElementIds(xml), [xml]);
 
   // The execution trace is folded from a bounded in-memory ring, so it may be
   // absent (never traced, or evicted). Only a 404 means "no trace" — surfaced as
@@ -223,6 +254,49 @@ export default function InstanceDetail({
   if (!data) return null;
 
   const { instance, variables, jobs, incidents, active_elements } = data;
+  // The child instances this parent spawned through its call activities (#1115,
+  // snake_case wire field). Default to an empty list so an older server payload
+  // that predates the field renders as "no called instances" rather than
+  // crashing. Grouped by calling cell for the section and the "View all" filter.
+  const calledInstances = data.called_instances ?? [];
+  const calledGroups = groupCalledInstances(calledInstances);
+
+  // Selecting an element on the diagram (BpmnViewer `onElementSelect`, #1114):
+  // resolve it against this parent's called instances, matching Camunda Operate.
+  // A single child navigates straight to it; a multi-instance call activity
+  // reveals its rows; an un-spawned call activity shows a "no called instance"
+  // affordance; a non-call-activity element is ignored (never navigates).
+  const onDiagramElementSelect = (elementId: string) => {
+    const sel = resolveCallActivitySelection(
+      elementId,
+      calledInstances,
+      callActivityIds,
+    );
+    if (sel.kind === "ignore") return;
+    // On mobile the diagram opens full-screen; close it so the navigation /
+    // revealed section / notice is visible underneath.
+    if (narrow) setPanel(null);
+    switch (sel.kind) {
+      case "navigate":
+        onNavigateInstance?.(sel.instanceKey);
+        break;
+      case "reveal":
+        setNoCalledNotice(null);
+        setCalledFilter(sel.elementId);
+        // The section renders this same tick; scroll after paint.
+        queueMicrotask(() =>
+          calledSectionRef.current?.scrollIntoView({
+            behavior: "smooth",
+            block: "start",
+          }),
+        );
+        break;
+      case "none":
+        setCalledFilter(null);
+        setNoCalledNotice(sel.elementId);
+        break;
+    }
+  };
   // Live token positions drive the overlay. Active element instances cover every
   // wait state — including catch events, timers, receive tasks and event-based
   // gateways that have no job — so an instance parked on one still shows a token.
@@ -324,6 +398,7 @@ export default function InstanceDetail({
         xml={xml ?? null}
         activeElementIds={activeEls}
         incidentElementIds={incidentEls}
+        onElementSelect={onDiagramElementSelect}
         fitOnResize
       />
     </div>
@@ -415,10 +490,40 @@ export default function InstanceDetail({
     </Section>
   );
 
-  // Mobile: Model / Variables / Process Trace are drill-in cards that open a
-  // full-screen panel (the diagram needs the whole viewport to be usable, and
-  // the wide variables/timeline tables would otherwise force horizontal page
-  // scroll at 375px). Incidents and Jobs stay inline as sections.
+  // "Called Process Instances": the child instances this parent spawned through
+  // its call activities, each row navigating to the child (Operate's Details-tab
+  // "Called Process Instance"). Rendered only when there is at least one. The
+  // optional `noCalledNotice` banner is shown when the operator selected a call
+  // activity that has not spawned a child yet.
+  const calledNotice = noCalledNotice != null && (
+    <div
+      role="status"
+      className="mb-6 flex items-center gap-2 rounded-md border border-edge bg-panel px-3 py-2 text-sm text-fg-muted"
+    >
+      <span>
+        The call activity{" "}
+        <span className="font-mono text-fg">{noCalledNotice}</span> has not
+        called a process instance yet.
+      </span>
+      <button
+        type="button"
+        className="ml-auto rounded text-xs text-accent-strong hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        onClick={() => setNoCalledNotice(null)}
+      >
+        Dismiss
+      </button>
+    </div>
+  );
+
+  const calledInstancesSection = calledInstances.length > 0 && (
+    <CalledInstancesSection
+      sectionRef={calledSectionRef}
+      groups={calledGroups}
+      filterElementId={calledFilter}
+      onClearFilter={() => setCalledFilter(null)}
+      onNavigate={onNavigateInstance}
+    />
+  );
   if (narrow) {
     const panels = {
       model: { title: `${instance.process_id} · Model`, body: modelBody },
@@ -453,6 +558,8 @@ export default function InstanceDetail({
             />
           </CardGrid>
           {incidentsSection}
+          {calledNotice}
+          {calledInstancesSection}
           {jobsSection}
         </div>
         {openPanel && (
@@ -482,6 +589,7 @@ export default function InstanceDetail({
           xml={xml ?? null}
           activeElementIds={activeEls}
           incidentElementIds={incidentEls}
+          onElementSelect={onDiagramElementSelect}
         />
       </div>
 
@@ -499,6 +607,8 @@ export default function InstanceDetail({
       <div className="min-h-0 flex-1 overflow-auto p-8">
         {actionBanner}
         {incidentsSection}
+        {calledNotice}
+        {calledInstancesSection}
         <Section title="Variables">{variablesBody}</Section>
         {jobsSection}
         <Section title="Process Trace">{traceBody}</Section>
@@ -987,4 +1097,124 @@ function Td({
 
 function Empty({ children }: { children: ReactNode }) {
   return <p className="text-sm text-fg-faint">{children}</p>;
+}
+
+/** Badge tone for a called instance's state (mirrors the Explorer list). */
+function calledStateTone(
+  state: string,
+  hasIncident: boolean,
+): "danger" | "info" | "ok" | "neutral" {
+  if (hasIncident) return "danger";
+  switch (state) {
+    case "Active":
+      return "info";
+    case "Completed":
+      return "ok";
+    default:
+      return "neutral";
+  }
+}
+
+/**
+ * The "Called Process Instances" section: the child instances this parent
+ * spawned through its call activities, grouped by the calling cell. Each row is
+ * keyboard-activatable and navigates to the child via `onNavigate`. When
+ * `filterElementId` is set (the operator selected a multi-instance call-activity
+ * cell — "View all"), only that cell's rows are shown, with a "Show all" control
+ * to clear the filter.
+ */
+function CalledInstancesSection({
+  sectionRef,
+  groups,
+  filterElementId,
+  onClearFilter,
+  onNavigate,
+}: {
+  sectionRef: RefObject<HTMLElement>;
+  groups: CalledInstanceGroup[];
+  filterElementId: string | null;
+  onClearFilter: () => void;
+  onNavigate?: (instanceKey: string) => void;
+}) {
+  const shown =
+    filterElementId != null
+      ? groups.filter((g) => g.elementId === filterElementId)
+      : groups;
+  const filterLabel =
+    filterElementId != null
+      ? (groups.find((g) => g.elementId === filterElementId)?.elementName ??
+        filterElementId)
+      : null;
+  const canNavigate = typeof onNavigate === "function";
+  const rows = shown.flatMap((g) => g.instances.map((c) => ({ group: g, c })));
+
+  return (
+    <section ref={sectionRef} className="mb-8">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <SectionLabel>Called Process Instances</SectionLabel>
+        {filterElementId != null && (
+          <div className="flex items-center gap-2 text-xs text-fg-muted">
+            <span>
+              Showing <span className="font-mono text-fg">{filterLabel}</span>
+            </span>
+            <Button size="sm" variant="ghost" onClick={onClearFilter}>
+              Show all
+            </Button>
+          </div>
+        )}
+      </div>
+      {rows.length === 0 ? (
+        <Empty>No called process instances.</Empty>
+      ) : (
+        <ScrollX>
+          <Table head={["Called from", "Process", "Instance", "State", ""]}>
+            {rows.map(({ group, c }) => {
+              const navigate = () => canNavigate && onNavigate?.(c.key);
+              return (
+                <tr
+                  key={c.key}
+                  role={canNavigate ? "button" : undefined}
+                  tabIndex={canNavigate ? 0 : undefined}
+                  aria-label={
+                    canNavigate
+                      ? `Open called instance ${c.process_id} ${c.key}`
+                      : undefined
+                  }
+                  onClick={navigate}
+                  onKeyDown={(e) => {
+                    if (canNavigate && (e.key === "Enter" || e.key === " ")) {
+                      e.preventDefault();
+                      navigate();
+                    }
+                  }}
+                  className={`border-b border-edge ${
+                    canNavigate
+                      ? "cursor-pointer hover:bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+                      : ""
+                  }`}
+                >
+                  <Td title={group.elementId ?? undefined}>
+                    {group.elementName ?? group.elementId ?? "—"}
+                  </Td>
+                  <Td>
+                    {c.process_id}
+                    <span className="text-fg-faint"> · v{c.version}</span>
+                  </Td>
+                  <Td className="font-mono text-fg-faint">{c.key}</Td>
+                  <Td>
+                    <Badge tone={calledStateTone(c.state, c.has_incident)}>
+                      {c.state}
+                    </Badge>
+                  </Td>
+                  <Td className="text-right">
+                    {c.has_incident && <Badge tone="danger">Incident</Badge>}
+                  </Td>
+                </tr>
+              );
+            })}
+          </Table>
+        </ScrollX>
+      )}
+    </section>
+  );
 }
