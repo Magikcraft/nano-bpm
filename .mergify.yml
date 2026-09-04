@@ -52,21 +52,25 @@ queue_rules:
     batch_max_wait_time: 5 min
 
 # The gate. These are the same 8 required checks configured on `main` branch
-# protection. Every one of them is change-gated in ci.yml: the six code checks
-# share the `code` filter (`*code_gate`), `processos (clippy + test)` has its own
-# `processos` filter, and `console (journey e2e)` has its own `console` filter, so
-# each is SKIPPED for PRs that don't touch its inputs (e.g. a console-/website-/
-# docs-only PR skips all six code checks; a Rust-only PR skips console e2e). A
-# skipped check never reports `success`, so — matching the authoritative
-# merge-protocol in AGENTS.md ("required-when-run, skip-tolerant":
-# acceptedConclusions `["success", "skipped"]` for all eight) — each is accepted
-# as success OR skipped. Encoding only `processos` as skip-tolerant (as this file
-# did before #1128) left the other checks requiring a strict `check-success` that
-# a skipped run can never satisfy, so the queue stalled indefinitely on
-# console-only PRs (#1126): it blocked on `@nanobpm/nano-bernd (build + test)`,
-# whose `check-success` / `check-skipped` group was perpetually false. Every
-# required check gets the same `or: [check-success, check-skipped]` acceptance so
-# a skipped required job satisfies the queue condition instead of deadlocking it.
+# protection. Every one of them is change-gated by the `changes` job's
+# paths-filter in `.github/workflows/ci.yml`: the six code checks share the
+# `code` filter (`*code_gate`), `processos (clippy + test)` has its own
+# `processos` filter (skipped for PRs that don't touch `processos/**`,
+# `engine-core/**`, or `.github/workflows/ci.yml`), and `console (journey e2e)`
+# has its own `console` filter (skipped for PRs that don't touch `console/**`,
+# `spec-console/**`, `spec-app/**`, or `.github/workflows/ci.yml`), so each is
+# SKIPPED for PRs that don't touch its inputs (e.g. a console-/website-/docs-only
+# PR skips all six code checks; a Rust-only PR skips console e2e). A skipped
+# check never reports `success`, so — matching the authoritative merge-protocol
+# in AGENTS.md ("required-when-run, skip-tolerant": acceptedConclusions
+# `["success", "skipped"]` for all eight) — each is accepted as success OR
+# skipped. Encoding only `processos` as skip-tolerant (as this file did before
+# #1128) left the other checks requiring a strict `check-success` that a skipped
+# run can never satisfy, so the queue stalled indefinitely on console-only PRs
+# (#1126): it blocked on `@nanobpm/nano-bernd (build + test)`, whose
+# `check-success` / `check-skipped` group was perpetually false. Every required
+# check gets the same `or: [check-success, check-skipped]` acceptance so a
+# skipped required job satisfies the queue condition instead of deadlocking it.
 merge_protections:
   - name: required CI checks
     description: All required CI jobs must be green (or skipped) before merge.
