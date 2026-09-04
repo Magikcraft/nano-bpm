@@ -55,6 +55,16 @@ export type Instance = {
     has_incident: boolean;
     business_id: string | null;
     tags: Array<string>;
+    /**
+     * C8 parent linkage for a call-activity **child** process instance: the key of the calling (parent) process instance. `null` for a top-level instance. Mirrors C8's `parentProcessInstanceKey`.
+     *
+     */
+    parent_process_instance_key?: string | null;
+    /**
+     * C8 parent linkage for a call-activity **child** process instance: the element-instance key of the call-activity that spawned this instance in the parent. `null` for a top-level instance. Mirrors C8's `parentElementInstanceKey`.
+     *
+     */
+    parent_element_instance_key?: string | null;
 };
 
 export type Variable = {
