@@ -66,6 +66,37 @@ export default defineConfig({
       "@nanobpm/bojtos-kit",
       "@nanobpm/bojtos-react",
     ],
+    // The whole BPMN/DMN/form modeler stack is reached only through the lazy
+    // `lazy(() => import())` modeler routes, so esbuild's cold-start dependency
+    // scan does not always prebundle it up front. When a *later* navigation then
+    // pulls one of these packages in for the first time, Vite runs a mid-session
+    // re-optimize + full reload — and that second esbuild pass can split
+    // `@bpmn-io/properties-panel`'s vendored preact (its `../preact`, shared with
+    // `bpmn-js-properties-panel` and `bpmn-js-element-templates` via the
+    // `@bpmn-io/properties-panel/preact` subpath) into a *second* copy. Two
+    // preact instances means the properties-panel `Group` renders under one
+    // preact while its hooks read the other's "current component" — the exact
+    // `Cannot read '__H'` + `debounce is not a function` crash that unmounts the
+    // Agent-task properties group mid-render (issue #1127). Prebundling the whole
+    // stack — plus preact's own entry points — up front makes the optimize pass
+    // complete and stable at server start, so no runtime re-optimize reshuffles
+    // preact and the panel renders deterministically.
+    include: [
+      "bpmn-js/lib/Modeler",
+      "bpmn-js/lib/NavigatedViewer",
+      "bpmn-js-properties-panel",
+      "bpmn-js-element-templates",
+      "@bpmn-io/properties-panel",
+      "@bpmn-io/extract-process-variables/zeebe",
+      "camunda-bpmn-js-behaviors/lib/camunda-cloud",
+      "diagram-js/lib/draw/BaseRenderer",
+      "@bpmn-io/form-js-editor",
+      "@bpmn-io/form-js-viewer",
+      "dmn-js/lib/Modeler",
+      "preact",
+      "preact/hooks",
+      "preact/jsx-runtime",
+    ],
   },
   build: {
     outDir: "dist",

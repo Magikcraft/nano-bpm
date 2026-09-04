@@ -232,9 +232,10 @@ merges it:
     { "name": "server (clippy + test)", "acceptedConclusions": ["success", "skipped"] },
     { "name": "@nanobpm/nano-bernd (build + test)", "acceptedConclusions": ["success", "skipped"] },
     { "name": "io.github.jwulf:nano-bernd (JVM, Chicory)", "acceptedConclusions": ["success", "skipped"] },
-    { "name": "processos (clippy + test)", "acceptedConclusions": ["success", "skipped"] }
+    { "name": "processos (clippy + test)", "acceptedConclusions": ["success", "skipped"] },
+    { "name": "console (journey e2e)", "acceptedConclusions": ["success", "skipped"] }
   ],
-  "checksSemantics": "Every entry in requiredChecks gates the merge and must reach one of its acceptedConclusions. All seven checks are change-gated in ci.yml: the six code checks share the `code` filter (`*code_gate`) and 'processos (clippy + test)' has its own `processos` filter, so each is SKIPPED for PRs that don't touch its inputs (e.g. console/spec-app-only PRs skip every code check) and RUNS on the merge_group queue build. A skipped check never reports success, so each accepts 'skipped' too (required-when-run, skip-tolerant). Without this, a merge orchestrator that treats a skipped required check as unsatisfied blocks console-only PRs that GitHub itself reports as CLEAN.",
+  "checksSemantics": "Every entry in requiredChecks gates the merge and must reach one of its acceptedConclusions. All eight checks are change-gated in ci.yml: the six code checks share the `code` filter (`*code_gate`), 'processos (clippy + test)' has its own `processos` filter, and 'console (journey e2e)' has its own `console` filter (console/spec-console/spec-app/ci.yml), so each is SKIPPED for PRs (and merge_group batches) that don't touch its inputs (e.g. a Rust-only PR skips console e2e; a console-only PR skips every code check) and RUNS when they do. A skipped check never reports success, so each accepts 'skipped' too (required-when-run, skip-tolerant). Without this, a merge orchestrator that treats a skipped required check as unsatisfied blocks console-only PRs that GitHub itself reports as CLEAN.",
   "doc": "AGENTS.md#merging-prs"
 }
 ```
