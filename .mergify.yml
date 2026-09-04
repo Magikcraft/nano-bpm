@@ -52,21 +52,44 @@ queue_rules:
     batch_max_wait_time: 5 min
 
 # The gate. These are the same 7 required checks configured on `main` branch
-# protection. `processos (clippy + test)` is change-gated in ci.yml (skipped for
-# PRs that don't touch processos/engine-core/ci.yml), and a skipped check never
-# reports `success`, so it's accepted as either success OR skipped.
+# protection. Every one of them is change-gated in ci.yml: the six code checks
+# share the `code` filter (`*code_gate`) and `processos (clippy + test)` has its
+# own `processos` filter, so each is SKIPPED for PRs that don't touch its inputs
+# (e.g. a console-/website-/docs-only PR skips all six code checks). A skipped
+# check never reports `success`, so — matching the authoritative merge-protocol
+# in AGENTS.md ("required-when-run, skip-tolerant": acceptedConclusions
+# `["success", "skipped"]` for all seven) — each is accepted as success OR
+# skipped. Encoding only `processos` as skip-tolerant (as this file did before
+# #1128) left the other six requiring a strict `check-success` that a skipped run
+# can never satisfy, so the queue stalled indefinitely on console-only PRs (#1126):
+# it blocked on `@nanobpm/nano-bernd (build + test)`, whose `check-success` /
+# `check-skipped` group was perpetually false. Every code check gets the same
+# `or: [check-success, check-skipped]` acceptance so a skipped required job
+# satisfies the queue condition instead of deadlocking it.
 merge_protections:
   - name: required CI checks
     description: All required CI jobs must be green (or skipped) before merge.
     if:
       - base=main
     success_conditions:
-      - check-success=rustfmt (pinned nightly)
-      - check-success=engine-core (clippy + test)
-      - check-success=engine-wasm-ffi (dist + verify)
-      - check-success=server (clippy + test)
-      - check-success=@nanobpm/nano-bernd (build + test)
-      - check-success=io.github.jwulf:nano-bernd (JVM, Chicory)
+      - or:
+          - check-success=rustfmt (pinned nightly)
+          - check-skipped=rustfmt (pinned nightly)
+      - or:
+          - check-success=engine-core (clippy + test)
+          - check-skipped=engine-core (clippy + test)
+      - or:
+          - check-success=engine-wasm-ffi (dist + verify)
+          - check-skipped=engine-wasm-ffi (dist + verify)
+      - or:
+          - check-success=server (clippy + test)
+          - check-skipped=server (clippy + test)
+      - or:
+          - check-success=@nanobpm/nano-bernd (build + test)
+          - check-skipped=@nanobpm/nano-bernd (build + test)
+      - or:
+          - check-success=io.github.jwulf:nano-bernd (JVM, Chicory)
+          - check-skipped=io.github.jwulf:nano-bernd (JVM, Chicory)
       - or:
           - check-success=processos (clippy + test)
           - check-skipped=processos (clippy + test)
