@@ -2325,6 +2325,15 @@ struct InstanceDto {
     has_incident: bool,
     business_id: Option<String>,
     tags: Vec<String>,
+    /// C8 parent linkage for a call-activity **child** process instance: the key
+    /// of the calling (parent) process instance. `None` for a top-level
+    /// instance. Mirrors C8's `parentProcessInstanceKey`.
+    parent_process_instance_key: Option<String>,
+    /// C8 parent linkage for a call-activity **child** process instance: the
+    /// element-instance key of the call-activity that spawned this instance in
+    /// the parent. `None` for a top-level instance. Mirrors C8's
+    /// `parentElementInstanceKey`.
+    parent_element_instance_key: Option<String>,
 }
 
 impl From<&nano_server_storage::readstore::ProcessInstanceRow> for InstanceDto {
@@ -2339,7 +2348,57 @@ impl From<&nano_server_storage::readstore::ProcessInstanceRow> for InstanceDto {
             has_incident: r.has_incident,
             business_id: r.business_id.clone(),
             tags: r.tags.clone(),
+            parent_process_instance_key: r.parent_process_instance_key.map(|k| k.to_string()),
+            parent_element_instance_key: r.parent_element_instance_key.map(|k| k.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod instance_dto_parent_linkage_tests {
+    use nano_server_storage::readstore::ProcessInstanceRow;
+    use nanobpmn_engine_core::{Key, ProcessInstanceState};
+
+    use super::*;
+
+    fn row(parent_pi: Option<Key>, parent_ei: Option<Key>) -> ProcessInstanceRow {
+        ProcessInstanceRow {
+            key: 100,
+            process_id: "child".to_string(),
+            process_definition_id: "child".to_string(),
+            process_definition_key: "7".to_string(),
+            version: 1,
+            state: ProcessInstanceState::Active,
+            start_date_ms: 1_700_000_000_000,
+            has_incident: false,
+            tags: vec![],
+            business_id: None,
+            parent_process_instance_key: parent_pi,
+            parent_element_instance_key: parent_ei,
+        }
+    }
+
+    #[test]
+    fn call_activity_child_passes_parent_linkage_through_as_strings() {
+        let dto = InstanceDto::from(&row(Some(42), Some(4242)));
+        assert_eq!(dto.parent_process_instance_key.as_deref(), Some("42"));
+        assert_eq!(dto.parent_element_instance_key.as_deref(), Some("4242"));
+
+        // Serialized wire shape carries the parent linkage as string|null fields.
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["parent_process_instance_key"], "42");
+        assert_eq!(json["parent_element_instance_key"], "4242");
+    }
+
+    #[test]
+    fn top_level_instance_has_null_parent_linkage() {
+        let dto = InstanceDto::from(&row(None, None));
+        assert!(dto.parent_process_instance_key.is_none());
+        assert!(dto.parent_element_instance_key.is_none());
+
+        let json = serde_json::to_value(&dto).unwrap();
+        assert!(json["parent_process_instance_key"].is_null());
+        assert!(json["parent_element_instance_key"].is_null());
     }
 }
 
