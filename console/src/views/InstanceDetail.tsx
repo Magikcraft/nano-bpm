@@ -93,6 +93,16 @@ export default function InstanceDetail({
   const [noCalledNotice, setNoCalledNotice] = useState<string | null>(null);
   const calledSectionRef = useRef<HTMLElement>(null);
 
+  // Explorer keeps this component mounted (no `key` prop) and simply swaps the
+  // `instanceKey`, so the parent->child navigation slice above would otherwise
+  // carry over: a filter or "has not called" notice selected on one instance
+  // would stay applied to the next. Reset it whenever the inspected instance
+  // changes so each instance starts from the unfiltered, notice-free view.
+  useEffect(() => {
+    setCalledFilter(null);
+    setNoCalledNotice(null);
+  }, [instanceKey]);
+
   // Resizable, reload-persistent model space. Dragging the divider below the
   // BPMN diagram taller gives the model more room and shrinks the variables/
   // detail area beneath it; the height is stored under `nano.explorer.modelHeight`.
