@@ -294,8 +294,11 @@ export default function InstanceDetail({
       case "reveal":
         setNoCalledNotice(null);
         setCalledFilter(sel.elementId);
-        // The section renders this same tick; scroll after paint.
-        queueMicrotask(() =>
+        // The section renders this same tick, but React commits the DOM after
+        // this handler returns. `queueMicrotask` would run before that commit,
+        // so the ref could still be null; `requestAnimationFrame` defers the
+        // scroll to the next frame, once the section is in the DOM.
+        requestAnimationFrame(() =>
           calledSectionRef.current?.scrollIntoView({
             behavior: "smooth",
             block: "start",
