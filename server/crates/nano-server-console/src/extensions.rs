@@ -710,11 +710,28 @@ pub fn extensions_root() -> PathBuf {
 /// "first-pack-wins" resolver ([`all_extensions`], [`trigger_driver`],
 /// [`worker_driver`], …) nondeterministic; sorting gives one stable resolution
 /// order. Returns empty when the root is missing or unreadable.
+///
+/// Dot-prefixed entries are skipped: [`install_atomic`] builds a new pack in a
+/// dot-prefixed `.<leaf>.staging.*` sibling and parks the old copy in a
+/// `.<leaf>.backup.*` sibling during the swap. An installed pack dir is always
+/// the `scope__name` mapping from [`safe_pkg_dir`], which never starts with a
+/// dot, so filtering the leading-dot scratch dirs here means an in-flight
+/// install can NEVER be observed as a pack — its readable manifest (and, since
+/// `.` sorts first, its would-be precedence) is invisible to the scan until the
+/// atomic rename lands it under its real, non-dot name.
 fn pack_dirs() -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(extensions_root()) else {
         return Vec::new();
     };
-    let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    let mut dirs: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| !n.starts_with('.'))
+        })
+        .collect();
     dirs.sort();
     dirs
 }
@@ -1429,40 +1446,126 @@ pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
     // fails). Trimming here keeps validation and the npm call consistent.
     let pkg = pkg.trim();
     let dir = safe_pkg_dir(pkg).ok_or("invalid package name")?;
-    // Clean install: clear any prior copy so a re-install (i.e. an update to a
-    // newer npm version) never leaves stale files from the old version behind.
-    if dir.exists() {
-        let _ = std::fs::remove_dir_all(&dir);
+    // Build the whole new pack in a staging dir and swap it into place only once
+    // it is complete + valid — so a failed fetch/extract can NEVER leave `dir`
+    // half-written or empty (issue #1108). A destructive `remove_dir_all(dir)`
+    // *before* the extract used to wipe a good install and, if `npm pack`/`tar`
+    // then failed on a transient registry hiccup, strand an EMPTY pack dir. An
+    // empty dir reads back as `installed_version == None`, which suppresses the
+    // marketplace "Update" affordance (dir exists ⇒ `installed == true`, yet no
+    // readable version ⇒ `update_available == false`) AND breaks the templated-
+    // project update path (`installed_pack_versions` has no entry to compare).
+    install_atomic(&dir, |staging| {
+        npm_pack_extract(staging, pkg)?;
+        let mf = staging.join(manifest_name());
+        let txt = std::fs::read_to_string(&mf)
+            .map_err(|_| "package has no nano-ide.ext.json".to_string())?;
+        let m: ExtManifest =
+            serde_json::from_str(&txt).map_err(|e| format!("bad manifest: {e}"))?;
+        // Second, guarded step for packs that front an npm CLI (issue #520): an
+        // `npm pack` tarball carries `package.json` but not `node_modules`, so a
+        // pack whose bundled bins live in its dependencies (e.g. the
+        // `nano-ide-app-urban` pack → `@nanobpm/urban`'s `urban`/`create-urban-app`)
+        // must have its runtime deps installed to materialise
+        // `node_modules/.bin/*`. Gated on the opt-in manifest flag so every existing
+        // declaration-only pack stays a pure pack+extract with no network install.
+        // Running it in the staging dir keeps the atomicity guarantee: a deps
+        // failure aborts the swap and leaves the prior install untouched.
+        if m.install_deps {
+            // Lifecycle scripts run only for a pack the user has already trusted;
+            // a freshly-installed pack is untrusted, so its install is
+            // `--ignore-scripts` by default (supply-chain guardrail). npm still
+            // writes the `.bin/*` shims without running scripts, so the CLI resolves.
+            //
+            // Trust is decided by [`install_scripts_trusted`], NOT [`is_trusted`]:
+            // `m.id` is self-declared by the just-downloaded manifest, and
+            // `is_trusted` treats any built-in id as trusted — so a third-party pack
+            // could spoof a built-in id (e.g. `deno`) to gain implicit trust and run
+            // arbitrary npm lifecycle scripts. A pack fetched from npm is by
+            // definition never a bundled built-in, so that shortcut must not apply
+            // here; only explicit consent (yolo / a prior approve of this id) counts.
+            install_pack_deps(staging, install_scripts_trusted(&load_trust(), &m.id))?;
+        }
+        Ok(m)
+    })
+}
+
+/// Atomically (re)install the pack directory `dest`: run `build` against a
+/// freshly-created *staging* sibling dir and swap it into place only if `build`
+/// succeeds. On ANY failure (or panic-free error return) the previous contents
+/// of `dest` are left intact — never half-written, never empty (issue #1108).
+///
+/// The swap is a same-filesystem `rename`, so staging and backup are created as
+/// siblings of `dest` under the extensions root. Sequence:
+///   1. build the new pack in `staging`; on error, drop `staging`, leave `dest`.
+///   2. move any existing `dest` aside to `backup`.
+///   3. `rename(staging → dest)`. On failure, restore `backup → dest`.
+///   4. drop `backup`.
+///
+/// The staging/backup names are dot-prefixed and carry pid + a nanosecond stamp
+/// so concurrent installs of the same pack can't collide on the scratch dirs and
+/// the marketplace scan ([`pack_dirs`], which skips leading-dot entries) ignores
+/// them in flight.
+fn install_atomic<T>(
+    dest: &Path,
+    build: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
+    let parent = dest.parent().ok_or("invalid install dir")?;
+    let leaf = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or("invalid install dir")?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    let uniq = format!(
+        "{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let staging = parent.join(format!(".{leaf}.staging.{uniq}"));
+    let backup = parent.join(format!(".{leaf}.backup.{uniq}"));
+    // Start from a clean staging dir (a stale one from a crashed prior run must
+    // not leak into the new pack).
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| format!("mkdir staging: {e}"))?;
+
+    let out = match build(&staging) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+
+    // Swap staging into place, keeping the old copy as a backup until the new one
+    // is committed so a mid-swap failure can be rolled back.
+    let _ = std::fs::remove_dir_all(&backup);
+    let had_prev = dest.exists();
+    if had_prev && let Err(e) = std::fs::rename(dest, &backup) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("stage backup: {e}"));
     }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
-    npm_pack_extract(&dir, pkg)?;
-    let mf = dir.join(manifest_name());
-    let txt =
-        std::fs::read_to_string(&mf).map_err(|_| "package has no nano-ide.ext.json".to_string())?;
-    let m: ExtManifest = serde_json::from_str(&txt).map_err(|e| format!("bad manifest: {e}"))?;
-    // Second, guarded step for packs that front an npm CLI (issue #520): an
-    // `npm pack` tarball carries `package.json` but not `node_modules`, so a
-    // pack whose bundled bins live in its dependencies (e.g. the
-    // `nano-ide-app-urban` pack → `@nanobpm/urban`'s `urban`/`create-urban-app`)
-    // must have its runtime deps installed to materialise
-    // `node_modules/.bin/*`. Gated on the opt-in manifest flag so every existing
-    // declaration-only pack stays a pure pack+extract with no network install.
-    if m.install_deps {
-        // Lifecycle scripts run only for a pack the user has already trusted;
-        // a freshly-installed pack is untrusted, so its install is
-        // `--ignore-scripts` by default (supply-chain guardrail). npm still
-        // writes the `.bin/*` shims without running scripts, so the CLI resolves.
-        //
-        // Trust is decided by [`install_scripts_trusted`], NOT [`is_trusted`]:
-        // `m.id` is self-declared by the just-downloaded manifest, and
-        // `is_trusted` treats any built-in id as trusted — so a third-party pack
-        // could spoof a built-in id (e.g. `deno`) to gain implicit trust and run
-        // arbitrary npm lifecycle scripts. A pack fetched from npm is by
-        // definition never a bundled built-in, so that shortcut must not apply
-        // here; only explicit consent (yolo / a prior approve of this id) counts.
-        install_pack_deps(&dir, install_scripts_trusted(&load_trust(), &m.id))?;
+    if let Err(e) = std::fs::rename(&staging, dest) {
+        // Roll back to the previous install so a failed swap never empties `dest`.
+        // Surface whether the rollback itself succeeded: if restoring `backup →
+        // dest` also fails, `dest` is now MISSING and the prior install is
+        // stranded in `backup` — the operator must recover it, so we keep
+        // `backup` on disk and name it in the error rather than swallowing the
+        // second failure and reporting a bare, misleading commit error.
+        let _ = std::fs::remove_dir_all(&staging);
+        if had_prev && let Err(re) = std::fs::rename(&backup, dest) {
+            return Err(format!(
+                "commit install: {e}; rollback failed: {re}; prior install \
+                 preserved at {}",
+                backup.display()
+            ));
+        }
+        return Err(format!("commit install: {e}"));
     }
-    Ok(m)
+    let _ = std::fs::remove_dir_all(&backup);
+    Ok(out)
 }
 
 /// The npm package name of the first-party Urban App marketplace pack (issue
@@ -2775,6 +2878,163 @@ mod tests {
         assert_eq!(installed_version("@nanobpm/not-installed"), None);
         // The update-available rule: installed version differs from latest.
         assert_ne!(installed_version(pkg).as_deref(), Some("1.1.0"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    /// Regression guard for issue #1108: a re-install whose build step FAILS must
+    /// leave the previously-installed pack byte-for-byte intact — never wiped to
+    /// an empty dir. The old destructive `remove_dir_all` before the extract
+    /// stranded an empty pack on a transient `npm pack`/`tar` failure, which read
+    /// back as `installed_version == None` and silently killed the marketplace
+    /// "Update" affordance.
+    #[test]
+    fn install_atomic_failed_build_preserves_prior_install() {
+        let root =
+            std::env::temp_dir().join(format!("nano-ext-atomic-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dest = root.join("nanobpm__nano-workforce");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("package.json"), r#"{"version":"0.178.1"}"#).unwrap();
+        std::fs::write(dest.join("nano-ide.ext.json"), r#"{"id":"nano-workforce"}"#).unwrap();
+
+        let res: Result<(), String> = install_atomic(&dest, |staging| {
+            // Simulate a partial extract that then fails (registry hiccup): write
+            // some bytes into staging, then error out.
+            std::fs::write(staging.join("package.json"), r#"{"version":"0.178.4"}"#).unwrap();
+            Err("npm pack failed".into())
+        });
+
+        assert!(res.is_err(), "a failing build must surface the error");
+        // The prior 0.178.1 install is untouched — NOT emptied.
+        let kept = std::fs::read_to_string(dest.join("package.json")).unwrap();
+        assert!(
+            kept.contains("0.178.1"),
+            "prior install must be preserved, got: {kept}"
+        );
+        assert!(
+            dest.join("nano-ide.ext.json").is_file(),
+            "prior manifest must survive"
+        );
+        // No scratch dirs leak into the extensions root (they'd be mis-scanned as packs).
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".staging.") || n.contains(".backup."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no staging/backup dirs should remain: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The success path of the atomic swap: a completed build replaces the prior
+    /// install wholesale (stale files gone), and no scratch dirs remain.
+    #[test]
+    fn install_atomic_success_replaces_atomically() {
+        let root = std::env::temp_dir().join(format!("nano-ext-atomic-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dest = root.join("nanobpm__nano-workforce");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("package.json"), r#"{"version":"0.178.1"}"#).unwrap();
+        // A file only the OLD version had — must be gone after a clean swap.
+        std::fs::write(dest.join("stale-old-file"), "x").unwrap();
+
+        let out = install_atomic(&dest, |staging| {
+            std::fs::write(staging.join("package.json"), r#"{"version":"0.178.4"}"#).unwrap();
+            Ok("ok".to_string())
+        })
+        .expect("successful build commits");
+        assert_eq!(out, "ok");
+
+        let now = std::fs::read_to_string(dest.join("package.json")).unwrap();
+        assert!(now.contains("0.178.4"), "new version must be in place");
+        assert!(
+            !dest.join("stale-old-file").exists(),
+            "stale files must not survive the swap"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".staging.") || n.contains(".backup."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no staging/backup dirs should remain: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A first-time install (no prior `dest`) whose build fails must leave NO
+    /// directory behind — not an empty one that would read as a broken install.
+    #[test]
+    fn install_atomic_failed_first_install_leaves_no_dir() {
+        let root =
+            std::env::temp_dir().join(format!("nano-ext-atomic-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dest = root.join("nanobpm__nano-workforce");
+
+        let res: Result<(), String> =
+            install_atomic(&dest, |_staging| Err("npm pack failed".into()));
+        assert!(res.is_err());
+        assert!(
+            !dest.exists(),
+            "a failed first install must not leave an empty pack dir"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Defect-class guard (issue #1108 review): an in-flight [`install_atomic`]
+    /// staging dir is a dot-prefixed sibling of the real pack dir and carries a
+    /// readable `nano-ide.ext.json` the moment the extract lands. Because its
+    /// leading `.` sorts first, if the scan enumerated it, it would *shadow* the
+    /// real installed pack of the same id mid-install. [`pack_dirs`] must skip
+    /// every leading-dot entry so neither staging nor backup scratch dirs are
+    /// ever observable as packs.
+    #[test]
+    fn pack_dirs_ignores_dot_prefixed_scratch_dirs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("nano-ext-scratch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+
+        // The real, committed pack.
+        let real = root.join("nanobpm__nano-workforce");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(
+            real.join(manifest_name()),
+            r#"{"id":"nano-workforce","kind":"lang"}"#,
+        )
+        .unwrap();
+
+        // A mid-install staging sibling of the SAME leaf, dot-prefixed, already
+        // carrying a manifest — the exact shadowing hazard.
+        let staging = root.join(".nanobpm__nano-workforce.staging.123.456");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join(manifest_name()),
+            r#"{"id":"nano-workforce","kind":"lang"}"#,
+        )
+        .unwrap();
+        let backup = root.join(".nanobpm__nano-workforce.backup.123.456");
+        std::fs::create_dir_all(&backup).unwrap();
+
+        let dirs = pack_dirs();
+        assert!(
+            dirs.contains(&real),
+            "the real committed pack must be scanned: {dirs:?}"
+        );
+        assert!(
+            !dirs.iter().any(|p| p == &staging || p == &backup),
+            "dot-prefixed scratch dirs must never be scanned as packs: {dirs:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
