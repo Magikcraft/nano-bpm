@@ -51,10 +51,14 @@ queue_rules:
       max: 5
     batch_max_wait_time: 5 min
 
-# The gate. These are the same 8 required checks configured on `main` branch
-# protection. Every one of them is change-gated by the `changes` job's
-# paths-filter in `.github/workflows/ci.yml`: the six code checks share the
-# `code` filter (`*code_gate`), `processos (clippy + test)` has its own
+# The gate. These are the 8 required CI checks Mergify gates merges on. Seven of
+# them are already required on `main` branch protection; `console (journey e2e)`
+# is newly promoted to a required gate here, and flipping its branch-protection
+# required-check toggle is an out-of-band admin action applied after this PR
+# merges (see the PR description) — so the two sources of truth converge to the
+# same 8 once that toggle lands. Every one of them is change-gated by the
+# `changes` job's paths-filter in `.github/workflows/ci.yml`: the six code checks
+# share the `code` filter (`*code_gate`), `processos (clippy + test)` has its own
 # `processos` filter (skipped for PRs that don't touch `processos/**`,
 # `engine-core/**`, or `.github/workflows/ci.yml`), and `console (journey e2e)`
 # has its own `console` filter (skipped for PRs that don't touch `console/**`,
