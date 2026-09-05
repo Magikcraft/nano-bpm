@@ -51,23 +51,26 @@ queue_rules:
       max: 5
     batch_max_wait_time: 5 min
 
-# The gate. These are the 8 required CI checks Mergify gates merges on. Seven of
-# them are already required on `main` branch protection; `console (journey e2e)`
-# is newly promoted to a required gate here, and flipping its branch-protection
-# required-check toggle is an out-of-band admin action applied after this PR
-# merges (see the PR description) — so the two sources of truth converge to the
-# same 8 once that toggle lands. Every one of them is change-gated by the
+# The gate. These are the 9 required CI checks Mergify gates merges on. Eight of
+# them are already required on `main` branch protection; `console (typecheck +
+# test)` is newly promoted to a required gate here (epic #1119 retro), and
+# flipping its branch-protection required-check toggle is an out-of-band admin
+# action applied after this PR merges (see the PR description) — so the two
+# sources of truth converge to the same 9 once that toggle lands. Every one of
+# them is change-gated by the
 # `changes` job's paths-filter in `.github/workflows/ci.yml`: the six code checks
 # share the `code` filter (`*code_gate`), `processos (clippy + test)` has its own
 # `processos` filter (skipped for PRs that don't touch `processos/**`,
-# `engine-core/**`, or `.github/workflows/ci.yml`), and `console (journey e2e)`
-# has its own `console` filter (skipped for PRs that don't touch `console/**`,
-# `spec-console/**`, `spec-app/**`, or `.github/workflows/ci.yml`), so each is
+# `engine-core/**`, or `.github/workflows/ci.yml`), and the two console jobs
+# (`console (typecheck + test)` and `console (journey e2e)`) are gated by the
+# `console` filter (skipped for PRs that don't touch `console/**`,
+# `spec-console/**`, `spec-app/**`, or `.github/workflows/ci.yml`; the typecheck
+# job additionally runs on the `docs` filter), so each is
 # SKIPPED for PRs that don't touch its inputs (e.g. a console-/website-/docs-only
-# PR skips all six code checks; a Rust-only PR skips console e2e). A skipped
+# PR skips all six code checks; a Rust-only PR skips both console jobs). A skipped
 # check never reports `success`, so — matching the authoritative merge-protocol
 # in AGENTS.md ("required-when-run, skip-tolerant": acceptedConclusions
-# `["success", "skipped"]` for all eight) — each is accepted as success OR
+# `["success", "skipped"]` for all nine) — each is accepted as success OR
 # skipped. Encoding only `processos` as skip-tolerant (as this file did before
 # #1128) left the other checks requiring a strict `check-success` that a skipped
 # run can never satisfy, so the queue stalled indefinitely on console-only PRs
@@ -109,6 +112,17 @@ merge_protections:
       - or:
           - check-success=console (journey e2e)
           - check-skipped=console (journey e2e)
+      # Promoted to a required gate by the epic #1119 retro: this is the only
+      # merge gate on the console `tsc -p tsconfig.test.json` type surface and
+      # the `git diff --exit-code -- src/gen` client-drift guard. It was
+      # non-required, so a foundation slice that added a REQUIRED field to a
+      # console generated type without updating the e2e fixture defaults
+      # (console/e2e/fixtures.ts) landed on main red repeatedly — each following
+      # slice had to repair the prior slice's break. Change-gated, so accept
+      # skipped too.
+      - or:
+          - check-success=console (typecheck + test)
+          - check-skipped=console (typecheck + test)
 
 # AUTO-MERGE OFF. There is deliberately NO `merge_protections_settings.
 # auto_merge_conditions` key here: omitting it is Mergify's documented way to
