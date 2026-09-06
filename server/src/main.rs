@@ -11303,36 +11303,16 @@ impl ServerImpl {
                 max_model_calls: l.max_model_calls as i64,
                 max_tool_calls: l.max_tool_calls as i64,
             });
-        // A present-but-unparsable jobKey/jobLease must be rejected rather than
-        // silently coerced to 0: 0 changes ownership/attribution, so a malformed
-        // value is a 400, not a default. For every agent type, supplied attribution
-        // must match the element's ACTIVATED job and lease. History-free CREATE
-        // may omit attribution; workers explicitly register their AgentInstance.
-        let job_key: Key = match body.job_key.as_ref() {
-            None => 0,
-            Some(k) => match k.0.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid job key",
-                        400,
-                        format!("Job key '{}' is not a valid key.", k.0),
-                    )));
-                }
-            },
-        };
-        let job_lease: u64 = match body.job_lease.as_ref() {
-            None => 0,
-            Some(l) => match l.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid job lease",
-                        400,
-                        format!("Job lease '{l}' is not a valid value."),
-                    )));
-                }
-            },
+        let (job_key, job_lease) = match parse_agent_job_attribution(
+            body.job_key.as_ref().map(|key| key.0.as_str()),
+            body.job_lease.as_deref(),
+        ) {
+            Ok(attribution) => attribution,
+            Err((title, detail)) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    title, 400, detail,
+                )));
+            }
         };
         let command = Command::CreateAgentInstance {
             element_instance_key,
@@ -11452,34 +11432,16 @@ impl ServerImpl {
             }
         };
 
-        // A present-but-unparsable jobKey/jobLease must be rejected rather than
-        // silently coerced to 0: 0 changes ownership/attribution and can defeat
-        // retry de-duplication, so a malformed value is a 400, not a default.
-        let job_key: Key = match body.job_key.as_ref() {
-            None => 0,
-            Some(k) => match k.0.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid job key",
-                        400,
-                        format!("Job key '{}' is not a valid key.", k.0),
-                    )));
-                }
-            },
-        };
-        let job_lease: u64 = match body.job_lease.as_ref() {
-            None => 0,
-            Some(l) => match l.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid job lease",
-                        400,
-                        format!("Job lease '{l}' is not a valid value."),
-                    )));
-                }
-            },
+        let (job_key, job_lease) = match parse_agent_job_attribution(
+            body.job_key.as_ref().map(|key| key.0.as_str()),
+            body.job_lease.as_deref(),
+        ) {
+            Ok(attribution) => attribution,
+            Err((title, detail)) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    title, 400, detail,
+                )));
+            }
         };
         let status = body.status.map(agent_update_status);
         let metrics = body
@@ -19864,6 +19826,33 @@ fn agent_metrics_delta_from(
         model_calls: d.model_calls.unwrap_or(0) as i64,
         tool_calls: d.tool_calls.unwrap_or(0) as i64,
         ..Default::default()
+    }
+}
+
+fn parse_agent_job_attribution(
+    job_key: Option<&str>,
+    job_lease: Option<&str>,
+) -> Result<(Key, u64), (&'static str, String)> {
+    match (job_key, job_lease) {
+        (None, None) => Ok((0, 0)),
+        (Some(key), Some(lease)) => Ok((
+            key.parse().map_err(|_| {
+                (
+                    "Invalid job key",
+                    format!("Job key '{key}' is not a valid key."),
+                )
+            })?,
+            lease.parse().map_err(|_| {
+                (
+                    "Invalid job lease",
+                    format!("Job lease '{lease}' is not a valid value."),
+                )
+            })?,
+        )),
+        _ => Err((
+            "Incomplete job attribution",
+            "jobKey and jobLease must be supplied together or both omitted.".into(),
+        )),
     }
 }
 
@@ -35263,6 +35252,30 @@ mod call_activity_hierarchy_read_model_tests {
         }
     }
 
+    #[test]
+    fn agent_job_attribution_requires_a_complete_valid_pair() {
+        assert_eq!(parse_agent_job_attribution(None, None), Ok((0, 0)));
+        assert_eq!(
+            parse_agent_job_attribution(Some("0"), Some("0")),
+            Ok((0, 0))
+        );
+        assert_eq!(
+            parse_agent_job_attribution(Some("42"), Some("99")),
+            Ok((42, 99))
+        );
+        for (key, lease) in [
+            (Some("42"), None),
+            (None, Some("99")),
+            (Some("0"), None),
+            (None, Some("0")),
+            (Some("invalid"), Some("99")),
+            (Some("42"), Some("invalid")),
+            (Some("42"), Some("18446744073709551616")),
+        ] {
+            assert!(parse_agent_job_attribution(key, lease).is_err());
+        }
+    }
+
     async fn agent_instances_rest_roundtrip(agent_type: &str) {
         let xml = include_str!("../../engine-core/tests/fixtures/external-agent-job-type.bpmn")
             .replace(
@@ -35325,6 +35338,21 @@ mod call_activity_hierarchy_read_model_tests {
             job_key: Some(job.job_key.clone()),
             job_lease: Some(job_lease.clone()),
         };
+        for omit_key in [false, true] {
+            let mut partial = create_body.clone();
+            if omit_key {
+                partial.job_key = None;
+            } else {
+                partial.job_lease = None;
+            }
+            assert!(
+                matches!(
+                    srv.create_agent_instance_impl(&partial).await.unwrap(),
+                    CResp::Status400_TheProvidedDataIsNotValid(_)
+                ),
+                "CREATE must reject incomplete job attribution for {agent_type}"
+            );
+        }
         let mut unknown_job_create = create_body.clone();
         unknown_job_create.job_key = Some(models::JobKey("7788990011".into()));
         assert!(
@@ -35404,6 +35432,22 @@ mod call_activity_hierarchy_read_model_tests {
         let up = models::UpdateAgentInstancePathParams {
             agent_instance_key: agent_key.clone(),
         };
+        for omit_key in [false, true] {
+            let mut partial = upd.clone();
+            partial.history = None;
+            if omit_key {
+                partial.job_key = None;
+            } else {
+                partial.job_lease = None;
+            }
+            assert!(
+                matches!(
+                    srv.update_agent_instance_impl(&up, &partial).await.unwrap(),
+                    UResp::Status400_TheProvidedDataIsNotValid(_)
+                ),
+                "UPDATE must reject incomplete job attribution even without history for {agent_type}"
+            );
+        }
         let mut unattributed_history = upd.clone();
         unattributed_history.job_key = None;
         unattributed_history.job_lease = None;

@@ -130,8 +130,10 @@ export type AgentInstanceCreationRequest = {
      * supply it for an agent-marked job-worker element to lease-gate the
      * create. The server rejects the create unless it references that
      * element's ACTIVATED job with a matching lease token and elementInstanceKey.
-     * A jobless create (omit, or `0`) is always allowed on this REST create surface,
-     * which carries no history batch; when supplied it is always validated.
+     * A jobless create (omit both attribution fields, or supply `0` for both)
+     * is allowed on this REST create surface, which carries no history batch.
+     * jobKey and jobLease must be supplied together; incomplete attribution is a 400.
+     * When supplied, attribution is always validated.
      * All agent classifications use ordinary jobs and explicit worker registration;
      * none automatically creates an AgentInstance at activation.
      *
@@ -139,7 +141,8 @@ export type AgentInstanceCreationRequest = {
     jobKey?: JobKey;
     /**
      * Lease token received from the job activation response.
-     * Required alongside `jobKey` whenever a `jobKey` is supplied.
+     * jobKey and jobLease must be supplied together or both omitted;
+     * incomplete attribution is a 400.
      *
      */
     jobLease?: JobLease;
@@ -732,13 +735,15 @@ export type AgentInstanceUpdateRequest = {
      * Required when the request carries a history batch (a history-bearing update needs
      * a job context); may be omitted for a history-free update (a pure status/metrics
      * advance). When supplied it is always validated against the element's ACTIVATED
-     * job and matching lease token.
+     * job and matching lease token. jobKey and jobLease must be supplied together;
+     * incomplete attribution is a 400.
      *
      */
     jobKey?: JobKey;
     /**
      * Lease token received from the job activation response.
-     * Required alongside `jobKey` whenever a `jobKey` is supplied, and validated then.
+     * jobKey and jobLease must be supplied together or both omitted;
+     * incomplete attribution is a 400. Supplied attribution is always validated.
      *
      */
     jobLease?: JobLease;
