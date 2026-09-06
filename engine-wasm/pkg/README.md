@@ -83,9 +83,10 @@ Agent APIs follow the vendored stable/8.10 contract:
   history.
 - Both return canonical results containing positionally correlated `createdHistory`;
   CREATE also returns `agentInstanceKey`. Duplicate CREATE rejects rather than upserting.
-- History stays PENDING until the producing job completes under the winning lease;
-  failed attempts are DISCARDED. Searches default to COMMITTED. Timestamps are
-  RFC-3339 strings and loop iterations start at 1.
+- Failure and timeout leave history PENDING. Job completion commits the winning
+  attempt and discards superseded attempts; cancellation or a business error
+  discards pending history. Searches default to COMMITTED. Timestamps are RFC-3339
+  strings and loop iterations start at 1.
 - System prompts are typed content-block arrays. Persisted historical text remains
   one TEXT block, even when the text resembles JSON.
 - Metrics preserve the difference between an omitted object and an object with
