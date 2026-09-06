@@ -1523,7 +1523,7 @@ async fn handle_client_frame(
                             )
                             .await
                     }
-                    Err(_) => Err((404, "Invalid job key".into())),
+                    Err(_) => Err((400, "Invalid job key".into())),
                 };
                 let (status, body) = match outcome {
                     Ok(()) => (204, None),

@@ -25062,6 +25062,36 @@ mod clustered_startup_tests {
         panic!("no commandResult received");
     }
 
+    #[tokio::test]
+    async fn update_job_distinguishes_malformed_keys_from_missing_jobs() {
+        use futures_util::SinkExt;
+
+        let server =
+            build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1));
+        let (_, port) = serve_router(peer_facing_app(server, falcon::Registry::new())).await;
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/cluster"))
+                .await
+                .unwrap();
+        for (corr, key, status) in [
+            (1, "not-a-key", 400),
+            (2, "", 400),
+            (3, "-1", 400),
+            (4, "18446744073709551616", 400),
+            (5, "42", 404),
+        ] {
+            let frame = serde_json::json!({
+                "type": "updateJob", "corr": corr, "jobKey": key,
+            });
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                frame.to_string().into(),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(next_command_status(&mut ws).await, status, "{key}");
+        }
+    }
+
     /// ADR 0039: the public client `/falcon` channel must refuse intra-cluster
     /// control frames (a client cannot reach the cluster control plane) while
     /// still serving ordinary client commands.
