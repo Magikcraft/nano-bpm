@@ -47,22 +47,22 @@ mod lease_contract_tests {
 
     #[test]
     fn mutation_frames_preserve_opaque_lease_tokens() {
-        for kind in [
-            "completeJob",
-            "failJob",
-            "throwError",
-            "updateJobRetries",
-            "updateJobTimeout",
+        for mut wire in [
+            serde_json::json!({"type": "completeJob"}),
+            serde_json::json!({"type": "failJob", "retries": 2}),
+            serde_json::json!({"type": "throwError", "errorCode": "ERR"}),
+            serde_json::json!({"type": "updateJobRetries", "retries": 2}),
+            serde_json::json!({"type": "updateJobTimeout", "timeout": 1000}),
         ] {
-            let frame: ClientFrame = serde_json::from_value(serde_json::json!({
-                "type":kind,"corr":1,"jobKey":"42","errorCode":"ERR","retries":2,"timeout":1000,
-                "leaseToken":"opaque:not-a-number",
-            }))
-            .unwrap();
-            assert_eq!(
-                serde_json::to_value(frame).unwrap()["leaseToken"],
-                "opaque:not-a-number"
-            );
+            wire["corr"] = serde_json::json!(1);
+            wire["jobKey"] = serde_json::json!("42");
+            wire["leaseToken"] = serde_json::json!("opaque:not-a-number");
+            let frame: ClientFrame = serde_json::from_value(wire.clone()).unwrap();
+            let decoded = serde_json::to_value(frame).unwrap();
+            for (field, value) in wire.as_object().unwrap() {
+                assert_eq!(decoded.get(field), Some(value), "{}: {field}", wire["type"]);
+            }
+            assert_eq!(decoded["leaseToken"], "opaque:not-a-number");
         }
     }
 }
