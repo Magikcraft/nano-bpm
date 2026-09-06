@@ -4295,6 +4295,11 @@ mod tests {
             "<zeebe:taskDefinition type=\"= localRoute\"/>",
             "",
         ] {
+            let expected_declaration = if declaration.is_empty() {
+                "<zeebe:taskDefinition type=\"agent\"/>"
+            } else {
+                declaration
+            };
             let model = model.replace(
                 "<zeebe:taskDefinition type=\"senior:rebase\"/>",
                 declaration,
@@ -4302,12 +4307,12 @@ mod tests {
             let (def, _) = first_def(&model).unwrap();
             let xml = definition_to_xml(&def);
             assert!(xml.contains("<zeebe:taskDefinition"));
-            assert!(xml.contains(declaration), "{xml}");
+            assert!(xml.contains(expected_declaration), "{xml}");
             let ir = crate::model_ir::definition_to_ir(&def, &HashMap::new());
             assert!(ir.contains("jobType"), "{ir}");
             let restored = crate::model_ir::ir_to_definition(&ir).unwrap();
             let xml = definition_to_xml(&restored.definition);
-            assert!(xml.contains(declaration), "{xml}");
+            assert!(xml.contains(expected_declaration), "{xml}");
             assert_same_structure(&def, &parse_bpmn(&xml).unwrap()[0]);
         }
     }
