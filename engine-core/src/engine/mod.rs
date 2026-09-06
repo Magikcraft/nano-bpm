@@ -5084,7 +5084,14 @@ impl Engine {
                 // scope (absent from `scopes` ⇒ root) and re-derive only the
                 // activation body to re-open the subscription.
                 let scope = self.scope_of(instance_key, element_instance_key);
-                self.run_activation_body(instance_key, element_id, element_instance_key, scope)
+                let vars = self.variables_for_element(instance_key, element_instance_key);
+                self.run_activation_body(
+                    instance_key,
+                    element_id,
+                    element_instance_key,
+                    scope,
+                    vars,
+                )
             }
             Step::RetryActivation {
                 instance_key,
@@ -5376,6 +5383,13 @@ impl Engine {
             });
         }
 
+        // Scope writes above have not been applied yet. Both listeners and the
+        // activation body must evaluate against the same post-input view.
+        let mut activation_vars = element_vars;
+        if !input_updates.is_empty() {
+            Arc::make_mut(&mut activation_vars).extend(input_updates);
+        }
+
         // Start execution listeners (ADR 0037): before the element enacts its
         // own behaviour (creating a job, routing a gateway, opening a
         // sub-process) it runs a sequential chain of `start` listener jobs. The
@@ -5390,11 +5404,9 @@ impl Engine {
             crate::model::ListenerEventType::Start,
         );
         if let Some(first) = start_listeners.first() {
-            let mut listener_vars = (*element_vars).clone();
-            listener_vars.extend(input_updates);
             let job_key = self.mint_key();
-            let job_type = self.resolve_job_type(&listener_vars, &first.job_type);
-            let retries = self.resolve_retries(&listener_vars, first.retries.as_deref());
+            let job_type = self.resolve_job_type(&activation_vars, &first.job_type);
+            let retries = self.resolve_retries(&activation_vars, first.retries.as_deref());
             events.push(Event::ExecutionListenerJobCreated {
                 job_key,
                 instance_key,
@@ -5410,8 +5422,13 @@ impl Engine {
             return (events, followups);
         }
 
-        let (kind_events, kind_followups) =
-            self.run_activation_body(instance_key, element_id, element_instance_key, scope);
+        let (kind_events, kind_followups) = self.run_activation_body(
+            instance_key,
+            element_id,
+            element_instance_key,
+            scope,
+            activation_vars,
+        );
         events.extend(kind_events);
         (events, kind_followups)
     }
@@ -5460,10 +5477,10 @@ impl Engine {
         element_id: String,
         element_instance_key: Key,
         scope: Key,
+        element_vars: Arc<HashMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         let kind = self.element_kind(instance_key, &element_id);
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
-        let element_vars = self.variables_for_element(instance_key, scope);
         let mut events: Vec<Event> = Vec::new();
         let mut followups: Vec<Step> = Vec::new();
 
@@ -5940,6 +5957,7 @@ impl Engine {
             // agent runs, exactly like a job-bearing service task.
             Some(ElementKind::AgentTask {
                 agent_type,
+                job_type,
                 definition,
                 limits,
             }) => {
@@ -5953,17 +5971,19 @@ impl Engine {
                     // auto-mint an AgentInstance. The worker self-registers the
                     // AgentInstance lazily via a lease-gated
                     // `CreateAgentInstance` (`process_create_agent_instance`),
-                    // gated on this job's ACTIVATED lease. The job type is the
-                    // element id — an `AgentTask` carries no
-                    // `zeebe:taskDefinition`, so the element id is the worker's
-                    // deterministic type to subscribe to.
+                    // gated on this job's ACTIVATED lease. A taskDefinition
+                    // supplies the job type; otherwise retain element-id routing.
                     let job_key = self.mint_key();
+                    let job_type = job_type
+                        .as_deref()
+                        .map(|job_type| self.resolve_job_type(&element_vars, job_type))
+                        .unwrap_or_else(|| element_id.clone());
                     events.push(Event::JobCreated {
                         job_key,
                         instance_key,
                         element_instance_key,
                         element_id: element_id.clone(),
-                        job_type: element_id.clone(),
+                        job_type,
                         created_at: self.now,
                         priority: crate::state::DEFAULT_JOB_PRIORITY,
                         retries: crate::state::DEFAULT_JOB_RETRIES,
@@ -9141,7 +9161,14 @@ impl Engine {
                         self.spawn_multi_instance_children(instance_key, element_instance_key),
                     )
                 } else {
-                    self.run_activation_body(instance_key, element_id, element_instance_key, scope)
+                    let vars = self.variables_for_element(instance_key, element_instance_key);
+                    self.run_activation_body(
+                        instance_key,
+                        element_id,
+                        element_instance_key,
+                        scope,
+                        vars,
+                    )
                 }
             }
             crate::model::ListenerEventType::End => {

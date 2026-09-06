@@ -69,7 +69,9 @@
 //!   creating a job. An `"external"` agent is job-backed (Camunda parity #1099):
 //!   on activation it creates a **normal job** (activatable through the standard
 //!   job loop) and its `AgentInstance` is minted lazily by the worker via a
-//!   lease-gated `CreateAgentInstance`. Placement mirrors Camunda's
+//!   lease-gated `CreateAgentInstance`. Its job type comes from a co-located
+//!   `zeebe:taskDefinition type` (literal or FEEL), or the element id when absent.
+//!   Placement mirrors Camunda's
 //!   `AgentDefinitionValidator`: `aiAgentTask` is only valid on a `serviceTask`
 //!   and `aiAgentSubProcess` only on an `adHocSubProcess`; the wrong placement
 //!   (or an unknown `agentType`) is rejected at parse time.
@@ -2936,11 +2938,12 @@ impl ProcessAcc {
                                 node.linked_resources,
                             )
                         } else {
-                            builder.agent_task(
+                            builder.agent_task_with_job_type(
                                 node.id,
                                 agent_type,
                                 crate::agent::AgentDefinition::default(),
                                 None,
+                                node.job_type,
                             )
                         }
                     } else if let (Some(expr), Some(rv)) = (

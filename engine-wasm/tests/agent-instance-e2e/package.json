@@ -5,7 +5,7 @@
   "type": "module",
   "description": "End-to-end probe of the engine-native AgentInstance/AgentHistory surface through @nanobpm/engine-wasm's read-model TestEngine: deploy an aiAgentTask serviceTask, mint/reconcile an AgentInstance (INITIALIZING), push a turn via UPDATE (status advances), history-search returns that COMMITTED turn, and COMPLETE drives COMPLETED.",
   "scripts": {
-    "test": "node verify.mjs"
+    "test": "node verify.mjs && node external-routing.mjs"
   },
   "dependencies": {
     "@nanobpm/engine-wasm": "file:../../pkg"

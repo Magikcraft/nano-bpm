@@ -211,11 +211,16 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
                 attrs.push(format!("resultVariable {}", quote(v)));
             }
         }
-        ElementKind::AgentTask { agent_type, .. } => {
-            // Only the structural `agentType` marker round-trips through the
-            // compact IR; the runtime definition/limits are agent config, not
-            // model structure, and are supplied at CREATE time (slice S3).
+        ElementKind::AgentTask {
+            agent_type,
+            job_type,
+            ..
+        } => {
+            // Runtime definition/limits are supplied at CREATE, not model structure.
             attrs.push(format!("agentType {}", quote(agent_type.as_str())));
+            if let Some(job_type) = job_type {
+                attrs.push(format!("jobType {}", quote(job_type)));
+            }
         }
         ElementKind::UserTask(props) => {
             if let Some(v) = &props.assignee {
@@ -1240,6 +1245,7 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
             }
             ElementKind::AgentTask {
                 agent_type,
+                job_type: attrs.take("jobType"),
                 definition: nanobpmn_engine_core::AgentDefinition::default(),
                 limits: None,
             }

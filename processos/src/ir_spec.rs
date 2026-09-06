@@ -490,15 +490,23 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
     },
     KindSpec {
         keyword: "agentTask",
-        doc: "Engine-native AI agent task (Camunda stable/8.10). A serviceTask bearing a \
-              `zeebe:agentDefinition` marker; on activation the engine mints a first-class \
-              AgentInstance instead of a job.",
-        attrs: &[AttrSpec {
-            key: "agentType",
-            required: true,
-            ty: AttrType::Str,
-            doc: "The `zeebe:agentDefinition agentType`. An `agentTask` round-trips as a serviceTask, so only `aiAgentTask` or `external` are valid here (`aiAgentSubProcess` is an adHocSubProcess form).",
-        }],
+        doc: "AI agent task (Camunda stable/8.10). A serviceTask bearing a \
+              `zeebe:agentDefinition` marker. Engine-native agents mint an AgentInstance; \
+              external agents create a job and register their AgentInstance under its lease.",
+        attrs: &[
+            AttrSpec {
+                key: "agentType",
+                required: true,
+                ty: AttrType::Str,
+                doc: "The `zeebe:agentDefinition agentType`. An `agentTask` round-trips as a serviceTask, so only `aiAgentTask` or `external` are valid here (`aiAgentSubProcess` is an adHocSubProcess form).",
+            },
+            AttrSpec {
+                key: "jobType",
+                required: false,
+                ty: AttrType::Str,
+                doc: "Optional `zeebe:taskDefinition type` (literal or FEEL). External agents route by this type, falling back to the element id when absent.",
+            },
+        ],
     },
 ];
 
@@ -1043,7 +1051,8 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
         (
             "agentTask",
             ElementKind::AgentTask {
-                agent_type: nanobpmn_engine_core::AgentType::AiAgentTask,
+                agent_type: nanobpmn_engine_core::AgentType::External,
+                job_type: Some("senior:rebase".into()),
                 definition: nanobpmn_engine_core::AgentDefinition::default(),
                 limits: None,
             },

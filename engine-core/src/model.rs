@@ -825,6 +825,11 @@ pub enum ElementKind {
     AgentTask {
         /// The `agentType` marker this element was built from.
         agent_type: crate::agent::AgentType,
+        /// Optional `zeebe:taskDefinition` type (literal or FEEL expression).
+        /// External agents use it for job routing, defaulting to the element id
+        /// when absent. Engine-native agents do not create jobs.
+        #[cfg_attr(feature = "serde", serde(default))]
+        job_type: Option<String>,
         /// The static agent definition (model/provider/systemPrompt).
         #[cfg_attr(feature = "serde", serde(default))]
         definition: crate::agent::AgentDefinition,
@@ -1791,8 +1796,8 @@ impl ProcessBuilder {
 
     /// Adds an AI agent task (Camunda `zeebe:agentDefinition`, stable/8.10):
     /// a `bpmn:serviceTask` bearing the agent marker. On activation the engine
-    /// creates a first-class [`crate::AgentInstance`] (status `INITIALIZING`)
-    /// linked to the active element instance. `definition`/`limits` are the
+    /// creates a first-class [`crate::AgentInstance`] for engine-native agents,
+    /// or a job typed by the element id for external agents. `definition`/`limits` are the
     /// static agent configuration (model/provider/systemPrompt + optional
     /// limits); pass defaults for an unconfigured agent.
     pub fn agent_task(
@@ -1802,10 +1807,24 @@ impl ProcessBuilder {
         definition: crate::agent::AgentDefinition,
         limits: Option<crate::agent::AgentInstanceLimits>,
     ) -> Self {
+        self.agent_task_with_job_type(id, agent_type, definition, limits, None)
+    }
+
+    /// Adds an agent task with an optional model-authored job type. External
+    /// agents resolve this type at activation; `None` preserves element-id routing.
+    pub fn agent_task_with_job_type(
+        self,
+        id: impl Into<String>,
+        agent_type: crate::agent::AgentType,
+        definition: crate::agent::AgentDefinition,
+        limits: Option<crate::agent::AgentInstanceLimits>,
+        job_type: Option<String>,
+    ) -> Self {
         self.add(
             id,
             ElementKind::AgentTask {
                 agent_type,
+                job_type,
                 definition,
                 limits,
             },

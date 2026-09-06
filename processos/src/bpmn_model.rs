@@ -2512,17 +2512,24 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             }
             out.push_str("    </bpmn:subProcess>\n");
         }
-        ElementKind::AgentTask { agent_type, .. } => {
-            // An engine-native agent task round-trips as a serviceTask carrying a
-            // `zeebe:agentDefinition` marker. The runtime definition/limits are
-            // agent config supplied at CREATE (slice S3), not model structure, so
-            // only the structural `agentType` marker is emitted here.
+        ElementKind::AgentTask {
+            agent_type,
+            job_type,
+            ..
+        } => {
+            // Runtime definition/limits are supplied at CREATE, not model structure.
             out.push_str(&format!("    <bpmn:serviceTask id=\"{eid}\"{na}>\n"));
             out.push_str("      <bpmn:extensionElements>\n");
             out.push_str(&format!(
                 "        <zeebe:agentDefinition agentType=\"{}\"/>\n",
                 xml_escape(agent_type.as_str())
             ));
+            if let Some(job_type) = job_type {
+                out.push_str(&format!(
+                    "        <zeebe:taskDefinition type=\"{}\"/>\n",
+                    xml_escape(job_type)
+                ));
+            }
             emit_io_mapping(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             emit_multi_instance(el, out);
@@ -4167,6 +4174,34 @@ mod tests {
     /// Serialize with no operator label overrides (humanized fallbacks only).
     fn definition_to_xml(def: &ProcessDefinition) -> String {
         definition_to_xml_labeled(def, &HashMap::new())
+    }
+
+    #[test]
+    fn external_agent_job_type_survives_xml_and_ir_round_trips() {
+        let model = include_str!("../../engine-core/tests/fixtures/external-agent-job-type.bpmn");
+        for declaration in [
+            "<zeebe:taskDefinition type=\"senior:rebase\"/>",
+            "<zeebe:taskDefinition type=\"= localRoute\"/>",
+            "",
+        ] {
+            let model = model.replace(
+                "<zeebe:taskDefinition type=\"senior:rebase\"/>",
+                declaration,
+            );
+            let (def, _) = first_def(&model).unwrap();
+            let xml = definition_to_xml(&def);
+            assert_eq!(
+                xml.contains("<zeebe:taskDefinition"),
+                !declaration.is_empty()
+            );
+            assert!(xml.contains(declaration), "{xml}");
+            let ir = crate::model_ir::definition_to_ir(&def, &HashMap::new());
+            assert_eq!(ir.contains("jobType"), !declaration.is_empty(), "{ir}");
+            let restored = crate::model_ir::ir_to_definition(&ir).unwrap();
+            let xml = definition_to_xml(&restored.definition);
+            assert!(xml.contains(declaration), "{xml}");
+            assert_same_structure(&def, &parse_bpmn(&xml).unwrap()[0]);
+        }
     }
 
     #[test]

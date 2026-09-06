@@ -333,6 +333,10 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > AgentInstance is auto-minted); a worker activates that job and self-registers
 > the `AgentInstance` via a **lease-gated** create/update that must reference the
 > element's ACTIVATED job with the matching lease token and element-instance key.
+> A co-located `zeebe:taskDefinition type="..."` supplies the external agent's
+> job type (literal or FEEL, evaluated after input mappings); without one it
+> defaults to the element id. Adding the external marker therefore preserves
+> an existing worker's task-definition-based routing.
 > Placement mirrors Camunda's `AgentDefinitionValidator` (`aiAgentTask` only on a
 > `serviceTask`, `aiAgentSubProcess` only on an `adHocSubProcess`); the wrong
 > placement is rejected at deploy. Processes can be

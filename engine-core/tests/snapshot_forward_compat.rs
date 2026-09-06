@@ -77,6 +77,36 @@ fn strip_keys(value: &mut serde_json::Value, keys: &[&str]) {
     }
 }
 
+#[test]
+fn agent_job_type_survives_snapshot_and_legacy_snapshots_default_to_element_id() {
+    let model = include_str!("fixtures/external-agent-job-type.bpmn");
+    for legacy in [false, true] {
+        let def = nanobpmn_engine_core::bpmn::parse_bpmn(model)
+            .unwrap()
+            .remove(0);
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let mut json = serde_json::to_value(engine.snapshot()).unwrap();
+        assert!(json.to_string().contains("\"job_type\":\"senior:rebase\""));
+        if legacy {
+            strip_keys(&mut json, &["job_type"]);
+        }
+        let snapshot: EngineSnapshot = serde_json::from_value(json).unwrap();
+        let mut engine = Engine::from_snapshot(snapshot);
+        engine
+            .apply_command(Command::create_instance_with(
+                "external-agent-routing",
+                std::collections::HashMap::from([(
+                    "route".into(),
+                    nanobpmn_engine_core::Value::Str("senior:rebase".into()),
+                )]),
+            ))
+            .unwrap();
+        let expected = if legacy { "agent" } else { "senior:rebase" };
+        assert_eq!(engine.activate_jobs(expected, "W", 1, 1_000, 0).len(), 1);
+    }
+}
+
 /// Builds a one-element process whose only flow node is a `CallActivity`, deploys
 /// it, and returns the resulting `EngineSnapshot` (which embeds the deployed
 /// model, and therefore the `ElementKind::CallActivity`).
