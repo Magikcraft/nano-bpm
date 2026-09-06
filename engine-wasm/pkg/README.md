@@ -52,10 +52,53 @@ engine.reset();                     // back to a clean engine
 ```
 
 The lean surface covers primary state and execution: `deploy`, `createInstance`,
-`snapshot`, `events`, job ops (`activateJobs`, `completeJob`, `failJob`,
-`updateRetries`, `throwError`), user-task ops (`completeUserTask`,
+`snapshot`, `events`, `replayEvents`, job ops (`activateJobs`, `completeJob`, `failJob`,
+`updateRetries`, `updateTimeout`, `throwError`), user-task ops (`completeUserTask`,
 `assignUserTask`, …), messaging/signals, the virtual clock (`advanceTime`,
 `tickNow`), and `reset`. It links **no** SQLite / read-model code.
+
+### Optional job leasing and agent history
+
+`activateJobs(type, maxJobs, timeoutMs, worker, withLease?)` defaults to nonleasing
+for **every** job kind and agent marker. Activated jobs always contain
+`leaseToken`: `null` without a lease, otherwise an opaque string. Never parse it
+as a number. Once a job is leased, subsequent activations must also opt in;
+nonleasing workers skip it after failures and timeouts.
+
+Pass the token as the final optional argument to `completeJob`, `completeAgentJob`,
+`failJob`, or `throwError`. Leased lifecycle commands require the current token.
+`updateRetries` and `updateTimeout` also accept a final token; it is optional, but
+a supplied stale value is rejected. Timeout updates accept signed millisecond
+durations; zero and negative updates make the activation immediately eligible for
+expiry on the next clock tick without discarding its current lease.
+
+Agent APIs follow the vendored stable/8.10 contract:
+
+- `createAgentInstance(JSON.stringify({elementInstanceKey, jobKey, jobLease, history}))`
+  requires nonempty history establishing CONFIGURATION. `jobLease` is the activated
+  job's `leaseToken`, unchanged. Definition, limits, tools, and metrics are history
+  fields, not top-level request properties.
+- `updateAgentInstance(agentInstanceKey, JSON.stringify({elementInstanceKey, jobKey,
+  jobLease, status?, history?}))` requires all three attribution fields even without
+  history.
+- Both return canonical results containing positionally correlated `createdHistory`;
+  CREATE also returns `agentInstanceKey`. Duplicate CREATE rejects rather than upserting.
+- Failure and timeout leave history PENDING. Job completion commits the winning
+  attempt and discards superseded attempts; cancellation or a business error
+  discards pending history. Searches default to COMMITTED. Timestamps are RFC-3339
+  strings and loop iterations start at 1.
+- System prompts are typed content-block arrays. Persisted historical text remains
+  one TEXT block, even when the text resembles JSON.
+- Metrics preserve the difference between an omitted object and an object with
+  nullable counters. Zero and signed values remain observations, never sentinels.
+
+Agent searches currently support exact scalar filters and `$eq`, plus `$in` for
+history commit status. Other advanced operators are rejected; pagination and sorting
+are not implemented by the simulation API.
+
+`replayEvents(engine.events())` restores a complete exported trace through core
+replay, including opaque lease state. It rejects unknown event types and missing
+prefixes rather than silently dropping records.
 
 ## Usage — read-model
 

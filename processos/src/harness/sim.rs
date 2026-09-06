@@ -160,11 +160,7 @@ pub fn run_instance(
                 apply_and_fold(
                     &mut engine,
                     &mut output,
-                    Command::FailJob {
-                        job_key,
-                        retries: 0,
-                        error_message: format!("mock worker '{}' failed", worker.id),
-                    },
+                    Command::fail_job(job_key, 0, format!("mock worker '{}' failed", worker.id)),
                     clock,
                 );
             } else {

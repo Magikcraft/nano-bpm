@@ -2,18 +2,17 @@
 //!
 //! The engine is the system-of-record for AgentInstance state. This module
 //! holds the *shape* of that state: the `zeebe:agentDefinition` marker
-//! ([`AgentType`]), the static per-element agent definition
-//! ([`AgentDefinition`]) and its optional limits ([`AgentInstanceLimits`]) that
-//! ride on [`crate::model::ElementKind::AgentTask`], and the runtime
+//! ([`AgentType`]) on [`crate::model::ElementKind::ServiceTask`], the definition
+//! ([`AgentDefinition`]) and optional limits ([`AgentInstanceLimits`]) supplied
+//! by the worker at registration, and the runtime
 //! [`AgentInstance`] record — a first-class object keyed by its own dedicated
 //! `agent_instance_key`, linked to the activating `element_instance_key`, and
 //! driven through the [`AgentInstanceStatus`] state machine.
 //!
 //! LLM calls / prompt assembly / tool dispatch are deliberately **out of
 //! scope**: those live in the worker layer. Here we only model the state the
-//! engine owns. The lifecycle *processors* (CREATE/UPDATE/COMPLETE) are a later
-//! slice; this slice makes a `CREATED` AgentInstance (status `INITIALIZING`)
-//! representable and defines the full intent enum downstream slices reuse.
+//! engine owns. Every agent marker retains the normal job-worker lifecycle;
+//! CREATE/UPDATE/COMPLETE explicitly manage the persisted agent state.
 
 use crate::model::ElementId;
 use crate::state::Key;
@@ -72,9 +71,14 @@ pub struct AgentDefinition {
     /// The LLM provider (for example, `openai` or `anthropic`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub provider: Option<String>,
-    /// The system prompt configured for this agent.
+    /// Typed system-prompt content. Persisted legacy strings decode as one
+    /// literal TEXT block, including strings that happen to look like JSON.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub system_prompt: Option<String>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(deserialize_with = "deserialize_persisted_prompt")
+    )]
+    pub system_prompt: Option<Vec<AgentHistoryContent>>,
 }
 
 impl AgentDefinition {
@@ -85,13 +89,46 @@ impl AgentDefinition {
     pub fn approx_bytes(&self) -> u64 {
         opt_str_bytes(&self.model)
             + opt_str_bytes(&self.provider)
-            + opt_str_bytes(&self.system_prompt)
+            + prompt_bytes(&self.system_prompt)
     }
 }
 
 /// The heap payload of an optional string field, in bytes (`0` when absent).
 fn opt_str_bytes(s: &Option<String>) -> u64 {
     s.as_ref().map_or(0, |v| v.len() as u64)
+}
+
+fn prompt_bytes(prompt: &Option<Vec<AgentHistoryContent>>) -> u64 {
+    prompt.as_ref().map_or(0, |blocks| {
+        blocks.iter().map(AgentHistoryContent::approx_bytes).sum()
+    })
+}
+
+#[cfg(feature = "serde")]
+fn deserialize_persisted_prompt<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<AgentHistoryContent>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum PersistedPrompt {
+        LegacyText(String),
+        Blocks(Vec<AgentHistoryContent>),
+    }
+    Ok(
+        Option::<PersistedPrompt>::deserialize(deserializer)?.map(|prompt| match prompt {
+            PersistedPrompt::LegacyText(text) => vec![AgentHistoryContent {
+                content_type: AgentHistoryContentType::Text,
+                text: Some(text),
+                document_reference: None,
+                object: None,
+            }],
+            PersistedPrompt::Blocks(blocks) => blocks,
+        }),
+    )
 }
 
 /// A limit value meaning "no limit is configured".
@@ -151,8 +188,8 @@ impl AgentInstanceLimits {
     /// unbounded and never breached. `max_tokens` governs the combined
     /// `input_tokens + output_tokens` total; `max_model_calls` / `max_tool_calls`
     /// govern their same-named counters. This is the sole place the limit ->
-    /// counter mapping lives, so the CREATE/UPDATE processors enforce limits by
-    /// calling it rather than duplicating the comparison.
+    /// counter mapping lives for embedded callers inspecting recorded usage.
+    /// Recording actual history does not reject usage that exceeds a limit.
     pub fn first_breach(&self, metrics: &AgentInstanceMetrics) -> Option<AgentLimitKind> {
         let total_tokens = metrics.input_tokens.saturating_add(metrics.output_tokens);
         if self.max_tokens != AGENT_LIMIT_UNLIMITED && total_tokens > self.max_tokens {
@@ -392,9 +429,13 @@ pub struct AgentInstance {
     /// The key of the agent job driving this instance, if any (`0` = none).
     #[cfg_attr(feature = "serde", serde(default))]
     pub job_key: Key,
-    /// The agent job's lease deadline, if leased (`0` = none).
+    /// Opaque job activation token (empty for an unleased attribution).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub job_lease: u64,
+    #[cfg_attr(
+        feature = "serde",
+        serde(deserialize_with = "crate::lease::deserialize")
+    )]
+    pub job_lease: String,
     /// The instant this agent instance was created (ms since Unix epoch).
     #[cfg_attr(feature = "serde", serde(default))]
     pub created_at: u64,
@@ -481,7 +522,8 @@ pub struct AgentHistoryContent {
     /// Plain-text payload (for `Text`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub text: Option<String>,
-    /// An opaque document reference (for `Document`).
+    /// Canonical REST document-reference object encoded losslessly as JSON
+    /// (for `Document`), retaining its camelCase field names.
     #[cfg_attr(feature = "serde", serde(default))]
     pub document_reference: Option<String>,
     /// A structured object payload (for `Object`); an opaque JSON string so the
@@ -528,15 +570,18 @@ impl AgentHistoryToolCall {
 }
 
 /// Per-turn LLM metrics (`metrics{...}`) recorded on an AgentHistory turn.
+/// Null counters are distinct from every submitted integer, including `-1`
+/// and zero. Historical integer fields deserialize naturally as `Some`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct AgentHistoryMetrics {
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub reasoning_token_count: i64,
-    pub cache_creation_token_count: i64,
-    pub cache_read_token_count: i64,
-    pub duration_ms: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub reasoning_token_count: Option<i64>,
+    pub cache_creation_token_count: Option<i64>,
+    pub cache_read_token_count: Option<i64>,
+    pub duration_ms: Option<i64>,
 }
 
 /// The derived commit status of an AgentHistory turn (`commitStatus`).
@@ -614,6 +659,14 @@ impl AgentHistoryIntent {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AgentHistoryTurn {
+    /// Explicit CONFIGURATION changes: `model`, `provider`, `systemPrompt`,
+    /// `tools`, `maxTokens`, `maxModelCalls`, `maxToolCalls`. An empty supplied
+    /// tools list still includes `tools`; partial limits name only changed members.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub changed_attributes: Vec<String>,
     /// The agent loop iteration this turn belongs to (primary ordering key).
     pub loop_iteration: i32,
     /// The instant the turn was produced (ms since Unix epoch; secondary
@@ -624,15 +677,16 @@ pub struct AgentHistoryTurn {
     /// The content blocks of the turn.
     #[cfg_attr(feature = "serde", serde(default))]
     pub content: Vec<AgentHistoryContent>,
-    /// The system prompt in effect for the turn, if any.
+    /// Typed system-prompt content. `None` means no prompt supplied, distinct
+    /// from an explicitly supplied empty array.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub system_prompt: Option<String>,
+    pub system_prompt: Option<Vec<AgentHistoryContent>>,
     /// The tool calls issued on the turn.
     #[cfg_attr(feature = "serde", serde(default))]
     pub tool_calls: Vec<AgentHistoryToolCall>,
-    /// Per-turn LLM metrics.
+    /// Per-turn metrics. `None` differs from a present object with null counters.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub metrics: AgentHistoryMetrics,
+    pub metrics: Option<AgentHistoryMetrics>,
     /// A stable, worker-supplied identity for the turn (`historyItemId`), used to
     /// detect duplicates across retries.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -655,9 +709,9 @@ pub struct AgentHistoryTurn {
     /// The agent job key that produced this turn, if any (`0` = none).
     #[cfg_attr(feature = "serde", serde(default))]
     pub job_key: Key,
-    /// The agent job's lease deadline for this turn, if any (`0` = none).
+    /// Opaque activation token for this turn (empty for an unleased attribution).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub job_lease: u64,
+    pub job_lease: String,
 }
 
 impl AgentHistoryTurn {
@@ -682,7 +736,7 @@ impl AgentHistoryTurn {
         content
             + tool_calls
             + tools
-            + opt_str_bytes(&self.system_prompt)
+            + prompt_bytes(&self.system_prompt)
             + opt_str_bytes(&self.history_item_id)
             + opt_str_bytes(&self.model)
             + opt_str_bytes(&self.provider)
@@ -699,6 +753,12 @@ impl AgentHistoryTurn {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AgentHistoryRecord {
+    /// Configuration fields changed by this item, applied when its job commits.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub changed_attributes: Vec<String>,
     /// The dedicated, monotonic key identifying this history turn.
     pub agent_history_key: Key,
     /// The agent instance this turn belongs to.
@@ -718,9 +778,13 @@ pub struct AgentHistoryRecord {
     /// The agent job key that produced this turn, if any (`0` = none).
     #[cfg_attr(feature = "serde", serde(default))]
     pub job_key: Key,
-    /// The agent job's lease deadline for this turn, if any (`0` = none).
+    /// Opaque activation token for this turn (empty for an unleased attribution).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub job_lease: u64,
+    #[cfg_attr(
+        feature = "serde",
+        serde(deserialize_with = "crate::lease::deserialize")
+    )]
+    pub job_lease: String,
     /// The agent loop iteration this turn belongs to (primary ordering key).
     pub loop_iteration: i32,
     /// The author role of the turn.
@@ -731,15 +795,20 @@ pub struct AgentHistoryRecord {
     /// The content blocks of the turn.
     #[cfg_attr(feature = "serde", serde(default))]
     pub content: Vec<AgentHistoryContent>,
-    /// The system prompt in effect for the turn, if any.
+    /// Typed system-prompt content. Historical persisted strings become one
+    /// literal TEXT block; malformed new arrays fail decoding.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub system_prompt: Option<String>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(deserialize_with = "deserialize_persisted_prompt")
+    )]
+    pub system_prompt: Option<Vec<AgentHistoryContent>>,
     /// The tool calls issued on the turn.
     #[cfg_attr(feature = "serde", serde(default))]
     pub tool_calls: Vec<AgentHistoryToolCall>,
-    /// Per-turn LLM metrics.
+    /// Per-turn metrics. `None` differs from a present object with null counters.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub metrics: AgentHistoryMetrics,
+    pub metrics: Option<AgentHistoryMetrics>,
     /// A stable, worker-supplied identity for the turn (`historyItemId`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub history_item_id: Option<String>,

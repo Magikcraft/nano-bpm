@@ -2,6 +2,19 @@
 
 Status: **Proposed.**
 Date: 2026-07-30.
+
+> **Compatibility correction (#1136):** The historical proposal below inferred
+> an engine-hosted reasoning loop from Camunda's persisted agent records. That
+> inference is not the current execution contract. `aiAgentTask` and `external`
+> service-task markers use ordinary worker jobs, as do job-backed
+> `aiAgentSubProcess` containers. Workers explicitly CREATE/UPDATE AgentInstances;
+> activation never creates one automatically. The engine persists lifecycle and
+> history, while the worker runs the reasoning loop. Leasing is explicitly
+> requested through `withLease`, independently of the marker. Agent requests use
+> job attribution, history is resolved with the job, and agent completion follows
+> process-instance cleanup. See the current
+> [compatibility guide](../camunda-compatibility.md#3-agentic--ai-agent-elements).
+
 Relates to:
 ADR 0023 (`0023-adhoc-subprocess-execution-parity.md`, the executable ad-hoc sub-process — the
 "agent-in-the-node" primitive this ADR positions), ADR 0044

@@ -515,6 +515,32 @@ pub fn match_agent_instance_key(
     }
 }
 
+pub fn match_agent_definition_key(
+    filter: &Option<models::AgentDefinitionKeyFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::AgentDefinitionKeyFilterProperty::AgentDefinitionKey(key)) => key.0 == value,
+        Some(models::AgentDefinitionKeyFilterProperty::AdvancedAgentDefinitionKeyFilter(
+            filter,
+        )) => ops!(filter, |key: &models::AgentDefinitionKey| key.0.clone()).matches(Some(value)),
+    }
+}
+
+pub fn match_agent_history_item_key(
+    filter: &Option<models::AgentHistoryItemKeyFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::AgentHistoryItemKeyFilterProperty::AgentHistoryItemKey(key)) => key.0 == value,
+        Some(models::AgentHistoryItemKeyFilterProperty::AdvancedAgentHistoryItemKeyFilter(
+            filter,
+        )) => ops!(filter, |key: &models::AgentHistoryItemKey| key.0.clone()).matches(Some(value)),
+    }
+}
+
 /// Matches an `AgentInstanceStatusFilterProperty` (exact enum or advanced
 /// `$eq`/`$neq`/`$exists`/`$in`/`$like`) against a status's wire spelling
 /// (`INITIALIZING`, `IDLE`, …).

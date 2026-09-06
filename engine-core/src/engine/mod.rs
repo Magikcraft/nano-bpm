@@ -18,6 +18,7 @@ use crate::event::Event;
 use crate::model::{ElementId, ElementKind, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
 
+mod agent_behavior;
 mod api;
 mod boundary;
 mod debug;
@@ -85,7 +86,11 @@ struct Paused {
 ///
 /// `0` is reserved for the historical *headerless* on-disk format (bare
 /// `serde_json` with no envelope); the first versioned envelope is `1`.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+/// Version `2` writes opaque string lease tokens, typed system-prompt arrays,
+/// and explicitly nullable history metrics.
+/// Persistence decoders retain numeric tokens and literal legacy prompt strings
+/// so version-1 journals and snapshots still load.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 /// A compact, serializable capture of an [`Engine`]: its materialized [`State`]
 /// plus the scalar generator and clock metadata required to resume operation
 /// identically. Produced by [`Engine::snapshot`] and consumed by
@@ -106,6 +111,15 @@ pub struct EngineSnapshot {
 /// [`Engine::recover_lease`]). It marks the lease as "restored from a digest, not
 /// held by a live worker connection".
 pub const LEASE_DIGEST_WORKER: &str = "__lease_digest__";
+
+struct ActivationPlan {
+    job_keys: Vec<Key>,
+    worker: String,
+    timeout: u64,
+    now: u64,
+    options: crate::JobActivationOptions,
+    durable: bool,
+}
 
 /// An embeddable BPMN engine instance.
 ///
@@ -631,7 +645,7 @@ impl Engine {
         })
     }
 
-    /// Validate the job context an `external`, job-backed agent's
+    /// Validate the job context an agent's
     /// `CreateAgentInstance` / `UpdateAgentInstance` carries — the nano-bpm analog
     /// of Camunda's `AgentHistoryBatchBehavior.validateJobContext`
     /// (#1099/#1106), reproducing its exact rule order and rejection kinds:
@@ -653,16 +667,13 @@ impl Engine {
     /// The lease "token" is the job's per-activation **staleness handle**
     /// ([`state::Job::lease_token`], distinct from `deadline`) — the value an
     /// activation response returns to the worker and which it echoes back as
-    /// `job_lease`. It is a monotonic key, *not* a cryptographically unguessable
-    /// secret: it only fences a command against a **superseded** activation of
-    /// the same job (Camunda's `hasLeaseToken()` gate), so a predictable value
-    /// suffices. Forgery-resistance of external callers is the gateway auth
-    /// layer's responsibility (ADR-0028), not this token's.
+    /// `job_lease`. Comparisons use opaque strings; only persisted legacy frames
+    /// accept numeric tokens through the compatibility decoder.
     fn validate_agent_job_context(
         &self,
         element_instance_key: Key,
         job_key: Key,
-        job_lease: u64,
+        job_lease: &str,
         has_history: bool,
     ) -> Result<(), EngineError> {
         // No job supplied: only permitted when no history batch is attached.
@@ -686,7 +697,7 @@ impl Engine {
         };
         // Conditional lease comparison (Camunda `hasLeaseToken()`): a lease-less
         // activation carries no token and skips this check.
-        if let Some(token) = job.lease_token {
+        if let Some(token) = job.lease_token.as_deref() {
             if token != job_lease {
                 return Err(EngineError::AgentInstanceJobLeaseMismatch {
                     element_instance_key,
@@ -707,39 +718,27 @@ impl Engine {
 
     /// Process a `Command::CreateAgentInstance` (Camunda `AgentInstanceIntent.CREATE`,
     /// stable/8.10). The referenced `element_instance_key` must be an **active**
-    /// element instance modelled as an [`ElementKind::AgentTask`](crate::model::ElementKind::AgentTask)
-    /// — a `serviceTask` bearing a `zeebe:agentDefinition` (`aiAgentTask` or
-    /// `external`). A plain `SERVICE_TASK` without that marker is rejected as
+    /// job-worker element bearing a `zeebe:agentDefinition` marker, including
+    /// job-backed ad-hoc containers. A service task without the marker is rejected as
     /// missing an agentDefinition, and any other element kind is not eligible.
     ///
-    /// For an engine-native `aiAgentTask` the engine already mints an
-    /// AgentInstance when the element activates; this processor **reconciles**
-    /// with that record — configuring its definition/limits and applying any
-    /// initial `history[]` batch — rather than minting a duplicate, so there is
-    /// one source of truth per element instance.
-    ///
-    /// For an `external` agent (job-backed, Camunda parity #1099) there is **no**
-    /// activation-time record: the worker mints it here, gated on the element's
-    /// job. `job_key`/`job_lease` must reference that element's **ACTIVATED** job
+    /// There is no activation-time record: the worker registers it here.
+    /// Supplied `job_key`/`job_lease` must reference that element's **ACTIVATED** job
     /// with a matching lease token and `elementInstanceKey`
     /// ([`Self::validate_agent_job_context`]); otherwise the CREATE is rejected.
-    /// A repeat CREATE for the same element instance still reconciles (idempotent
-    /// upsert), so a reactivation folds into one AgentInstance.
-    ///
-    /// It (re-)emits `AgentInstanceCreated` (status `INITIALIZING`, an idempotent
-    /// upsert). Limits come from the explicit `limits`, else the last `limits`
-    /// carried by a history turn (a CONFIGURATION item), else default to
-    /// unlimited.
+    /// History requires job attribution; history-free registration may omit it.
+    /// A repeat CREATE conflicts. History-bearing registration derives definition
+    /// and limits from CONFIGURATION, then records pending history.
     #[allow(clippy::too_many_arguments)]
     fn process_create_agent_instance(
         &mut self,
         log: &mut Vec<Event>,
         element_instance_key: Key,
         job_key: Key,
-        job_lease: u64,
+        job_lease: String,
         definition: crate::agent::AgentDefinition,
         limits: Option<crate::agent::AgentInstanceLimits>,
-        history: Vec<crate::agent::AgentHistoryTurn>,
+        mut history: Vec<crate::agent::AgentHistoryTurn>,
     ) -> Result<(), EngineError> {
         // 1. The element instance must be active.
         let (process_instance_key, element_id) = self
@@ -747,64 +746,29 @@ impl Engine {
             .ok_or(EngineError::AgentInstanceElementInstanceInactive {
                 element_instance_key,
             })?;
-        // 2. Its element must be agent-eligible and carry an agentDefinition.
-        let agent_type = match self.element_kind(process_instance_key, &element_id) {
-            Some(crate::model::ElementKind::AgentTask { agent_type, .. }) => agent_type,
-            Some(crate::model::ElementKind::ServiceTask { .. }) => {
-                return Err(EngineError::AgentInstanceMissingAgentDefinition {
-                    element_instance_key,
-                });
-            }
-            _ => {
-                return Err(EngineError::AgentInstanceElementNotEligible {
-                    element_instance_key,
-                });
-            }
-        };
-        // 2a. An `external` agent is job-backed and worker-registered: its CREATE
-        // must reference the element's ACTIVATED job with a matching lease token
-        // and elementInstanceKey (Camunda `validateJobContext`, #1099/#1106) —
-        // but a *jobless* CREATE is allowed when it carries **no** history batch
-        // (Camunda's `jobKey == -1` short-circuit): the job is only required once
-        // a history batch is attached. The engine-native
-        // `aiAgentTask`/`aiAgentSubProcess` variants have no job and are not gated.
-        if agent_type == crate::agent::AgentType::External {
-            self.validate_agent_job_context(
+        if let Some(agent_instance_key) = self.owning_agent_instance(element_instance_key) {
+            return Err(EngineError::AgentInstanceAlreadyExists {
                 element_instance_key,
-                job_key,
-                job_lease,
-                !history.is_empty(),
-            )?;
-        }
-        // 3. Reconcile with the auto-created instance (slice S1), if any.
-        let existing = self
-            .state
-            .instances
-            .get(&process_instance_key)
-            .and_then(|inst| {
-                inst.agent_instances
-                    .values()
-                    .find(|ai| ai.element_instance_keys.contains(&element_instance_key))
-                    .cloned()
+                agent_instance_key,
             });
-        // Limits: explicit wins, else the last CONFIGURATION history item, else
-        // the existing record's limits, else unlimited default. Only a
-        // CONFIGURATION turn may seed limits — a non-CONFIGURATION turn (e.g.
-        // ASSISTANT) carrying `limits` must not silently override them, per the
-        // stable/8.10 semantics documented above.
-        let resolved_limits = limits
-            .or_else(|| {
-                history.iter().rev().find_map(|turn| {
-                    turn.limits
-                        .filter(|_| turn.role == crate::agent::AgentHistoryRole::Configuration)
-                })
-            })
-            .or_else(|| existing.as_ref().map(|ai| ai.limits))
-            .unwrap_or_default();
-        let agent_instance_key = existing
-            .as_ref()
-            .map(|ai| ai.agent_instance_key)
-            .unwrap_or_else(|| self.mint_key());
+        }
+        // 2. Its element must be agent-eligible and carry an agentDefinition.
+        let agent_type =
+            self.agent_type_for_element(process_instance_key, &element_id, element_instance_key)?;
+        // 2a. Every supplied job is validated; history requires attribution.
+        // History-free jobless registration follows Camunda's short-circuit.
+        self.validate_agent_job_context(
+            element_instance_key,
+            job_key,
+            &job_lease,
+            !history.is_empty(),
+        )?;
+        Self::validate_agent_history(&history, true)?;
+        for turn in &mut history {
+            turn.job_key = job_key;
+            turn.job_lease = job_lease.clone();
+        }
+        let agent_instance_key = self.mint_key();
         let root_process_instance_key = self.root_process_instance_key(process_instance_key);
         let (bpmn_process_id, process_definition_key, process_definition_version) = self
             .state
@@ -824,65 +788,41 @@ impl Engine {
                 )
             })
             .unwrap_or_default();
-        let agent_instance = crate::agent::AgentInstance {
+        let mut agent_instance = crate::agent::AgentInstance {
             agent_instance_key,
-            agent_definition_key: existing
-                .as_ref()
-                .map(|ai| ai.agent_definition_key)
-                .unwrap_or(0),
+            agent_definition_key: 0,
             element_instance_key,
-            element_instance_keys: existing
-                .as_ref()
-                .map(|ai| ai.element_instance_keys.clone())
-                .unwrap_or_else(|| vec![element_instance_key]),
+            element_instance_keys: vec![element_instance_key],
             element_id: element_id.clone(),
             process_instance_key,
             root_process_instance_key,
             bpmn_process_id,
             process_definition_key,
             process_definition_version,
-            process_definition_version_tag: existing
-                .as_ref()
-                .and_then(|ai| ai.process_definition_version_tag.clone()),
-            tenant_id: existing
-                .as_ref()
-                .map(|ai| ai.tenant_id.clone())
-                .unwrap_or_else(|| crate::DEFAULT_TENANT.to_string()),
+            process_definition_version_tag: None,
+            tenant_id: crate::DEFAULT_TENANT.to_string(),
             agent_type,
             status: crate::agent::AgentInstanceStatus::Initializing,
-            definition,
-            limits: resolved_limits,
-            metrics: existing.as_ref().map(|ai| ai.metrics).unwrap_or_default(),
-            tools: existing
-                .as_ref()
-                .map(|ai| ai.tools.clone())
-                .unwrap_or_default(),
-            // For an `external` agent the CREATE was just lease-validated
-            // (step 2a), so record the freshly-proven attribution — a repeat
-            // CREATE after re-activation must refresh, not preserve, a stale
-            // lease token (else later history-bearing updates keyed off the
-            // snapshot's lease are wrongly rejected). Engine-native variants
-            // carry no job: the docs on `CreateAgentInstance` declare their
-            // `job_key`/`job_lease` ignored, so hard-ignore any caller-supplied
-            // values and default to 0 when no prior record exists (only ever
-            // preserve an existing snapshot's attribution).
-            job_key: if agent_type == crate::agent::AgentType::External {
-                job_key
+            definition: if history.is_empty() {
+                definition
             } else {
-                existing.as_ref().map(|ai| ai.job_key).unwrap_or(0)
+                Default::default()
             },
-            job_lease: if agent_type == crate::agent::AgentType::External {
-                job_lease
+            limits: if history.is_empty() {
+                limits.unwrap_or_default()
             } else {
-                existing.as_ref().map(|ai| ai.job_lease).unwrap_or(0)
+                Default::default()
             },
-            created_at: existing
-                .as_ref()
-                .map(|ai| ai.created_at)
-                .unwrap_or(self.now),
+            metrics: Default::default(),
+            tools: Vec::new(),
+            // Refresh attribution after reactivation rather than retaining a stale lease.
+            job_key,
+            job_lease,
+            created_at: self.now,
             last_updated_at: self.now,
             completed_at: 0,
         };
+        self.apply_history_changes(&mut agent_instance, &history, true);
         self.emit(
             log,
             Event::AgentInstanceCreated {
@@ -890,12 +830,10 @@ impl Engine {
                 agent_instance,
             },
         );
-        // 4. Apply the initial history batch (append + commit), slice S2.
+        // History stays pending until the attributed job resolves.
         if !history.is_empty() {
             let created = self.append_agent_history(agent_instance_key, history);
             log.extend(created);
-            let committed = self.commit_agent_history(agent_instance_key);
-            log.extend(committed);
         }
         Ok(())
     }
@@ -905,9 +843,8 @@ impl Engine {
     /// element/process instance matches, the referenced element instance is
     /// active and not owned by a *different* agent instance, and that the target
     /// `status` (if any) is an **active** state (`COMPLETED` is not settable via
-    /// UPDATE). Accumulates the metric deltas — rejecting the batch if the new
-    /// totals would breach a configured limit — replaces the tool set when
-    /// given, appends the history batch (slice S2), and emits `AgentInstanceUpdated`.
+    /// UPDATE). Enforces a single active writer, records history-derived metrics,
+    /// and defers configuration changes until the attributed job commits.
     #[allow(clippy::too_many_arguments)]
     fn process_update_agent_instance(
         &mut self,
@@ -917,51 +854,30 @@ impl Engine {
         element_id: crate::model::ElementId,
         process_instance_key: Key,
         job_key: Key,
-        job_lease: u64,
+        job_lease: String,
         status: Option<crate::agent::AgentInstanceStatus>,
         metrics: crate::agent::AgentInstanceMetricsDelta,
         tools: Option<Vec<crate::agent::AgentTool>>,
-        history: Vec<crate::agent::AgentHistoryTurn>,
+        mut history: Vec<crate::agent::AgentHistoryTurn>,
     ) -> Result<(), EngineError> {
         // 1. The instance must exist.
         let mut updated = self
             .find_agent_instance(agent_instance_key)
             .cloned()
             .ok_or(EngineError::AgentInstanceNotFound { agent_instance_key })?;
-        // 1a. An `external` agent is job-backed: a supplied job is always
-        // validated — active + matching lease token + elementInstanceKey (Camunda
-        // `validateJobContext`, #1099/#1106) — whether or not this UPDATE carries
-        // a history batch. Only a fully job-optional UPDATE (no `job_key` *and* no
-        // history — a pure status/metrics advance) skips the gate; a history-free
-        // UPDATE that still supplies a `job_key` must prove it, and a
-        // history-bearing UPDATE requires one. The engine-native variants are not
-        // gated.
-        if updated.agent_type == crate::agent::AgentType::External {
-            self.validate_agent_job_context(
-                element_instance_key,
-                job_key,
-                job_lease,
-                !history.is_empty(),
-            )?;
-        }
         // 2. The asserted ownership (element id + process instance) must match.
         if updated.element_id != element_id || updated.process_instance_key != process_instance_key
         {
             return Err(EngineError::AgentInstanceOwnershipMismatch { agent_instance_key });
         }
-        // 3. The referenced element instance must be active and belong to the
-        //    same logical element (so a re-entry key is a fresh activation of the
-        //    same element, not a foreign one). It may live in another process
-        //    instance only when this same agent instance *already* owns it —
-        //    a fresh (unowned) re-entry key must belong to the agent instance's
-        //    own process instance (step 4a); cross-owner references are rejected
-        //    as a conflict in step 4.
+        // The actual element and process ownership precede association conflicts
+        // and the job gate, including when the command proposes a re-entry key.
         let (active_pi, active_element_id) = self
             .resolve_active_element_instance(element_instance_key)
             .ok_or(EngineError::AgentInstanceElementInstanceInactive {
                 element_instance_key,
             })?;
-        if active_element_id != updated.element_id {
+        if active_element_id != updated.element_id || active_pi != updated.process_instance_key {
             return Err(EngineError::AgentInstanceOwnershipMismatch { agent_instance_key });
         }
         // 4. No conflicting instance: the element instance may only be owned by
@@ -975,48 +891,76 @@ impl Engine {
                 });
             }
         }
-        // 4a. A fresh (not already owned by this agent instance) re-entry key must
-        //     live in this agent instance's own process instance. An element
-        //     instance in a *foreign* process instance that merely shares the
-        //     element id — and is not agent-eligible, so no owner minted it —
-        //     would otherwise be linkable and corrupt ownership/re-entry tracking.
-        if !updated
-            .element_instance_keys
-            .contains(&element_instance_key)
-            && active_pi != process_instance_key
+        if updated.element_instance_key != element_instance_key
+            && self.state.jobs.values().any(|job| {
+                job.element_instance_key == updated.element_instance_key
+                    && job.state == state::JobState::Activated
+            })
         {
-            return Err(EngineError::AgentInstanceOwnershipMismatch { agent_instance_key });
+            return Err(EngineError::AgentInstanceActiveWriter {
+                agent_instance_key,
+                element_instance_key: updated.element_instance_key,
+            });
+        }
+        self.validate_agent_job_context(
+            element_instance_key,
+            job_key,
+            &job_lease,
+            !history.is_empty(),
+        )?;
+        Self::validate_agent_history(&history, false)?;
+        if !history.is_empty()
+            && (metrics != crate::agent::AgentInstanceMetricsDelta::default() || tools.is_some())
+        {
+            return Err(EngineError::AgentHistoryInvalid {
+                reason: "history-bearing UPDATE permits only status at request level".to_string(),
+            });
+        }
+        if [
+            metrics.input_tokens,
+            metrics.output_tokens,
+            metrics.model_calls,
+            metrics.tool_calls,
+        ]
+        .iter()
+        .any(|value| *value < -1)
+        {
+            return Err(EngineError::AgentHistoryInvalid {
+                reason: "metric deltas must be -1 or nonnegative".to_string(),
+            });
+        }
+        for turn in &mut history {
+            turn.job_key = job_key;
+            turn.job_lease = job_lease.clone();
         }
         // 5. The target status (if any) must be an active state.
         if let Some(target) = status {
-            if !target.is_active() {
+            if !target.is_active()
+                || (target == crate::agent::AgentInstanceStatus::Initializing
+                    && updated.status != crate::agent::AgentInstanceStatus::Initializing)
+            {
                 return Err(EngineError::AgentInstanceStatusNotSettable {
                     agent_instance_key,
                     status: target,
                 });
             }
         }
-        // 6. Accumulate metrics and enforce limits (reject before applying).
+        // Legacy internal history-free deltas remain supported; REST derives metrics from history.
         let new_metrics = updated.metrics.with_delta(&metrics);
-        if let Some(limit) = updated.limits.first_breach(&new_metrics) {
-            return Err(EngineError::AgentInstanceLimitExceeded {
-                agent_instance_key,
-                limit,
-            });
-        }
         // 7. Apply: status, metrics, tools, re-entry link, timestamp.
         if let Some(target) = status {
             updated.status = target;
         }
         updated.metrics = new_metrics;
+        self.apply_history_changes(&mut updated, &history, false);
         if let Some(new_tools) = tools {
             updated.tools = new_tools;
         }
-        // A history-bearing `external` UPDATE was lease-validated (step 1a), so
+        // A supplied job was lease-validated (step 1a), so
         // record the freshly-proven attribution on the snapshot rather than
         // leaving a stale lease token — a later update keyed off the snapshot's
         // lease would otherwise be wrongly rejected by `validate_agent_job_context`.
-        if updated.agent_type == crate::agent::AgentType::External && !history.is_empty() {
+        if job_key != 0 {
             updated.job_key = job_key;
             updated.job_lease = job_lease;
         }
@@ -1036,22 +980,16 @@ impl Engine {
                 agent_instance: updated,
             },
         );
-        // 8. Apply the history batch (append + commit), slice S2.
+        // History stays pending until the attributed job resolves.
         if !history.is_empty() {
             let created = self.append_agent_history(agent_instance_key, history);
             log.extend(created);
-            let committed = self.commit_agent_history(agent_instance_key);
-            log.extend(committed);
         }
         Ok(())
     }
 
-    /// Process a `Command::CompleteAgentInstance` (Camunda `AgentInstanceIntent.COMPLETE`,
-    /// stable/8.10). Drives one agent instance to the terminal `COMPLETED` status
-    /// — the only path to it. Rejects an unknown instance and a re-completion of
-    /// an already-terminal one. Commits any still-pending history, then emits
-    /// `AgentInstanceCompleted`. A caller drains a process instance's agents by
-    /// re-issuing COMPLETE (by key) until none remain active.
+    /// Legacy embedded per-agent completion. The canonical lifecycle completes
+    /// agents during process cleanup, while history resolves with its job.
     fn process_complete_agent_instance(
         &mut self,
         log: &mut Vec<Event>,
@@ -1064,9 +1002,6 @@ impl Engine {
         if !completed.status.is_active() {
             return Err(EngineError::AgentInstanceAlreadyCompleted { agent_instance_key });
         }
-        // Commit any pending history before the record turns terminal.
-        let committed = self.commit_agent_history(agent_instance_key);
-        log.extend(committed);
         completed.status = crate::agent::AgentInstanceStatus::Completed;
         completed.completed_at = self.now;
         completed.last_updated_at = self.now;
@@ -1123,32 +1058,6 @@ impl Engine {
             },
             None => return log,
         };
-        // Seed the dedup index from already-recorded turns: a turn whose
-        // `historyItemId` matches an existing non-discarded record is an
-        // idempotent retry (Camunda 8.10) and must resolve to that original
-        // record rather than materialise a second one. Discarded turns were
-        // rejected, so a resubmission of their id is allowed to create a fresh
-        // record — they are excluded from the index.
-        let mut seen_by_item_id: HashMap<String, Key> = self
-            .state
-            .instances
-            .get(&base.instance_key)
-            .and_then(|inst| inst.agent_history.get(&agent_instance_key))
-            .map(|records| {
-                records
-                    .iter()
-                    .filter(|r| {
-                        r.commit_status != crate::agent::AgentHistoryCommitStatus::Discarded
-                    })
-                    .filter_map(|r| {
-                        r.history_item_id
-                            .clone()
-                            .filter(|id| !id.is_empty())
-                            .map(|id| (id, r.agent_history_key))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         for turn in turns {
             // Idempotent dedup by `historyItemId`. An absent/empty id cannot be
             // correlated to a prior turn, so it always materialises a fresh
@@ -1156,7 +1065,9 @@ impl Engine {
             // this same batch) resolves to the original key and creates no new
             // AGENT_HISTORY record.
             if let Some(id) = turn.history_item_id.as_deref().filter(|id| !id.is_empty()) {
-                if let Some(&original_agent_history_key) = seen_by_item_id.get(id) {
+                if let Some(original_agent_history_key) =
+                    self.duplicate_agent_history(agent_instance_key, &turn)
+                {
                     self.emit(
                         &mut log,
                         Event::AgentHistoryDeduplicated {
@@ -1171,6 +1082,7 @@ impl Engine {
             }
             let agent_history_key = self.mint_key();
             let record = crate::agent::AgentHistoryRecord {
+                changed_attributes: Self::configuration_attributes(&turn),
                 agent_history_key,
                 agent_instance_key,
                 element_instance_key: base.element_instance_key,
@@ -1196,11 +1108,6 @@ impl Engine {
                 is_duplicate: turn.is_duplicate,
                 commit_status: crate::agent::AgentHistoryCommitStatus::Pending,
             };
-            // Index this freshly-minted record so a later turn in the same batch
-            // carrying the same id dedups against it.
-            if let Some(id) = record.history_item_id.clone().filter(|id| !id.is_empty()) {
-                seen_by_item_id.insert(id, agent_history_key);
-            }
             self.emit(
                 &mut log,
                 Event::AgentHistoryCreated {
@@ -1215,7 +1122,8 @@ impl Engine {
     /// Commit `agent_instance_key`'s pending AgentHistory turns (PENDING ->
     /// COMMITTED). Emits a single [`Event::AgentHistoryCommitted`] naming the
     /// affected turns, or nothing when there are no pending turns / the instance
-    /// is unknown. Internal behavior the S3 processors call on turn accept.
+    /// is unknown. Test-only helper for exercising the low-level turn log.
+    #[cfg(test)]
     pub(crate) fn commit_agent_history(&mut self, agent_instance_key: Key) -> Vec<Event> {
         self.transition_pending_agent_history(agent_instance_key, true)
     }
@@ -1223,8 +1131,7 @@ impl Engine {
     /// Discard `agent_instance_key`'s pending AgentHistory turns (PENDING ->
     /// DISCARDED). Emits a single [`Event::AgentHistoryDiscarded`] naming the
     /// affected turns, or nothing when there are no pending turns / the instance
-    /// is unknown. Internal behavior the S3 processors call on turn reject.
-    #[allow(dead_code)] // AgentHistory (S2) behavior; S3 processors wire the callers.
+    /// is unknown. Process cleanup discards any unresolved attempts.
     pub(crate) fn discard_agent_history(&mut self, agent_instance_key: Key) -> Vec<Event> {
         self.transition_pending_agent_history(agent_instance_key, false)
     }
@@ -1475,8 +1382,11 @@ impl Engine {
     fn deploy(
         &mut self,
         log: &mut Vec<Event>,
-        processes: Vec<ProcessDefinition>,
+        mut processes: Vec<ProcessDefinition>,
     ) -> Result<(), EngineError> {
+        for process in &mut processes {
+            process.normalize_legacy_agent_tasks();
+        }
         for process in &processes {
             if !process.elements.contains_key(&process.start_event) {
                 return Err(EngineError::NoStartEvent {
@@ -1974,6 +1884,7 @@ impl Engine {
 
             Command::CompleteJob {
                 job_key,
+                lease_token,
                 variables,
                 adhoc_result,
                 task_listener_result,
@@ -1992,10 +1903,9 @@ impl Engine {
                 ) {
                     return Err(EngineError::JobNotActive { job_key });
                 }
-                // Completion is by key alone, but a job must have been activated
-                // at least once first. The current lock holder is irrelevant:
-                // any worker that holds the key may complete it, even after the
-                // lock expired and another worker re-activated it. Under lenient
+                Self::validate_job_lease(job, lease_token.as_deref(), true)?;
+                // A job must have been activated at least once. For leased jobs,
+                // the fence above also requires the current activation token. Under lenient
                 // completion (leader-local locks; see `lenient_completion`) the
                 // activation may not have been replicated to this engine, so the
                 // latch is not required.
@@ -2464,96 +2374,53 @@ impl Engine {
                 timeout,
                 now,
                 fetch_variables,
+                with_lease,
             } => {
-                let deadline = now.saturating_add(timeout);
-                // Deterministic selection: walk the per-type activatable index in
-                // its order — `(−priority, key)`, i.e. highest priority first then
-                // oldest (lowest key) — and take the first `max_jobs`. The index
-                // holds only `Created` jobs (an `Activated` job is removed when it
-                // locks and re-added by `JobLockExpired` when its lock expires), so
-                // the walk is O(`max_jobs`) even with a large in-flight backlog
-                // rather than rescanning and skipping every locked job on each poll.
-                // The `job_activatable` check is a defensive guard against any stale
-                // key (none expected).
-                let keys: Vec<Key> = match self.state.activatable_jobs.get(&job_type) {
-                    Some(set) => set
-                        .iter()
-                        .map(|&(_, k)| k)
-                        .filter(|k| {
-                            self.state
-                                .jobs
-                                .get(k)
-                                .is_some_and(|j| job_activatable(j, now))
-                        })
-                        .take(max_jobs)
-                        .collect(),
-                    None => Vec::new(),
-                };
-                for job_key in keys {
-                    let instance_key = self.state.jobs[&job_key].instance_key;
-                    // Mint a fresh lease token for a job that backs an
-                    // `external`, job-backed agent task — the "activate with
-                    // lease" path (Camunda `BpmnJobActivationBehavior`, ADR
-                    // 0005-810-job-lease). It is minted once here at
-                    // command-processing (a monotonic key, distinct from
-                    // `deadline`) and carried on the event so replay restores it.
-                    // The token is a per-activation **staleness handle**, not a
-                    // cryptographically unguessable secret: it only fences a
-                    // command against a *superseded* activation of the same job
-                    // (Camunda's `hasLeaseToken()` gate), so a predictable
-                    // monotonic value suffices — forgery-resistance of external
-                    // callers is the gateway auth layer's job (ADR-0028), not
-                    // this token's. Ordinary jobs activate lease-less (`None`) —
-                    // the agent lease gate then skips the lease comparison for
-                    // them (Camunda's `!hasLeaseToken()`).
-                    let lease_token = if self.is_external_agent_job(job_key) {
-                        Some(self.mint_key())
-                    } else {
-                        None
-                    };
-                    self.emit(
-                        &mut log,
-                        Event::JobActivated {
-                            job_key,
-                            instance_key,
-                            worker: worker.clone(),
-                            deadline,
-                            activated_at: Some(now),
-                            // Stamp the declared read-set onto every activation in
-                            // this batch. Cloned per job so each `JobActivated`
-                            // independently carries its provenance; empty for a
-                            // fetch-all activation (byte-identical, no field).
-                            fetch_variables: fetch_variables.clone(),
-                            lease_token,
+                let keys = self.select_activatable_job_keys(&job_type, max_jobs, now, with_lease);
+                self.apply_activation_plan(
+                    &mut log,
+                    ActivationPlan {
+                        job_keys: keys,
+                        worker,
+                        timeout,
+                        now,
+                        options: crate::JobActivationOptions {
+                            fetch_variables,
+                            with_lease,
                         },
-                    );
-                }
+                        durable: false,
+                    },
+                );
+            }
+            Command::ActivateJobsByKey {
+                job_keys,
+                worker,
+                timeout,
+                now,
+                fetch_variables,
+                with_lease,
+            } => {
+                self.apply_activation_plan(
+                    &mut log,
+                    ActivationPlan {
+                        job_keys,
+                        worker,
+                        timeout,
+                        now,
+                        options: crate::JobActivationOptions {
+                            fetch_variables,
+                            with_lease,
+                        },
+                        durable: true,
+                    },
+                );
             }
 
             Command::ExpireJobs { now } => {
-                // Only Activated jobs can have an expired lock, and they are
-                // indexed, so iterate that small set instead of every job.
-                let mut expired: Vec<(Key, Key)> = self
-                    .state
-                    .activated_jobs
-                    .iter()
-                    .filter_map(|k| {
-                        let j = self.state.jobs.get(k)?;
-                        (j.state == state::JobState::Activated
-                            && j.deadline.is_some_and(|d| d <= now))
-                        .then_some((j.key, j.instance_key))
-                    })
-                    .collect();
-                expired.sort_unstable();
-                for (job_key, instance_key) in expired {
-                    self.emit(
-                        &mut log,
-                        Event::JobLockExpired {
-                            job_key,
-                            instance_key,
-                        },
-                    );
-                }
+                self.expire_job_locks(&mut log, now, None);
+            }
+            Command::ExpireJobsByDurability { now, durable } => {
+                self.expire_job_locks(&mut log, now, Some(durable));
             }
 
             Command::TriggerTimers { now } => {
@@ -2721,6 +2588,7 @@ impl Engine {
 
             Command::FailJob {
                 job_key,
+                lease_token,
                 retries,
                 error_message,
             } => {
@@ -2738,6 +2606,7 @@ impl Engine {
                 ) {
                     return Err(EngineError::JobNotActive { job_key });
                 }
+                Self::validate_job_lease(job, lease_token.as_deref(), true)?;
                 // Like completion, failing a job requires that it was activated
                 // (unless lenient completion allows leader-local activation).
                 if !self.lenient_completion && !job.activated {
@@ -2781,6 +2650,7 @@ impl Engine {
 
             Command::ThrowJobError {
                 job_key,
+                lease_token,
                 error_code,
                 error_message,
                 variables,
@@ -2807,6 +2677,7 @@ impl Engine {
                 let task_element_id = job.element_id.clone();
                 let worker = job.worker.clone();
 
+                Self::validate_job_lease(job, lease_token.as_deref(), true)?;
                 // The job is consumed by the thrown error either way.
                 self.emit(
                     &mut log,
@@ -2915,63 +2786,50 @@ impl Engine {
 
             Command::UpdateJobRetries {
                 job_key,
+                lease_token,
                 retries,
                 operation_reference,
             } => {
-                let job = self
-                    .state
-                    .jobs
-                    .get(&job_key)
-                    .ok_or(EngineError::JobNotFound { job_key })?;
-                // Retries are only meaningful while a job is still in play;
-                // completed/errored jobs are terminal.
-                if matches!(
-                    job.state,
-                    state::JobState::Completed
-                        | state::JobState::Errored
-                        | state::JobState::Canceled
-                ) {
-                    return Err(EngineError::JobNotActive { job_key });
-                }
-                let instance_key = job.instance_key;
-                let retries = retries.max(0);
-                self.emit(
+                self.update_job_properties(
                     &mut log,
-                    Event::JobRetriesUpdated {
-                        job_key,
-                        instance_key,
-                        retries,
-                        operation_reference,
-                    },
-                );
+                    job_key,
+                    Some(retries),
+                    None,
+                    operation_reference,
+                    lease_token.as_deref(),
+                )?;
             }
 
             Command::UpdateJobTimeout {
                 job_key,
+                lease_token,
                 timeout,
                 operation_reference,
             } => {
-                let job = self
-                    .state
-                    .jobs
-                    .get(&job_key)
-                    .ok_or(EngineError::JobNotFound { job_key })?;
-                // Only a currently-locked (Activated) job has a lock to extend.
-                // A Created/terminal job has no active deadline to reset.
-                if job.state != state::JobState::Activated {
-                    return Err(EngineError::JobNotActive { job_key });
-                }
-                let instance_key = job.instance_key;
-                let deadline = now.saturating_add(timeout);
-                self.emit(
+                self.update_job_properties(
                     &mut log,
-                    Event::JobTimeoutUpdated {
-                        job_key,
-                        instance_key,
-                        deadline,
-                        operation_reference,
-                    },
-                );
+                    job_key,
+                    None,
+                    Some(timeout),
+                    operation_reference,
+                    lease_token.as_deref(),
+                )?;
+            }
+            Command::UpdateJob {
+                job_key,
+                retries,
+                timeout,
+                operation_reference,
+                lease_token,
+            } => {
+                self.update_job_properties(
+                    &mut log,
+                    job_key,
+                    retries,
+                    timeout,
+                    operation_reference,
+                    lease_token.as_deref(),
+                )?;
             }
 
             Command::ResolveIncident {
@@ -4152,7 +4010,7 @@ impl Engine {
             }
             // AgentInstance lifecycle commands (slice S3). Each processor
             // validates against the stable/8.10 rules, applies any history batch
-            // via the S2 append/commit behavior, enforces the configured limits,
+            // via the attributed pending-history behavior,
             // and emits the CREATED/UPDATED/COMPLETED record event. Validation
             // failures return an `EngineError` and apply nothing.
             Command::CreateAgentInstance {
@@ -5084,7 +4942,14 @@ impl Engine {
                 // scope (absent from `scopes` ⇒ root) and re-derive only the
                 // activation body to re-open the subscription.
                 let scope = self.scope_of(instance_key, element_instance_key);
-                self.run_activation_body(instance_key, element_id, element_instance_key, scope)
+                let vars = self.variables_for_element(instance_key, element_instance_key);
+                self.run_activation_body(
+                    instance_key,
+                    element_id,
+                    element_instance_key,
+                    scope,
+                    vars,
+                )
             }
             Step::RetryActivation {
                 instance_key,
@@ -5376,6 +5241,13 @@ impl Engine {
             });
         }
 
+        // Scope writes above have not been applied yet. Both listeners and the
+        // activation body must evaluate against the same post-input view.
+        let mut activation_vars = element_vars;
+        if !input_updates.is_empty() {
+            Arc::make_mut(&mut activation_vars).extend(input_updates);
+        }
+
         // Start execution listeners (ADR 0037): before the element enacts its
         // own behaviour (creating a job, routing a gateway, opening a
         // sub-process) it runs a sequential chain of `start` listener jobs. The
@@ -5390,11 +5262,9 @@ impl Engine {
             crate::model::ListenerEventType::Start,
         );
         if let Some(first) = start_listeners.first() {
-            let mut listener_vars = (*element_vars).clone();
-            listener_vars.extend(input_updates);
             let job_key = self.mint_key();
-            let job_type = self.resolve_job_type(&listener_vars, &first.job_type);
-            let retries = self.resolve_retries(&listener_vars, first.retries.as_deref());
+            let job_type = self.resolve_job_type(&activation_vars, &first.job_type);
+            let retries = self.resolve_retries(&activation_vars, first.retries.as_deref());
             events.push(Event::ExecutionListenerJobCreated {
                 job_key,
                 instance_key,
@@ -5410,8 +5280,13 @@ impl Engine {
             return (events, followups);
         }
 
-        let (kind_events, kind_followups) =
-            self.run_activation_body(instance_key, element_id, element_instance_key, scope);
+        let (kind_events, kind_followups) = self.run_activation_body(
+            instance_key,
+            element_id,
+            element_instance_key,
+            scope,
+            activation_vars,
+        );
         events.extend(kind_events);
         (events, kind_followups)
     }
@@ -5460,10 +5335,10 @@ impl Engine {
         element_id: String,
         element_instance_key: Key,
         scope: Key,
+        element_vars: Arc<HashMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         let kind = self.element_kind(instance_key, &element_id);
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
-        let element_vars = self.variables_for_element(instance_key, scope);
         let mut events: Vec<Event> = Vec::new();
         let mut followups: Vec<Step> = Vec::new();
 
@@ -5930,107 +5805,6 @@ impl Engine {
                         });
                     }
                 }
-            }
-            // An AI agent element (Camunda `zeebe:agentDefinition`). The engine
-            // is the system-of-record for agent state: on activation create a
-            // first-class AgentInstance (status INITIALIZING) keyed by its own
-            // dedicated key and linked to this element instance. LLM calls /
-            // prompt assembly / tool dispatch stay in the worker layer; the
-            // token parks on the element (no completion follow-up) while the
-            // agent runs, exactly like a job-bearing service task.
-            Some(ElementKind::AgentTask {
-                agent_type,
-                definition,
-                limits,
-            }) => {
-                if agent_type == crate::agent::AgentType::External {
-                    // Camunda parity (#1099): an `external` agent element is
-                    // **job-backed**. There is no `AGENT_TASK` element type in
-                    // Camunda — an `external` agent is an ordinary service-task
-                    // job. So on activation it creates a normal job (a worker
-                    // activates it through the standard job loop) and parks the
-                    // token, exactly like a service task; it does **not**
-                    // auto-mint an AgentInstance. The worker self-registers the
-                    // AgentInstance lazily via a lease-gated
-                    // `CreateAgentInstance` (`process_create_agent_instance`),
-                    // gated on this job's ACTIVATED lease. The job type is the
-                    // element id — an `AgentTask` carries no
-                    // `zeebe:taskDefinition`, so the element id is the worker's
-                    // deterministic type to subscribe to.
-                    let job_key = self.mint_key();
-                    events.push(Event::JobCreated {
-                        job_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id: element_id.clone(),
-                        job_type: element_id.clone(),
-                        created_at: self.now,
-                        priority: crate::state::DEFAULT_JOB_PRIORITY,
-                        retries: crate::state::DEFAULT_JOB_RETRIES,
-                    });
-                }
-                // Only mint an AgentInstance when the owning ProcessInstance is
-                // present: defaulting a missing/corrupt instance would silently
-                // record an agent with an empty bpmn_process_id and a zero
-                // process_definition_key. Resolve-or-skip instead. This eager
-                // auto-mint is for the engine-native `aiAgentTask` /
-                // `aiAgentSubProcess` variants only (they have no external
-                // worker); an `external` agent is minted by its worker's CREATE.
-                else if let Some((
-                    bpmn_process_id,
-                    process_definition_key,
-                    process_definition_version,
-                )) = self.state.instances.get(&instance_key).map(|inst| {
-                    let version = self
-                        .state
-                        .process_versions
-                        .get(&inst.process_definition_key)
-                        .map(|d| d.version)
-                        .unwrap_or(0);
-                    (
-                        inst.process_id.clone(),
-                        inst.process_definition_key,
-                        version,
-                    )
-                }) {
-                    let agent_instance_key = self.mint_key();
-                    let root_process_instance_key = self.root_process_instance_key(instance_key);
-                    let agent_instance = crate::agent::AgentInstance {
-                        agent_instance_key,
-                        agent_definition_key: 0,
-                        element_instance_key,
-                        element_instance_keys: vec![element_instance_key],
-                        element_id: element_id.clone(),
-                        process_instance_key: instance_key,
-                        root_process_instance_key,
-                        bpmn_process_id,
-                        process_definition_key,
-                        process_definition_version,
-                        process_definition_version_tag: None,
-                        tenant_id: crate::DEFAULT_TENANT.to_string(),
-                        agent_type,
-                        status: crate::agent::AgentInstanceStatus::Initializing,
-                        definition,
-                        limits: limits.unwrap_or_default(),
-                        metrics: crate::agent::AgentInstanceMetrics::default(),
-                        tools: Vec::new(),
-                        job_key: 0,
-                        job_lease: 0,
-                        created_at: self.now,
-                        last_updated_at: self.now,
-                        completed_at: 0,
-                    };
-                    events.push(Event::AgentInstanceCreated {
-                        instance_key,
-                        agent_instance,
-                    });
-                }
-                events.extend(self.arm_boundary_events(
-                    instance_key,
-                    element_instance_key,
-                    scope,
-                    &element_id,
-                ));
             }
             // An inline-FEEL script task is a synchronous activity: it activates
             // and immediately completes (no job). Its FEEL expression is
@@ -9141,7 +8915,14 @@ impl Engine {
                         self.spawn_multi_instance_children(instance_key, element_instance_key),
                     )
                 } else {
-                    self.run_activation_body(instance_key, element_id, element_instance_key, scope)
+                    let vars = self.variables_for_element(instance_key, element_instance_key);
+                    self.run_activation_body(
+                        instance_key,
+                        element_id,
+                        element_instance_key,
+                        scope,
+                        vars,
+                    )
                 }
             }
             crate::model::ListenerEventType::End => {
@@ -10502,6 +10283,38 @@ impl Engine {
             .collect()
     }
     fn emit(&mut self, log: &mut Vec<Event>, event: Event) {
+        let resolution = match &event {
+            Event::JobCompleted {
+                job_key,
+                instance_key,
+                ..
+            } => Some((
+                *instance_key,
+                *job_key,
+                self.state
+                    .jobs
+                    .get(job_key)
+                    .and_then(|job| job.lease_token.clone())
+                    .unwrap_or_default(),
+                true,
+            )),
+            Event::JobCanceled {
+                job_key,
+                instance_key,
+                ..
+            }
+            | Event::JobErrorThrown {
+                job_key,
+                instance_key,
+                ..
+            } => Some((*instance_key, *job_key, String::new(), false)),
+            _ => None,
+        };
+        if let Event::ProcessInstanceCompleted { instance_key }
+        | Event::ProcessInstanceTerminated { instance_key } = &event
+        {
+            self.cleanup_agent_instances(log, *instance_key);
+        }
         if self.track_dirty_vars {
             match &event {
                 Event::ProcessInstanceCreated { instance_key, .. }
@@ -10525,6 +10338,9 @@ impl Engine {
         }
         state::apply(&mut self.state, &event);
         log.push(event);
+        if let Some((instance_key, job_key, lease, commit)) = resolution {
+            self.settle_job_history(log, instance_key, job_key, &lease, commit);
+        }
     }
 
     fn process_of_instance(&self, instance_key: Key) -> Option<&crate::model::ProcessDefinition> {
@@ -10538,25 +10354,127 @@ impl Engine {
             .map(|e| e.kind.clone())
     }
 
-    /// Whether `job_key` backs an `external`, job-backed agent task — the jobs
-    /// that activate *with a lease* (Camunda `withLease()`), and so are minted an
-    /// opaque per-activation lease token in the `ActivateJobs` handler. Ordinary
-    /// service-task / listener jobs (and the engine-native `aiAgentTask`
-    /// variants, which carry no job) activate lease-less.
-    fn is_external_agent_job(&self, job_key: Key) -> bool {
-        self.state
+    fn apply_activation_plan(&mut self, log: &mut Vec<Event>, plan: ActivationPlan) {
+        let ActivationPlan {
+            job_keys,
+            worker,
+            timeout,
+            now,
+            options,
+            durable,
+        } = plan;
+        let mut seen = std::collections::HashSet::new();
+        for job_key in job_keys {
+            if !seen.insert(job_key) {
+                continue;
+            }
+            let Some(job) = self.state.jobs.get(&job_key) else {
+                continue;
+            };
+            let activatable = job.state == state::JobState::Created
+                || (job.state == state::JobState::Activated
+                    && !self.job_requires_durable_activation(job_key));
+            if !activatable || (!options.with_lease && job.lease_token.is_some()) {
+                continue;
+            }
+            let instance_key = job.instance_key;
+            // Consuming replicated keys makes issuance deterministic. Replay
+            // restores this reservation through Event::max_key.
+            let lease_token = options
+                .with_lease
+                .then(|| crate::lease::issue(self.mint_key()));
+            self.emit(
+                log,
+                Event::JobActivated {
+                    job_key,
+                    instance_key,
+                    durable,
+                    worker: worker.clone(),
+                    deadline: now.saturating_add(timeout),
+                    activated_at: Some(now),
+                    fetch_variables: options.fetch_variables.clone(),
+                    lease_token,
+                },
+            );
+        }
+    }
+
+    fn update_job_properties(
+        &mut self,
+        log: &mut Vec<Event>,
+        job_key: Key,
+        retries: Option<i32>,
+        timeout: Option<i64>,
+        operation_reference: Option<i64>,
+        lease_token: Option<&str>,
+    ) -> Result<(), EngineError> {
+        let job = self
+            .state
             .jobs
             .get(&job_key)
-            .and_then(|job| self.element_kind(job.instance_key, &job.element_id))
-            .is_some_and(|kind| {
-                matches!(
-                    kind,
-                    ElementKind::AgentTask {
-                        agent_type: crate::agent::AgentType::External,
-                        ..
-                    }
-                )
-            })
+            .ok_or(EngineError::JobNotFound { job_key })?;
+        if matches!(
+            job.state,
+            state::JobState::Completed | state::JobState::Canceled
+        ) {
+            return Err(EngineError::JobNotActive { job_key });
+        }
+        Self::validate_job_lease(job, lease_token, false)?;
+        if retries.is_some_and(|value| value < 1) {
+            return Err(EngineError::JobUpdateInvalid {
+                job_key,
+                reason: "retries must be at least 1".into(),
+            });
+        }
+        if timeout.is_some() && (job.state != state::JobState::Activated || job.deadline.is_none())
+        {
+            return Err(EngineError::JobUpdateInvalid {
+                job_key,
+                reason: "timeout requires an active job deadline".into(),
+            });
+        }
+        let instance_key = job.instance_key;
+        if let Some(retries) = retries {
+            self.emit(
+                log,
+                Event::JobRetriesUpdated {
+                    job_key,
+                    instance_key,
+                    retries,
+                    operation_reference,
+                },
+            );
+        }
+        if let Some(timeout) = timeout {
+            self.emit(
+                log,
+                Event::JobTimeoutUpdated {
+                    job_key,
+                    instance_key,
+                    deadline: self.now.saturating_add_signed(timeout),
+                    operation_reference,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_job_lease(
+        job: &state::Job,
+        supplied: Option<&str>,
+        required: bool,
+    ) -> Result<(), EngineError> {
+        let Some(stored) = job.lease_token.as_deref().filter(|token| !token.is_empty()) else {
+            return Ok(());
+        };
+        let supplied = supplied.filter(|token| !token.is_empty());
+        if supplied.is_none() && !required {
+            return Ok(());
+        }
+        if supplied != Some(stored) {
+            return Err(EngineError::JobLeaseMismatch { job_key: job.key });
+        }
+        Ok(())
     }
 
     /// The multi-instance loop characteristics declared on `element_id`, if any.
@@ -10658,6 +10576,22 @@ pub enum EngineError {
     /// `CompleteJob`/`FailJob` referenced a job that is not in a state where it
     /// can be acted on (already completed, or failed with an incident raised).
     JobNotActive { job_key: Key },
+    /// A leased lifecycle command omitted its token, or supplied a stale token (409).
+    JobLeaseMismatch { job_key: Key },
+    /// A requested job property is invalid for the current job (400).
+    JobUpdateInvalid { job_key: Key, reason: String },
+    /// CREATE cannot replace an agent already associated with the element (409).
+    AgentInstanceAlreadyExists {
+        element_instance_key: Key,
+        agent_instance_key: Key,
+    },
+    /// Another element's activated job still owns the write claim (409).
+    AgentInstanceActiveWriter {
+        agent_instance_key: Key,
+        element_instance_key: Key,
+    },
+    /// Invalid history shape, configuration, or request-level history patch (400).
+    AgentHistoryInvalid { reason: String },
     /// `CompleteJob`/`FailJob` referenced a job that has never been activated. A
     /// job must be activated at least once before it can be completed or failed.
     JobNotActivated { job_key: Key },
@@ -10884,6 +10818,11 @@ fn unsupported_migration_reason(kind: &crate::model::ElementKind) -> Option<&'st
 impl std::fmt::Display for EngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            EngineError::JobLeaseMismatch { job_key } => write!(f, "job {job_key} requires the current activation lease token"),
+            EngineError::JobUpdateInvalid { job_key, reason } => write!(f, "invalid update for job {job_key}: {reason}"),
+            EngineError::AgentInstanceAlreadyExists { element_instance_key, agent_instance_key } => write!(f, "element instance {element_instance_key} is already associated with agent instance {agent_instance_key}"),
+            EngineError::AgentInstanceActiveWriter { agent_instance_key, element_instance_key } => write!(f, "agent instance {agent_instance_key} still has an active writer on element instance {element_instance_key}"),
+            EngineError::AgentHistoryInvalid { reason } => write!(f, "invalid agent history: {reason}"),
             EngineError::ProcessNotFound { process_id } => {
                 write!(f, "no deployed process with id {process_id}")
             }
@@ -11218,15 +11157,9 @@ pub struct ActivatedJob {
     pub worker: String,
     /// Logical instant at which the activation lock expires.
     pub deadline: u64,
-    /// The per-activation **lease token** for a job activated *with a lease* (an
-    /// `external`, job-backed agent task's job), distinct from `deadline`. A
-    /// staleness handle (monotonic key, *not* a cryptographically unguessable
-    /// secret) that only fences a command against a superseded activation;
-    /// caller forgery-resistance is the gateway auth layer's job (ADR-0028).
-    /// `None` for a lease-less activation. An `external` agent worker
-    /// echoes this back as `jobLease` when it registers its AgentInstance /
-    /// history batch (#1099/#1106).
-    pub lease_token: Option<u64>,
+    /// Opaque token for an explicitly leased activation, distinct from `deadline`.
+    /// Every job kind supports leasing. `None` when the worker did not opt in.
+    pub lease_token: Option<String>,
     /// Remaining retries for this job.
     pub retries: i32,
     /// Activation priority (higher is activated first; Zeebe

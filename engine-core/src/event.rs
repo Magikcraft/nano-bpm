@@ -347,6 +347,13 @@ pub enum Event {
     JobActivated {
         job_key: Key,
         instance_key: Key,
+        /// An authoritative activation must never become a leader-local lock,
+        /// including when no lease token was requested.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "std::ops::Not::not")
+        )]
+        durable: bool,
         worker: String,
         deadline: u64,
         /// The logical instant the lock was acquired (the activating command's
@@ -380,16 +387,16 @@ pub enum Event {
             serde(default, skip_serializing_if = "Vec::is_empty")
         )]
         fetch_variables: Vec<String>,
-        /// The **per-activation lease token** minted for this activation
-        /// when it was activated *with a lease* (an `external`, job-backed agent
-        /// task's job), distinct from `deadline` (Camunda `JobRecord.leaseToken`,
-        /// ADR 0005-810-job-lease). A staleness handle (monotonic key, not a
+        /// The opaque **per-activation lease token**, minted only when the worker
+        /// requests `withLease`, for any job kind. Distinct from `deadline`
+        /// (Camunda `JobRecord.leaseToken`, ADR 0005-810-job-lease).
+        /// A staleness handle (backed by a monotonic key, not a
         /// cryptographically unguessable secret) that only fences a command
         /// against a superseded activation; caller forgery-resistance is the
         /// gateway auth layer's job (ADR-0028). Generated exactly once at
         /// command-processing and carried here so replay restores it verbatim
-        /// rather than regenerating it (D2). `None` for a *lease-less* activation
-        /// (ordinary service-task / listener jobs), which the agent lease gate
+        /// rather than regenerating it (D2). `None` for a *lease-less* activation,
+        /// which the agent lease gate
         /// (`validate_agent_job_context`) treats as Camunda's `!hasLeaseToken()`
         /// — the lease comparison is skipped. Serialized only when present, so
         /// lease-less activations stay byte-identical in the journal.
@@ -397,7 +404,11 @@ pub enum Event {
             feature = "serde",
             serde(default, skip_serializing_if = "Option::is_none")
         )]
-        lease_token: Option<u64>,
+        #[cfg_attr(
+            feature = "serde",
+            serde(deserialize_with = "crate::lease::deserialize_optional")
+        )]
+        lease_token: Option<String>,
     },
     /// A job's activation lock expired (its `deadline` passed); it becomes
     /// activatable again. Emitted by an `ExpireJobs` tick.
@@ -1373,8 +1384,19 @@ impl Event {
                     .max(*element_instance_key)
                     .max(*user_task_key)
             }
-            Event::JobActivated { job_key, .. }
-            | Event::JobLockExpired { job_key, .. }
+            Event::JobActivated {
+                job_key,
+                lease_token,
+                ..
+            } => {
+                m = m.max(*job_key).max(
+                    lease_token
+                        .as_deref()
+                        .map(crate::lease::issued_key)
+                        .unwrap_or(0),
+                );
+            }
+            Event::JobLockExpired { job_key, .. }
             | Event::JobFailed { job_key, .. }
             | Event::JobErrorThrown { job_key, .. }
             | Event::JobCompleted { job_key, .. }

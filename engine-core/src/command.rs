@@ -11,6 +11,18 @@ use crate::model::{
 };
 use crate::state::{Key, MessageSubscriptionKind};
 
+/// Worker activation options. Leasing is opt-in for every kind of job.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct JobActivationOptions {
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub fetch_variables: Vec<String>,
+    /// Request a fencing token, not a replication policy. Replicated agent
+    /// CREATE/UPDATE require durable activation context even when this is false.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub with_lease: bool,
+}
+
 /// An instruction submitted to [`crate::Engine::apply_command`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -77,10 +89,15 @@ pub enum Command {
         version: Option<i32>,
     },
     /// Report that the work for a job has finished, optionally merging variables
-    /// into the instance before the token resumes. Completion is by key alone:
-    /// any holder of the key may complete a job that has been activated.
+    /// into the instance before the token resumes. Leased jobs require the
+    /// current activation token; unleased jobs require only the job key.
     CompleteJob {
         job_key: Key,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        lease_token: Option<String>,
         variables: HashMap<String, Value>,
         /// Optional agentic result for a JOB_WORKER ad-hoc sub-process container
         /// job (Camunda `JobResult`). `None` for every ordinary completion, and
@@ -146,11 +163,34 @@ pub enum Command {
             serde(default, skip_serializing_if = "Vec::is_empty")
         )]
         fetch_variables: Vec<String>,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "std::ops::Not::not")
+        )]
+        with_lease: bool,
+    },
+    /// Apply an authoritative activation plan without selecting replacement jobs.
+    /// The host serializes selection through commit against local activations.
+    /// Replica-local soft locks may be replaced; durable activations cannot.
+    /// Every selected job stays in the durable domain, even without a lease.
+    ActivateJobsByKey {
+        job_keys: Vec<Key>,
+        worker: String,
+        timeout: u64,
+        now: u64,
+        #[cfg_attr(feature = "serde", serde(default))]
+        fetch_variables: Vec<String>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        with_lease: bool,
     },
     /// Release the activation lock of every job whose `deadline` is at or before
     /// `now`, making it activatable again. A periodic "tick" the host drives;
     /// keeps lock expiry deterministic and out of the engine's clock.
     ExpireJobs { now: u64 },
+    /// Expire only durable activations (`true`) or leader-local soft locks
+    /// (`false`). Hosts mixing replicated and leader-local activation must keep
+    /// these expiry domains separate.
+    ExpireJobsByDurability { now: u64, durable: bool },
     /// Fire every armed timer whose `due_at` is at or before `now`, releasing the
     /// token parked on its timer intermediate catch event along the event's
     /// outgoing flow. A periodic "tick" the host drives; keeps timer firing
@@ -161,6 +201,11 @@ pub enum Command {
     /// and the job parks. `error_message` is recorded as the incident reason.
     FailJob {
         job_key: Key,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        lease_token: Option<String>,
         retries: i32,
         error_message: String,
     },
@@ -169,6 +214,11 @@ pub enum Command {
     /// otherwise an incident is raised. The job is consumed either way.
     ThrowJobError {
         job_key: Key,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        lease_token: Option<String>,
         error_code: String,
         error_message: String,
         /// Variables to instantiate at the local scope of the error catch event
@@ -189,6 +239,11 @@ pub enum Command {
     /// resulting event.
     UpdateJobRetries {
         job_key: Key,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        lease_token: Option<String>,
         retries: i32,
         #[cfg_attr(
             feature = "serde",
@@ -196,22 +251,42 @@ pub enum Command {
         )]
         operation_reference: Option<i64>,
     },
-    /// Extend the activation lock of a currently-activated job, resetting its
-    /// `deadline` to `now + timeout`. This is the worker-side mechanism for
+    /// Reset the activation lock of a currently-activated job to `now + timeout`.
+    /// Signed durations may shorten it; zero or negative values make the lock
+    /// due for expiration on the next host-driven expiry sweep.
+    /// This is the worker-side mechanism for
     /// legitimately holding a long-running job open past its original lock:
     /// without it the lock simply expires (`JobLockExpired`) and the job is
     /// re-activated elsewhere. Only meaningful for an `Activated` job — a job
-    /// that is not currently locked returns `JobNotActive`. `operation_reference`
+    /// that is not currently locked returns `JobUpdateInvalid`. `operation_reference`
     /// is an optional caller-supplied audit correlation id, journaled on the
     /// resulting event.
     UpdateJobTimeout {
         job_key: Key,
-        timeout: u64,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        lease_token: Option<String>,
+        timeout: i64,
         #[cfg_attr(
             feature = "serde",
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         operation_reference: Option<i64>,
+    },
+    /// Atomically validate and update job properties. An empty changeset still
+    /// validates job state and a supplied lease token.
+    UpdateJob {
+        job_key: Key,
+        #[cfg_attr(feature = "serde", serde(default))]
+        retries: Option<i32>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        timeout: Option<i64>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        operation_reference: Option<i64>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        lease_token: Option<String>,
     },
     /// Resolve an open incident by retrying the work that failed. A job-incident
     /// returns the parked job (which must have retries left) to the activatable
@@ -390,35 +465,27 @@ pub enum Command {
     CreateAgentInstance {
         /// The key of the AI Agent Sub-process / AI Agent Task element instance.
         element_instance_key: Key,
-        /// The agent job whose ACTIVATED lease authorizes this create. Required
-        /// for an `external` (job-backed) agent element (#1099): the referenced
-        /// job must be `ACTIVATED`, its `element_instance_key` must match, and
-        /// its lease deadline must equal `job_lease` — mirroring Camunda's
-        /// `AgentHistoryBatchBehavior.validateJobContext`. Ignored (`0`) for the
-        /// engine-native `aiAgentTask`/`aiAgentSubProcess` variants, which have
-        /// no external worker and whose AgentInstance is auto-minted at
-        /// activation.
+        /// Job attribution for any agent type. A supplied job must be ACTIVATED,
+        /// belong to this element instance, and have the matching opaque lease.
+        /// History requires a job; a history-free request may omit it (`0`),
+        /// mirroring Camunda's `AgentHistoryBatchBehavior.validateJobContext`.
         #[cfg_attr(feature = "serde", serde(default))]
         job_key: Key,
-        /// The activation lease deadline (the "lease token") of `job_key`. Must
-        /// equal the referenced job's current lease deadline for an `external`
-        /// agent; ignored (`0`) otherwise.
+        /// The opaque activation lease token of `job_key`, not its deadline.
         #[cfg_attr(feature = "serde", serde(default))]
-        job_lease: u64,
-        /// Static definition set once at creation (model/provider/systemPrompt).
+        job_lease: String,
+        /// Legacy internal history-free definition. History-bearing CREATE
+        /// derives its definition exclusively from CONFIGURATION items.
         definition: crate::agent::AgentDefinition,
-        /// Limits for the agent execution; `None` = all limits default to `-1`.
-        /// An explicit value wins; absent that, the last `limits` carried by a
-        /// turn in `history` (a CONFIGURATION item) is used; absent both, limits
-        /// default to unlimited (`-1/-1/-1`).
+        /// Legacy internal history-free limits. The canonical REST path supplies
+        /// limits through CONFIGURATION history; unspecified limits default to -1.
         #[cfg_attr(
             feature = "serde",
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         limits: Option<crate::agent::AgentInstanceLimits>,
-        /// An optional initial batch of AgentHistory turns applied (append +
-        /// commit, slice S2 behavior) at creation. Each becomes its own
-        /// AGENT_HISTORY record.
+        /// Initial history, required by the REST contract. Each new item remains
+        /// pending until its job resolves. CONFIGURATION establishes the definition.
         #[cfg_attr(
             feature = "serde",
             serde(default, skip_serializing_if = "Vec::is_empty")
@@ -427,9 +494,8 @@ pub enum Command {
     },
     /// Update an engine-native AgentInstance (Camunda `AgentInstanceIntent.UPDATE`,
     /// stable/8.10; `PATCH /v2/agent-instances/{key}`): advance its status
-    /// (to one of the *active* states), accumulate metric deltas, replace the
-    /// tool set, and append the turn history (slice S2 behavior). The processor
-    /// enforces the configured limits.
+    /// (to one of the active states) and append attributed, pending history.
+    /// Usage is derived from history; configuration changes apply on job commit.
     UpdateAgentInstance {
         agent_instance_key: Key,
         /// The element instance asserting ownership of this update. Must be an
@@ -446,19 +512,15 @@ pub enum Command {
         /// instance; must match the stored instance.
         #[cfg_attr(feature = "serde", serde(default))]
         process_instance_key: Key,
-        /// The agent job whose ACTIVATED lease authorizes an appended history
-        /// batch for an `external` (job-backed) agent element (#1099). When this
-        /// update carries `history` for an `external` agent, the referenced job
-        /// must be `ACTIVATED`, match `element_instance_key`, and its lease
-        /// deadline must equal `job_lease` (parity with Camunda's
-        /// `validateJobContext`). Ignored (`0`) for the engine-native variants
-        /// and for history-free updates.
+        /// A supplied job is always lease-validated, for every agent type.
+        /// History requires an ACTIVATED job belonging to this element instance;
+        /// a history-free update may omit job attribution (`0`).
         #[cfg_attr(feature = "serde", serde(default))]
         job_key: Key,
-        /// The activation lease deadline (the "lease token") of `job_key`; see
+        /// The opaque activation lease token of `job_key`; see
         /// `job_key`.
         #[cfg_attr(feature = "serde", serde(default))]
-        job_lease: u64,
+        job_lease: String,
         /// The target status; must be one of the *active* states (`COMPLETED`
         /// is not settable via UPDATE — it is reached only via COMPLETE).
         #[cfg_attr(
@@ -466,29 +528,26 @@ pub enum Command {
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         status: Option<crate::agent::AgentInstanceStatus>,
-        /// Metric increments folded into the instance's running totals. The
-        /// processor rejects the batch if the resulting totals would breach a
-        /// configured (`!= -1`) limit.
+        /// Legacy internal history-free metric patch. Must be default when history
+        /// is supplied; canonical REST usage derives metrics from the history items.
         #[cfg_attr(feature = "serde", serde(default))]
         metrics: crate::agent::AgentInstanceMetricsDelta,
-        /// The new tool set (replaces the stored one) when present.
+        /// Legacy internal history-free tool patch; history-bearing updates use CONFIGURATION.
         #[cfg_attr(
             feature = "serde",
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         tools: Option<Vec<crate::agent::AgentTool>>,
-        /// A batch of AgentHistory turns appended (append + commit, slice S2
-        /// behavior) as part of this update.
+        /// A batch of AgentHistory turns appended pending resolution of their job.
         #[cfg_attr(
             feature = "serde",
             serde(default, skip_serializing_if = "Vec::is_empty")
         )]
         history: Vec<crate::agent::AgentHistoryTurn>,
     },
-    /// Complete an engine-native AgentInstance (Camunda `AgentInstanceIntent.COMPLETE`,
-    /// stable/8.10): drive it to `COMPLETED`. The completion processor landed in
-    /// this slice (S3); its wasm `TestEngine` driver (`completeAgentInstance`) is
-    /// surfaced in `engine-wasm` (agent-instance-parity S6).
+    /// Legacy embedded per-agent completion extension, not the Camunda REST
+    /// contract. Does not commit history or advance BPMN. Canonical completion
+    /// cleans up all agents when their process instance finishes.
     CompleteAgentInstance { agent_instance_key: Key },
 }
 
@@ -610,12 +669,15 @@ impl Command {
             Command::UpdateUserTask { .. } => "update_user_task",
             Command::CompleteUserTask { .. } => "complete_user_task",
             Command::ActivateJobs { .. } => "activate_jobs",
+            Command::ActivateJobsByKey { .. } => "activate_jobs_by_key",
             Command::ExpireJobs { .. } => "expire_jobs",
+            Command::ExpireJobsByDurability { .. } => "expire_jobs_by_durability",
             Command::TriggerTimers { .. } => "trigger_timers",
             Command::FailJob { .. } => "fail_job",
             Command::ThrowJobError { .. } => "throw_job_error",
             Command::UpdateJobRetries { .. } => "update_job_retries",
             Command::UpdateJobTimeout { .. } => "update_job_timeout",
+            Command::UpdateJob { .. } => "update_job",
             Command::ResolveIncident { .. } => "resolve_incident",
             Command::SetVariables { .. } => "set_variables",
             Command::CorrelateMessage { .. } => "correlate_message",
@@ -780,6 +842,7 @@ impl Command {
     pub fn complete_job(job_key: Key) -> Self {
         Command::CompleteJob {
             job_key,
+            lease_token: None,
             variables: HashMap::new(),
             adhoc_result: None,
             task_listener_result: None,
@@ -794,6 +857,7 @@ impl Command {
     ) -> Self {
         Command::CompleteJob {
             job_key,
+            lease_token: None,
             variables: HashMap::new(),
             adhoc_result: None,
             task_listener_result: Some(task_listener_result),
@@ -804,6 +868,7 @@ impl Command {
     pub fn complete_job_with(job_key: Key, variables: HashMap<String, Value>) -> Self {
         Command::CompleteJob {
             job_key,
+            lease_token: None,
             variables,
             adhoc_result: None,
             task_listener_result: None,
@@ -819,6 +884,7 @@ impl Command {
     ) -> Self {
         Command::CompleteJob {
             job_key,
+            lease_token: None,
             variables,
             adhoc_result: Some(adhoc_result),
             task_listener_result: None,
@@ -867,6 +933,7 @@ impl Command {
     pub fn fail_job(job_key: Key, retries: i32, error_message: impl Into<String>) -> Self {
         Command::FailJob {
             job_key,
+            lease_token: None,
             retries,
             error_message: error_message.into(),
         }
@@ -880,6 +947,7 @@ impl Command {
     ) -> Self {
         Command::ThrowJobError {
             job_key,
+            lease_token: None,
             error_code: error_code.into(),
             error_message: error_message.into(),
             variables: HashMap::new(),
@@ -896,6 +964,7 @@ impl Command {
     ) -> Self {
         Command::ThrowJobError {
             job_key,
+            lease_token: None,
             error_code: error_code.into(),
             error_message: error_message.into(),
             variables,
@@ -906,6 +975,7 @@ impl Command {
     pub fn update_job_retries(job_key: Key, retries: i32) -> Self {
         Command::UpdateJobRetries {
             job_key,
+            lease_token: None,
             retries,
             operation_reference: None,
         }
@@ -919,15 +989,17 @@ impl Command {
     ) -> Self {
         Command::UpdateJobRetries {
             job_key,
+            lease_token: None,
             retries,
             operation_reference,
         }
     }
 
     /// Convenience constructor for an `UpdateJobTimeout`.
-    pub fn update_job_timeout(job_key: Key, timeout: u64) -> Self {
+    pub fn update_job_timeout(job_key: Key, timeout: i64) -> Self {
         Command::UpdateJobTimeout {
             job_key,
+            lease_token: None,
             timeout,
             operation_reference: None,
         }
@@ -936,11 +1008,12 @@ impl Command {
     /// `UpdateJobTimeout` tagged with a caller audit `operation_reference`.
     pub fn update_job_timeout_with_ref(
         job_key: Key,
-        timeout: u64,
+        timeout: i64,
         operation_reference: Option<i64>,
     ) -> Self {
         Command::UpdateJobTimeout {
             job_key,
+            lease_token: None,
             timeout,
             operation_reference,
         }
@@ -1001,6 +1074,7 @@ impl Command {
             timeout,
             now,
             fetch_variables: Vec::new(),
+            with_lease: false,
         }
     }
 
@@ -1023,7 +1097,65 @@ impl Command {
             timeout,
             now,
             fetch_variables,
+            with_lease: false,
         }
+    }
+
+    /// Activate jobs with explicit read-set and leasing options.
+    pub fn activate_jobs_with_options(
+        job_type: impl Into<String>,
+        worker: impl Into<String>,
+        max_jobs: usize,
+        timeout: u64,
+        now: u64,
+        options: JobActivationOptions,
+    ) -> Self {
+        Command::ActivateJobs {
+            job_type: job_type.into(),
+            worker: worker.into(),
+            max_jobs,
+            timeout,
+            now,
+            fetch_variables: options.fetch_variables,
+            with_lease: options.with_lease,
+        }
+    }
+
+    /// Construct an authoritative, immutable activation plan.
+    pub fn activate_jobs_by_key(
+        job_keys: Vec<Key>,
+        worker: impl Into<String>,
+        timeout: u64,
+        now: u64,
+        options: JobActivationOptions,
+    ) -> Self {
+        Self::ActivateJobsByKey {
+            job_keys,
+            worker: worker.into(),
+            timeout,
+            now,
+            fetch_variables: options.fetch_variables,
+            with_lease: options.with_lease,
+        }
+    }
+
+    /// Attach an opaque activation token to a job mutation command.
+    pub fn with_job_lease(self, token: impl Into<String>) -> Self {
+        self.with_lease_token(Some(token.into()))
+    }
+
+    /// Set or clear the optional fencing token of a job mutation command.
+    pub fn with_lease_token(mut self, token: Option<String>) -> Self {
+        match &mut self {
+            Self::CompleteJob { lease_token, .. }
+            | Self::FailJob { lease_token, .. }
+            | Self::ThrowJobError { lease_token, .. }
+            | Self::UpdateJobRetries { lease_token, .. }
+            | Self::UpdateJobTimeout { lease_token, .. }
+            | Self::UpdateJob { lease_token, .. } => *lease_token = token,
+            _ => panic!("with_lease_token requires a job mutation command"),
+        }
+        self
     }
 
     /// Convenience constructor for a `CorrelateMessage` with no variables.
@@ -1094,6 +1226,7 @@ mod kind_tests {
         assert_eq!(
             Command::CompleteJob {
                 job_key: 1,
+                lease_token: None,
                 variables: HashMap::new(),
                 adhoc_result: None,
                 task_listener_result: None,
@@ -1110,6 +1243,7 @@ mod kind_tests {
                 timeout: 0,
                 now: 0,
                 fetch_variables: Vec::new(),
+                with_lease: false,
             }
             .kind(),
             "activate_jobs"
@@ -1160,7 +1294,7 @@ mod kind_tests {
         let create = Command::CreateAgentInstance {
             element_instance_key: 1,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![turn.clone()],
@@ -1178,7 +1312,7 @@ mod kind_tests {
             element_id: String::new(),
             process_instance_key: 3,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             status: None,
             metrics: Default::default(),
             tools: Some(vec![AgentTool {

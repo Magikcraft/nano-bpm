@@ -123,28 +123,46 @@ When a native DMN engine milestone is signed, it is dedicated to Sebastian Mensk
 
 ## 3. Agentic / AI-Agent elements
 
-Camunda is moving the AI Agent **into the engine** via the `AgentInstance` record
-family (an engine-hosted reasoning loop whose tools are modeled inner elements of an
-`adHocSubProcess`).
+Nano supports the Camunda `AgentInstance` and `AgentHistory` record lifecycle
+without hosting the worker's reasoning loop. A `serviceTask` marked
+`aiAgentTask` or `external` remains an ordinary job-backed service task, preserving
+its task-definition routing, retries, priority, custom headers and linked
+resources (including prompts). An `aiAgentSubProcess` marker likewise does not
+replace the ad-hoc container's ordinary job-worker behavior.
 
-**Today's answer: engine-native `AgentInstance` is not implemented** — there is no
-`AgentInstance` symbol in `engine-core`. A Camunda user who brings a diagram with an
-AI-Agent ad-hoc sub-process will find the ad-hoc container handled only at the
-**partial** level above (collapsed to a job), and the agentic loop **not** run by the
-engine.
+The canonical public contract is the REST specification on Camunda's
+`stable/8.10` branch, not the asynchronously published documentation. This
+alignment uses [revision 04530c058589e3ea3f7873bb469ae2c0d7cc6003](https://github.com/camunda/camunda/tree/04530c058589e3ea3f7873bb469ae2c0d7cc6003/zeebe/gateway-protocol/src/main/proto/v2).
 
-This is a deliberate, documented position, not an oversight. [ADR 0046](adr/0046-agent-as-worker-vs-agent-in-the-node.md)
-distinguishes two topologies:
+Activation creates the job, **not** an AgentInstance. Job leasing is independent
+of the agent marker: a worker requests `withLease: true` to receive a fresh,
+opaque `leaseToken`. Omission, `null`, or `false` selects non-leasing activation,
+whose response contains `leaseToken: null`. This applies to all job kinds,
+including execution and task listeners. Once leased, a job remains eligible only
+for leasing workers, including after failure or timeout.
 
-- **Agent-as-worker** (Nano-native, differentiated): the agent is an external job
-  worker; the engine routes to and awaits it. This is what `c8ctl nano hire`/`work`
-  produces today and is Nano's leading model for open-ended, long-running agents.
-- **Agent-in-the-node** (Camunda `AgentInstance`): the engine hosts the loop. Nano
-  treats this as a **planned compatibility target** — a drop-in obligation — **not**
-  the authoring model, and it is **not built yet**.
+For a leased job, completion, failure, and error commands require its matching
+`leaseToken`; missing or stale tokens are rejected with HTTP 409. Job property
+updates may omit the token for operator updates, but a supplied token is checked.
+Expiry alone does not supersede the token: the previous worker can finish until
+a subsequent activation replaces it.
 
-So: **agent-as-worker = supported today; engine-native `AgentInstance` = planned
-(compat), unbuilt.**
+Agent CREATE requires `elementInstanceKey`, `jobKey`, `jobLease`, and nonempty
+`history`. CONFIGURATION history establishes the definition and limits; there
+are no top-level CREATE definition/limits fields. Repeated CREATE is a conflict,
+not an upsert. UPDATE requires the three attribution fields and permits status
+and history changes, rather than top-level metric/tool patches. The agent
+request's `jobLease` carries the activation's opaque token; it is not a deadline
+or a client-parsed number.
+
+History remains pending until job resolution. Completion commits the winning
+attempt and discards superseded attempts; failure and timeout do not themselves
+commit or discard it. Metrics derive from accepted history, with duplicates
+excluded. Agent completion follows process-instance cleanup, not a worker-facing
+REST completion operation.
+
+Legacy serialized `AgentTask` elements remain readable and are normalized to
+marked service tasks on deployment, replay and snapshot loading.
 
 ---
 

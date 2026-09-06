@@ -534,6 +534,7 @@ impl PeerLink {
     pub async fn complete_job(
         &self,
         job_key: String,
+        lease_token: Option<String>,
         variables: Option<serde_json::Map<String, Value>>,
         adhoc_result: Option<nanobpmn_engine_core::AdHocJobResult>,
         task_result: Option<nanobpmn_engine_core::TaskListenerJobResult>,
@@ -541,6 +542,7 @@ impl PeerLink {
         self.request_within(fast_forward_timeout(), |corr| ClientFrame::CompleteJob {
             corr,
             job_key,
+            lease_token,
             variables,
             adhoc_result,
             task_result,
@@ -559,6 +561,7 @@ impl PeerLink {
         max_jobs: i64,
         timeout: u64,
         fetch_variable: Option<Vec<String>>,
+        with_lease: bool,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| ClientFrame::ActivateJobs {
             corr,
@@ -567,6 +570,7 @@ impl PeerLink {
             max_jobs,
             timeout: Some(timeout),
             fetch_variable,
+            with_lease,
         })
         .await
     }
@@ -692,12 +696,14 @@ impl PeerLink {
     pub async fn fail_job(
         &self,
         job_key: String,
+        lease_token: Option<String>,
         retries: i32,
         error_message: String,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| ClientFrame::FailJob {
             corr,
             job_key,
+            lease_token,
             retries: Some(retries),
             error_message: Some(error_message),
         })
@@ -708,6 +714,7 @@ impl PeerLink {
     pub async fn throw_error(
         &self,
         job_key: String,
+        lease_token: Option<String>,
         error_code: String,
         error_message: String,
         variables: Option<serde_json::Map<String, Value>>,
@@ -715,6 +722,7 @@ impl PeerLink {
         self.request_within(fast_forward_timeout(), |corr| ClientFrame::ThrowError {
             corr,
             job_key,
+            lease_token,
             error_code,
             error_message: Some(error_message),
             variables,
@@ -765,6 +773,7 @@ impl PeerLink {
     pub async fn update_job_retries(
         &self,
         job_key: String,
+        lease_token: Option<String>,
         retries: i32,
         operation_reference: Option<i64>,
     ) -> Result<PeerResult, PeerError> {
@@ -772,6 +781,7 @@ impl PeerLink {
             ClientFrame::UpdateJobRetries {
                 corr,
                 job_key,
+                lease_token,
                 retries,
                 operation_reference,
             }
@@ -784,15 +794,51 @@ impl PeerLink {
     pub async fn update_job_timeout(
         &self,
         job_key: String,
-        timeout: u64,
+        lease_token: Option<String>,
+        timeout: i64,
         operation_reference: Option<i64>,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| {
             ClientFrame::UpdateJobTimeout {
                 corr,
                 job_key,
+                lease_token,
                 timeout,
                 operation_reference,
+            }
+        })
+        .await
+    }
+
+    pub async fn update_job(
+        &self,
+        job_key: String,
+        retries: Option<i32>,
+        timeout: Option<i64>,
+        operation_reference: Option<i64>,
+        lease_token: Option<String>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::UpdateJob {
+            corr,
+            job_key,
+            retries,
+            timeout,
+            operation_reference,
+            lease_token,
+        })
+        .await
+    }
+
+    pub async fn forward_agent_instance(
+        &self,
+        agent_instance_key: Option<String>,
+        body: Value,
+    ) -> Result<PeerResult, PeerError> {
+        self.request_within(fast_forward_timeout(), |corr| {
+            ClientFrame::ForwardAgentInstance {
+                corr,
+                agent_instance_key,
+                body,
             }
         })
         .await

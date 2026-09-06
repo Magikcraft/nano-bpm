@@ -54,6 +54,9 @@ use nanobpmn_engine_core::{
 /// recovered from the source BPMN, which the engine model itself drops); ids absent from the map
 /// render without a quoted name.
 pub fn definition_to_ir(def: &ProcessDefinition, names: &HashMap<String, String>) -> String {
+    let mut normalized = def.clone();
+    normalized.normalize_legacy_agent_tasks();
+    let def = &normalized;
     let mut out = String::new();
     out.push_str(&format!("process {} {{\n", quote(&def.id)));
     out.push_str(&format!("  start {}\n", def.start_event));
@@ -168,7 +171,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::ConditionalBoundaryEvent { .. } => "conditionalBoundaryEvent",
         ElementKind::CompensationBoundaryEvent { .. } => "compensationBoundaryEvent",
         ElementKind::CompensationThrowEvent => "compensationThrowEvent",
-        ElementKind::AgentTask { .. } => "agentTask",
+        ElementKind::AgentTask { .. } => "serviceTask",
     }
 }
 
@@ -193,10 +196,14 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
             // compact IR text format; only the lossless BPMN XML emitter
             // round-trips them. Ignore here so the IR stays stable.
             linked_resources: _,
+            agent_type,
         } => {
             attrs.push(format!("jobType {}", quote(job_type)));
             if let Some(p) = priority {
                 attrs.push(format!("priority {}", quote(p)));
+            }
+            if let Some(agent_type) = agent_type {
+                attrs.push(format!("agentType {}", quote(agent_type.as_str())));
             }
             for (k, v) in custom_headers {
                 attrs.push(format!("header {} <- {}", quote(k), quote(v)));
@@ -211,12 +218,7 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
                 attrs.push(format!("resultVariable {}", quote(v)));
             }
         }
-        ElementKind::AgentTask { agent_type, .. } => {
-            // Only the structural `agentType` marker round-trips through the
-            // compact IR; the runtime definition/limits are agent config, not
-            // model structure, and are supplied at CREATE time (slice S3).
-            attrs.push(format!("agentType {}", quote(agent_type.as_str())));
-        }
+        ElementKind::AgentTask { .. } => unreachable!("legacy agent tasks are normalized"),
         ElementKind::UserTask(props) => {
             if let Some(v) = &props.assignee {
                 attrs.push(format!("assignee {}", quote(v)));
@@ -1129,12 +1131,31 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
         "eventBasedGateway" => ElementKind::EventBasedGateway,
         "intermediateThrowEvent" => ElementKind::IntermediateThrowEvent,
         "task" => ElementKind::Task,
-        "serviceTask" => ElementKind::ServiceTask {
-            job_type: attrs.require("jobType", id)?,
-            priority: attrs.take("priority"),
-            custom_headers: std::mem::take(&mut attrs.headers),
-            linked_resources: Vec::new(),
-        },
+        "serviceTask" | "agentTask" => {
+            let raw = if keyword == "agentTask" {
+                Some(attrs.require("agentType", id)?)
+            } else {
+                attrs.take("agentType")
+            };
+            let agent_type = raw
+                .map(|raw| {
+                    nanobpmn_engine_core::AgentType::parse(&raw)
+                        .ok_or_else(|| format!("element '{id}': unknown agentType '{raw}'"))
+                })
+                .transpose()?;
+            let job_type = if keyword == "agentTask" {
+                attrs.take("jobType").unwrap_or_else(|| id.to_owned())
+            } else {
+                attrs.require("jobType", id)?
+            };
+            ElementKind::ServiceTask {
+                agent_type,
+                job_type,
+                priority: attrs.take("priority"),
+                custom_headers: std::mem::take(&mut attrs.headers),
+                linked_resources: Vec::new(),
+            }
+        }
         "businessRuleTask" => ElementKind::BusinessRuleTask {
             decision_id: attrs.require("decisionId", id)?,
             result_variable: attrs.take("resultVariable"),
@@ -1221,29 +1242,6 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
             handler: attrs.require("handler", id)?,
         },
         "compensationThrowEvent" => ElementKind::CompensationThrowEvent,
-        "agentTask" => {
-            let raw: String = attrs.require("agentType", id)?;
-            let agent_type = nanobpmn_engine_core::AgentType::parse(&raw)
-                .ok_or_else(|| format!("element '{id}': unknown agentType '{raw}'"))?;
-            // An `agentTask` round-trips as a `bpmn:serviceTask` carrying a
-            // `zeebe:agentDefinition` marker. The engine parser only accepts
-            // `aiAgentSubProcess` on an adHocSubProcess, so that variant would
-            // emit non-round-trippable (rejected) BPMN — refuse it here.
-            if matches!(
-                agent_type,
-                nanobpmn_engine_core::AgentType::AiAgentSubProcess
-            ) {
-                return Err(format!(
-                    "element '{id}': agentType 'aiAgentSubProcess' is not valid for an agentTask \
-                     (which round-trips as a serviceTask); use 'aiAgentTask' or 'external'"
-                ));
-            }
-            ElementKind::AgentTask {
-                agent_type,
-                definition: nanobpmn_engine_core::AgentDefinition::default(),
-                limits: None,
-            }
-        }
         other => return Err(format!("unknown element kind '{other}'")),
     };
     Ok(kind)
@@ -1411,43 +1409,98 @@ mod tests {
     }
 
     #[test]
-    fn agent_task_ir_rejects_ai_agent_sub_process_agent_type() {
+    fn agent_metadata_ir_round_trips_as_canonical_service_task() {
+        for marker in ["aiAgentTask", "external", "aiAgentSubProcess"] {
+            let ir = format!(
+                "process \"p\" {{\n start s\n startEvent s\n serviceTask a {{\n\
+                 jobType \"= workerType\"\n agentType \"{marker}\"\n priority \"= urgency\"\n\
+                 header \"model\" <- \"gpt\"\n retries \"7\"\n }}\n endEvent e\n s -> a\n a -> e\n}}\n"
+            );
+            let parsed = ir_to_definition(&ir).expect("agent metadata parses");
+            let canonical = definition_to_ir(&parsed.definition, &parsed.names);
+            assert!(canonical.contains("serviceTask a"));
+            assert!(!canonical.contains("agentTask a"));
+            assert!(canonical.contains(&format!("agentType \"{marker}\"")));
+            assert!(canonical.contains("header \"model\" <- \"gpt\""));
+            let roundtrip = ir_to_definition(&canonical).unwrap();
+            assert_eq!(roundtrip.definition.elements, parsed.definition.elements);
+            if marker == "aiAgentSubProcess" {
+                // The compact IR retains the marker, not an ad-hoc container's tool catalog.
+                continue;
+            }
+            let xml =
+                crate::bpmn_model::definition_to_xml_labeled(&parsed.definition, &parsed.names);
+            assert!(xml.contains("<bpmndi:BPMNDiagram"));
+            let reparsed = parse_bpmn(&xml).unwrap();
+            assert_eq!(definition_to_ir(&reparsed[0], &HashMap::new()), canonical);
+        }
+    }
+
+    #[test]
+    fn legacy_agent_task_ir_lowers_to_service_task() {
+        for job_type in [Some("worker"), None] {
+            let job_attr = job_type
+                .map(|v| format!("jobType \"{v}\""))
+                .unwrap_or_default();
+            let ir = format!(
+                "process \"p\" {{\n start s\n startEvent s\n agentTask a {{\n\
+                 agentType \"external\"\n {job_attr}\n }}\n endEvent e\n s -> a\n a -> e\n}}\n"
+            );
+            let parsed = ir_to_definition(&ir).expect("legacy alias parses");
+            assert!(matches!(
+                &parsed.definition.elements["a"].kind,
+                ElementKind::ServiceTask { job_type: actual, agent_type: Some(_), .. }
+                    if actual == job_type.unwrap_or("a")
+            ));
+            let canonical = definition_to_ir(&parsed.definition, &parsed.names);
+            assert!(canonical.contains("serviceTask a"));
+            assert!(!canonical.contains("agentTask a"));
+        }
+    }
+
+    #[test]
+    fn agent_metadata_ir_rejects_unknown_marker() {
+        let ir = "process \"p\" {\n start s\n startEvent s\n serviceTask a {\n\
+                  jobType \"worker\"\n agentType \"unknown\"\n }\n s -> a\n}\n";
+        assert!(ir_to_definition(ir)
+            .unwrap_err()
+            .contains("unknown agentType"));
+    }
+
+    #[test]
+    fn legacy_agent_model_emits_canonical_ir_and_xml() {
         use nanobpmn_engine_core::{AgentDefinition, AgentType};
 
-        // A valid, round-trippable agentTask model (agentType aiAgentTask).
-        let def = ProcessBuilder::new("p")
-            .start_event("s")
-            .agent_task(
-                "a",
-                AgentType::AiAgentTask,
-                AgentDefinition::default(),
-                None,
-            )
-            .end_event("e")
-            .connect("s", "a")
-            .connect("a", "e")
-            .build()
-            .unwrap();
-        let ir = definition_to_ir(&def, &HashMap::new());
-        // Baseline: the aiAgentTask form parses back.
-        ir_to_definition(&ir).expect("aiAgentTask agentTask must round-trip");
-
-        // An `agentTask` round-trips as a `bpmn:serviceTask`; the engine parser
-        // only accepts `aiAgentSubProcess` on an adHocSubProcess, so an IR
-        // `agentTask` carrying it would emit non-round-trippable BPMN. Refuse it
-        // at parse time rather than generate invalid output.
-        let bad = ir.replace("aiAgentTask", "aiAgentSubProcess");
-        assert_ne!(bad, ir, "the swap must actually change the IR");
-        let err =
-            ir_to_definition(&bad).expect_err("aiAgentSubProcess must be rejected on agentTask");
-        assert!(
-            err.contains("aiAgentSubProcess"),
-            "error should name the offending agentType, got: {err}"
-        );
-
-        // The other round-trippable agentType (external) still builds.
-        ir_to_definition(&ir.replace("aiAgentTask", "external"))
-            .expect("agentType 'external' must build");
+        for marker in [
+            AgentType::AiAgentTask,
+            AgentType::External,
+            AgentType::AiAgentSubProcess,
+        ] {
+            for job_type in [Some("= workerType".to_owned()), None] {
+                let mut def = ProcessBuilder::new("Legacy")
+                    .start_event("Start")
+                    .service_task("Agent", "unused")
+                    .end_event("End")
+                    .connect("Start", "Agent")
+                    .connect("Agent", "End")
+                    .build()
+                    .unwrap();
+                def.elements.get_mut("Agent").unwrap().kind = ElementKind::AgentTask {
+                    agent_type: marker,
+                    job_type,
+                    definition: AgentDefinition::default(),
+                    limits: None,
+                };
+                let ir = definition_to_ir(&def, &HashMap::new());
+                let xml = crate::bpmn_model::definition_to_xml_labeled(&def, &HashMap::new());
+                assert!(ir.contains("serviceTask Agent"));
+                assert!(!ir.contains("agentTask Agent"));
+                assert!(xml.contains("<zeebe:taskDefinition"));
+                let parsed = ir_to_definition(&ir).unwrap();
+                def.normalize_legacy_agent_tasks();
+                assert_eq!(parsed.definition.elements, def.elements);
+            }
+        }
     }
 
     #[test]

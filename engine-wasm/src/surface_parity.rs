@@ -102,6 +102,9 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::ActivateJobs { .. } => Surface::Surfaced {
             js_method: "activateJobs",
         },
+        Command::ActivateJobsByKey { .. } => Surface::NotSurfaced {
+            reason: "authoritative activation plans are host-internal rather than a public worker API",
+        },
         Command::CorrelateMessage { .. } => Surface::Surfaced {
             js_method: "correlateMessage",
         },
@@ -151,12 +154,14 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::DeleteDecisionInstance { .. } => Surface::NotSurfaced {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",
         },
-        Command::UpdateJobTimeout { .. } => Surface::NotSurfaced {
-            reason: "extends a job-activation lock deadline; the modeler test engine exposes \
-                     no long-poll job-lease API to extend (jobs are activated and completed \
-                     synchronously), so there is no held lock to prolong even though the \
-                     virtual clock's ExpireJobs can retire deadlines. Surface if the modeler \
-                     grows long-poll activation semantics.",
+        Command::UpdateJobTimeout { .. } => Surface::Surfaced {
+            js_method: "updateTimeout",
+        },
+        Command::UpdateJob { .. } => Surface::NotSurfaced {
+            reason: "combined REST property update; the simulation exposes updateRetries and updateTimeout separately",
+        },
+        Command::ExpireJobsByDurability { .. } => Surface::NotSurfaced {
+            reason: "worker-specific expiration scan; the simulation clock expires both lease modes via ExpireJobs",
         },
         Command::OpenMessageSubscription { .. } => Surface::NotSurfaced {
             reason: "internal subscription lifecycle the engine drives itself; not a user op",
@@ -168,12 +173,10 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
             reason: "internal subscription lifecycle the engine drives itself; not a user op",
         },
         Command::DispatchStartInstance { .. } => Surface::NotSurfaced {
-            reason:
-                "engine-internal message/timer start dispatch; instances start via createInstance",
+            reason: "engine-internal message/timer start dispatch; instances start via createInstance",
         },
         Command::ActivateAdHocActivities { .. } => Surface::NotSurfaced {
-            reason:
-                "external ad-hoc activity activation is a server/REST seam; the studio wasm engine \
+            reason: "external ad-hoc activity activation is a server/REST seam; the studio wasm engine \
                  drives ad-hoc tools through the agent-job path, not this direct command",
         },
         // AgentInstance write commands (engine-native AgentInstance parity). The
@@ -356,11 +359,12 @@ mod tests {
         ));
         assert!(matches!(
             classify(&Command::UpdateJobTimeout {
+                lease_token: None,
                 job_key: 0,
                 timeout: 0,
                 operation_reference: None,
             }),
-            Surface::NotSurfaced { .. }
+            Surface::Surfaced { .. }
         ));
     }
 

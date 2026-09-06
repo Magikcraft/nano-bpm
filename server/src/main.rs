@@ -1700,6 +1700,7 @@ pub struct ServerImpl {
     /// for the replicated deadline), narrowed by the soft digest under
     /// `Digest`/`Auto`. All variants are at-least-once.
     activation_policy: ActivationPolicy,
+    activation_guards: Arc<Vec<tokio::sync::Mutex<()>>>,
     /// Best-effort soft lease digest mode (`NANOBPMN_REPLICATE_ACTIVATION=digest`).
     /// Layered on top of leader-local activation (so `replicate_activation` is
     /// also `false`): a partition leader periodically broadcasts its currently-held
@@ -2282,6 +2283,11 @@ impl ServerImpl {
             Partitions::with_topology(topology, handles)
         };
 
+        let activation_guards = Arc::new(
+            (0..engine.topology().num_partitions)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
+        );
         Self {
             engine,
             store,
@@ -2322,6 +2328,7 @@ impl ServerImpl {
             raft_replicas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             spill_config,
             activation_policy,
+            activation_guards,
             lease_digest,
             lease_digests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_retirements: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -5823,6 +5830,9 @@ impl ServerImpl {
         body: &Option<models::JobCompletionRequest>,
     ) -> Result<apis::job::CompleteJobResponse, ()> {
         use apis::job::CompleteJobResponse as Resp;
+        let lease_token = body
+            .as_ref()
+            .and_then(|body| optional_lease_token(&body.lease_token));
 
         let job_key: u64 = match path_params.job_key.parse() {
             Ok(k) => k,
@@ -5878,7 +5888,7 @@ impl ServerImpl {
                     types::Nullable::Null => None,
                 });
             return Ok(self
-                .forward_complete_job(node, job_key, wire, adhoc_result, task_result)
+                .forward_complete_job(node, job_key, lease_token, wire, adhoc_result, task_result)
                 .await);
         }
 
@@ -5892,6 +5902,46 @@ impl ServerImpl {
             (None, Some(result)) => Command::complete_job_with_result(job_key, variables, result),
             (None, None) => Command::complete_job_with(job_key, variables),
         };
+        let command = job_command_with_lease(command, lease_token);
+        if !self.raft.is_empty() {
+            let metadata = self.job_worker_metadata(job_key).await;
+            return Ok(match self.propose_job_for_stream(job_key, command).await {
+                Ok(commit) => {
+                    commit.wait().await;
+                    self.note_job_completion("rest");
+                    if let Some((job_type, worker)) = metadata {
+                        self.job_statistics
+                            .record_completed(job_type, worker, now_millis());
+                    }
+                    self.signal_jobs_available();
+                    Resp::Status204_TheJobWasCompletedSuccessfully
+                }
+                Err((404, detail)) => Resp::Status404_TheJobWithTheGivenKeyWasNotFound(problem(
+                    "Job not found",
+                    404,
+                    detail,
+                )),
+                Err((409, detail)) => {
+                    Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                        "Job command rejected",
+                        409,
+                        detail,
+                    ))
+                }
+                Err((400, detail)) => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid job completion",
+                    400,
+                    detail,
+                )),
+                Err((_, detail)) => {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Job completion failed",
+                        500,
+                        detail,
+                    ))
+                }
+            });
+        }
         let result = self
             .engine
             .by_key(job_key)
@@ -5952,7 +6002,10 @@ impl ServerImpl {
                     format!("Job {job_key} is not active and cannot be completed."),
                 )),
             ),
-            Err(EngineError::JobNotActivated { job_key }) => Ok(
+            Err(
+                EngineError::JobNotActivated { job_key }
+                | EngineError::JobLeaseMismatch { job_key },
+            ) => Ok(
                 Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
                     "Job not activated",
                     409,
@@ -5994,6 +6047,9 @@ impl ServerImpl {
         body: &Option<models::JobFailRequest>,
     ) -> Result<apis::job::FailJobResponse, ()> {
         use apis::job::FailJobResponse as Resp;
+        let lease_token = body
+            .as_ref()
+            .and_then(|body| optional_lease_token(&body.lease_token));
 
         let job_key: u64 = match path_params.job_key.parse() {
             Ok(k) => k,
@@ -6014,8 +6070,42 @@ impl ServerImpl {
 
         if let Some(node) = self.route_by_leader(job_key) {
             return Ok(self
-                .forward_fail_job(node, job_key, retries, error_message)
+                .forward_fail_job(node, job_key, lease_token, retries, error_message)
                 .await);
+        }
+        if !self.raft.is_empty() {
+            let metadata = self.job_worker_metadata(job_key).await;
+            let command = job_command_with_lease(
+                Command::fail_job(job_key, retries, error_message),
+                lease_token,
+            );
+            return Ok(match self.propose_job_for_stream(job_key, command).await {
+                Ok(commit) => {
+                    commit.wait().await;
+                    self.note_job_completion("rest");
+                    if let Some((job_type, worker)) = metadata {
+                        self.job_statistics
+                            .record_failed(job_type, worker, now_millis());
+                    }
+                    self.signal_jobs_available();
+                    Resp::Status204_TheJobIsFailed
+                }
+                Err((404, detail)) => Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(problem(
+                    "Job not found",
+                    404,
+                    detail,
+                )),
+                Err((409, detail)) => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(
+                    problem("Job command rejected", 409, detail),
+                ),
+                Err((_, detail)) => {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Job failure failed",
+                        500,
+                        detail,
+                    ))
+                }
+            });
         }
 
         let result = self
@@ -6028,7 +6118,10 @@ impl ServerImpl {
                     .get(&job_key)
                     .map(|j| (Some(j.job_type.clone()), j.worker.clone()));
                 let outcome = engine.apply_command_at(
-                    Command::fail_job(job_key, retries, error_message),
+                    job_command_with_lease(
+                        Command::fail_job(job_key, retries, error_message),
+                        lease_token,
+                    ),
                     now_millis(),
                 );
                 (meta, outcome)
@@ -6070,13 +6163,16 @@ impl ServerImpl {
                     format!("Job {job_key} cannot be failed in its current state."),
                 )),
             ),
-            Err(EngineError::JobNotActivated { job_key }) => Ok(
-                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(problem(
+            Err(
+                EngineError::JobNotActivated { job_key }
+                | EngineError::JobLeaseMismatch { job_key },
+            ) => Ok(Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(
+                problem(
                     "Job not activated",
                     409,
                     format!("Job {job_key} has not been activated and cannot be failed."),
-                )),
-            ),
+                ),
+            )),
             Err(e) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
@@ -6093,6 +6189,7 @@ impl ServerImpl {
         body: &models::JobErrorRequest,
     ) -> Result<apis::job::ThrowJobErrorResponse, ()> {
         use apis::job::ThrowJobErrorResponse as Resp;
+        let lease_token = optional_lease_token(&body.lease_token);
 
         let job_key: u64 = match path_params.job_key.parse() {
             Ok(k) => k,
@@ -6127,12 +6224,64 @@ impl ServerImpl {
                 _ => None,
             };
             return Ok(self
-                .forward_throw_error(node, job_key, body_error_code, error_message, wire)
+                .forward_throw_error(
+                    node,
+                    job_key,
+                    lease_token,
+                    body_error_code,
+                    error_message,
+                    wire,
+                )
                 .await);
         }
 
         let stat_error_code = body_error_code.clone();
         let stat_error_message = error_message.clone();
+        if !self.raft.is_empty() {
+            let metadata = self.job_worker_metadata(job_key).await;
+            let command = job_command_with_lease(
+                Command::throw_job_error_with(job_key, body_error_code, error_message, variables),
+                lease_token,
+            );
+            return Ok(match self.propose_job_for_stream(job_key, command).await {
+                Ok(commit) => {
+                    commit.wait().await;
+                    self.note_job_completion("rest");
+                    if let Some((job_type, worker)) = metadata {
+                        self.job_statistics.record_error(
+                            job_type,
+                            worker,
+                            stat_error_code,
+                            stat_error_message,
+                            now_millis(),
+                        );
+                    }
+                    self.signal_jobs_available();
+                    Resp::Status204_AnErrorIsThrownForTheJob
+                }
+                Err((404, detail)) => {
+                    Resp::Status404_TheJobWithTheGivenKeyWasNotFoundOrIsNotActivated(problem(
+                        "Job not found",
+                        404,
+                        detail,
+                    ))
+                }
+                Err((409, detail)) => {
+                    Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                        "Job command rejected",
+                        409,
+                        detail,
+                    ))
+                }
+                Err((_, detail)) => {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Job error failed",
+                        500,
+                        detail,
+                    ))
+                }
+            });
+        }
         let result = self
             .engine
             .by_key(job_key)
@@ -6143,11 +6292,14 @@ impl ServerImpl {
                     .get(&job_key)
                     .map(|j| (Some(j.job_type.clone()), j.worker.clone()));
                 let outcome = engine.apply_command_at(
-                    Command::throw_job_error_with(
-                        job_key,
-                        body_error_code,
-                        error_message,
-                        variables,
+                    job_command_with_lease(
+                        Command::throw_job_error_with(
+                            job_key,
+                            body_error_code,
+                            error_message,
+                            variables,
+                        ),
+                        lease_token,
                     ),
                     now_millis(),
                 );
@@ -6181,6 +6333,13 @@ impl ServerImpl {
                     "Job not found",
                     404,
                     format!("No job with key {job_key}."),
+                )),
+            ),
+            Err(e @ EngineError::JobLeaseMismatch { .. }) => Ok(
+                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                    "Job lease invalid",
+                    409,
+                    e.to_string(),
                 )),
             ),
             Err(EngineError::JobNotActivated { job_key }) => Ok(
@@ -6626,6 +6785,7 @@ impl ServerImpl {
         body: &models::JobUpdateRequest,
     ) -> Result<apis::job::UpdateJobResponse, ()> {
         use apis::job::UpdateJobResponse as Resp;
+        let lease_token = optional_lease_token(&body.lease_token);
 
         let job_key: u64 = match path_params.job_key.parse() {
             Ok(k) => k,
@@ -6654,23 +6814,6 @@ impl ServerImpl {
         // (Camunda `JobUpdateRequest.operationReference`).
         let operation_reference = body.operation_reference;
 
-        if retries.is_none() && timeout.is_none() {
-            return Ok(Resp::Status204_TheJobWasUpdatedSuccessfully);
-        }
-
-        // A lock extension needs a strictly-positive number of milliseconds; a
-        // zero/negative timeout would set the deadline at or before "now",
-        // expiring the lock rather than extending it.
-        if let Some(t) = timeout
-            && t <= 0
-        {
-            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                "Invalid data",
-                400,
-                format!("timeout must be a positive number of milliseconds, got {t}."),
-            )));
-        }
-
         // Map a by-key update failure (u16 status + detail) to the right
         // response variant, shared by the local and forwarded paths.
         let to_resp = |status: u16, detail: String| match status {
@@ -6695,50 +6838,62 @@ impl ServerImpl {
             )),
         };
 
-        let node = self.route_by_leader(job_key);
-
-        // Apply `timeout` before `retries` to keep a combined update effectively
-        // atomic. `UpdateJobTimeout` only succeeds when the job is Activated
-        // (locked), whereas `UpdateJobRetries` only fails when the job is
-        // missing or terminal — so a successful timeout guarantees the job is
-        // in a state where the subsequent retries update also succeeds. Doing
-        // timeout first therefore avoids the partial-apply hazard where retries
-        // would be committed and then the request returns a failure because the
-        // timeout was rejected (e.g. an unlocked job yielding 409).
-        if let Some(timeout) = timeout {
-            let timeout = timeout as u64;
-            let res = match node {
-                Some(node) => {
-                    self.forward_update_job_timeout(node, job_key, timeout, operation_reference)
-                        .await
-                }
-                None => {
-                    self.update_job_timeout_local(job_key, timeout, operation_reference)
-                        .await
-                }
-            };
-            if let Err((status, detail)) = res {
-                return Ok(to_resp(status, detail));
-            }
-        }
-
-        if let Some(retries) = retries {
-            let res = match node {
-                Some(node) => {
-                    self.forward_update_job_retries(node, job_key, retries, operation_reference)
-                        .await
-                }
-                None => {
-                    self.update_job_retries_local(job_key, retries, operation_reference)
-                        .await
-                }
-            };
-            if let Err((status, detail)) = res {
-                return Ok(to_resp(status, detail));
-            }
+        if let Err((status, detail)) = self
+            .update_job_core(job_key, retries, timeout, operation_reference, lease_token)
+            .await
+        {
+            return Ok(to_resp(status, detail));
         }
 
         Ok(Resp::Status204_TheJobWasUpdatedSuccessfully)
+    }
+
+    pub(crate) async fn update_job_core(
+        &self,
+        job_key: Key,
+        retries: Option<i32>,
+        timeout: Option<i64>,
+        operation_reference: Option<i64>,
+        lease_token: Option<String>,
+    ) -> Result<(), (u16, String)> {
+        if let Some(node) = self.route_by_leader(job_key) {
+            let link = self.peer_link(node).await?;
+            let response = link
+                .update_job(
+                    job_key.to_string(),
+                    retries,
+                    timeout,
+                    operation_reference,
+                    lease_token,
+                )
+                .await
+                .map_err(|error| (502, error.to_string()))?;
+            return if is_ok_status(response.status) {
+                Ok(())
+            } else {
+                Err((response.status, peer_detail(&response)))
+            };
+        }
+        let command = Command::UpdateJob {
+            job_key,
+            retries,
+            timeout,
+            operation_reference,
+            lease_token,
+        };
+        let commit = if self.raft.is_empty() {
+            let result = self
+                .engine
+                .by_key(job_key)
+                .with(move |journal| journal.apply_command_at(command, now_millis()))
+                .await;
+            Self::map_job_outcome(result)?
+        } else {
+            self.propose_job_for_stream(job_key, command).await?
+        };
+        commit.wait().await;
+        self.signal_jobs_available();
+        Ok(())
     }
 
     /// Surface-independent core of "cancel a running process instance". Mirrors
@@ -6969,7 +7124,7 @@ impl ServerImpl {
         // primitives the `/v2` job-update handler uses.
         let granted = match self.route_by_leader(job_key) {
             Some(node) => {
-                self.forward_update_job_retries(node, job_key, 1, None)
+                self.forward_update_job_retries(node, job_key, None, 1, None)
                     .await
             }
             None => self.update_job_retries_local(job_key, 1, None).await,
@@ -7795,21 +7950,39 @@ impl ServerImpl {
     }
 
     /// Applies a job-retries update on this node's owning partition.
+    #[cfg(any(test, feature = "console"))]
     pub(crate) async fn update_job_retries_local(
         &self,
         job_key: u64,
         retries: i32,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
+        self.update_job_retries_local_with_lease(job_key, None, retries, operation_reference)
+            .await
+    }
+
+    pub(crate) async fn update_job_retries_local_with_lease(
+        &self,
+        job_key: u64,
+        lease_token: Option<String>,
+        retries: i32,
+        operation_reference: Option<i64>,
+    ) -> Result<(), (u16, String)> {
+        let command = job_command_with_lease(
+            Command::update_job_retries_with_ref(job_key, retries, operation_reference),
+            lease_token,
+        );
+        if !self.raft.is_empty() {
+            self.propose_job_for_stream(job_key, command)
+                .await?
+                .wait()
+                .await;
+            return Ok(());
+        }
         let result = self
             .engine
             .by_key(job_key)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    Command::update_job_retries_with_ref(job_key, retries, operation_reference),
-                    now_millis(),
-                )
-            })
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
             .await;
         match result {
             Ok((_, commit)) => {
@@ -7819,7 +7992,9 @@ impl ServerImpl {
             Err(EngineError::JobNotFound { job_key }) => {
                 Err((404, format!("No job with key {job_key}.")))
             }
-            Err(EngineError::JobNotActive { job_key }) => Err((
+            Err(
+                EngineError::JobNotActive { job_key } | EngineError::JobLeaseMismatch { job_key },
+            ) => Err((
                 409,
                 format!("Job {job_key} is terminal and its retries cannot be updated."),
             )),
@@ -7830,33 +8005,39 @@ impl ServerImpl {
     /// Extends a job's activation lock on this node's owning partition. The job
     /// must currently be activated (locked); otherwise there is no lock to
     /// extend and this yields a 409.
+    #[cfg(test)]
     pub(crate) async fn update_job_timeout_local(
         &self,
         job_key: u64,
-        timeout: u64,
+        timeout: i64,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
-        // A lock extension needs a strictly-positive duration; a zero timeout
-        // would set the deadline to `now + 0 == now`, immediately expiring the
-        // lock rather than extending it. The REST handler already rejects
-        // non-positive timeouts, but guard at this partition-boundary helper too
-        // so every call site — peer-forwarded `UpdateJobTimeout` frames and any
-        // future caller — enforces the same contract and can't misuse it.
-        if timeout == 0 {
-            return Err((
-                400,
-                "timeout must be a positive number of milliseconds, got 0.".to_string(),
-            ));
+        self.update_job_timeout_local_with_lease(job_key, None, timeout, operation_reference)
+            .await
+    }
+
+    pub(crate) async fn update_job_timeout_local_with_lease(
+        &self,
+        job_key: u64,
+        lease_token: Option<String>,
+        timeout: i64,
+        operation_reference: Option<i64>,
+    ) -> Result<(), (u16, String)> {
+        let command = job_command_with_lease(
+            Command::update_job_timeout_with_ref(job_key, timeout, operation_reference),
+            lease_token,
+        );
+        if !self.raft.is_empty() {
+            self.propose_job_for_stream(job_key, command)
+                .await?
+                .wait()
+                .await;
+            return Ok(());
         }
         let result = self
             .engine
             .by_key(job_key)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    Command::update_job_timeout_with_ref(job_key, timeout, operation_reference),
-                    now_millis(),
-                )
-            })
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
             .await;
         match result {
             Ok((_, commit)) => {
@@ -7866,7 +8047,9 @@ impl ServerImpl {
             Err(EngineError::JobNotFound { job_key }) => {
                 Err((404, format!("No job with key {job_key}.")))
             }
-            Err(EngineError::JobNotActive { job_key }) => Err((
+            Err(
+                EngineError::JobNotActive { job_key } | EngineError::JobLeaseMismatch { job_key },
+            ) => Err((
                 409,
                 format!("Job {job_key} is not activated; its lock timeout cannot be extended."),
             )),
@@ -8384,6 +8567,7 @@ impl ServerImpl {
         &self,
         node: u32,
         job_key: u64,
+        lease_token: Option<String>,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
@@ -8392,8 +8576,14 @@ impl ServerImpl {
         let res =
             match self.peer_link(node).await {
                 Ok(link) => {
-                    link.complete_job(job_key.to_string(), variables, adhoc_result, task_result)
-                        .await
+                    link.complete_job(
+                        job_key.to_string(),
+                        lease_token,
+                        variables,
+                        adhoc_result,
+                        task_result,
+                    )
+                    .await
                 }
                 Err((s, m)) => {
                     return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
@@ -8433,6 +8623,7 @@ impl ServerImpl {
         &self,
         node: u32,
         job_key: u64,
+        lease_token: Option<String>,
         retries: i32,
         error_message: String,
     ) -> apis::job::FailJobResponse {
@@ -8440,7 +8631,7 @@ impl ServerImpl {
         let res =
             match self.peer_link(node).await {
                 Ok(link) => {
-                    link.fail_job(job_key.to_string(), retries, error_message)
+                    link.fail_job(job_key.to_string(), lease_token, retries, error_message)
                         .await
                 }
                 Err((s, m)) => {
@@ -8471,10 +8662,12 @@ impl ServerImpl {
     }
 
     /// Forwards a `throwError` to the peer owning the job.
+    #[allow(clippy::too_many_arguments)]
     async fn forward_throw_error(
         &self,
         node: u32,
         job_key: u64,
+        lease_token: Option<String>,
         error_code: String,
         error_message: String,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
@@ -8483,8 +8676,14 @@ impl ServerImpl {
         let res =
             match self.peer_link(node).await {
                 Ok(link) => {
-                    link.throw_error(job_key.to_string(), error_code, error_message, variables)
-                        .await
+                    link.throw_error(
+                        job_key.to_string(),
+                        lease_token,
+                        error_code,
+                        error_message,
+                        variables,
+                    )
+                    .await
                 }
                 Err((s, m)) => {
                     return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
@@ -8530,13 +8729,20 @@ impl ServerImpl {
         &self,
         node: u32,
         job_key: u64,
+        lease_token: Option<String>,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
     ) -> (u16, Option<serde_json::Value>) {
         match self.peer_link(node).await {
             Ok(link) => match link
-                .complete_job(job_key.to_string(), variables, adhoc_result, task_result)
+                .complete_job(
+                    job_key.to_string(),
+                    lease_token,
+                    variables,
+                    adhoc_result,
+                    task_result,
+                )
                 .await
             {
                 Ok(r) => (r.status, r.body),
@@ -8552,12 +8758,13 @@ impl ServerImpl {
         &self,
         node: u32,
         job_key: u64,
+        lease_token: Option<String>,
         retries: i32,
         error_message: String,
     ) -> (u16, Option<serde_json::Value>) {
         match self.peer_link(node).await {
             Ok(link) => match link
-                .fail_job(job_key.to_string(), retries, error_message)
+                .fail_job(job_key.to_string(), lease_token, retries, error_message)
                 .await
             {
                 Ok(r) => (r.status, r.body),
@@ -8573,13 +8780,20 @@ impl ServerImpl {
         &self,
         node: u32,
         job_key: u64,
+        lease_token: Option<String>,
         error_code: String,
         error_message: String,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> (u16, Option<serde_json::Value>) {
         match self.peer_link(node).await {
             Ok(link) => match link
-                .throw_error(job_key.to_string(), error_code, error_message, variables)
+                .throw_error(
+                    job_key.to_string(),
+                    lease_token,
+                    error_code,
+                    error_message,
+                    variables,
+                )
                 .await
             {
                 Ok(r) => (r.status, r.body),
@@ -8596,6 +8810,7 @@ impl ServerImpl {
     /// completes, the lease expires and the job re-activates on the owner). Empty on
     /// any error — the dispatcher simply moves on. Drives job aggregation: a worker
     /// attached to one gateway draws jobs from every node's partitions.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn activate_from_peer(
         &self,
         node: u32,
@@ -8604,6 +8819,7 @@ impl ServerImpl {
         max_jobs: usize,
         timeout: u64,
         fetch_variable: Option<&[String]>,
+        with_lease: bool,
     ) -> Vec<models::ActivatedJobResult> {
         let link = match self.peer_link(node).await {
             Ok(l) => l,
@@ -8616,6 +8832,7 @@ impl ServerImpl {
                 max_jobs as i64,
                 timeout,
                 fetch_variable.map(|f| f.to_vec()),
+                with_lease,
             )
             .await;
         match res {
@@ -8639,43 +8856,28 @@ impl ServerImpl {
     }
 
     /// Forwards a job-retries update to the peer owning the job.
+    #[cfg(any(feature = "console", test))]
     async fn forward_update_job_retries(
         &self,
         node: u32,
         job_key: u64,
+        lease_token: Option<String>,
         retries: i32,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
         let link = self.peer_link(node).await?;
         match link
-            .update_job_retries(job_key.to_string(), retries, operation_reference)
+            .update_job_retries(
+                job_key.to_string(),
+                lease_token,
+                retries,
+                operation_reference,
+            )
             .await
         {
             Ok(r) if is_ok_status(r.status) => Ok(()),
             Ok(r) if r.status == 404 => Err((404, peer_detail(&r))),
             Ok(r) if r.status == 409 => Err((409, peer_detail(&r))),
-            Ok(r) => Err((500, peer_detail(&r))),
-            Err(e) => Err((502, e.to_string())),
-        }
-    }
-
-    /// Forwards a job lock-extension (timeout) to the peer owning the job.
-    async fn forward_update_job_timeout(
-        &self,
-        node: u32,
-        job_key: u64,
-        timeout: u64,
-        operation_reference: Option<i64>,
-    ) -> Result<(), (u16, String)> {
-        let link = self.peer_link(node).await?;
-        match link
-            .update_job_timeout(job_key.to_string(), timeout, operation_reference)
-            .await
-        {
-            Ok(r) if is_ok_status(r.status) => Ok(()),
-            Ok(r) if r.status == 404 => Err((404, peer_detail(&r))),
-            Ok(r) if r.status == 409 => Err((409, peer_detail(&r))),
-            Ok(r) if r.status == 400 => Err((400, peer_detail(&r))),
             Ok(r) => Err((500, peer_detail(&r))),
             Err(e) => Err((502, e.to_string())),
         }
@@ -11290,66 +11492,60 @@ impl ServerImpl {
             }
         };
 
-        let definition = agent_model::AgentDefinition {
-            model: Some(body.definition.model.clone()),
-            provider: Some(body.definition.provider.clone()),
-            system_prompt: Some(body.definition.system_prompt.clone()),
+        let (job_key, job_lease) = match parse_agent_job_attribution(
+            Some(body.job_key.0.as_str()),
+            Some(body.job_lease.as_str()),
+        ) {
+            Ok(attribution) => attribution,
+            Err((title, detail)) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    title, 400, detail,
+                )));
+            }
         };
-        let limits = body
-            .limits
-            .as_ref()
-            .map(|l| agent_model::AgentInstanceLimits {
-                max_tokens: l.max_tokens,
-                max_model_calls: l.max_model_calls as i64,
-                max_tool_calls: l.max_tool_calls as i64,
+        if element_instance_key == 0 || body.history.is_empty() {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid agent creation",
+                400,
+                "A positive elementInstanceKey and nonempty history are required.".into(),
+            )));
+        }
+        if let Err(detail) = validate_agent_history(&body.history) {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid agent history",
+                400,
+                detail,
+            )));
+        }
+        if let Some(node) = self.route_by_leader(element_instance_key) {
+            let forwarded = self.forward_agent_request(node, None, body).await;
+            return Ok(match forwarded {
+                Ok(response) => response,
+                Err((status, detail)) => agent_create_http_error(status, detail),
             });
-        // A present-but-unparsable jobKey/jobLease must be rejected rather than
-        // silently coerced to 0: 0 changes ownership/attribution, so a malformed
-        // value is a 400, not a default. An `external` (job-backed) agent's create
-        // is lease-gated on these against the element's ACTIVATED job; the native
-        // aiAgentTask / aiAgentSubProcess variants leave them absent (0) and are
-        // auto-minted, so the engine skips the lease check for them.
-        let job_key: Key = match body.job_key.as_ref() {
-            None => 0,
-            Some(k) => match k.0.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid job key",
-                        400,
-                        format!("Job key '{}' is not a valid key.", k.0),
-                    )));
-                }
-            },
-        };
-        let job_lease: u64 = match body.job_lease.as_ref() {
-            None => 0,
-            Some(l) => match l.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid job lease",
-                        400,
-                        format!("Job lease '{l}' is not a valid value."),
-                    )));
-                }
-            },
-        };
+        }
+        let history: Vec<_> = body
+            .history
+            .iter()
+            .map(|item| agent_history_turn_from(item, job_key, &job_lease))
+            .collect();
+        let submitted_ids = history
+            .iter()
+            .map(|turn| turn.history_item_id.clone().unwrap_or_default())
+            .collect();
         let command = Command::CreateAgentInstance {
             element_instance_key,
             job_key,
             job_lease,
-            definition,
-            limits,
-            history: Vec::new(),
+            definition: Default::default(),
+            limits: None,
+            history,
         };
 
-        match self
-            .engine
-            .by_key(element_instance_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await
-        {
+        let outcome = self
+            .apply_agent_command(element_instance_key, command)
+            .await;
+        match outcome {
             Ok((events, commit)) => {
                 commit.wait().await;
                 self.spawn_routing_if_needed(&events);
@@ -11359,11 +11555,14 @@ impl ServerImpl {
                     }
                     _ => None,
                 });
+                let created_history =
+                    created_history_from_events(&events, submitted_ids).ok_or(())?;
                 match agent_instance_key {
                     Some(key) => Ok(Resp::Status200_TheAgentInstanceWasCreated(
-                        models::AgentInstanceCreationResult::new(models::AgentInstanceKey(
-                            key.to_string(),
-                        )),
+                        models::AgentInstanceCreationResult::new(
+                            models::AgentInstanceKey(key.to_string()),
+                            created_history,
+                        ),
                     )),
                     None => Ok(
                         Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
@@ -11374,7 +11573,7 @@ impl ServerImpl {
                     ),
                 }
             }
-            Err(e) => Ok(agent_create_error_response(e)),
+            Err((status, detail)) => Ok(agent_create_http_error(status, detail)),
         }
     }
 
@@ -11387,8 +11586,8 @@ impl ServerImpl {
         use apis::agent_instance::GetAgentInstanceResponse as Resp;
 
         let key: Key = match path_params.agent_instance_key.parse() {
-            Ok(k) => k,
-            Err(_) => {
+            Ok(k) if k > 0 => k,
+            _ => {
                 return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                     "Invalid agent instance key",
                     400,
@@ -11400,9 +11599,9 @@ impl ServerImpl {
             }
         };
 
-        match self.store.agent_instance(key) {
+        match self.store.try_agent_instance(key).map_err(|_| ())? {
             Some(row) => Ok(Resp::Status200_TheAgentInstanceIsSuccessfullyReturned(
-                agent_instance_result(&row),
+                agent_instance_result(&row).map_err(|_| ())?,
             )),
             None => Ok(Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(
                 problem(
@@ -11453,53 +11652,47 @@ impl ServerImpl {
             }
         };
 
-        // A present-but-unparsable jobKey/jobLease must be rejected rather than
-        // silently coerced to 0: 0 changes ownership/attribution and can defeat
-        // retry de-duplication, so a malformed value is a 400, not a default.
-        let job_key: Key = match body.job_key.as_ref() {
-            None => 0,
-            Some(k) => match k.0.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid job key",
-                        400,
-                        format!("Job key '{}' is not a valid key.", k.0),
-                    )));
-                }
-            },
+        let (job_key, job_lease) = match parse_agent_job_attribution(
+            Some(body.job_key.0.as_str()),
+            Some(body.job_lease.as_str()),
+        ) {
+            Ok(attribution) => attribution,
+            Err((title, detail)) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    title, 400, detail,
+                )));
+            }
         };
-        let job_lease: u64 = match body.job_lease.as_ref() {
-            None => 0,
-            Some(l) => match l.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid job lease",
-                        400,
-                        format!("Job lease '{l}' is not a valid value."),
-                    )));
-                }
-            },
-        };
+        if element_instance_key == 0 || agent_instance_key == 0 {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid agent key",
+                400,
+                "Agent and element instance keys must be positive.".into(),
+            )));
+        }
+        if let Some(node) = self.route_by_leader(agent_instance_key) {
+            let forwarded = self
+                .forward_agent_request(node, Some(agent_instance_key.to_string()), body)
+                .await;
+            return Ok(match forwarded {
+                Ok(response) => response,
+                Err((status, detail)) => agent_update_http_error(status, detail),
+            });
+        }
         let status = body.status.map(agent_update_status);
-        let metrics = body
-            .metrics
-            .as_ref()
-            .map(agent_metrics_delta_from)
-            .unwrap_or_default();
-        // Distinguish an explicit `tools: null` (clear the tool set) from an
-        // absent field (no change): `Null` maps to an empty replacement set,
-        // mirroring how nullable changesets clear a value elsewhere.
-        let tools = match &body.tools {
-            Some(types::Nullable::Present(v)) => Some(v.iter().map(agent_tool_from).collect()),
-            Some(types::Nullable::Null) => Some(Vec::new()),
-            None => None,
-        };
+        if let Some(items) = present(&body.history)
+            && let Err(detail) = validate_agent_history(items)
+        {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid agent history",
+                400,
+                detail,
+            )));
+        }
         let history: Vec<agent_model::AgentHistoryTurn> = match &body.history {
             Some(types::Nullable::Present(items)) => items
                 .iter()
-                .map(|i| agent_history_turn_from(i, job_key, job_lease))
+                .map(|i| agent_history_turn_from(i, job_key, &job_lease))
                 .collect(),
             _ => Vec::new(),
         };
@@ -11508,9 +11701,13 @@ impl ServerImpl {
             .map(|t| t.history_item_id.clone().unwrap_or_default())
             .collect();
 
-        let outcome = self
-            .engine
-            .by_key(agent_instance_key)
+        let Some(handle) = self.engine_handle_for(partition_of(agent_instance_key)) else {
+            return Ok(agent_update_http_error(
+                404,
+                "Agent instance partition not found.".into(),
+            ));
+        };
+        let command = handle
             .with(move |engine| {
                 let (element_id, process_instance_key) = engine
                     .agent_instance_ownership(agent_instance_key)
@@ -11523,13 +11720,21 @@ impl ServerImpl {
                     job_key,
                     job_lease,
                     status,
-                    metrics,
-                    tools,
+                    metrics: Default::default(),
+                    tools: None,
                     history,
                 };
-                engine.apply_command_at(command, now_millis())
+                Ok(command)
             })
             .await;
+        let command = match command {
+            Ok(command) => command,
+            Err(error) => {
+                let (status, detail) = crate::raft::engine_error_status(&error);
+                return Ok(agent_update_http_error(status, detail));
+            }
+        };
+        let outcome = self.apply_agent_command(agent_instance_key, command).await;
 
         match outcome {
             Ok((events, commit)) => {
@@ -11537,29 +11742,7 @@ impl ServerImpl {
                 self.spawn_routing_if_needed(&events);
                 // Correlate each emitted AgentHistoryCreated to its submitted item
                 // in request order; the processor emits them in submission order.
-                let created: Vec<(String, String, bool)> = events
-                    .iter()
-                    .filter_map(|e| match e {
-                        Event::AgentHistoryCreated { record, .. } => Some((
-                            record.history_item_id.clone().unwrap_or_default(),
-                            record.agent_history_key.to_string(),
-                            record.is_duplicate,
-                        )),
-                        // An idempotent retry created no new record; echo the
-                        // original turn's key back with isDuplicate=true.
-                        Event::AgentHistoryDeduplicated {
-                            history_item_id,
-                            original_agent_history_key,
-                            ..
-                        } => Some((
-                            history_item_id.clone(),
-                            original_agent_history_key.to_string(),
-                            true,
-                        )),
-                        _ => None,
-                    })
-                    .collect();
-                let created_history = match correlate_created_history(submitted_ids, created) {
+                let created_history = match created_history_from_events(&events, submitted_ids) {
                     Some(v) => v,
                     // No emitted event correlates to some submitted item: the
                     // processor produced fewer AgentHistoryCreated events than
@@ -11583,29 +11766,73 @@ impl ServerImpl {
                     models::AgentInstanceUpdateResult::new(created_history),
                 ))
             }
-            Err(EngineError::AgentInstanceNotFound { agent_instance_key }) => Ok(
-                Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(problem(
-                    "Agent instance not found",
-                    404,
-                    format!("No agent instance with key {agent_instance_key}."),
-                )),
-            ),
-            // Split rejection status codes to match Camunda's `validateJobContext`
-            // (#1106): a not-active or lease-mismatched job is a 404; everything
-            // else (element-mismatch, job-required-for-history, ownership, …) is a
-            // 400.
-            Err(
-                e @ (EngineError::AgentInstanceJobNotActive { .. }
-                | EngineError::AgentInstanceJobLeaseMismatch { .. }),
-            ) => Ok(Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(
-                problem("Agent job lease invalid", 404, e.to_string()),
-            )),
-            Err(e) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                "Agent instance update rejected",
-                400,
-                e.to_string(),
-            ))),
+            Err((status, detail)) => Ok(agent_update_http_error(status, detail)),
         }
+    }
+
+    async fn apply_agent_command(
+        &self,
+        key: Key,
+        command: Command,
+    ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
+        if !self.raft.is_empty() {
+            return self.propose_partition_command(key, command).await;
+        }
+        self.engine
+            .by_key(key)
+            .with(move |journal| journal.apply_command_at(command, now_millis()))
+            .await
+            .map_err(|error| crate::raft::engine_error_status(&error))
+    }
+
+    async fn forward_agent_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        node: u32,
+        agent_instance_key: Option<String>,
+        body: &T,
+    ) -> Result<R, (u16, String)> {
+        let body = serde_json::to_value(body).map_err(|error| (500, error.to_string()))?;
+        let response = self
+            .peer_link(node)
+            .await?
+            .forward_agent_instance(agent_instance_key, body)
+            .await
+            .map_err(|error| (502, error.to_string()))?;
+        if !is_ok_status(response.status) {
+            return Err((response.status, peer_detail(&response)));
+        }
+        serde_json::from_value(
+            response
+                .body
+                .ok_or((502, "Peer response missing.".into()))?,
+        )
+        .map_err(|error| (502, error.to_string()))
+    }
+
+    pub(crate) async fn agent_instance_forwarded(
+        &self,
+        key: Option<String>,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        let result = if let Some(agent_instance_key) = key {
+            let request = serde_json::from_value(body).map_err(|error| (400, error.to_string()))?;
+            serde_json::to_value(
+                self.update_agent_instance_impl(
+                    &models::UpdateAgentInstancePathParams { agent_instance_key },
+                    &request,
+                )
+                .await
+                .map_err(|()| (500, "Agent update failed.".into()))?,
+            )
+        } else {
+            let request = serde_json::from_value(body).map_err(|error| (400, error.to_string()))?;
+            serde_json::to_value(
+                self.create_agent_instance_impl(&request)
+                    .await
+                    .map_err(|()| (500, "Agent creation failed.".into()))?,
+            )
+        };
+        result.map_err(|error| (500, error.to_string()))
     }
 
     /// `POST /v2/agent-instances/search` — filter, sort and paginate agent
@@ -11617,7 +11844,7 @@ impl ServerImpl {
         use apis::agent_instance::SearchAgentInstancesResponse as Resp;
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let rows = self.store.agent_instances();
+        let rows = self.store.try_agent_instances().map_err(|_| ())?;
         let mut matched: Vec<&readstore::AgentInstanceRow> = rows
             .iter()
             .filter(|row| match filter {
@@ -11642,8 +11869,12 @@ impl ServerImpl {
             .map(|row| (row.agent_instance_key, row))
             .collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
-        let items: Vec<models::AgentInstanceResult> =
-            page.items.into_iter().map(agent_instance_result).collect();
+        let items: Vec<models::AgentInstanceResult> = page
+            .items
+            .into_iter()
+            .map(agent_instance_result)
+            .collect::<Result<_, _>>()
+            .map_err(|_| ())?;
 
         Ok(Resp::Status200_TheAgentInstanceSearchResult(
             models::AgentInstanceSearchQueryResult::new(page.response, items),
@@ -11661,8 +11892,8 @@ impl ServerImpl {
         use apis::agent_instance::SearchAgentInstanceHistoryResponse as Resp;
 
         let key: Key = match path_params.agent_instance_key.parse() {
-            Ok(k) => k,
-            Err(_) => {
+            Ok(k) if k > 0 => k,
+            _ => {
                 return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                     "Invalid agent instance key",
                     400,
@@ -11675,29 +11906,14 @@ impl ServerImpl {
         };
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        // A commitStatus filter that is present but not expressible as an
-        // inclusion set ($eq/$in) cannot be honoured by the read-model query, so
-        // reject it rather than silently falling back to the COMMITTED-only
-        // default and violating the caller's filter intent.
-        let commit_status = match filter.and_then(|f| f.commit_status.as_ref()) {
-            None => None,
-            Some(cs) => match agent_commit_status_filter_values(cs) {
-                Some(values) => Some(values),
-                None => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Unsupported commitStatus filter",
-                        400,
-                        "The commitStatus filter must be an exact value or an inclusion set \
-                         ($eq/$in); other operators are not supported."
-                            .to_string(),
-                    )));
-                }
-            },
-        };
+        let commit_status = filter
+            .and_then(|filter| filter.commit_status.as_ref())
+            .map(agent_commit_status_filter_values);
         let history_filter = readstore::AgentHistoryFilter {
             agent_instance_key: Some(key),
             process_instance_key: None,
             commit_status,
+            ..Default::default()
         };
         // An explicit empty inclusion set (`commitStatus: { $in: [] }`) matches
         // nothing. The read-model collapses `Some(vec![])` to the COMMITTED-only
@@ -11706,7 +11922,9 @@ impl ServerImpl {
         let rows = if matches!(&history_filter.commit_status, Some(v) if v.is_empty()) {
             Vec::new()
         } else {
-            self.store.agent_history(&history_filter)
+            self.store
+                .try_agent_history(&history_filter)
+                .map_err(|_| ())?
         };
 
         let mut matched: Vec<&readstore::AgentHistoryRow> = rows
@@ -11714,12 +11932,19 @@ impl ServerImpl {
             .filter(|row| match filter {
                 None => true,
                 Some(f) => {
-                    f.loop_iteration.as_ref().is_none_or(|lf| {
-                        query::match_integer(&Some(lf.clone()), Some(row.loop_iteration as i64))
-                    }) && f
-                        .role
-                        .as_ref()
-                        .is_none_or(|rf| match_agent_history_role(rf, row.role))
+                    query::match_agent_history_item_key(
+                        &f.history_item_key,
+                        &row.agent_history_key.to_string(),
+                    ) && query::match_element_instance_key(
+                        &f.element_instance_key,
+                        &row.element_instance_key.to_string(),
+                    ) && query::match_job_key(&f.job_key, &row.job_key.to_string())
+                        && f.loop_iteration.as_ref().is_none_or(|lf| {
+                            query::match_integer(&Some(lf.clone()), Some(row.loop_iteration as i64))
+                        })
+                        && f.role
+                            .as_ref()
+                            .is_none_or(|rf| match_agent_history_role(rf, row.role))
                         && query::match_date_time_ms(
                             &f.produced_at,
                             Some(row.produced_at_ms as i64),
@@ -11748,7 +11973,8 @@ impl ServerImpl {
             .items
             .into_iter()
             .map(agent_history_item_result)
-            .collect();
+            .collect::<Result<_, _>>()
+            .map_err(|_| ())?;
 
         Ok(Resp::Status200_TheAgentInstanceHistorySearchResult(
             models::AgentInstanceHistorySearchQueryResult::new(page.response, items),
@@ -15772,6 +15998,10 @@ impl ServerImpl {
         // peer pull). Empty on a single-node cluster ⇒ the whole peer path is
         // skipped and this method is byte-identical to the pre-cluster long poll.
         let peers = self.peer_nodes();
+        let with_lease = matches!(
+            body.with_lease.as_ref(),
+            Some(types::Nullable::Present(true))
+        );
 
         loop {
             let mut jobs = self
@@ -15781,6 +16011,7 @@ impl ServerImpl {
                     max_jobs,
                     timeout,
                     fetch_variable.as_deref(),
+                    with_lease,
                 )
                 .await;
 
@@ -15803,6 +16034,7 @@ impl ServerImpl {
                             want,
                             timeout,
                             fetch_variable.as_deref(),
+                            with_lease,
                         )
                         .await;
                     jobs.extend(more);
@@ -15867,6 +16099,7 @@ impl ServerImpl {
         max_jobs: usize,
         timeout: u64,
         fetch_variable: Option<&[String]>,
+        with_lease: bool,
     ) -> Vec<models::ActivatedJobResult> {
         let handles = self.engine.all();
         let n = handles.len();
@@ -15883,7 +16116,6 @@ impl ServerImpl {
                 return Vec::new();
             }
             let start = self.engine.activate_start() % ln;
-            use futures_util::FutureExt;
             let base = max_jobs / ln;
             let rem = max_jobs % ln;
             let mut futures = Vec::with_capacity(ln);
@@ -15893,33 +16125,15 @@ impl ServerImpl {
                     continue;
                 }
                 let p = led[(start + off) % ln];
-                if self.replicate_activation_for(p) {
-                    futures.push(
-                        self.activate_on_raft(p, job_type, worker, want, timeout, fetch_variable)
-                            .boxed(),
-                    );
-                } else {
-                    // Leader-local activation: lock the jobs directly on this
-                    // leader's engine actor WITHOUT a Raft round-trip. The lock is
-                    // ephemeral leader state; followers learn of the job only when
-                    // its (replicated) completion arrives, which they apply under
-                    // lenient completion. Saves one quorum commit per activation and
-                    // keeps per-worker activation off the partition's commit budget.
-                    let Some(handle) = self.engine_handle_for(p) else {
-                        continue;
-                    };
-                    futures.push(
-                        self.activate_on_local(
-                            handle,
-                            job_type,
-                            worker,
-                            want,
-                            timeout,
-                            fetch_variable,
-                        )
-                        .boxed(),
-                    );
-                }
+                futures.push(self.activate_on_raft(
+                    p,
+                    job_type,
+                    worker,
+                    want,
+                    timeout,
+                    fetch_variable,
+                    with_lease,
+                ));
             }
             let activated: Vec<ActivatedJobWithIdentity> = futures_util::future::join_all(futures)
                 .await
@@ -15939,6 +16153,7 @@ impl ServerImpl {
                 max_jobs,
                 timeout,
                 fetch_variable,
+                with_lease,
             )
             .await
         } else {
@@ -15974,6 +16189,7 @@ impl ServerImpl {
                     want,
                     timeout,
                     fetch_variable,
+                    with_lease,
                 ));
             }
             futures_util::future::join_all(futures)
@@ -15994,6 +16210,7 @@ impl ServerImpl {
     /// (so the lookup runs on the engine thread that owns the state, not the
     /// caller). The serde-heavy variable projection is deferred to
     /// [`activated_job_result`] off the engine thread.
+    #[allow(clippy::too_many_arguments)]
     async fn activate_on(
         &self,
         handle: &DeepthiHandle,
@@ -16002,6 +16219,7 @@ impl ServerImpl {
         want: usize,
         timeout: u64,
         fetch_variable: Option<&[String]>,
+        with_lease: bool,
     ) -> Vec<ActivatedJobWithIdentity> {
         let job_type = job_type.to_string();
         let worker = worker.to_string();
@@ -16014,66 +16232,51 @@ impl ServerImpl {
             .unwrap_or_default();
         #[cfg(feature = "console")]
         let worker_for_trace = worker.clone();
-        let activated: Vec<ActivatedJobWithIdentity> = handle
+        let (activated, commit) = handle
             .with(move |engine| {
                 // Leader-local activation bypasses the Raft `apply_command_at`
                 // path, so it is profiled here directly on the engine thread.
                 let timer = cmd_profile::start();
                 let now = now_millis();
-                let out: Vec<ActivatedJobWithIdentity> = engine
-                    .activate_jobs_with_fetch(
-                        &job_type,
-                        &worker,
-                        want,
-                        timeout,
-                        now,
+                let command = Command::activate_jobs_with_options(
+                    &job_type,
+                    &worker,
+                    want,
+                    timeout,
+                    now,
+                    nanobpmn_engine_core::JobActivationOptions {
                         fetch_variables,
-                    )
-                    .into_iter()
-                    .map(|job| {
-                        let (process_id, version, process_definition_key) = engine
-                            .instance(job.instance_key)
-                            .and_then(|instance| engine.state().processes.get(&instance.process_id))
-                            .map(|deployed| {
-                                (
-                                    deployed.definition.id.clone(),
-                                    deployed.version,
-                                    deployed.key.to_string(),
-                                )
-                            })
-                            .unwrap_or_else(|| (String::new(), 1, String::new()));
-                        ActivatedJobWithIdentity {
-                            job,
-                            process_id,
-                            version,
-                            process_definition_key,
+                        with_lease,
+                    },
+                );
+                let (out, commit) = match prepare_activation(engine, command, false) {
+                    PreparedActivation::Durable(command) => {
+                        match engine.apply_command_at(*command, now) {
+                            Ok((events, commit)) => {
+                                let jobs = events
+                                    .iter()
+                                    .filter_map(|event| match event {
+                                        Event::JobActivated { job_key, .. } => {
+                                            engine.engine().activated_job(*job_key)
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                (activated_jobs_with_identity(engine, jobs), commit)
+                            }
+                            Err(_) => (Vec::new(), Commit::ready()),
                         }
-                    })
-                    .collect();
+                    }
+                    PreparedActivation::Soft(jobs) => (jobs, Commit::ready()),
+                };
                 cmd_profile::finish(timer, "activate_jobs");
-                out
+                (out, commit)
             })
             .await;
+        commit.wait().await;
         #[cfg(feature = "console")]
         self.record_trace_activations(&activated, &worker_for_trace);
         activated
-    }
-
-    /// Owned-handle variant of [`Self::activate_on`] for the leader-local Raft
-    /// activation path (`NANOBPMN_REPLICATE_ACTIVATION=0`): locks jobs directly on
-    /// the supplied engine actor without proposing through Raft. Takes the handle
-    /// by value so it can be awaited inside a `join_all` over the led partitions.
-    async fn activate_on_local(
-        &self,
-        handle: DeepthiHandle,
-        job_type: &str,
-        worker: &str,
-        want: usize,
-        timeout: u64,
-        fetch_variable: Option<&[String]>,
-    ) -> Vec<ActivatedJobWithIdentity> {
-        self.activate_on(&handle, job_type, worker, want, timeout, fetch_variable)
-            .await
     }
 
     /// `p`'s leader so the activation lock is committed to the log and applied on
@@ -16082,6 +16285,7 @@ impl ServerImpl {
     /// empty (the partition's actual leader runs its own dispatch). After the
     /// commit, the activated jobs are projected for the worker by a read on the
     /// leader's engine actor (the same copy the log was applied to).
+    #[allow(clippy::too_many_arguments)]
     async fn activate_on_raft(
         &self,
         p: u64,
@@ -16090,7 +16294,9 @@ impl ServerImpl {
         want: usize,
         timeout: u64,
         fetch_variable: Option<&[String]>,
+        with_lease: bool,
     ) -> Vec<ActivatedJobWithIdentity> {
+        let _guard = self.activation_guards[p as usize].lock().await;
         let Some(part) = self.raft.get(p) else {
             return Vec::new();
         };
@@ -16098,6 +16304,9 @@ impl ServerImpl {
         if part.raft.metrics().borrow().current_leader != Some(node_id) {
             return Vec::new();
         }
+        let Some(handle) = self.engine_handle_for(p) else {
+            return Vec::new();
+        };
         // A single logical instant drives both the command (job-lock deadlines)
         // and the journal apply, so leader and followers mint identical state.
         let now = now_millis();
@@ -16105,16 +16314,28 @@ impl ServerImpl {
         // (`fetchVariables`) rides the command into the durable event as
         // engine-native read provenance for reification (#986). Empty ⇒ fetch-all
         // (undeclared), keeping the command/event byte-identical.
-        let command = match fetch_variable {
-            Some(names) if !names.is_empty() => Command::activate_jobs_with_fetch(
-                job_type,
-                worker,
-                want,
-                timeout,
-                now,
-                names.to_vec(),
-            ),
-            _ => Command::activate_jobs(job_type, worker, want, timeout, now),
+        let command = Command::activate_jobs_with_options(
+            job_type,
+            worker,
+            want,
+            timeout,
+            now,
+            nanobpmn_engine_core::JobActivationOptions {
+                fetch_variables: fetch_variable.unwrap_or_default().to_vec(),
+                with_lease,
+            },
+        );
+        let force_durable = self.replicate_activation_for(p);
+        let command = match handle
+            .with(move |journal| prepare_activation(journal, command, force_durable))
+            .await
+        {
+            PreparedActivation::Durable(command) => *command,
+            PreparedActivation::Soft(jobs) => {
+                #[cfg(feature = "console")]
+                self.record_trace_activations(&jobs, worker);
+                return jobs;
+            }
         };
         let response = match part.propose_result(command, now).await {
             Ok(r) if r.error.is_none() => r,
@@ -16131,35 +16352,14 @@ impl ServerImpl {
         if job_keys.is_empty() {
             return Vec::new();
         }
-        let Some(handle) = self.engine_handle_for(p) else {
-            return Vec::new();
-        };
         let activated: Vec<ActivatedJobWithIdentity> = handle
             .with(move |journal| {
                 let engine = journal.engine();
-                job_keys
+                let jobs = job_keys
                     .into_iter()
-                    .filter_map(|jk| {
-                        let job = engine.activated_job(jk)?;
-                        let (process_id, version, process_definition_key) = engine
-                            .instance(job.instance_key)
-                            .and_then(|instance| engine.state().processes.get(&instance.process_id))
-                            .map(|deployed| {
-                                (
-                                    deployed.definition.id.clone(),
-                                    deployed.version,
-                                    deployed.key.to_string(),
-                                )
-                            })
-                            .unwrap_or_else(|| (String::new(), 1, String::new()));
-                        Some(ActivatedJobWithIdentity {
-                            job,
-                            process_id,
-                            version,
-                            process_definition_key,
-                        })
-                    })
-                    .collect()
+                    .filter_map(|key| engine.activated_job(key))
+                    .collect();
+                activated_jobs_with_identity(journal, jobs)
             })
             .await;
         #[cfg(feature = "console")]
@@ -16280,12 +16480,16 @@ impl ServerImpl {
                     produced = true;
                 }
             } else {
-                // Leader-local activation: the job lock lives ONLY on this leader's
-                // engine actor (it was never replicated), so expiring leases must
-                // stay leader-local too. Proposing `ExpireJobs` through Raft would
-                // emit `JobLockExpired` on the leader (job is Activated) but nothing
-                // on followers (their job is still Created), diverging the replicated
-                // event stream. Expire directly on the leader's engine actor.
+                // Durable activations share a partition with volatile soft
+                // activations; their expiration must never follow the soft path.
+                if let Ok(resp) = part
+                    .propose_result(Command::ExpireJobsByDurability { now, durable: true }, now)
+                    .await
+                    && resp.error.is_none()
+                    && !resp.events.is_empty()
+                {
+                    produced = true;
+                }
                 let expired = handle
                     .with(move |journal| {
                         let timer = cmd_profile::start();
@@ -16324,9 +16528,10 @@ impl ServerImpl {
             Err(EngineError::JobNotActive { job_key }) => {
                 Err((409, format!("Job {job_key} is not active.")))
             }
-            Err(EngineError::JobNotActivated { job_key }) => {
-                Err((409, format!("Job {job_key} has not been activated.")))
-            }
+            Err(
+                e @ (EngineError::JobNotActivated { .. } | EngineError::JobLeaseMismatch { .. }),
+            ) => Err((409, e.to_string())),
+            Err(e @ EngineError::JobUpdateInvalid { .. }) => Err((400, e.to_string())),
             Err(e) => Err((500, e.to_string())),
         }
     }
@@ -17092,7 +17297,17 @@ impl ServerImpl {
         job_key: u64,
         command: Command,
     ) -> Result<Commit, (u16, String)> {
-        let p = partition_of(job_key);
+        self.propose_partition_command(job_key, command)
+            .await
+            .map(|(_, commit)| commit)
+    }
+
+    async fn propose_partition_command(
+        &self,
+        key: Key,
+        command: Command,
+    ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
+        let p = partition_of(key);
         // Bounded completion write-pause (ADR 0019): while this node is handing
         // `p` back to its returning owner, pause job-mutation writes so the raft
         // log fully quiesces and the catch-up learner can reach zero lag. Retryable
@@ -17123,7 +17338,19 @@ impl ServerImpl {
         self.spawn_routing_if_needed(&response.events);
         self.observe_job_sojourn(&response.events, now_millis());
         self.record_adhoc_events(&response.events);
-        Ok(Commit::ready())
+        Ok((Arc::new(response.events), Commit::ready()))
+    }
+
+    async fn job_worker_metadata(&self, job_key: Key) -> Option<(String, Option<String>)> {
+        self.engine_handle_for(partition_of(job_key))?
+            .with(move |journal| {
+                journal
+                    .state()
+                    .jobs
+                    .get(&job_key)
+                    .map(|job| (job.job_type.clone(), job.worker.clone()))
+            })
+            .await
     }
 
     /// Stream `CompleteJob`: applies the command on the engine actor (establishing
@@ -17142,9 +17369,22 @@ impl ServerImpl {
     /// (~5ms window), the job re-activates on restart (lock expires), preserving
     /// at-least-once semantics. See README.md "Stream durability: ack-before-fsync
     /// pipelining" and `falcon::pipeline_job_command` for full rationale.
+    #[cfg(test)]
     pub(crate) async fn complete_job_for_stream(
         &self,
         job_key: u64,
+        variables: std::collections::HashMap<String, Value>,
+        adhoc_result: Option<AdHocJobResult>,
+        task_result: Option<TaskListenerJobResult>,
+    ) -> Result<Commit, (u16, String)> {
+        self.complete_job_for_stream_with_lease(job_key, None, variables, adhoc_result, task_result)
+            .await
+    }
+
+    pub(crate) async fn complete_job_for_stream_with_lease(
+        &self,
+        job_key: u64,
+        lease_token: Option<String>,
         variables: std::collections::HashMap<String, Value>,
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
@@ -17162,6 +17402,7 @@ impl ServerImpl {
             (None, Some(result)) => Command::complete_job_with_result(job_key, variables, result),
             (None, None) => Command::complete_job_with(job_key, variables),
         };
+        let command = job_command_with_lease(command, lease_token);
         if !self.raft.is_empty() {
             return self.propose_job_for_stream(job_key, command).await;
         }
@@ -17180,15 +17421,33 @@ impl ServerImpl {
 
     /// Stream `FailJob`. Returns the [`Commit`] for off-path pipelining; see
     /// [`Self::complete_job_for_stream`].
+    #[cfg(test)]
     pub(crate) async fn fail_job_for_stream(
         &self,
         job_key: u64,
         retries: i32,
         error_message: String,
     ) -> Result<Commit, (u16, String)> {
+        self.fail_job_for_stream_with_lease(job_key, None, retries, error_message)
+            .await
+    }
+
+    pub(crate) async fn fail_job_for_stream_with_lease(
+        &self,
+        job_key: u64,
+        lease_token: Option<String>,
+        retries: i32,
+        error_message: String,
+    ) -> Result<Commit, (u16, String)> {
         if !self.raft.is_empty() {
             return self
-                .propose_job_for_stream(job_key, Command::fail_job(job_key, retries, error_message))
+                .propose_job_for_stream(
+                    job_key,
+                    job_command_with_lease(
+                        Command::fail_job(job_key, retries, error_message),
+                        lease_token,
+                    ),
+                )
                 .await;
         }
         let result = self
@@ -17196,7 +17455,10 @@ impl ServerImpl {
             .by_key(job_key)
             .with(move |engine| {
                 engine.apply_command_at(
-                    Command::fail_job(job_key, retries, error_message),
+                    job_command_with_lease(
+                        Command::fail_job(job_key, retries, error_message),
+                        lease_token,
+                    ),
                     now_millis(),
                 )
             })
@@ -17209,9 +17471,10 @@ impl ServerImpl {
 
     /// Stream `ThrowError`. Returns the [`Commit`] for off-path pipelining; see
     /// [`Self::complete_job_for_stream`].
-    pub(crate) async fn throw_error_for_stream(
+    pub(crate) async fn throw_error_for_stream_with_lease(
         &self,
         job_key: u64,
+        lease_token: Option<String>,
         error_code: String,
         error_message: String,
         variables: std::collections::HashMap<String, Value>,
@@ -17220,7 +17483,15 @@ impl ServerImpl {
             return self
                 .propose_job_for_stream(
                     job_key,
-                    Command::throw_job_error_with(job_key, error_code, error_message, variables),
+                    job_command_with_lease(
+                        Command::throw_job_error_with(
+                            job_key,
+                            error_code,
+                            error_message,
+                            variables,
+                        ),
+                        lease_token,
+                    ),
                 )
                 .await;
         }
@@ -17229,7 +17500,15 @@ impl ServerImpl {
             .by_key(job_key)
             .with(move |engine| {
                 engine.apply_command_at(
-                    Command::throw_job_error_with(job_key, error_code, error_message, variables),
+                    job_command_with_lease(
+                        Command::throw_job_error_with(
+                            job_key,
+                            error_code,
+                            error_message,
+                            variables,
+                        ),
+                        lease_token,
+                    ),
                     now_millis(),
                 )
             })
@@ -17244,6 +17523,7 @@ impl ServerImpl {
     /// projected REST job results. Thin wrapper over [`Self::try_activate`] so the
     /// stream dispatcher reuses the exact activation + off-thread variable
     /// encoding path as the REST `activateJobs`.
+    #[cfg(test)]
     pub(crate) async fn activate_for_stream(
         &self,
         job_type: &str,
@@ -17252,8 +17532,35 @@ impl ServerImpl {
         timeout: u64,
         fetch_variable: Option<&[String]>,
     ) -> Vec<models::ActivatedJobResult> {
-        self.try_activate(job_type, worker, max_jobs, timeout, fetch_variable)
-            .await
+        self.activate_for_stream_with_lease(
+            job_type,
+            worker,
+            max_jobs,
+            timeout,
+            fetch_variable,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn activate_for_stream_with_lease(
+        &self,
+        job_type: &str,
+        worker: &str,
+        max_jobs: usize,
+        timeout: u64,
+        fetch_variable: Option<&[String]>,
+        with_lease: bool,
+    ) -> Vec<models::ActivatedJobResult> {
+        self.try_activate(
+            job_type,
+            worker,
+            max_jobs,
+            timeout,
+            fetch_variable,
+            with_lease,
+        )
+        .await
     }
 
     /// The SLA mode currently in effect. Read live from the shared handle, so it
@@ -19367,22 +19674,23 @@ fn agent_commit_status_from(
 /// value so the wire carries JSON, not a JSON-in-a-string.
 fn agent_message_content(
     c: &agent_model::AgentHistoryContent,
-) -> models::AgentInstanceMessageContent {
+) -> Result<models::AgentInstanceMessageContent, serde_json::Error> {
     use agent_model::AgentHistoryContentType as CT;
-    let content_type = match c.content_type {
-        CT::Text => models::AgentInstanceContentTypeEnum::Text,
-        CT::Document => models::AgentInstanceContentTypeEnum::Document,
-        CT::Object => models::AgentInstanceContentTypeEnum::Object,
-    };
-    let mut m = models::AgentInstanceMessageContent::new(content_type);
-    m.text = c.text.clone().map(types::Nullable::Present);
-    m.document_reference = c.document_reference.clone().map(types::Nullable::Present);
-    m.object = c.object.as_ref().map(|s| {
-        let value = serde_json::from_str::<serde_json::Value>(s)
-            .unwrap_or_else(|_| serde_json::Value::String(s.to_string()));
-        types::Nullable::Present(types::Object(value))
-    });
-    m
+    Ok(match c.content_type {
+        CT::Text => models::AgentInstanceMessageContent::AgentInstanceTextContent(
+            models::AgentInstanceTextContent::new(c.text.clone().unwrap_or_default()),
+        ),
+        CT::Document => models::AgentInstanceMessageContent::AgentInstanceDocumentContent(
+            models::AgentInstanceDocumentContent::new(serde_json::from_str(
+                c.document_reference.as_deref().unwrap_or("null"),
+            )?),
+        ),
+        CT::Object => models::AgentInstanceMessageContent::AgentInstanceObjectContent(
+            models::AgentInstanceObjectContent::new(types::Object(serde_json::from_str(
+                c.object.as_deref().unwrap_or("null"),
+            )?)),
+        ),
+    })
 }
 
 /// Maps a REST message-content block to the engine content shape. The structured
@@ -19390,16 +19698,27 @@ fn agent_message_content(
 /// stores (it stays free of a `serde_json::Value` dependency).
 fn agent_content_from(c: &models::AgentInstanceMessageContent) -> agent_model::AgentHistoryContent {
     use agent_model::AgentHistoryContentType as CT;
-    let content_type = match c.content_type {
-        models::AgentInstanceContentTypeEnum::Text => CT::Text,
-        models::AgentInstanceContentTypeEnum::Document => CT::Document,
-        models::AgentInstanceContentTypeEnum::Object => CT::Object,
+    let (content_type, text, document_reference, object) = match c {
+        models::AgentInstanceMessageContent::AgentInstanceTextContent(c) => {
+            (CT::Text, Some(c.text.clone()), None, None)
+        }
+        models::AgentInstanceMessageContent::AgentInstanceDocumentContent(c) => (
+            CT::Document,
+            None,
+            Some(
+                serde_json::to_string(&c.document_reference).expect("document DTO is serializable"),
+            ),
+            None,
+        ),
+        models::AgentInstanceMessageContent::AgentInstanceObjectContent(c) => {
+            (CT::Object, None, None, Some(c.object.0.to_string()))
+        }
     };
     agent_model::AgentHistoryContent {
         content_type,
-        text: present(&c.text).cloned(),
-        document_reference: present(&c.document_reference).cloned(),
-        object: present(&c.object).map(|o| o.0.to_string()),
+        text,
+        document_reference,
+        object,
     }
 }
 
@@ -19486,9 +19805,12 @@ fn agent_history_metrics_result(
     m: &agent_model::AgentHistoryMetrics,
 ) -> models::AgentInstanceHistoryItemMetrics {
     models::AgentInstanceHistoryItemMetrics::new(
-        types::Nullable::Present(m.input_tokens),
-        types::Nullable::Present(m.output_tokens),
-        types::Nullable::Present(m.duration_ms),
+        m.input_tokens
+            .map_or(types::Nullable::Null, types::Nullable::Present),
+        m.output_tokens
+            .map_or(types::Nullable::Null, types::Nullable::Present),
+        m.duration_ms
+            .map_or(types::Nullable::Null, types::Nullable::Present),
     )
 }
 
@@ -19498,8 +19820,8 @@ fn agent_history_metrics_from(
     m: &models::AgentInstanceHistoryItemMetrics,
 ) -> agent_model::AgentHistoryMetrics {
     let val = |n: &types::Nullable<i64>| match n {
-        types::Nullable::Present(v) => *v,
-        types::Nullable::Null => 0,
+        types::Nullable::Present(v) => Some(*v),
+        types::Nullable::Null => None,
     };
     agent_model::AgentHistoryMetrics {
         input_tokens: val(&m.input_tokens),
@@ -19514,9 +19836,21 @@ fn agent_history_metrics_from(
 /// deployment carried no tag); tools are decoded from the row's stored JSON,
 /// defaulting to an empty list when absent or malformed; `elementInstanceKeys`
 /// reports every element instance associated with the agent instance.
-fn agent_instance_result(row: &readstore::AgentInstanceRow) -> models::AgentInstanceResult {
-    let tools: Vec<agent_model::AgentTool> =
-        serde_json::from_str(&row.tools_json).unwrap_or_default();
+fn agent_system_prompt(
+    prompt: &Option<Vec<agent_model::AgentHistoryContent>>,
+) -> Result<Vec<models::AgentInstanceMessageContent>, serde_json::Error> {
+    prompt
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(agent_message_content)
+        .collect()
+}
+
+fn agent_instance_result(
+    row: &readstore::AgentInstanceRow,
+) -> Result<models::AgentInstanceResult, serde_json::Error> {
+    let tools: Vec<agent_model::AgentTool> = serde_json::from_str(&row.tools_json)?;
     let completion_date = match row.completion_date_ms {
         Some(ms) => types::Nullable::Present(ms_to_datetime(ms)),
         None => types::Nullable::Null,
@@ -19525,13 +19859,14 @@ fn agent_instance_result(row: &readstore::AgentInstanceRow) -> models::AgentInst
         Some(tag) => types::Nullable::Present(tag.clone()),
         None => types::Nullable::Null,
     };
-    models::AgentInstanceResult::new(
+    Ok(models::AgentInstanceResult::new(
         models::AgentInstanceKey(row.agent_instance_key.to_string()),
+        models::AgentDefinitionKey(row.agent_definition_key.to_string()),
         agent_instance_status_enum(row.status),
-        models::AgentInstanceDefinition::new(
+        models::AgentInstanceDefinitionResult::new(
             row.model.clone().unwrap_or_default(),
             row.provider.clone().unwrap_or_default(),
-            row.system_prompt.clone().unwrap_or_default(),
+            agent_system_prompt(&row.system_prompt)?,
         ),
         models::AgentInstanceMetrics::new(
             row.input_tokens,
@@ -19560,7 +19895,7 @@ fn agent_instance_result(row: &readstore::AgentInstanceRow) -> models::AgentInst
             .iter()
             .map(|k| k.to_string())
             .collect(),
-    )
+    ))
 }
 
 /// Correlates each emitted `AgentHistoryCreated` event (in request/emission
@@ -19591,7 +19926,7 @@ fn correlate_created_history(
         let (eid, key, dup) = created.remove(pos);
         out.push(models::AgentInstanceCreatedHistoryItem::new(
             if id.is_empty() { eid } else { id },
-            models::AgentHistoryKey(key),
+            models::AgentHistoryItemKey(key),
             dup,
         ));
     }
@@ -19679,43 +20014,44 @@ mod correlate_created_history_tests {
 /// duration subset.
 fn agent_history_item_result(
     row: &readstore::AgentHistoryRow,
-) -> models::AgentInstanceHistoryItemResult {
-    let content: Vec<agent_model::AgentHistoryContent> =
-        serde_json::from_str(&row.content_json).unwrap_or_default();
+) -> Result<models::AgentInstanceHistoryItemResult, serde_json::Error> {
+    let content: Vec<agent_model::AgentHistoryContent> = serde_json::from_str(&row.content_json)?;
     let tool_calls: Vec<agent_model::AgentHistoryToolCall> =
-        serde_json::from_str(&row.tool_calls_json).unwrap_or_default();
-    let tools: Vec<agent_model::AgentTool> =
-        serde_json::from_str(&row.tools_json).unwrap_or_default();
-    // Per the contract, per-call `metrics` are present on ASSISTANT items only;
-    // for USER/TOOL_RESULT/CONFIGURATION turns the field is required-but-nullable
-    // and must be null rather than leaking meaningless zero metrics.
-    let metrics = match row.role {
-        agent_model::AgentHistoryRole::Assistant => types::Nullable::Present(
-            agent_history_metrics_result(&agent_model::AgentHistoryMetrics {
-                input_tokens: row.input_tokens,
-                output_tokens: row.output_tokens,
-                reasoning_token_count: row.reasoning_token_count,
-                cache_creation_token_count: row.cache_creation_token_count,
-                cache_read_token_count: row.cache_read_token_count,
-                duration_ms: row.duration_ms,
-            }),
-        ),
-        _ => types::Nullable::Null,
-    };
-    models::AgentInstanceHistoryItemResult::new(
-        models::AgentHistoryKey(row.agent_history_key.to_string()),
+        serde_json::from_str(&row.tool_calls_json)?;
+    let tools: Vec<agent_model::AgentTool> = serde_json::from_str(&row.tools_json)?;
+    let metrics = row
+        .metrics_json
+        .as_deref()
+        .map(serde_json::from_str::<Option<agent_model::AgentHistoryMetrics>>)
+        .transpose()?
+        .flatten()
+        .as_ref()
+        .map(agent_history_metrics_result)
+        .map_or(types::Nullable::Null, types::Nullable::Present);
+    let limits: agent_model::AgentInstanceLimits = row
+        .limits_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(models::AgentInstanceHistoryItemResult::new(
+        models::AgentHistoryItemKey(row.agent_history_key.to_string()),
         row.history_item_id.clone().unwrap_or_default(),
         models::AgentInstanceKey(row.agent_instance_key.to_string()),
         models::ElementInstanceKey(row.element_instance_key.to_string()),
-        models::ProcessInstanceKey(row.process_instance_key.to_string()),
-        models::ProcessInstanceKey(row.root_process_instance_key.to_string()),
-        models::ProcessDefinitionKey(row.process_definition_key.to_string()),
-        row.process_definition_id.clone(),
-        tenant_or_default(&row.tenant_id),
         models::JobKey(row.job_key.to_string()),
-        row.loop_iteration,
+        row.job_lease.clone(),
+        u32::try_from(row.loop_iteration)
+            .ok()
+            .filter(|iteration| *iteration > 0)
+            .ok_or_else(|| {
+                <serde_json::Error as serde::de::Error>::custom("invalid stored loopIteration")
+            })?,
         agent_history_role_enum(row.role),
-        content.iter().map(agent_message_content).collect(),
+        content
+            .iter()
+            .map(agent_message_content)
+            .collect::<Result<_, _>>()?,
         tool_calls.iter().map(agent_tool_call_result).collect(),
         metrics,
         agent_commit_status_enum(row.commit_status),
@@ -19729,8 +20065,13 @@ fn agent_history_item_result(
             Some(p) => types::Nullable::Present(p.clone()),
             None => types::Nullable::Null,
         },
-        row.is_duplicate,
-    )
+        models::AgentInstanceLimits::new(
+            limits.max_model_calls as i32,
+            limits.max_tool_calls as i32,
+            limits.max_tokens,
+        ),
+        agent_system_prompt(&row.system_prompt)?,
+    ))
 }
 
 /// Builds an engine [`agent_model::AgentHistoryTurn`] from a REST history item.
@@ -19739,7 +20080,7 @@ fn agent_history_item_result(
 fn agent_history_turn_from(
     item: &models::AgentInstanceHistoryItem,
     job_key: Key,
-    job_lease: u64,
+    job_lease: &str,
 ) -> agent_model::AgentHistoryTurn {
     let tool_calls = match &item.tool_calls {
         Some(types::Nullable::Present(v)) => v.iter().map(agent_tool_call_from).collect(),
@@ -19750,8 +20091,8 @@ fn agent_history_turn_from(
         _ => Vec::new(),
     };
     let metrics = match &item.metrics {
-        Some(types::Nullable::Present(m)) => agent_history_metrics_from(m),
-        _ => agent_model::AgentHistoryMetrics::default(),
+        Some(types::Nullable::Present(m)) => Some(agent_history_metrics_from(m)),
+        _ => None,
     };
     let limits = item
         .limits
@@ -19762,22 +20103,48 @@ fn agent_history_turn_from(
             max_tool_calls: l.max_tool_calls as i64,
         });
     agent_model::AgentHistoryTurn {
-        loop_iteration: item.loop_iteration,
+        changed_attributes: [
+            (item.model.is_some(), "model"),
+            (item.provider.is_some(), "provider"),
+            (present(&item.system_prompt).is_some(), "systemPrompt"),
+            (present(&item.tools).is_some(), "tools"),
+            (item.limits.is_some(), "maxTokens"),
+            (item.limits.is_some(), "maxModelCalls"),
+            (item.limits.is_some(), "maxToolCalls"),
+        ]
+        .into_iter()
+        .filter(|(present, _)| *present)
+        .map(|(_, field)| field.to_owned())
+        .collect(),
+        loop_iteration: item.loop_iteration as i32,
         produced_at: item.produced_at.timestamp_millis().max(0) as u64,
         role: agent_history_role_from(&item.role),
         content: item.content.iter().map(agent_content_from).collect(),
-        system_prompt: present(&item.system_prompt).cloned(),
+        system_prompt: present(&item.system_prompt)
+            .map(|prompt| prompt.iter().map(agent_content_from).collect()),
         tool_calls,
         metrics,
         history_item_id: Some(item.history_item_id.clone()),
         tools,
-        model: present(&item.model).cloned(),
-        provider: present(&item.provider).cloned(),
+        model: item.model.clone(),
+        provider: item.provider.clone(),
         limits,
         job_key,
-        job_lease,
+        job_lease: job_lease.to_owned(),
         ..Default::default()
     }
+}
+
+fn validate_agent_history(items: &[models::AgentInstanceHistoryItem]) -> Result<(), String> {
+    for item in items {
+        if item.history_item_id.trim().is_empty() {
+            return Err("historyItemId must be nonblank.".into());
+        }
+        if item.loop_iteration == 0 || item.loop_iteration > i32::MAX as u32 {
+            return Err("loopIteration must be a positive int32.".into());
+        }
+    }
+    Ok(())
 }
 
 /// The [`query::SortVal`] for an agent-instance row on the given REST sort field.
@@ -19812,11 +20179,19 @@ fn match_agent_instance_filter(
     f: &models::AgentInstanceFilter,
 ) -> bool {
     query::match_agent_instance_key(&f.agent_instance_key, &row.agent_instance_key.to_string())
+        && query::match_agent_definition_key(
+            &f.agent_definition_key,
+            &row.agent_definition_key.to_string(),
+        )
         && query::match_agent_instance_status(&f.status, row.status.as_str())
         && query::match_element_id(&f.element_id, &row.element_id)
         && query::match_process_instance_key(
             &f.process_instance_key,
             &row.process_instance_key.to_string(),
+        )
+        && query::match_process_instance_key(
+            &f.root_process_instance_key,
+            &row.root_process_instance_key.to_string(),
         )
         && query::match_process_definition_key(
             &f.process_definition_key,
@@ -19854,95 +20229,103 @@ fn match_agent_instance_element_keys(
     }
 }
 
-/// Maps a REST metrics-delta to the engine's delta (the engine carries extra
-/// token counters not part of the 8.10 request, so they default to 0).
-fn agent_metrics_delta_from(
-    d: &models::AgentInstanceMetricsDelta,
-) -> agent_model::AgentInstanceMetricsDelta {
-    agent_model::AgentInstanceMetricsDelta {
-        input_tokens: d.input_tokens.unwrap_or(0),
-        output_tokens: d.output_tokens.unwrap_or(0),
-        model_calls: d.model_calls.unwrap_or(0) as i64,
-        tool_calls: d.tool_calls.unwrap_or(0) as i64,
-        ..Default::default()
-    }
+fn created_history_from_events(
+    events: &[Event],
+    submitted_ids: Vec<String>,
+) -> Option<Vec<models::AgentInstanceCreatedHistoryItem>> {
+    let created = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::AgentHistoryCreated { record, .. } => Some((
+                record.history_item_id.clone().unwrap_or_default(),
+                record.agent_history_key.to_string(),
+                record.is_duplicate,
+            )),
+            Event::AgentHistoryDeduplicated {
+                history_item_id,
+                original_agent_history_key,
+                ..
+            } => Some((
+                history_item_id.clone(),
+                original_agent_history_key.to_string(),
+                true,
+            )),
+            _ => None,
+        })
+        .collect();
+    correlate_created_history(submitted_ids, created)
 }
 
-/// Maps a create-command [`EngineError`] to the create endpoint's response. The
-/// spec defines 404 for an inactive/unknown element instance and 400 for an
-/// element that cannot host an agent; everything else is a 500.
-fn agent_create_error_response(
-    e: EngineError,
-) -> apis::agent_instance::CreateAgentInstanceResponse {
-    use apis::agent_instance::CreateAgentInstanceResponse as Resp;
-    match e {
-        EngineError::AgentInstanceElementInstanceInactive {
-            element_instance_key,
-        } => Resp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(
-            problem(
-                "Element instance not active",
-                404,
-                format!(
-                    "Element instance {element_instance_key} is not an active element instance."
-                ),
-            ),
-        ),
-        EngineError::AgentInstanceElementNotEligible { .. }
-        | EngineError::AgentInstanceMissingAgentDefinition { .. } => {
-            Resp::Status400_TheProvidedDataIsNotValid(problem(
-                "Element not eligible for an agent instance",
-                400,
-                e.to_string(),
-            ))
+fn parse_agent_job_attribution(
+    job_key: Option<&str>,
+    job_lease: Option<&str>,
+) -> Result<(Key, String), (&'static str, String)> {
+    match (job_key, job_lease) {
+        (Some(key), Some(lease)) => {
+            let key = key
+                .parse::<Key>()
+                .ok()
+                .filter(|key| *key > 0)
+                .ok_or(("Invalid job key", "jobKey must be a positive key.".into()))?;
+            Ok((key, lease.to_owned()))
         }
-        EngineError::AgentInstanceConflict { .. } => Resp::Status400_TheProvidedDataIsNotValid(
-            problem("Agent instance conflict", 400, e.to_string()),
-        ),
-        // Split rejection status codes to match Camunda's
-        // `validateJobContext` (#1106): a not-active or lease-mismatched job is a
-        // 404, an element-mismatch / job-required-for-history is a 400.
-        EngineError::AgentInstanceJobNotActive { .. }
-        | EngineError::AgentInstanceJobLeaseMismatch { .. } => {
-            Resp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(
-                problem("Agent job lease invalid", 404, e.to_string()),
-            )
-        }
-        EngineError::AgentInstanceJobElementMismatch { .. }
-        | EngineError::AgentInstanceJobRequiredForHistory { .. } => {
-            Resp::Status400_TheProvidedDataIsNotValid(problem(
-                "Agent job lease invalid",
-                400,
-                e.to_string(),
-            ))
-        }
-        other => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-            "Agent instance creation failed",
-            500,
-            other.to_string(),
+        _ => Err((
+            "Invalid job attribution",
+            "A positive jobKey and a jobLease string are required.".into(),
         )),
     }
 }
 
-/// Resolves a REST commit-status filter to the read-model's inclusion list, or
-/// `None` when the filter cannot be expressed as an inclusion set (a bare
-/// `$neq`/`$exists`). The caller rejects a `None` with HTTP 400 rather than
-/// silently applying the COMMITTED-only default, so `None` signals an
-/// unsupported filter shape — not a fallback. Exact match and `$eq`/`$in` map to
-/// their listed statuses.
+fn agent_create_http_error(
+    status: u16,
+    detail: String,
+) -> apis::agent_instance::CreateAgentInstanceResponse {
+    use apis::agent_instance::CreateAgentInstanceResponse as Resp;
+    let problem = problem("Agent instance creation rejected", status, detail);
+    match status {
+        400 => Resp::Status400_TheProvidedDataIsNotValid(problem),
+        404 => {
+            Resp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(problem)
+        }
+        409 => Resp::Status409_AnAgentInstanceAlreadyExistsForTheGivenElementInstance(problem),
+        _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem),
+    }
+}
+
+fn agent_update_http_error(
+    status: u16,
+    detail: String,
+) -> apis::agent_instance::UpdateAgentInstanceResponse {
+    use apis::agent_instance::UpdateAgentInstanceResponse as Resp;
+    let problem = problem("Agent instance update rejected", status, detail);
+    match status {
+        400 => Resp::Status400_TheProvidedDataIsNotValid(problem),
+        404 => Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(problem),
+        409 => Resp::Status409_TheAgentInstanceHasAConflictingActiveWriter(problem),
+        _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem),
+    }
+}
+
 fn agent_commit_status_filter_values(
     filter: &models::AgentInstanceHistoryCommitStatusFilterProperty,
-) -> Option<Vec<agent_model::AgentHistoryCommitStatus>> {
+) -> Vec<agent_model::AgentHistoryCommitStatus> {
     use models::AgentInstanceHistoryCommitStatusFilterProperty as P;
     match filter {
-        P::AgentInstanceHistoryCommitStatusEnum(e) => Some(vec![agent_commit_status_from(e)]),
+        P::AgentInstanceHistoryCommitStatusEnum(e) => vec![agent_commit_status_from(e)],
         P::AdvancedAgentInstanceHistoryCommitStatusFilter(a) => {
-            if let Some(list) = &a.dollar_in {
-                Some(list.iter().map(agent_commit_status_from).collect())
-            } else {
-                a.dollar_eq
-                    .as_ref()
-                    .map(|e| vec![agent_commit_status_from(e)])
-            }
+            use models::AgentInstanceHistoryCommitStatusEnum as S;
+            [S::Committed, S::Pending, S::Discarded]
+                .into_iter()
+                .filter(|status| {
+                    a.dollar_exists != Some(false)
+                        && a.dollar_eq.is_none_or(|value| value == *status)
+                        && a.dollar_neq.is_none_or(|value| value != *status)
+                        && a.dollar_in
+                            .as_ref()
+                            .is_none_or(|values| values.contains(status))
+                })
+                .map(|status| agent_commit_status_from(&status))
+                .collect()
         }
     }
 }
@@ -20162,6 +20545,99 @@ struct ActivatedJobWithIdentity {
     process_definition_key: String,
 }
 
+enum PreparedActivation {
+    Durable(Box<Command>),
+    Soft(Vec<ActivatedJobWithIdentity>),
+}
+
+fn prepare_activation(
+    journal: &mut Journal,
+    command: Command,
+    force_durable: bool,
+) -> PreparedActivation {
+    let Command::ActivateJobs {
+        job_type,
+        worker,
+        max_jobs,
+        timeout,
+        now,
+        fetch_variables,
+        with_lease,
+    } = command
+    else {
+        unreachable!("activation preparation requires ActivateJobs");
+    };
+    let job_keys = journal.select_activatable_job_keys(&job_type, max_jobs, now, with_lease);
+    if job_keys.is_empty() {
+        return PreparedActivation::Soft(Vec::new());
+    }
+    if force_durable
+        || with_lease
+        || job_keys
+            .iter()
+            .any(|key| journal.engine().job_requires_durable_activation(*key))
+    {
+        PreparedActivation::Durable(Box::new(Command::ActivateJobsByKey {
+            job_keys,
+            worker,
+            timeout,
+            now,
+            fetch_variables,
+            with_lease,
+        }))
+    } else {
+        // Selection and the soft activation share one actor turn, so deployment
+        // or instance creation cannot insert an agent job between the two.
+        let jobs = journal.activate_jobs_with_fetch(
+            job_type,
+            worker,
+            max_jobs,
+            timeout,
+            now,
+            fetch_variables,
+        );
+        PreparedActivation::Soft(activated_jobs_with_identity(journal, jobs))
+    }
+}
+
+fn activated_jobs_with_identity(
+    journal: &Journal,
+    jobs: Vec<ActivatedJob>,
+) -> Vec<ActivatedJobWithIdentity> {
+    jobs.into_iter()
+        .map(|job| {
+            let (process_id, version, process_definition_key) = journal
+                .instance(job.instance_key)
+                .and_then(|instance| journal.state().processes.get(&instance.process_id))
+                .map(|deployed| {
+                    (
+                        deployed.definition.id.clone(),
+                        deployed.version,
+                        deployed.key.to_string(),
+                    )
+                })
+                .unwrap_or_else(|| (String::new(), 1, String::new()));
+            ActivatedJobWithIdentity {
+                job,
+                process_id,
+                version,
+                process_definition_key,
+            }
+        })
+        .collect()
+}
+
+fn optional_lease_token(token: &Option<types::Nullable<String>>) -> Option<String> {
+    match token {
+        Some(types::Nullable::Present(token)) => Some(token.clone()),
+        _ => None,
+    }
+}
+
+fn job_command_with_lease(command: Command, lease_token: Option<String>) -> Command {
+    command.with_lease_token(lease_token)
+}
+
 fn activated_job_result(
     activated: ActivatedJobWithIdentity,
     fetch_variable: Option<&[String]>,
@@ -20226,6 +20702,9 @@ fn activated_job_result(
         tags,
         nanobpm_gateway_rest::types::Nullable::Null,
         job.priority,
+        job.lease_token
+            .map(|lease| types::Nullable::Present(lease.to_string()))
+            .unwrap_or(types::Nullable::Null),
     )
 }
 
@@ -22795,6 +23274,12 @@ async fn main() {
                     futures_util::future::join_all(engine.all().iter().map(|handle| {
                         handle.with(move |journal| {
                             let (fired, _commit) = journal.trigger_timers(now);
+                            let (leased_expired, _lease_commit) = journal
+                                .apply_command_at(
+                                    Command::ExpireJobsByDurability { now, durable: true },
+                                    now,
+                                )
+                                .expect("expiry cannot reject");
                             let expired = journal.expire_jobs(now);
                             // Shed to disk if hot RAM is over the high-water mark
                             // (cheap no-op below it / when unset): active-backlog
@@ -22824,7 +23309,12 @@ async fn main() {
                             // job lease (frees a job for redelivery) means there is
                             // pushable work — wake dispatch instead of waiting for
                             // its own backstop tick.
-                            (!fired.is_empty() || !expired.is_empty(), routable)
+                            (
+                                !fired.is_empty()
+                                    || !expired.is_empty()
+                                    || !leased_expired.is_empty(),
+                                routable,
+                            )
                         })
                     }))
                     .await
@@ -24570,6 +25060,36 @@ mod clustered_startup_tests {
             }
         }
         panic!("no commandResult received");
+    }
+
+    #[tokio::test]
+    async fn update_job_distinguishes_malformed_keys_from_missing_jobs() {
+        use futures_util::SinkExt;
+
+        let server =
+            build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1));
+        let (_, port) = serve_router(peer_facing_app(server, falcon::Registry::new())).await;
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/cluster"))
+                .await
+                .unwrap();
+        for (corr, key, status) in [
+            (1, "not-a-key", 400),
+            (2, "", 400),
+            (3, "-1", 400),
+            (4, "18446744073709551616", 400),
+            (5, "42", 404),
+        ] {
+            let frame = serde_json::json!({
+                "type": "updateJob", "corr": corr, "jobKey": key,
+            });
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                frame.to_string().into(),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(next_command_status(&mut ws).await, status, "{key}");
+        }
     }
 
     /// ADR 0039: the public client `/falcon` channel must refuse intra-cluster
@@ -27940,7 +28460,7 @@ mod clustered_startup_tests {
         // Forward the completion to node 0 over the wire and map its answer back.
         use apis::job::CompleteJobResponse as R;
         let resp = node1
-            .forward_complete_job(owner, job_key, None, None, None)
+            .forward_complete_job(owner, job_key, None, None, None, None)
             .await;
         assert!(
             matches!(resp, R::Status204_TheJobWasCompletedSuccessfully),
@@ -27950,7 +28470,7 @@ mod clustered_startup_tests {
         // The completion really mutated node 0's state: completing the same job
         // again is rejected (it is no longer an activated job).
         let again = node1
-            .forward_complete_job(owner, job_key, None, None, None)
+            .forward_complete_job(owner, job_key, None, None, None, None)
             .await;
         assert!(
             !matches!(again, R::Status204_TheJobWasCompletedSuccessfully),
@@ -28484,7 +29004,7 @@ mod clustered_startup_tests {
         assert!(local.is_empty(), "node 1 owns no demo-work job of its own");
 
         let pulled = node1
-            .activate_from_peer(0, "demo-work", "w", 10, 60_000, None)
+            .activate_from_peer(0, "demo-work", "w", 10, 60_000, None, false)
             .await;
         assert_eq!(pulled.len(), 1, "node 1 pulls the peer's parked job");
         let job_key: u64 = pulled[0].job_key.0.parse().expect("numeric job key");
@@ -28500,7 +29020,7 @@ mod clustered_startup_tests {
             .expect("the job's partition is owned by node 0");
         assert_eq!(owner, 0);
         let (status, _) = node1
-            .forward_complete_job_stream(owner, job_key, None, None, None)
+            .forward_complete_job_stream(owner, job_key, None, None, None, None)
             .await;
         assert!(
             is_ok_status(status),
@@ -28509,7 +29029,7 @@ mod clustered_startup_tests {
 
         // Re-completing the same job is rejected — proof it mutated node 0's state.
         let (again, _) = node1
-            .forward_complete_job_stream(owner, job_key, None, None, None)
+            .forward_complete_job_stream(owner, job_key, None, None, None, None)
             .await;
         assert!(
             !is_ok_status(again),
@@ -29021,6 +29541,35 @@ mod clustered_startup_tests {
 
     #[tokio::test]
     async fn a_raft_routed_complete_converges_the_follower_replica_actor() {
+        raft_job_completion_converges(false, false, ActivationPolicy::Always).await;
+    }
+
+    const LEASE_ACTIVATION_POLICIES: [ActivationPolicy; 4] = [
+        ActivationPolicy::Always,
+        ActivationPolicy::LeaderLocal,
+        ActivationPolicy::Digest,
+        ActivationPolicy::Auto,
+    ];
+
+    #[tokio::test]
+    async fn leased_rest_completion_converges_with_same_type_soft_activations() {
+        for policy in LEASE_ACTIVATION_POLICIES {
+            raft_job_completion_converges(true, true, policy).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unleased_agent_registration_preserves_replicated_activation_context() {
+        for policy in LEASE_ACTIVATION_POLICIES {
+            raft_job_completion_converges(false, true, policy).await;
+        }
+    }
+
+    async fn raft_job_completion_converges(
+        with_lease: bool,
+        agent_registration: bool,
+        policy: ActivationPolicy,
+    ) {
         // s3-failover correctness: because activation is now a LOGGED command, the
         // follower's replica engine actor locks the job in lockstep, so a later
         // replicated `CompleteJob` applies cleanly there too and the instance
@@ -29055,22 +29604,37 @@ mod clustered_startup_tests {
                 .collect();
             build_server_in_memory(journals, topology)
         };
-        let node0 = build_node(0);
-        let node1 = build_node(1);
+        let mut node0 = build_node(0);
+        let mut node1 = build_node(1);
+        node0.activation_policy = policy;
+        node1.activation_policy = policy;
 
         let proc = ProcessBuilder::new("intake")
+            .start_event("start")
+            .agent_task(
+                "work",
+                "do-work",
+                nanobpmn_engine_core::AgentType::AiAgentTask,
+            )
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .expect("valid process");
+        let soft_proc = ProcessBuilder::new("soft-intake")
             .start_event("start")
             .service_task("work", "do-work")
             .end_event("end")
             .connect("start", "work")
             .connect("work", "end")
             .build()
-            .expect("valid process");
+            .unwrap();
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
+        names.insert("soft-intake".to_string(), "soft-intake.bpmn".to_string());
         let (_r, events) = node0
             .deploy_resources_locally(
-                vec![proc],
+                vec![proc, soft_proc],
                 &names,
                 Vec::new(),
                 &std::collections::HashMap::new(),
@@ -29108,11 +29672,43 @@ mod clustered_startup_tests {
             assert!(ok, "node 0 must lead partition {p}");
         }
 
-        let (instance_key, _completed) = node0
-            .create_for_stream(Some("intake".into()), None, Default::default())
+        let (mut instance_key, _completed) = node0
+            .create_for_stream(
+                Some(
+                    if agent_registration {
+                        "soft-intake"
+                    } else {
+                        "intake"
+                    }
+                    .into(),
+                ),
+                None,
+                Default::default(),
+            )
             .await
             .expect("raft-routed create commits");
         let part = nanobpmn_engine_core::partition_of(instance_key);
+        if agent_registration {
+            let soft = node0
+                .activate_for_stream("do-work", "soft", 1, 60_000, None)
+                .await;
+            assert_eq!(soft.len(), 1);
+            let created = node0
+                .raft
+                .get(part)
+                .unwrap()
+                .propose_result(Command::create_instance("intake"), now_millis())
+                .await
+                .unwrap();
+            instance_key = created
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                    _ => None,
+                })
+                .unwrap();
+        }
 
         // Grab the follower's replica engine actor up front so we can watch it
         // apply each replicated command in lockstep.
@@ -29143,23 +29739,182 @@ mod clustered_startup_tests {
 
         // Activate through the leader (a LOGGED ActivateJobs), then complete.
         let mut job_key = None;
+        let mut lease_token = None;
+        let mut element_instance_key = None;
+        let mut activation_deadline = 0;
         for _ in 0..50 {
             let jobs = node0
-                .activate_for_stream("do-work", "w", 10, 60_000, None)
+                .activate_for_stream_with_lease(
+                    "do-work",
+                    "w",
+                    10,
+                    if agent_registration { 1 } else { 60_000 },
+                    None,
+                    with_lease,
+                )
                 .await;
             if let Some(j) = jobs.into_iter().next() {
+                activation_deadline = j.deadline as u64;
+                element_instance_key = Some(j.element_instance_key);
+                lease_token = match j.lease_token {
+                    types::Nullable::Present(token) => Some(token),
+                    _ => None,
+                };
                 job_key = Some(j.job_key.0.parse::<u64>().expect("numeric job key"));
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let job_key = job_key.expect("the parked job activates on the leader");
-        node0
-            .complete_job_for_stream(job_key, Default::default(), None, None)
-            .await
-            .expect("raft-routed complete commits via quorum")
-            .wait()
-            .await;
+        if agent_registration {
+            assert_eq!(lease_token.is_some(), with_lease);
+            let expected = lease_token.clone();
+            let mut replicated = false;
+            for _ in 0..400 {
+                let expected = expected.clone();
+                if replica
+                    .with(move |journal| {
+                        journal.state().jobs.get(&job_key).is_some_and(|job| {
+                            job.lease_token == expected
+                                && job.state == nanobpmn_engine_core::JobState::Activated
+                        })
+                    })
+                    .await
+                {
+                    replicated = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                replicated,
+                "leased activation selects the same job on every replica despite soft locks"
+            );
+            let creation = serde_json::from_value(serde_json::json!({
+                "elementInstanceKey": element_instance_key,
+                "jobKey": job_key.to_string(), "jobLease": lease_token.clone().unwrap_or_default(),
+                "history": [{
+                    "historyItemId":"configuration", "loopIteration":1,
+                    "role":"CONFIGURATION", "content":[], "producedAt":"2026-01-01T00:00:00Z",
+                    "model":"model", "provider":"provider",
+                    "systemPrompt":[{"contentType":"TEXT","text":"prompt"}]
+                }]
+            }))
+            .unwrap();
+            let apis::agent_instance::CreateAgentInstanceResponse::Status200_TheAgentInstanceWasCreated(created) =
+                node1.create_agent_instance_impl(&creation).await.unwrap()
+            else { panic!("expected agent registration"); };
+            let agent_key: Key = created.agent_instance_key.0.parse().unwrap();
+            let mut agent_replicated = false;
+            for _ in 0..400 {
+                if replica
+                    .with(move |journal| journal.agent_instance_ownership(agent_key).is_some())
+                    .await
+                {
+                    agent_replicated = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                agent_replicated,
+                "explicit agent registration must replicate its minted keys"
+            );
+            while now_millis() < activation_deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            node0
+                .tick_partition_via_raft(part, now_millis(), true)
+                .await;
+            let mut expired = false;
+            for _ in 0..400 {
+                if replica
+                    .with(move |journal| {
+                        journal
+                            .engine()
+                            .job(job_key)
+                            .is_some_and(|job| job.state == nanobpmn_engine_core::JobState::Created)
+                            && journal
+                                .instance(instance_key)
+                                .and_then(|instance| instance.agent_history.get(&agent_key))
+                                .is_some_and(|history| {
+                                    history.len() == 1
+                                        && history.iter().all(|record| {
+                                            record.commit_status
+                                                == agent_model::AgentHistoryCommitStatus::Pending
+                                        })
+                                })
+                    })
+                    .await
+                {
+                    expired = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                expired,
+                "expiry must release the lock and preserve pending history on every replica under {policy:?}"
+            );
+            let mut reactivated = node0
+                .activate_for_stream_with_lease(
+                    "do-work",
+                    "next-worker",
+                    10,
+                    60_000,
+                    None,
+                    with_lease,
+                )
+                .await;
+            let renewed = reactivated
+                .iter_mut()
+                .find(|job| job.job_key.0 == job_key.to_string())
+                .unwrap();
+            let renewed_token = match &renewed.lease_token {
+                types::Nullable::Present(token) => Some(token.clone()),
+                _ => None,
+            };
+            if with_lease {
+                assert_ne!(renewed_token, lease_token);
+            }
+            lease_token = renewed_token;
+            let update = serde_json::from_value(serde_json::json!({
+                "elementInstanceKey":renewed.element_instance_key,
+                "jobKey":job_key.to_string(),"jobLease":lease_token.clone().unwrap_or_default(),
+                "status":"THINKING","history":[{
+                    "historyItemId":"attempt-2","loopIteration":1,"role":"USER",
+                    "content":[{"contentType":"TEXT","text":"next attempt"}],
+                    "producedAt":"2026-01-01T00:00:00Z"
+                }]
+            }))
+            .unwrap();
+            assert!(matches!(node1.update_agent_instance_impl(
+                &models::UpdateAgentInstancePathParams { agent_instance_key:agent_key.to_string() },
+                &update).await.unwrap(),
+                apis::agent_instance::UpdateAgentInstanceResponse::Status200_TheAgentInstanceWasUpdatedSuccessfully(_)));
+            let request = Some(
+                serde_json::from_value(serde_json::json!({"leaseToken": lease_token})).unwrap(),
+            );
+            assert!(matches!(
+                node0
+                    .complete_job_impl(
+                        &models::CompleteJobPathParams {
+                            job_key: job_key.to_string()
+                        },
+                        &request
+                    )
+                    .await
+                    .unwrap(),
+                apis::job::CompleteJobResponse::Status204_TheJobWasCompletedSuccessfully
+            ));
+        } else {
+            node0
+                .complete_job_for_stream(job_key, Default::default(), None, None)
+                .await
+                .expect("raft-routed complete commits via quorum")
+                .wait()
+                .await;
+        }
 
         // Phase 2: the follower's REPLICA engine actor must converge to the
         // instance being COMPLETED — proof it applied the replicated `CompleteJob`
@@ -32857,25 +33612,16 @@ mod subscription_placement_tests {
         </bpmn:message>
       </bpmn:definitions>"#;
 
-    /// A zero `timeout` at the partition-boundary helper must be rejected with a
-    /// 400 *before* the engine is touched — a lock "extension" of 0ms would set
-    /// the deadline to `now`, instantly expiring the lock. This guards the
-    /// peer-forwarded `UpdateJobTimeout` path (and any future caller), which does
-    /// not re-run the REST validation. The guard short-circuits ahead of the job
-    /// lookup, so it holds even for an unknown key (400, not 404).
+    /// Signed timeout updates use canonical job lookup and validation; zero is
+    /// a valid duration, not a transport-specific error masking an unknown job.
     #[tokio::test]
-    async fn update_job_timeout_local_rejects_zero_timeout_before_lookup() {
+    async fn update_job_timeout_local_checks_job_existence_for_zero_timeout() {
         let server = single_node_multi_partition();
         let err = server
             .update_job_timeout_local(0xdead_beef, 0, None)
             .await
-            .expect_err("a zero timeout must be rejected");
-        assert_eq!(err.0, 400, "zero timeout is a client (validation) error");
-        assert!(
-            err.1.contains("positive"),
-            "detail explains the positive-duration contract, got {:?}",
-            err.1
-        );
+            .expect_err("unknown job must be rejected");
+        assert_eq!(err.0, 404);
     }
 
     /// Minimal agentic ad-hoc process for the gap-#3 server tests: an `agent`
@@ -34004,6 +34750,7 @@ mod adhoc_result_mapping_tests {
     fn plain_completion_has_no_adhoc_result() {
         assert!(adhoc_result_from_completion(&None).is_none());
         let body = models::JobCompletionRequest {
+            lease_token: None,
             variables: None,
             result: None,
         };
@@ -34014,6 +34761,7 @@ mod adhoc_result_mapping_tests {
     #[test]
     fn user_task_result_is_not_an_adhoc_result() {
         let body = models::JobCompletionRequest {
+            lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(
                 models::JobResultUserTask::new(),
@@ -34042,6 +34790,7 @@ mod adhoc_result_mapping_tests {
             r_type: Some("adHocSubProcess".to_string()),
         };
         let body = models::JobCompletionRequest {
+            lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultAdHocSubProcess(adhoc)),
         };
@@ -34069,6 +34818,7 @@ mod task_result_mapping_tests {
     fn plain_and_adhoc_completions_have_no_task_result() {
         assert!(task_result_from_completion(&None).is_none());
         let body = models::JobCompletionRequest {
+            lease_token: None,
             variables: None,
             result: None,
         };
@@ -34081,6 +34831,7 @@ mod task_result_mapping_tests {
             r_type: Some("adHocSubProcess".to_string()),
         };
         let body = models::JobCompletionRequest {
+            lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultAdHocSubProcess(adhoc)),
         };
@@ -34092,6 +34843,7 @@ mod task_result_mapping_tests {
     #[test]
     fn empty_user_task_result_stays_on_the_fast_path() {
         let body = models::JobCompletionRequest {
+            lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(
                 models::JobResultUserTask::new(),
@@ -34111,6 +34863,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(user)),
         };
@@ -34133,6 +34886,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(user)),
         };
@@ -34146,6 +34900,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(user)),
         };
@@ -34181,6 +34936,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(user)),
         };
@@ -34219,6 +34975,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(user)),
         };
@@ -35221,10 +35978,9 @@ mod call_activity_hierarchy_read_model_tests {
 
     /// A TEXT content block carrying `t` (8.10 `contentType: TEXT`).
     fn text_content(t: &str) -> models::AgentInstanceMessageContent {
-        let mut c =
-            models::AgentInstanceMessageContent::new(models::AgentInstanceContentTypeEnum::Text);
-        c.text = Some(types::Nullable::Present(t.to_string()));
-        c
+        models::AgentInstanceMessageContent::AgentInstanceTextContent(
+            models::AgentInstanceTextContent::new(t.to_owned()),
+        )
     }
 
     /// Polls `search_agent_instances_impl` (no filter) until at least `want`
@@ -35256,26 +36012,194 @@ mod call_activity_hierarchy_read_model_tests {
     /// advances status; GET; instance-search filters/sorts; history-search
     /// returns the turns and defaults to COMMITTED).
     #[tokio::test]
-    async fn agent_instances_rest_roundtrips_the_810_schema() {
-        let xml = r#"
-          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
-            <bpmn:process id="agent-proc" isExecutable="true">
-              <bpmn:startEvent id="start" />
-              <bpmn:serviceTask id="agent">
-                <bpmn:extensionElements>
-                  <zeebe:agentDefinition agentType="aiAgentTask" />
-                </bpmn:extensionElements>
-              </bpmn:serviceTask>
-              <bpmn:endEvent id="end" />
-              <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent" />
-              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="end" />
-            </bpmn:process>
-          </bpmn:definitions>"#;
-        let srv = build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1));
-        deploy(&srv, parse_bpmn(xml).expect("parse agent-proc")).await;
+    async fn rest_job_lease_is_opt_in_and_fences_lifecycle() {
+        for mode in ["omitted", "null", "false", "true"] {
+            let with_lease = mode == "true";
+            let srv =
+                build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1));
+            let xml = include_str!("../../engine-core/tests/fixtures/external-agent-job-type.bpmn")
+                .replace("<zeebe:agentDefinition agentType=\"external\"/>", "")
+                .replace(
+                    "source=\"= route\"",
+                    "source=\"= &quot;senior:rebase&quot;\"",
+                );
+            deploy(&srv, parse_bpmn(&xml).unwrap()).await;
+            srv.create_for_stream(
+                Some("external-agent-routing".into()),
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+            let mut request = serde_json::json!({
+                "type": "senior:rebase", "timeout": 60000, "maxJobsToActivate": 1,
+                "requestTimeout": -1,
+            });
+            if mode != "omitted" {
+                request["withLease"] = if mode == "null" {
+                    serde_json::Value::Null
+                } else {
+                    with_lease.into()
+                };
+            }
+            let request: models::JobActivationRequest = serde_json::from_value(request).unwrap();
+            let apis::job::ActivateJobsResponse::Status200_TheListOfActivatedJobs(result) =
+                srv.activate_jobs_impl(&request).await.unwrap()
+            else {
+                panic!("expected activated jobs");
+            };
+            assert_eq!(result.jobs.len(), 1);
+            let job = serde_json::to_value(&result.jobs[0]).unwrap();
+            assert!(
+                job.get("leaseToken").is_some(),
+                "leaseToken is required, nullable"
+            );
+            assert!(
+                job.get("jobLease").is_none(),
+                "jobLease belongs to agent requests only"
+            );
+            if with_lease {
+                assert!(
+                    job["leaseToken"]
+                        .as_str()
+                        .is_some_and(|token| !token.is_empty())
+                );
+                let update_path = models::UpdateJobPathParams {
+                    job_key: result.jobs[0].job_key.0.clone(),
+                };
+                let stale_empty = serde_json::from_value(serde_json::json!({
+                    "changeset": {}, "leaseToken": "stale-token",
+                }))
+                .unwrap();
+                assert!(matches!(srv.update_job_impl(&update_path, &stale_empty).await.unwrap(),
+                    apis::job::UpdateJobResponse::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(_)),
+                    "even an empty changeset validates a supplied lease token");
+                for lease in [serde_json::Value::Null, serde_json::json!("")] {
+                    let operator = serde_json::from_value(serde_json::json!({
+                        "changeset":{"retries":4}, "leaseToken":lease,
+                    }))
+                    .unwrap();
+                    assert!(matches!(
+                        srv.update_job_impl(&update_path, &operator).await.unwrap(),
+                        apis::job::UpdateJobResponse::Status204_TheJobWasUpdatedSuccessfully
+                    ));
+                }
+                let invalid_combination = serde_json::from_value(serde_json::json!({
+                    "changeset":{"retries":0,"timeout":120000}, "leaseToken":job["leaseToken"],
+                }))
+                .unwrap();
+                assert!(matches!(
+                    srv.update_job_impl(&update_path, &invalid_combination)
+                        .await
+                        .unwrap(),
+                    apis::job::UpdateJobResponse::Status400_TheProvidedDataIsNotValid(_)
+                ));
+                let job_key: Key = update_path.job_key.parse().unwrap();
+                let (deadline, retries) = srv
+                    .engine
+                    .by_key(job_key)
+                    .with(move |journal| {
+                        let job = &journal.state().jobs[&job_key];
+                        (job.deadline, job.retries)
+                    })
+                    .await;
+                assert_eq!(
+                    deadline.unwrap().to_string(),
+                    result.jobs[0].deadline.to_string(),
+                    "an invalid combined update cannot partially extend the deadline"
+                );
+                assert_eq!(retries, 4);
+                let path = models::CompleteJobPathParams {
+                    job_key: result.jobs[0].job_key.0.clone(),
+                };
+                for body in [
+                    serde_json::json!({}),
+                    serde_json::json!({"leaseToken": ""}),
+                    serde_json::json!({"leaseToken": "stale-token"}),
+                ] {
+                    let mut fail = body.clone();
+                    fail["retries"] = 1.into();
+                    let fail = Some(serde_json::from_value(fail).unwrap());
+                    assert!(matches!(srv.fail_job_impl(&models::FailJobPathParams {
+                        job_key: path.job_key.clone() }, &fail).await.unwrap(),
+                        apis::job::FailJobResponse::Status409_TheJobWithTheGivenKeyIsInTheWrongState(_)));
+                    let mut error = body.clone();
+                    error["errorCode"] = "ERR".into();
+                    let error = serde_json::from_value(error).unwrap();
+                    assert!(matches!(srv.throw_job_error_impl(&models::ThrowJobErrorPathParams {
+                        job_key: path.job_key.clone() }, &error).await.unwrap(),
+                        apis::job::ThrowJobErrorResponse::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(_)));
+                    let request = Some(serde_json::from_value(body).unwrap());
+                    assert!(matches!(
+                        srv.complete_job_impl(&path, &request).await.unwrap(),
+                        apis::job::CompleteJobResponse::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(_)
+                    ), "a leased job rejects missing and stale tokens");
+                }
+                let request = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "leaseToken": job["leaseToken"],
+                    }))
+                    .unwrap(),
+                );
+                assert!(matches!(
+                    srv.complete_job_impl(&path, &request).await.unwrap(),
+                    apis::job::CompleteJobResponse::Status204_TheJobWasCompletedSuccessfully
+                ));
+            } else {
+                assert!(job["leaseToken"].is_null());
+            }
+        }
+    }
 
-        // Start an instance; S1 auto-mints an AgentInstance on agent-task activation.
+    #[tokio::test]
+    async fn agent_instances_rest_roundtrips_the_810_schema() {
+        for agent_type in ["aiAgentTask", "external"] {
+            agent_instances_rest_roundtrip(agent_type).await;
+        }
+    }
+
+    #[test]
+    fn agent_job_attribution_requires_a_complete_valid_pair() {
+        assert!(parse_agent_job_attribution(None, None).is_err());
+        assert!(parse_agent_job_attribution(Some("0"), Some("0")).is_err());
+        assert_eq!(
+            parse_agent_job_attribution(Some("42"), Some("99")),
+            Ok((42, "99".into()))
+        );
+        for (key, lease) in [
+            (Some("42"), None),
+            (None, Some("99")),
+            (Some("0"), None),
+            (None, Some("0")),
+            (Some("invalid"), Some("99")),
+        ] {
+            assert!(parse_agent_job_attribution(key, lease).is_err());
+        }
+        assert_eq!(
+            parse_agent_job_attribution(Some("42"), Some("opaque-token")),
+            Ok((42, "opaque-token".into()))
+        );
+        assert_eq!(
+            parse_agent_job_attribution(Some("42"), Some("")),
+            Ok((42, String::new()))
+        );
+    }
+
+    async fn agent_instances_rest_roundtrip(agent_type: &str) {
+        let xml = include_str!("../../engine-core/tests/fixtures/external-agent-job-type.bpmn")
+            .replace(
+                "agentType=\"external\"",
+                &format!("agentType=\"{agent_type}\""),
+            )
+            .replace("external-agent-routing", "agent-proc")
+            .replace(
+                "source=\"= route\"",
+                "source=\"= &quot;senior:rebase&quot;\"",
+            );
+        let srv = build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1));
+        deploy(&srv, parse_bpmn(&xml).expect("parse agent-proc")).await;
+
+        // Start an instance and activate the ordinary job; registration is explicit.
         let instr = models::ProcessInstanceCreationInstruction::from(
             models::ProcessInstanceCreationInstructionById::new("agent-proc".to_string()),
         );
@@ -35284,33 +36208,83 @@ mod call_activity_hierarchy_read_model_tests {
             .await
             .expect("create process instance");
 
-        let minted = agent_search_until(&srv, 1).await;
-        let inst = &minted[0];
-        assert_eq!(
-            inst.status,
-            models::AgentInstanceStatusEnum::Initializing,
-            "a freshly-minted agent instance is INITIALIZING"
+        assert!(agent_search_until(&srv, 0).await.is_empty());
+        let mut activation = models::JobActivationRequest::new("senior:rebase".into(), 60_000, 1);
+        activation.request_timeout = Some(-1);
+        activation.with_lease = Some(types::Nullable::Present(true));
+        let apis::job::ActivateJobsResponse::Status200_TheListOfActivatedJobs(activated) = srv
+            .activate_jobs_impl(&activation)
+            .await
+            .expect("activate agent job")
+        else {
+            panic!("expected an activated agent job");
+        };
+        assert_eq!(activated.jobs.len(), 1);
+        let job = &activated.jobs[0];
+        let element_instance_key = job.element_instance_key.0.clone();
+        let activation_json = serde_json::to_value(job).unwrap();
+        let job_lease = activation_json["leaseToken"]
+            .as_str()
+            .expect("REST activation must expose the agent job's lease token")
+            .to_string();
+        assert_ne!(
+            job_lease,
+            job.deadline.to_string(),
+            "the lease is not the deadline"
         );
-        let agent_key = inst.agent_instance_key.0.clone();
-        let element_instance_key = inst
-            .element_instance_keys
-            .first()
-            .cloned()
-            .expect("minted instance carries its element instance key");
 
-        // POST create is idempotent — reconciles to the same key, INITIALIZING.
+        // POST creates the configuration history and rejects duplicate registration.
         use apis::agent_instance::CreateAgentInstanceResponse as CResp;
+        let mut configuration = models::AgentInstanceHistoryItem::new(
+            "configuration".into(),
+            1,
+            models::AgentInstanceHistoryRoleEnum::Configuration,
+            vec![],
+            epoch(),
+        );
+        configuration.model = Some("gpt".into());
+        configuration.provider = Some("openai".into());
+        configuration.system_prompt =
+            Some(types::Nullable::Present(vec![text_content("be helpful")]));
         let create_body = models::AgentInstanceCreationRequest {
             element_instance_key: models::ElementInstanceKey(element_instance_key.clone()),
-            definition: models::AgentInstanceDefinition::new(
-                "gpt".to_string(),
-                "openai".to_string(),
-                "be helpful".to_string(),
-            ),
-            limits: None,
-            job_key: None,
-            job_lease: None,
+            history: vec![configuration],
+            job_key: job.job_key.clone(),
+            job_lease: job_lease.clone(),
         };
+        for omit_key in [false, true] {
+            let mut partial = serde_json::to_value(&create_body).unwrap();
+            partial
+                .as_object_mut()
+                .unwrap()
+                .remove(if omit_key { "jobKey" } else { "jobLease" });
+            assert!(
+                serde_json::from_value::<models::AgentInstanceCreationRequest>(partial).is_err(),
+                "CREATE must reject incomplete job attribution for {agent_type}"
+            );
+        }
+        let mut unknown_job_create = create_body.clone();
+        unknown_job_create.job_key = models::JobKey("7788990011".into());
+        assert!(
+            matches!(
+                srv.create_agent_instance_impl(&unknown_job_create)
+                    .await
+                    .unwrap(),
+                CResp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(_)
+            ),
+            "CREATE must reject supplied unknown job attribution for {agent_type}"
+        );
+        let mut stale_lease_create = create_body.clone();
+        stale_lease_create.job_lease = format!("{job_lease}-stale");
+        assert!(
+            matches!(
+                srv.create_agent_instance_impl(&stale_lease_create)
+                    .await
+                    .unwrap(),
+                CResp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(_)
+            ),
+            "CREATE must reject a stale lease for {agent_type}"
+        );
         let CResp::Status200_TheAgentInstanceWasCreated(created) = srv
             .create_agent_instance_impl(&create_body)
             .await
@@ -35318,10 +36292,13 @@ mod call_activity_hierarchy_read_model_tests {
         else {
             panic!("expected a 200 create result");
         };
-        assert_eq!(
-            created.agent_instance_key.0, agent_key,
-            "create reconciles to the auto-minted instance's key"
-        );
+        let agent_key = created.agent_instance_key.0;
+        assert_eq!(created.created_history.len(), 1);
+        assert!(matches!(
+            srv.create_agent_instance_impl(&create_body).await.unwrap(),
+            CResp::Status409_AnAgentInstanceAlreadyExistsForTheGivenElementInstance(_)
+        ));
+        agent_search_until(&srv, 1).await;
 
         // GET returns it in INITIALIZING.
         use apis::agent_instance::GetAgentInstanceResponse as GResp;
@@ -35339,21 +36316,26 @@ mod call_activity_hierarchy_read_model_tests {
 
         // PATCH: append two history turns and advance status to THINKING.
         use apis::agent_instance::UpdateAgentInstanceResponse as UResp;
-        let mut upd = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
-            element_instance_key.clone(),
-        ));
+        let update_request = || {
+            models::AgentInstanceUpdateRequest::new(
+                models::ElementInstanceKey(element_instance_key.clone()),
+                job.job_key.clone(),
+                job_lease.clone(),
+            )
+        };
+        let mut upd = update_request();
         upd.status = Some(models::AgentInstanceUpdateStatusEnum::Thinking);
         upd.history = Some(types::Nullable::Present(vec![
             models::AgentInstanceHistoryItem::new(
                 "h1".to_string(),
-                0,
+                1,
                 models::AgentInstanceHistoryRoleEnum::User,
                 vec![text_content("hello")],
                 epoch(),
             ),
             models::AgentInstanceHistoryItem::new(
                 "h2".to_string(),
-                0,
+                1,
                 models::AgentInstanceHistoryRoleEnum::Assistant,
                 vec![text_content("hi there")],
                 epoch(),
@@ -35362,6 +36344,42 @@ mod call_activity_hierarchy_read_model_tests {
         let up = models::UpdateAgentInstancePathParams {
             agent_instance_key: agent_key.clone(),
         };
+        for omit_key in [false, true] {
+            let mut partial = upd.clone();
+            partial.history = None;
+            let mut partial = serde_json::to_value(&partial).unwrap();
+            partial
+                .as_object_mut()
+                .unwrap()
+                .remove(if omit_key { "jobKey" } else { "jobLease" });
+            assert!(
+                serde_json::from_value::<models::AgentInstanceUpdateRequest>(partial).is_err(),
+                "UPDATE must reject incomplete job attribution even without history for {agent_type}"
+            );
+        }
+        let mut unattributed_history = upd.clone();
+        unattributed_history.job_key = models::JobKey("0".into());
+        unattributed_history.job_lease = String::new();
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &unattributed_history)
+                    .await
+                    .unwrap(),
+                UResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "history must carry activated job attribution for {agent_type}"
+        );
+        let mut unknown_job_update = upd.clone();
+        unknown_job_update.job_key = models::JobKey("7788990011".into());
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &unknown_job_update)
+                    .await
+                    .unwrap(),
+                UResp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(_)
+            ),
+            "UPDATE must reject supplied unknown job attribution for {agent_type}"
+        );
         let UResp::Status200_TheAgentInstanceWasUpdatedSuccessfully(updated) = srv
             .update_agent_instance_impl(&up, &upd)
             .await
@@ -35381,13 +36399,11 @@ mod call_activity_hierarchy_read_model_tests {
         // Idempotent retry: re-submitting "h1" (same historyItemId) must NOT
         // create a second AGENT_HISTORY record; the response echoes
         // isDuplicate=true with the ORIGINAL turn's key.
-        let mut retry = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
-            element_instance_key.clone(),
-        ));
+        let mut retry = update_request();
         retry.history = Some(types::Nullable::Present(vec![
             models::AgentInstanceHistoryItem::new(
                 "h1".to_string(),
-                0,
+                1,
                 models::AgentInstanceHistoryRoleEnum::User,
                 vec![text_content("hello")],
                 epoch(),
@@ -35464,21 +36480,31 @@ mod call_activity_hierarchy_read_model_tests {
         );
         assert_eq!(sr.items[0].agent_instance_key.0, agent_key);
 
-        // history-search defaults to COMMITTED and returns the two appended turns.
+        // History remains pending until the worker completes its leased job.
         use apis::agent_instance::SearchAgentInstanceHistoryResponse as HResp;
         let hp = models::SearchAgentInstanceHistoryPathParams {
             agent_instance_key: agent_key.clone(),
         };
         let mut items = Vec::new();
+        let pending = models::AgentInstanceHistoryCommitStatusFilterProperty::AgentInstanceHistoryCommitStatusEnum(
+            models::AgentInstanceHistoryCommitStatusEnum::Pending);
+        let pending_query = Some(models::AgentInstanceHistorySearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(models::AgentInstanceHistoryFilter {
+                commit_status: Some(pending.clone()),
+                ..models::AgentInstanceHistoryFilter::new()
+            }),
+        });
         for _ in 0..200 {
             let HResp::Status200_TheAgentInstanceHistorySearchResult(hr) = srv
-                .search_agent_instance_history_impl(&hp, &None)
+                .search_agent_instance_history_impl(&hp, &pending_query)
                 .await
                 .expect("history search")
             else {
                 panic!("expected a 200 history search result");
             };
-            if hr.items.len() >= 2 {
+            if hr.items.len() >= 3 {
                 items = hr.items;
                 break;
             }
@@ -35486,8 +36512,12 @@ mod call_activity_hierarchy_read_model_tests {
         }
         assert_eq!(
             items.len(),
-            2,
-            "history-search returns the committed turns by default"
+            3,
+            "history-search includes the pending configuration and message turns"
+        );
+        assert_eq!(
+            items.remove(0).role,
+            models::AgentInstanceHistoryRoleEnum::Configuration
         );
         assert_eq!(items[0].history_item_id, "h1");
         assert_eq!(items[0].role, models::AgentInstanceHistoryRoleEnum::User);
@@ -35499,25 +36529,43 @@ mod call_activity_hierarchy_read_model_tests {
             matches!(
                 items[1].role,
                 models::AgentInstanceHistoryRoleEnum::Assistant
-            ) && matches!(items[1].metrics, types::Nullable::Present(_)),
-            "ASSISTANT history items carry present per-call metrics"
+            ) && matches!(items[1].metrics, types::Nullable::Null),
+            "omitted ASSISTANT metrics stay null rather than becoming fabricated zeroes"
         );
         assert_eq!(
             items[0].commit_status,
-            models::AgentInstanceHistoryCommitStatusEnum::Committed,
-            "the default history search returns COMMITTED turns"
+            models::AgentInstanceHistoryCommitStatusEnum::Pending,
+            "the worker's history remains PENDING while its job is active"
         );
         assert!(
             matches!(
-                items[1].content[0].content_type,
-                models::AgentInstanceContentTypeEnum::Text
+                items[1].content[0],
+                models::AgentInstanceMessageContent::AgentInstanceTextContent(_)
             ),
             "content round-trips the 8.10 TEXT contentType"
         );
-        assert_eq!(
-            items[1].agent_instance_key.0, agent_key,
-            "each history item carries its owning agentInstanceKey"
-        );
+        assert_eq!(items[1].job_key, job.job_key);
+        assert_eq!(items[1].job_lease, job_lease);
+        for (field, value, expected_count) in [
+            ("historyItemKey", items[0].history_item_key.0.clone(), 1),
+            ("elementInstanceKey", element_instance_key.clone(), 3),
+            ("jobKey", job.job_key.0.clone(), 3),
+        ] {
+            for (value, count) in [(value, expected_count), ("7788990011".into(), 0)] {
+                let query = serde_json::from_value(serde_json::json!({
+                    "filter": {"commitStatus":"PENDING", field:{"$eq":value}}
+                }))
+                .unwrap();
+                let HResp::Status200_TheAgentInstanceHistorySearchResult(found) = srv
+                    .search_agent_instance_history_impl(&hp, &Some(query))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected keyed history filter");
+                };
+                assert_eq!(found.items.len(), count, "{field} must constrain history");
+            }
+        }
 
         // --- Validation & filter behaviour (review-convergence coverage) ---
 
@@ -35534,14 +36582,7 @@ mod call_activity_hierarchy_read_model_tests {
         );
         let bad_create = models::AgentInstanceCreationRequest {
             element_instance_key: models::ElementInstanceKey("not-a-key".to_string()),
-            definition: models::AgentInstanceDefinition::new(
-                "gpt".to_string(),
-                "openai".to_string(),
-                "be helpful".to_string(),
-            ),
-            limits: None,
-            job_key: None,
-            job_lease: None,
+            ..create_body.clone()
         };
         assert!(
             matches!(
@@ -35553,9 +36594,7 @@ mod call_activity_hierarchy_read_model_tests {
         let bad_patch_path = models::UpdateAgentInstancePathParams {
             agent_instance_key: "not-a-key".to_string(),
         };
-        let patch_body = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
-            element_instance_key.clone(),
-        ));
+        let patch_body = update_request();
         assert!(
             matches!(
                 srv.update_agent_instance_impl(&bad_patch_path, &patch_body)
@@ -35579,10 +36618,8 @@ mod call_activity_hierarchy_read_model_tests {
         );
 
         // A present-but-unparsable jobKey is rejected (not coerced to 0).
-        let mut bad_job = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
-            element_instance_key.clone(),
-        ));
-        bad_job.job_key = Some(models::JobKey("not-a-number".to_string()));
+        let mut bad_job = update_request();
+        bad_job.job_key = models::JobKey("not-a-number".to_string());
         assert!(
             matches!(
                 srv.update_agent_instance_impl(&up, &bad_job).await.unwrap(),
@@ -35591,7 +36628,7 @@ mod call_activity_hierarchy_read_model_tests {
             "PATCH with a malformed jobKey is 400, not a silent 0"
         );
 
-        // A commitStatus filter that is not an inclusion set ($eq/$in) is 400.
+        // Exclusion predicates are evaluated rather than rejected or ignored.
         let unsupported_commit = models::AgentInstanceHistoryFilter {
             commit_status: Some(
                 models::AgentInstanceHistoryCommitStatusFilterProperty::AdvancedAgentInstanceHistoryCommitStatusFilter(
@@ -35610,14 +36647,17 @@ mod call_activity_hierarchy_read_model_tests {
             sort: None,
             filter: Some(unsupported_commit),
         });
+        let HResp::Status200_TheAgentInstanceHistorySearchResult(excluded) = srv
+            .search_agent_instance_history_impl(&hp, &unsupported_query)
+            .await
+            .unwrap()
+        else {
+            panic!("expected exclusion filter result");
+        };
+        assert_eq!(excluded.items.len(), 3);
         assert!(
-            matches!(
-                srv.search_agent_instance_history_impl(&hp, &unsupported_query)
-                    .await
-                    .unwrap(),
-                HResp::Status400_TheProvidedDataIsNotValid(_)
-            ),
-            "an unsupported commitStatus filter shape is 400, not a silent default"
+            excluded.items.iter().all(|item| item.commit_status
+                != models::AgentInstanceHistoryCommitStatusEnum::Committed)
         );
 
         // An explicit empty inclusion set (`$in: []`) matches nothing — it must
@@ -35659,6 +36699,7 @@ mod call_activity_hierarchy_read_model_tests {
         // return the two committed rows and fail this assertion.
         let far_future = chrono::DateTime::from_timestamp_millis(32_503_680_000_000).unwrap();
         let produced_after_future = models::AgentInstanceHistoryFilter {
+            commit_status: Some(pending.clone()),
             produced_at: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
                 models::AdvancedDateTimeFilter {
                     dollar_gt: Some(far_future),
@@ -35686,6 +36727,7 @@ mod call_activity_hierarchy_read_model_tests {
             "producedAt $gt (far future) matches nothing — the filter must not be ignored"
         );
         let produced_before_future = models::AgentInstanceHistoryFilter {
+            commit_status: Some(pending),
             produced_at: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
                 models::AdvancedDateTimeFilter {
                     dollar_lte: Some(far_future),
@@ -35710,8 +36752,8 @@ mod call_activity_hierarchy_read_model_tests {
         };
         assert_eq!(
             produced_all_result.items.len(),
-            2,
-            "producedAt $lte (far future) matches every committed turn"
+            3,
+            "producedAt $lte (far future) matches every pending turn"
         );
 
         // Search now honours the previously-ignored filters: processDefinitionId,
@@ -35766,15 +36808,21 @@ mod call_activity_hierarchy_read_model_tests {
             "a non-matching processDefinitionId excludes the instance (filter is not ignored)"
         );
 
-        // tools: null clears the stored tool set. First set a tool, then clear it.
-        let mut set_tools = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
-            element_instance_key.clone(),
-        ));
-        set_tools.tools = Some(types::Nullable::Present(vec![models::AgentTool::new(
+        // Tools are updated only by configuration history, with [] clearing them.
+        let mut set_tools = update_request();
+        let mut tools_history = models::AgentInstanceHistoryItem::new(
+            "set-tools".into(),
+            1,
+            models::AgentInstanceHistoryRoleEnum::Configuration,
+            vec![],
+            epoch(),
+        );
+        tools_history.tools = Some(types::Nullable::Present(vec![models::AgentTool::new(
             "search".to_string(),
             types::Nullable::Null,
             types::Nullable::Null,
         )]));
+        set_tools.history = Some(types::Nullable::Present(vec![tools_history.clone()]));
         assert!(
             matches!(
                 srv.update_agent_instance_impl(&up, &set_tools)
@@ -35786,23 +36834,42 @@ mod call_activity_hierarchy_read_model_tests {
         );
         let mut has_tool = false;
         for _ in 0..200 {
-            let GResp::Status200_TheAgentInstanceIsSuccessfullyReturned(g) =
-                srv.get_agent_instance_impl(&gp).await.unwrap()
+            let HResp::Status200_TheAgentInstanceHistorySearchResult(history) = srv
+                .search_agent_instance_history_impl(&hp, &pending_query)
+                .await
+                .unwrap()
             else {
                 panic!("expected 200");
             };
-            if g.tools.len() == 1 {
+            if history
+                .items
+                .iter()
+                .any(|item| item.history_item_id == "set-tools" && item.tools.len() == 1)
+            {
                 has_tool = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(has_tool, "the tool set was stored");
+        assert!(
+            has_tool,
+            "the tool set was stored in pending configuration history"
+        );
+        let GResp::Status200_TheAgentInstanceIsSuccessfullyReturned(before_commit) =
+            srv.get_agent_instance_impl(&gp).await.unwrap()
+        else {
+            panic!("expected agent result");
+        };
+        assert!(
+            before_commit.tools.is_empty(),
+            "pending configuration must not update committed tools"
+        );
 
-        let mut clear_tools = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
-            element_instance_key.clone(),
-        ));
-        clear_tools.tools = Some(types::Nullable::Null);
+        let mut clear_tools = update_request();
+        tools_history.history_item_id = "clear-tools".into();
+        tools_history.provider = Some("updated-provider".into());
+        tools_history.tools = Some(types::Nullable::Present(vec![]));
+        clear_tools.history = Some(types::Nullable::Present(vec![tools_history]));
         assert!(
             matches!(
                 srv.update_agent_instance_impl(&up, &clear_tools)
@@ -35812,20 +36879,56 @@ mod call_activity_hierarchy_read_model_tests {
             ),
             "clearing tools succeeds"
         );
-        let mut cleared = false;
+        let HResp::Status200_TheAgentInstanceHistorySearchResult(before_completion) = srv
+            .search_agent_instance_history_impl(&hp, &None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected history result");
+        };
+        assert!(
+            before_completion.items.is_empty(),
+            "the default query excludes pending history"
+        );
+        srv.complete_job_for_stream_with_lease(
+            job.job_key.0.parse().unwrap(),
+            Some(job_lease),
+            Default::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .wait()
+        .await;
+        let mut committed = false;
         for _ in 0..200 {
-            let GResp::Status200_TheAgentInstanceIsSuccessfullyReturned(g) =
-                srv.get_agent_instance_impl(&gp).await.unwrap()
+            let HResp::Status200_TheAgentInstanceHistorySearchResult(history) = srv
+                .search_agent_instance_history_impl(&hp, &None)
+                .await
+                .unwrap()
             else {
-                panic!("expected 200");
+                panic!("expected history result");
             };
-            if g.tools.is_empty() {
-                cleared = true;
+            if history.items.len() == 5 {
+                assert!(history.items.iter().all(|item| item.commit_status
+                    == models::AgentInstanceHistoryCommitStatusEnum::Committed));
+                committed = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(cleared, "tools: null clears the stored tool set");
+        assert!(committed, "job completion commits the lease's history");
+        let GResp::Status200_TheAgentInstanceIsSuccessfullyReturned(after_commit) =
+            srv.get_agent_instance_impl(&gp).await.unwrap()
+        else {
+            panic!("expected agent result");
+        };
+        assert_eq!(after_commit.definition.provider, "updated-provider");
+        assert!(
+            after_commit.tools.is_empty(),
+            "committed configuration preserves explicit tools clearing"
+        );
     }
 
     /// The `AgentInstanceResult` mapper must propagate the projected
@@ -35849,7 +36952,7 @@ mod call_activity_hierarchy_read_model_tests {
                 agent_type: "aiAgentTask".to_string(),
                 model: Some("gpt".to_string()),
                 provider: Some("openai".to_string()),
-                system_prompt: Some("be helpful".to_string()),
+                system_prompt: Some(vec![agent_content_from(&text_content("be helpful"))]),
                 max_tokens: 1000,
                 max_model_calls: 10,
                 max_tool_calls: 10,
@@ -35861,6 +36964,7 @@ mod call_activity_hierarchy_read_model_tests {
                 model_calls: 1,
                 tool_calls: 0,
                 job_key: 0,
+                job_lease: String::new(),
                 tools_json: "[]".to_string(),
                 creation_date_ms: 100,
                 last_updated_date_ms: 200,
@@ -35870,7 +36974,21 @@ mod call_activity_hierarchy_read_model_tests {
             }
         }
 
-        let tagged = agent_instance_result(&row(Some("v1.2.3")));
+        let tagged = agent_instance_result(&row(Some("v1.2.3"))).unwrap();
+        for (field, value) in [
+            ("agentDefinitionKey", "7"),
+            ("rootProcessInstanceKey", "42"),
+        ] {
+            for (value, expected) in [(value, true), ("998877", false)] {
+                let filter =
+                    serde_json::from_value(serde_json::json!({field:{"$eq":value}})).unwrap();
+                assert_eq!(
+                    match_agent_instance_filter(&row(None), &filter),
+                    expected,
+                    "{field} must constrain agent instances"
+                );
+            }
+        }
         assert!(
             matches!(&tagged.process_definition_version_tag, types::Nullable::Present(t) if t == "v1.2.3"),
             "a projected version tag surfaces in the result, not a hardcoded null"
@@ -35881,7 +36999,7 @@ mod call_activity_hierarchy_read_model_tests {
             "every associated element instance key is reported, not just the owner"
         );
 
-        let untagged = agent_instance_result(&row(None));
+        let untagged = agent_instance_result(&row(None)).unwrap();
         assert!(
             matches!(
                 untagged.process_definition_version_tag,
@@ -35889,6 +37007,68 @@ mod call_activity_hierarchy_read_model_tests {
             ),
             "an absent version tag maps to null"
         );
+    }
+
+    #[test]
+    fn agent_content_union_roundtrips_without_string_encoding() {
+        for value in [
+            serde_json::json!({"contentType":"TEXT","text":"[{\"looks\":\"like JSON\"}]"}),
+            serde_json::json!({"contentType":"OBJECT","object":{"nested":[1,2],"ok":true}}),
+            serde_json::json!({"contentType":"DOCUMENT","documentReference":{
+                "camunda.document.type":"camunda","storeId":"store","documentId":"doc",
+                "contentHash":null,"metadata":{
+                    "contentType":"application/json","fileName":"document.json","size":12,
+                    "expiresAt":null,"processDefinitionId":null,"processInstanceKey":null,
+                    "customProperties":{}
+                }
+            }}),
+        ] {
+            let input: models::AgentInstanceMessageContent = serde_json::from_value(value).unwrap();
+            let core = agent_content_from(&input);
+            assert_eq!(agent_message_content(&core).unwrap(), input);
+            assert_eq!(agent_system_prompt(&Some(vec![core])).unwrap(), vec![input]);
+        }
+    }
+
+    #[test]
+    fn agent_history_requires_nonblank_ids_and_positive_int32_iterations() {
+        let mut item = models::AgentInstanceHistoryItem::new(
+            "id".into(),
+            1,
+            models::AgentInstanceHistoryRoleEnum::User,
+            vec![],
+            epoch(),
+        );
+        assert!(validate_agent_history(&[item.clone()]).is_ok());
+        for iteration in [0, i32::MAX as u32 + 1, u32::MAX] {
+            item.loop_iteration = iteration;
+            assert!(validate_agent_history(&[item.clone()]).is_err());
+        }
+        item.loop_iteration = 1;
+        item.history_item_id = " \n".into();
+        assert!(validate_agent_history(&[item]).is_err());
+    }
+
+    #[test]
+    fn agent_history_metrics_preserve_outer_and_counter_nulls() {
+        let mut item = models::AgentInstanceHistoryItem::new(
+            "metrics".into(),
+            1,
+            models::AgentInstanceHistoryRoleEnum::Assistant,
+            vec![],
+            epoch(),
+        );
+        assert!(agent_history_turn_from(&item, 1, "").metrics.is_none());
+        item.metrics = Some(types::Nullable::Null);
+        assert!(agent_history_turn_from(&item, 1, "").metrics.is_none());
+        let metrics = models::AgentInstanceHistoryItemMetrics::new(
+            types::Nullable::Null,
+            types::Nullable::Present(0),
+            types::Nullable::Null,
+        );
+        item.metrics = Some(types::Nullable::Present(metrics.clone()));
+        let mapped = agent_history_turn_from(&item, 1, "").metrics.unwrap();
+        assert_eq!(agent_history_metrics_result(&mapped), metrics);
     }
 
     /// Runs `search` with a `parentProcessInstanceKey` filter, returning the keys.

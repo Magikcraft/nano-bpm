@@ -23,10 +23,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use nanobpmn_engine_core::{
-    AgentHistoryCommitStatus, AgentHistoryRecord, AgentHistoryRole, AgentInstance,
-    AgentInstanceStatus, Event, IncidentKind, IncidentState, JobKind, JobState, Key,
-    ListenerEventType, ProcessInstanceState, TaskListenerEventType, UserTaskState, Value,
-    partition_of,
+    AgentHistoryCommitStatus, AgentHistoryContent, AgentHistoryContentType, AgentHistoryRecord,
+    AgentHistoryRole, AgentInstance, AgentInstanceStatus, Event, IncidentKind, IncidentState,
+    JobKind, JobState, Key, ListenerEventType, ProcessInstanceState, TaskListenerEventType,
+    UserTaskState, Value, partition_of,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -48,7 +48,7 @@ const SCHEMA_VERSION: i64 = 6;
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = 7948718529194504891;
+const SCHEMA_FINGERPRINT: i64 = -6204772450958810819;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -138,7 +138,8 @@ CREATE TABLE jobs (
     -- Engine-native read provenance for reification (issue #986). A JSON array;
     -- '[]' means no durable activation has declared a set (fetch-all / undeclared
     -- reads) or the job has not been activated with a declared set.
-    read_set               TEXT NOT NULL DEFAULT '[]'
+    read_set               TEXT NOT NULL DEFAULT '[]',
+    lease_token            TEXT
 );
 CREATE TABLE incidents (
     key                    INTEGER PRIMARY KEY,
@@ -307,6 +308,7 @@ CREATE TABLE agent_instances (
     model                      TEXT,
     provider                   TEXT,
     system_prompt              TEXT,
+    system_prompt_json         TEXT,
     max_tokens                 INTEGER NOT NULL DEFAULT -1,
     max_model_calls            INTEGER NOT NULL DEFAULT -1,
     max_tool_calls             INTEGER NOT NULL DEFAULT -1,
@@ -323,7 +325,8 @@ CREATE TABLE agent_instances (
     last_updated_date_ms       INTEGER NOT NULL,
     completion_date_ms         INTEGER,
     process_definition_version_tag TEXT,
-    element_instance_keys_json TEXT NOT NULL DEFAULT '[]'
+    element_instance_keys_json TEXT NOT NULL DEFAULT '[]',
+    job_lease                 TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX idx_agent_instances_process_instance ON agent_instances(process_instance_key);
 CREATE TABLE agent_history (
@@ -341,19 +344,23 @@ CREATE TABLE agent_history (
     produced_at_ms             INTEGER NOT NULL,
     content_json               TEXT NOT NULL DEFAULT '[]',
     system_prompt              TEXT,
+    system_prompt_json         TEXT,
     tool_calls_json            TEXT NOT NULL DEFAULT '[]',
-    input_tokens               INTEGER NOT NULL DEFAULT 0,
-    output_tokens              INTEGER NOT NULL DEFAULT 0,
-    reasoning_token_count      INTEGER NOT NULL DEFAULT 0,
-    cache_creation_token_count INTEGER NOT NULL DEFAULT 0,
-    cache_read_token_count     INTEGER NOT NULL DEFAULT 0,
-    duration_ms                INTEGER NOT NULL DEFAULT 0,
+    input_tokens               INTEGER,
+    output_tokens              INTEGER,
+    reasoning_token_count      INTEGER,
+    cache_creation_token_count INTEGER,
+    cache_read_token_count     INTEGER,
+    duration_ms                INTEGER,
     history_item_id            TEXT,
     tools_json                 TEXT NOT NULL DEFAULT '[]',
     model                      TEXT,
     provider                   TEXT,
     is_duplicate               INTEGER NOT NULL DEFAULT 0,
-    commit_status              TEXT NOT NULL
+    commit_status              TEXT NOT NULL,
+    job_lease                  TEXT NOT NULL DEFAULT '',
+    limits_json                TEXT,
+    metrics_json               TEXT
 );
 CREATE INDEX idx_agent_history_instance ON agent_history(agent_instance_key);
 ";
@@ -372,6 +379,7 @@ struct ColumnShape {
     decl_type: String,
     notnull: bool,
     dflt: Option<String>,
+    primary_key: bool,
 }
 
 /// The introspected shape of a database: table name -> (create statement, columns
@@ -405,6 +413,7 @@ fn introspect_shape(conn: &Connection) -> rusqlite::Result<SchemaShape> {
                 decl_type: r.get::<_, String>(2)?,
                 notnull: r.get::<_, i64>(3)? != 0,
                 dflt: r.get::<_, Option<String>>(4)?,
+                primary_key: r.get::<_, i64>(5)? != 0,
             })
         })?;
         for col in rows {
@@ -440,9 +449,9 @@ fn target_shape() -> rusqlite::Result<SchemaShape> {
 
 /// Non-destructively brings the live database at `conn` up to [`SCHEMA`]: creates
 /// any missing table, adds any missing column (`ALTER TABLE ADD COLUMN`), and
-/// creates any missing index. **Never drops or rewrites existing data** — this is
-/// the core of the issue #831 fix. Idempotent: a partially-applied run is
-/// completed on the next open.
+/// creates any missing index. Historical numeric lease columns are converted to
+/// text without losing their values or any rows. Idempotent: a partially-applied
+/// run is completed on the next open.
 fn reconcile_to_schema(conn: &Connection) -> rusqlite::Result<()> {
     let target = target_shape()?;
     let live = introspect_shape(conn)?;
@@ -460,6 +469,48 @@ fn reconcile_to_schema(conn: &Connection) -> rusqlite::Result<()> {
                 let have: std::collections::HashSet<&str> =
                     live_cols.iter().map(|c| c.name.as_str()).collect();
                 for col in target_cols {
+                    let old = live_cols.iter().find(|old| old.name == col.name);
+                    let lease_affinity = matches!(col.name.as_str(), "lease_token" | "job_lease")
+                        && col.decl_type == "TEXT"
+                        && old.is_some_and(|old| old.decl_type != "TEXT");
+                    let nullable_history_metric = table == "agent_history"
+                        && col.decl_type == "INTEGER"
+                        && !col.notnull
+                        && !col.primary_key
+                        && old.is_some_and(|old| old.notnull);
+                    if lease_affinity || nullable_history_metric {
+                        // INTEGER affinity would coerce fresh opaque tokens such as "0007".
+                        // Historical metrics also need their NOT NULL constraint relaxed.
+                        // Column replacement preserves values and derives the new shape from SCHEMA.
+                        let legacy = format!("__nano_legacy_{}", col.name);
+                        let cast = if lease_affinity {
+                            format!("CAST(\"{legacy}\" AS TEXT)")
+                        } else {
+                            format!("\"{legacy}\"")
+                        };
+                        let value = if col.notnull {
+                            format!(
+                                "COALESCE({cast}, {})",
+                                col.dflt
+                                    .as_deref()
+                                    .expect("non-null lease column has a schema default")
+                            )
+                        } else {
+                            cast
+                        };
+                        ddl.push_str(&format!(
+                            "SAVEPOINT column_shape;\n\
+                             ALTER TABLE \"{table}\" RENAME COLUMN \"{}\" TO \"{legacy}\";\n",
+                            col.name,
+                        ));
+                        ddl.push_str(&add_column_ddl(table, col));
+                        ddl.push_str(&format!(
+                            "\nUPDATE \"{table}\" SET \"{}\" = {value};\n\
+                             ALTER TABLE \"{table}\" DROP COLUMN \"{legacy}\";\n\
+                             RELEASE column_shape;\n",
+                            col.name,
+                        ));
+                    }
                     if !have.contains(col.name.as_str()) {
                         ddl.push_str(&add_column_ddl(table, col));
                         ddl.push('\n');
@@ -1233,6 +1284,7 @@ pub struct JobRow {
     /// reads), or when the job's activation was never durably recorded (e.g.
     /// leader-local activation, which does not export `JobActivated`).
     pub read_set: Vec<String>,
+    pub lease_token: Option<String>,
 }
 
 pub struct UserTaskRow {
@@ -2452,7 +2504,7 @@ impl ReadStore {
             .prepare(
                 "SELECT key, instance_key, element_instance_key, element_id, job_type, state, \
                  retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 job_kind, listener_event_type, created_at_ms, read_set \
+                 job_kind, listener_event_type, created_at_ms, read_set, CAST(lease_token AS TEXT) \
                  FROM jobs",
             )
             .expect("prepare jobs");
@@ -2971,6 +3023,7 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         // Stored as a JSON array (mirrors `candidate_groups`); a malformed value
         // degrades to an empty read-set rather than failing the whole row map.
         read_set: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(14)?).unwrap_or_default(),
+        lease_token: r.get(15)?,
     })
 }
 
@@ -3646,6 +3699,22 @@ fn project_engine_state(
         for (scope, vars) in &inst.scope_variables {
             upsert_variables(tx, inst.key, *scope, vars)?;
         }
+        for agent in inst.agent_instances.values() {
+            project_agent_instance(tx, agent)?;
+        }
+        for (agent_key, history) in &inst.agent_history {
+            for record in history {
+                project_agent_history_record(tx, record)?;
+                if record.commit_status != AgentHistoryCommitStatus::Pending {
+                    transition_agent_history(
+                        tx,
+                        *agent_key,
+                        &[record.agent_history_key],
+                        record.commit_status,
+                    )?;
+                }
+            }
+        }
     }
 
     // 6) Live element instances (all ACTIVE — the engine only tracks open tokens).
@@ -3669,10 +3738,10 @@ fn project_engine_state(
         tx.cexecute(
             "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
              state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-             job_kind, listener_event_type) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             job_kind, listener_event_type, lease_token) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
              ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-             worker = excluded.worker, deadline_ms = excluded.deadline_ms",
+             worker = excluded.worker, deadline_ms = excluded.deadline_ms, lease_token = excluded.lease_token",
             params![
                 job.key as i64,
                 job.instance_key as i64,
@@ -3687,6 +3756,7 @@ fn project_engine_state(
                 def_key,
                 kind_code,
                 event_code,
+                job.lease_token,
             ],
         )?;
     }
@@ -4262,6 +4332,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             worker,
             deadline,
             fetch_variables,
+            lease_token,
             ..
         } => {
             // Record the declared read-set alongside the activation. Serialized as
@@ -4271,19 +4342,20 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // declared provenance.
             if fetch_variables.is_empty() {
                 tx.cexecute(
-                    "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4 WHERE key = ?1",
+                    "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, lease_token = ?5 WHERE key = ?1",
                     params![
                         *job_key as i64,
                         job_state_code(JobState::Activated),
                         worker,
                         *deadline as i64,
+                        lease_token,
                     ],
                 )?;
             } else {
                 let read_set =
                     serde_json::to_string(fetch_variables).unwrap_or_else(|_| "[]".into());
                 tx.cexecute(
-                    "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, read_set = ?5 \
+                    "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, read_set = ?5, lease_token = ?6 \
                      WHERE key = ?1",
                     params![
                         *job_key as i64,
@@ -4291,6 +4363,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                         worker,
                         *deadline as i64,
                         read_set,
+                        lease_token,
                     ],
                 )?;
             }
@@ -5144,7 +5217,7 @@ const AGENT_INSTANCE_COLS: &str = "agent_instance_key, agent_definition_key, ele
      provider, system_prompt, max_tokens, max_model_calls, max_tool_calls, input_tokens, \
      output_tokens, reasoning_token_count, cache_creation_token_count, cache_read_token_count, \
      model_calls, tool_calls, job_key, tools_json, creation_date_ms, last_updated_date_ms, \
-     completion_date_ms, process_definition_version_tag, element_instance_keys_json";
+     completion_date_ms, process_definition_version_tag, element_instance_keys_json, CAST(job_lease AS TEXT), system_prompt_json";
 
 /// The `SELECT` column list for [`AgentHistoryRow`], single-sourced.
 const AGENT_HISTORY_COLS: &str = "agent_history_key, agent_instance_key, element_instance_key, \
@@ -5152,7 +5225,8 @@ const AGENT_HISTORY_COLS: &str = "agent_history_key, agent_instance_key, element
      process_definition_id, tenant_id, job_key, loop_iteration, role, produced_at_ms, \
      content_json, system_prompt, tool_calls_json, input_tokens, output_tokens, \
      reasoning_token_count, cache_creation_token_count, cache_read_token_count, duration_ms, \
-     history_item_id, tools_json, model, provider, is_duplicate, commit_status";
+     history_item_id, tools_json, model, provider, is_duplicate, commit_status, \
+     CAST(job_lease AS TEXT), limits_json, metrics_json, system_prompt_json";
 
 /// Full-record UPSERT of an [`AgentInstance`] into the `agent_instances` table.
 /// Keyed by `agent_instance_key`; on conflict the mutable state (status, metrics,
@@ -5179,12 +5253,12 @@ fn project_agent_instance(tx: &rusqlite::Transaction, ai: &AgentInstance) -> rus
              input_tokens, output_tokens, reasoning_token_count, cache_creation_token_count, \
              cache_read_token_count, model_calls, tool_calls, job_key, tools_json, \
              creation_date_ms, last_updated_date_ms, completion_date_ms, \
-             process_definition_version_tag, element_instance_keys_json) \
+             process_definition_version_tag, element_instance_keys_json, job_lease, system_prompt_json) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32) \
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34) \
          ON CONFLICT(agent_instance_key) DO UPDATE SET \
              status = excluded.status, model = excluded.model, provider = excluded.provider, \
-             system_prompt = excluded.system_prompt, max_tokens = excluded.max_tokens, \
+             system_prompt = excluded.system_prompt, system_prompt_json = excluded.system_prompt_json, max_tokens = excluded.max_tokens, \
              max_model_calls = excluded.max_model_calls, max_tool_calls = excluded.max_tool_calls, \
              input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens, \
              reasoning_token_count = excluded.reasoning_token_count, \
@@ -5195,7 +5269,8 @@ fn project_agent_instance(tx: &rusqlite::Transaction, ai: &AgentInstance) -> rus
              last_updated_date_ms = excluded.last_updated_date_ms, \
              completion_date_ms = excluded.completion_date_ms, \
              process_definition_version_tag = excluded.process_definition_version_tag, \
-             element_instance_keys_json = excluded.element_instance_keys_json",
+             element_instance_keys_json = excluded.element_instance_keys_json, \
+             element_instance_key = excluded.element_instance_key, job_lease = excluded.job_lease",
         params![
             ai.agent_instance_key as i64,
             ai.agent_definition_key as i64,
@@ -5211,7 +5286,7 @@ fn project_agent_instance(tx: &rusqlite::Transaction, ai: &AgentInstance) -> rus
             ai.agent_type.as_str(),
             ai.definition.model.as_ref(),
             ai.definition.provider.as_ref(),
-            ai.definition.system_prompt.as_ref(),
+            rusqlite::types::Null,
             ai.limits.max_tokens,
             ai.limits.max_model_calls,
             ai.limits.max_tool_calls,
@@ -5229,6 +5304,9 @@ fn project_agent_instance(tx: &rusqlite::Transaction, ai: &AgentInstance) -> rus
             completion,
             ai.process_definition_version_tag.as_ref(),
             element_instance_keys_json,
+            ai.job_lease,
+            ai.definition.system_prompt.as_ref().map(serde_json::to_string).transpose()
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
         ],
     )?;
     Ok(())
@@ -5252,9 +5330,9 @@ fn project_agent_history_record(
              job_key, loop_iteration, role, produced_at_ms, content_json, system_prompt, \
              tool_calls_json, input_tokens, output_tokens, reasoning_token_count, \
              cache_creation_token_count, cache_read_token_count, duration_ms, history_item_id, \
-             tools_json, model, provider, is_duplicate, commit_status) \
+             tools_json, model, provider, is_duplicate, commit_status, job_lease, limits_json, metrics_json, system_prompt_json) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27) \
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31) \
          ON CONFLICT(agent_history_key) DO NOTHING",
         params![
             r.agent_history_key as i64,
@@ -5270,20 +5348,25 @@ fn project_agent_history_record(
             r.role.as_str(),
             r.produced_at as i64,
             content_json,
-            r.system_prompt.as_ref(),
+            rusqlite::types::Null,
             tool_calls_json,
-            r.metrics.input_tokens,
-            r.metrics.output_tokens,
-            r.metrics.reasoning_token_count,
-            r.metrics.cache_creation_token_count,
-            r.metrics.cache_read_token_count,
-            r.metrics.duration_ms,
+            r.metrics.as_ref().and_then(|m| m.input_tokens),
+            r.metrics.as_ref().and_then(|m| m.output_tokens),
+            r.metrics.as_ref().and_then(|m| m.reasoning_token_count),
+            r.metrics.as_ref().and_then(|m| m.cache_creation_token_count),
+            r.metrics.as_ref().and_then(|m| m.cache_read_token_count),
+            r.metrics.as_ref().and_then(|m| m.duration_ms),
             r.history_item_id.as_ref(),
             tools_json,
             r.model.as_ref(),
             r.provider.as_ref(),
             i64::from(r.is_duplicate),
             r.commit_status.as_str(),
+            r.job_lease,
+            r.limits.as_ref().map(serde_json::to_string).transpose().unwrap(),
+            serde_json::to_string(&r.metrics).unwrap(),
+            r.system_prompt.as_ref().map(serde_json::to_string).transpose()
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
         ],
     )?;
     Ok(())
@@ -5383,6 +5466,13 @@ pub struct AgentInstanceFilter {
     pub root_process_instance_key: Option<Key>,
     pub process_definition_key: Option<Key>,
     pub tenant_id: Option<String>,
+    pub process_definition_id: Option<String>,
+    pub process_definition_version: Option<i32>,
+    pub process_definition_version_tag: Option<String>,
+    pub element_instance_keys: Vec<Key>,
+    pub creation_date_ms: Option<u64>,
+    pub last_updated_date_ms: Option<u64>,
+    pub completion_date_ms: Option<u64>,
 }
 
 impl AgentInstanceFilter {
@@ -5434,6 +5524,44 @@ impl AgentInstanceFilter {
             clauses.push(format!("tenant_id = ?{}", values.len() + 1));
             values.push(Value::Text(tenant_id.clone()));
         }
+        for (col, value) in [
+            ("process_definition_id", &self.process_definition_id),
+            (
+                "process_definition_version_tag",
+                &self.process_definition_version_tag,
+            ),
+        ] {
+            if let Some(value) = value {
+                clauses.push(format!("{col} = ?{}", values.len() + 1));
+                values.push(Value::Text(value.clone()));
+            }
+        }
+        for (col, value) in [
+            (
+                "process_definition_version",
+                self.process_definition_version.map(i64::from),
+            ),
+            ("creation_date_ms", self.creation_date_ms.map(|v| v as i64)),
+            (
+                "last_updated_date_ms",
+                self.last_updated_date_ms.map(|v| v as i64),
+            ),
+            (
+                "completion_date_ms",
+                self.completion_date_ms.map(|v| v as i64),
+            ),
+        ] {
+            if let Some(value) = value {
+                push_int(&mut clauses, &mut values, col, value);
+            }
+        }
+        for key in &self.element_instance_keys {
+            clauses.push(format!(
+                "EXISTS (SELECT 1 FROM json_each(element_instance_keys_json) WHERE value = ?{})",
+                values.len() + 1,
+            ));
+            values.push(Value::Integer(*key as i64));
+        }
         let where_sql = if clauses.is_empty() {
             String::new()
         } else {
@@ -5469,6 +5597,12 @@ impl AgentHistorySortField {
 pub struct AgentHistoryFilter {
     pub agent_instance_key: Option<Key>,
     pub process_instance_key: Option<Key>,
+    pub history_item_key: Option<Key>,
+    pub element_instance_key: Option<Key>,
+    pub job_key: Option<Key>,
+    pub role: Option<AgentHistoryRole>,
+    pub loop_iteration: Option<i32>,
+    pub produced_at_ms: Option<u64>,
     /// The commit statuses to include. `None` (the default) restricts the result
     /// to `COMMITTED`; `Some(list)` returns exactly the listed statuses (an empty
     /// list is treated as the COMMITTED default rather than "match nothing").
@@ -5487,6 +5621,25 @@ impl AgentHistoryFilter {
         if let Some(v) = self.process_instance_key {
             clauses.push(format!("process_instance_key = ?{}", values.len() + 1));
             values.push(Value::Integer(v as i64));
+        }
+        for (col, value) in [
+            ("agent_history_key", self.history_item_key.map(|v| v as i64)),
+            (
+                "element_instance_key",
+                self.element_instance_key.map(|v| v as i64),
+            ),
+            ("job_key", self.job_key.map(|v| v as i64)),
+            ("loop_iteration", self.loop_iteration.map(i64::from)),
+            ("produced_at_ms", self.produced_at_ms.map(|v| v as i64)),
+        ] {
+            if let Some(value) = value {
+                clauses.push(format!("{col} = ?{}", values.len() + 1));
+                values.push(Value::Integer(value));
+            }
+        }
+        if let Some(role) = self.role {
+            clauses.push(format!("role = ?{}", values.len() + 1));
+            values.push(Value::Text(role.as_str().into()));
         }
         // Default filter = COMMITTED (an omitted or empty commit_status).
         let statuses: Vec<AgentHistoryCommitStatus> = match &self.commit_status {
@@ -5523,7 +5676,7 @@ pub struct AgentInstanceRow {
     pub agent_type: String,
     pub model: Option<String>,
     pub provider: Option<String>,
-    pub system_prompt: Option<String>,
+    pub system_prompt: Option<Vec<AgentHistoryContent>>,
     pub max_tokens: i64,
     pub max_model_calls: i64,
     pub max_tool_calls: i64,
@@ -5546,6 +5699,7 @@ pub struct AgentInstanceRow {
     /// Every element instance associated with this agent instance (the owning
     /// `element_instance_key` is always the first). Projected as a JSON array.
     pub element_instance_keys: Vec<Key>,
+    pub job_lease: String,
 }
 
 /// A projected AgentHistory turn row.
@@ -5564,20 +5718,23 @@ pub struct AgentHistoryRow {
     pub role: AgentHistoryRole,
     pub produced_at_ms: u64,
     pub content_json: String,
-    pub system_prompt: Option<String>,
+    pub system_prompt: Option<Vec<AgentHistoryContent>>,
     pub tool_calls_json: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub reasoning_token_count: i64,
-    pub cache_creation_token_count: i64,
-    pub cache_read_token_count: i64,
-    pub duration_ms: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub reasoning_token_count: Option<i64>,
+    pub cache_creation_token_count: Option<i64>,
+    pub cache_read_token_count: Option<i64>,
+    pub duration_ms: Option<i64>,
     pub history_item_id: Option<String>,
     pub tools_json: String,
     pub model: Option<String>,
     pub provider: Option<String>,
     pub is_duplicate: bool,
     pub commit_status: AgentHistoryCommitStatus,
+    pub job_lease: String,
+    pub limits_json: Option<String>,
+    pub metrics_json: Option<String>,
 }
 
 /// Parse a stored `AgentInstanceStatus` label back to the enum. An unrecognised
@@ -5627,7 +5784,7 @@ fn map_agent_instance(r: &rusqlite::Row) -> rusqlite::Result<AgentInstanceRow> {
         agent_type: r.get(11)?,
         model: r.get(12)?,
         provider: r.get(13)?,
-        system_prompt: r.get(14)?,
+        system_prompt: read_agent_prompt(r, 14, 33)?,
         max_tokens: r.get(15)?,
         max_model_calls: r.get(16)?,
         max_tool_calls: r.get(17)?,
@@ -5650,6 +5807,7 @@ fn map_agent_instance(r: &rusqlite::Row) -> rusqlite::Result<AgentInstanceRow> {
                 .map(|v| v.into_iter().map(|k| k as Key).collect())
                 .unwrap_or_default()
         },
+        job_lease: r.get(32)?,
     })
 }
 
@@ -5668,7 +5826,7 @@ fn map_agent_history(r: &rusqlite::Row) -> rusqlite::Result<AgentHistoryRow> {
         role: agent_role_from_label(&r.get::<_, String>(10)?),
         produced_at_ms: r.get::<_, i64>(11)? as u64,
         content_json: r.get(12)?,
-        system_prompt: r.get(13)?,
+        system_prompt: read_agent_prompt(r, 13, 30)?,
         tool_calls_json: r.get(14)?,
         input_tokens: r.get(15)?,
         output_tokens: r.get(16)?,
@@ -5682,7 +5840,54 @@ fn map_agent_history(r: &rusqlite::Row) -> rusqlite::Result<AgentHistoryRow> {
         provider: r.get(24)?,
         is_duplicate: r.get::<_, i64>(25)? != 0,
         commit_status: commit_status_from_label(&r.get::<_, String>(26)?),
+        job_lease: r.get(27)?,
+        limits_json: r.get(28)?,
+        metrics_json: match r.get::<_, Option<String>>(29)? {
+            Some(json) => Some(json),
+            None => Some(
+                serde_json::to_string(&nanobpmn_engine_core::AgentHistoryMetrics {
+                    input_tokens: r.get(15)?,
+                    output_tokens: r.get(16)?,
+                    reasoning_token_count: r.get(17)?,
+                    cache_creation_token_count: r.get(18)?,
+                    cache_read_token_count: r.get(19)?,
+                    duration_ms: r.get(20)?,
+                })
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        29,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+            ),
+        },
     })
+}
+
+fn read_agent_prompt(
+    row: &rusqlite::Row,
+    legacy_column: usize,
+    canonical_column: usize,
+) -> rusqlite::Result<Option<Vec<AgentHistoryContent>>> {
+    if let Some(json) = row.get::<_, Option<String>>(canonical_column)? {
+        return serde_json::from_str(&json).map(Some).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                canonical_column,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        });
+    }
+    // The old column is explicitly plain text, even when it looks like JSON.
+    Ok(row.get::<_, Option<String>>(legacy_column)?.map(|text| {
+        vec![AgentHistoryContent {
+            content_type: AgentHistoryContentType::Text,
+            text: Some(text),
+            document_reference: None,
+            object: None,
+        }]
+    }))
 }
 
 impl ReadStore {
@@ -5696,6 +5901,16 @@ impl ReadStore {
         filter: &AgentInstanceFilter,
         sort: Option<(AgentInstanceSortField, SortOrder)>,
     ) -> Vec<AgentInstanceRow> {
+        self.try_agent_instances(filter, sort)
+            .expect("query agent_instances")
+    }
+
+    /// Search agents without hiding malformed persisted projections.
+    pub fn try_agent_instances(
+        &self,
+        filter: &AgentInstanceFilter,
+        sort: Option<(AgentInstanceSortField, SortOrder)>,
+    ) -> rusqlite::Result<Vec<AgentInstanceRow>> {
         let conn = self.conn.lock().expect("read store poisoned");
         let (where_sql, values) = filter.where_clause();
         let (col, dir) = match sort {
@@ -5706,15 +5921,18 @@ impl ReadStore {
             "SELECT {AGENT_INSTANCE_COLS} FROM agent_instances{where_sql} \
              ORDER BY {col} {dir}, agent_instance_key ASC"
         );
-        let mut stmt = conn.prepare(&sql).expect("prepare agent_instances");
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(values), map_agent_instance)
-            .expect("query agent_instances");
-        rows.filter_map(Result::ok).collect()
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), map_agent_instance)?;
+        rows.collect()
     }
 
     /// A single AgentInstance by its dedicated key.
     pub fn agent_instance(&self, key: Key) -> Option<AgentInstanceRow> {
+        self.try_agent_instance(key).expect("query agent_instance")
+    }
+
+    /// Look up an agent, distinguishing absence from corrupt persisted data.
+    pub fn try_agent_instance(&self, key: Key) -> rusqlite::Result<Option<AgentInstanceRow>> {
         let conn = self.conn.lock().expect("read store poisoned");
         conn.query_row(
             &format!(
@@ -5724,7 +5942,6 @@ impl ReadStore {
             map_agent_instance,
         )
         .optional()
-        .expect("query agent_instance")
     }
 
     /// Search AgentHistory turns by `filter`, ordered by `sort`, or by the
@@ -5736,6 +5953,16 @@ impl ReadStore {
         filter: &AgentHistoryFilter,
         sort: Option<(AgentHistorySortField, SortOrder)>,
     ) -> Vec<AgentHistoryRow> {
+        self.try_agent_history(filter, sort)
+            .expect("query agent_history")
+    }
+
+    /// Search history without silently dropping malformed rows.
+    pub fn try_agent_history(
+        &self,
+        filter: &AgentHistoryFilter,
+        sort: Option<(AgentHistorySortField, SortOrder)>,
+    ) -> rusqlite::Result<Vec<AgentHistoryRow>> {
         let conn = self.conn.lock().expect("read store poisoned");
         let (where_sql, values) = filter.where_clause();
         let order_sql = match sort {
@@ -5751,11 +5978,9 @@ impl ReadStore {
         let sql = format!(
             "SELECT {AGENT_HISTORY_COLS} FROM agent_history{where_sql} ORDER BY {order_sql}"
         );
-        let mut stmt = conn.prepare(&sql).expect("prepare agent_history");
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(values), map_agent_history)
-            .expect("query agent_history");
-        rows.filter_map(Result::ok).collect()
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), map_agent_history)?;
+        rows.collect()
     }
 }
 
@@ -8084,6 +8309,8 @@ mod element_instance_tests {
                     worker: "w1".to_string(),
                     deadline: 60_000,
                     activated_at: Some(1),
+                    lease_token: None,
+                    durable: false,
                     fetch_variables: Vec::new(),
                 },
                 &Event::JobFailed {
@@ -8109,6 +8336,8 @@ mod element_instance_tests {
                     worker: "w2".to_string(),
                     deadline: 60_000,
                     activated_at: Some(1),
+                    lease_token: None,
+                    durable: false,
                     fetch_variables: Vec::new(),
                 },
                 &Event::JobErrorThrown {
@@ -8134,6 +8363,8 @@ mod element_instance_tests {
                     worker: "w3".to_string(),
                     deadline: 60_000,
                     activated_at: Some(1),
+                    lease_token: None,
+                    durable: false,
                     fetch_variables: Vec::new(),
                 },
                 &Event::JobFailed {
@@ -8225,6 +8456,56 @@ mod element_instance_tests {
     }
 
     #[test]
+    fn projects_opaque_job_leases_for_both_activation_read_set_forms() {
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &Event::JobCreated {
+                    job_key: 7001,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".into(),
+                    job_type: "worker".into(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 3,
+                },
+            ])
+            .unwrap();
+        assert!(store.jobs()[0].lease_token.is_none());
+        for (token, fetch_variables) in [
+            ("lease:opaque/0001", Vec::new()),
+            ("lease:opaque/0002", vec!["input".into()]),
+        ] {
+            store
+                .export(&[&Event::JobActivated {
+                    job_key: 7001,
+                    instance_key: INST,
+                    worker: "W".into(),
+                    deadline: 100,
+                    activated_at: Some(1),
+                    fetch_variables,
+                    lease_token: Some(token.into()),
+                    durable: false,
+                }])
+                .unwrap();
+            assert_eq!(store.jobs()[0].lease_token.as_deref(), Some(token));
+        }
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "ALTER TABLE jobs RENAME COLUMN lease_token TO old_lease_token; \
+                 ALTER TABLE jobs ADD COLUMN lease_token INTEGER; \
+                 UPDATE jobs SET lease_token = 314;",
+            )
+            .unwrap();
+        }
+        assert_eq!(store.jobs()[0].lease_token.as_deref(), Some("314"));
+    }
+
+    #[test]
     fn projects_the_declared_read_set_from_job_activated_onto_the_row() {
         // #986 — a `JobActivated` that carries a declared read-set (`fetchVariables`)
         // must surface it on the read-model job row (engine-native read provenance
@@ -8254,6 +8535,8 @@ mod element_instance_tests {
                     deadline: 60_000,
                     activated_at: Some(1),
                     fetch_variables: vec!["a".to_string(), "c".to_string()],
+                    lease_token: None,
+                    durable: false,
                 },
                 // Declaration-free: no fetchVariables ⇒ read-set stays empty.
                 &Event::JobCreated {
@@ -8273,6 +8556,8 @@ mod element_instance_tests {
                     deadline: 60_000,
                     activated_at: Some(1),
                     fetch_variables: Vec::new(),
+                    lease_token: None,
+                    durable: false,
                 },
             ])
             .unwrap();
@@ -8296,6 +8581,8 @@ mod element_instance_tests {
                 deadline: 120_000,
                 activated_at: Some(2),
                 fetch_variables: Vec::new(),
+                lease_token: None,
+                durable: false,
             }])
             .unwrap();
         let jobs: HashMap<Key, super::JobRow> =
@@ -8734,13 +9021,18 @@ mod agent_projection_tests {
             definition: AgentDefinition {
                 model: Some("gpt".to_string()),
                 provider: Some("openai".to_string()),
-                system_prompt: Some("be helpful".to_string()),
+                system_prompt: Some(vec![nanobpmn_engine_core::AgentHistoryContent {
+                    content_type: nanobpmn_engine_core::AgentHistoryContentType::Text,
+                    text: Some("be helpful".to_string()),
+                    document_reference: None,
+                    object: None,
+                }]),
             },
             limits: AgentInstanceLimits::default(),
             metrics: AgentInstanceMetrics::default(),
             tools: Vec::new(),
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             created_at,
             last_updated_at: created_at,
             completed_at: if matches!(status, AgentInstanceStatus::Completed) {
@@ -8760,6 +9052,7 @@ mod agent_projection_tests {
         role: AgentHistoryRole,
     ) -> AgentHistoryRecord {
         AgentHistoryRecord {
+            changed_attributes: Vec::new(),
             agent_history_key: key,
             agent_instance_key: instance_key,
             element_instance_key: instance_key + 1000,
@@ -8769,14 +9062,14 @@ mod agent_projection_tests {
             process_definition_key: 99,
             tenant_id: "<default>".to_string(),
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             loop_iteration,
             role,
             produced_at,
             content: Vec::new(),
             system_prompt: None,
             tool_calls: Vec::new(),
-            metrics: AgentHistoryMetrics::default(),
+            metrics: None,
             history_item_id: None,
             tools: Vec::new(),
             model: None,
@@ -8792,6 +9085,355 @@ mod agent_projection_tests {
         let refs: Vec<&Event> = events.iter().collect();
         store.export(&refs).unwrap();
         store
+    }
+
+    #[test]
+    fn legacy_prompt_rows_preserve_json_looking_text() {
+        let agent = instance(1, "agent", AgentInstanceStatus::Thinking, 10);
+        let store = store_with(&[Event::AgentInstanceCreated {
+            instance_key: 42,
+            agent_instance: agent,
+        }]);
+        for prompt in [
+            "ordinary prompt",
+            r#"[{"content_type":"Text","text":"not a block"}]"#,
+            "[]",
+        ] {
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE agent_instances SET system_prompt = ?1, system_prompt_json = NULL",
+                    rusqlite::params![prompt],
+                )
+                .unwrap();
+            let row = store.agent_instance(1).unwrap();
+            let encoded = serde_json::to_value(row.system_prompt).unwrap();
+            assert!(
+                encoded.is_array(),
+                "legacy text must decode as a typed content array"
+            );
+            assert_eq!(encoded[0]["text"], prompt);
+        }
+    }
+
+    #[test]
+    fn canonical_prompt_rows_are_arrays_and_corruption_is_not_legacy_text() {
+        let agent = instance(1, "agent", AgentInstanceStatus::Thinking, 10);
+        let history = record(2, 1, 1, 20, AgentHistoryRole::Configuration);
+        let store = store_with(&[
+            Event::AgentInstanceCreated {
+                instance_key: 42,
+                agent_instance: agent,
+            },
+            Event::AgentHistoryCreated {
+                instance_key: 42,
+                record: history,
+            },
+        ]);
+        let blocks = serde_json::json!([
+            {"content_type":"Text","text":"[]","document_reference":null,"object":null},
+        ]);
+        for table in ["agent_instances", "agent_history"] {
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET system_prompt_json = ?1, system_prompt = 'old fallback'"
+                    ),
+                    rusqlite::params![blocks.to_string()],
+                )
+                .unwrap();
+        }
+        let filter = AgentHistoryFilter {
+            agent_instance_key: Some(1),
+            commit_status: Some(vec![AgentHistoryCommitStatus::Pending]),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(store.agent_instance(1).unwrap().system_prompt).unwrap(),
+            blocks
+        );
+        assert_eq!(
+            serde_json::to_value(&store.agent_history(&filter, None)[0].system_prompt).unwrap(),
+            blocks
+        );
+        for corrupt in [
+            "broken JSON",
+            r#""a new-column string is not legacy text""#,
+            "[{}]",
+        ] {
+            for table in ["agent_instances", "agent_history"] {
+                store
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        &format!("UPDATE {table} SET system_prompt_json = ?1"),
+                        rusqlite::params![corrupt],
+                    )
+                    .unwrap();
+            }
+            assert!(store.try_agent_instance(1).is_err());
+            assert!(
+                store
+                    .try_agent_instances(&AgentInstanceFilter::default(), None)
+                    .is_err()
+            );
+            assert!(store.try_agent_history(&filter, None).is_err());
+        }
+    }
+
+    #[test]
+    fn history_metric_columns_allow_absence_without_zero() {
+        let store = ReadStore::open(None).unwrap();
+        let conn = store.conn.lock().unwrap();
+        for column in [
+            "input_tokens",
+            "output_tokens",
+            "reasoning_token_count",
+            "cache_creation_token_count",
+            "cache_read_token_count",
+            "duration_ms",
+        ] {
+            let notnull: i64 = conn
+                .query_row(
+                    "SELECT \"notnull\" FROM pragma_table_info('agent_history') WHERE name = ?1",
+                    rusqlite::params![column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(notnull, 0, "{column} must preserve absent observations");
+        }
+    }
+
+    #[test]
+    fn history_metric_nullability_migration_preserves_existing_observations() {
+        let mut old = record(2, 1, 1, 20, AgentHistoryRole::Assistant);
+        old.metrics = Some(AgentHistoryMetrics {
+            input_tokens: Some(2),
+            output_tokens: Some(0),
+            duration_ms: Some(7),
+            ..Default::default()
+        });
+        let store = store_with(&[Event::AgentHistoryCreated {
+            instance_key: 42,
+            record: old,
+        }]);
+        {
+            let conn = store.conn.lock().unwrap();
+            let columns = super::target_shape()
+                .unwrap()
+                .tables
+                .remove("agent_history")
+                .unwrap()
+                .1;
+            for column in columns
+                .into_iter()
+                .filter(|c| c.decl_type == "INTEGER" && !c.notnull && !c.primary_key)
+            {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE agent_history RENAME COLUMN \"{0}\" TO old_metric;
+                     ALTER TABLE agent_history ADD COLUMN \"{0}\" INTEGER NOT NULL DEFAULT 0;
+                     UPDATE agent_history SET \"{0}\" = COALESCE(old_metric, 0);
+                     ALTER TABLE agent_history DROP COLUMN old_metric;",
+                    column.name,
+                ))
+                .unwrap();
+            }
+            conn.execute("UPDATE agent_history SET metrics_json = NULL", [])
+                .unwrap();
+            super::reconcile_to_schema(&conn).unwrap();
+        }
+        let fresh = record(3, 1, 1, 30, AgentHistoryRole::Assistant);
+        store
+            .export(&[&Event::AgentHistoryCreated {
+                instance_key: 42,
+                record: fresh,
+            }])
+            .unwrap();
+        let rows = store.agent_history(
+            &AgentHistoryFilter {
+                agent_instance_key: Some(1),
+                commit_status: Some(vec![AgentHistoryCommitStatus::Pending]),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(rows[0].input_tokens, Some(2));
+        assert_eq!(rows[0].output_tokens, Some(0));
+        assert_eq!(rows[1].input_tokens, None);
+        assert_eq!(rows[1].metrics_json.as_deref(), Some("null"));
+    }
+
+    #[test]
+    fn legacy_history_metrics_preserve_observed_counters() {
+        let mut history = record(2, 1, 1, 20, AgentHistoryRole::Assistant);
+        history.metrics = Some(AgentHistoryMetrics {
+            input_tokens: Some(2),
+            output_tokens: Some(0),
+            duration_ms: Some(7),
+            ..Default::default()
+        });
+        let store = store_with(&[Event::AgentHistoryCreated {
+            instance_key: 42,
+            record: history,
+        }]);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE agent_history SET metrics_json = NULL", [])
+            .unwrap();
+        let filter = AgentHistoryFilter {
+            agent_instance_key: Some(1),
+            commit_status: Some(vec![AgentHistoryCommitStatus::Pending]),
+            ..Default::default()
+        };
+        let rows = store.agent_history(&filter, None);
+        let metrics: AgentHistoryMetrics =
+            serde_json::from_str(rows[0].metrics_json.as_deref().unwrap()).unwrap();
+        assert_eq!(metrics.input_tokens, Some(2));
+        assert_eq!(metrics.output_tokens, Some(0));
+        assert_eq!(metrics.duration_ms, Some(7));
+    }
+
+    #[test]
+    fn history_projection_preserves_loop_iteration_boundary() {
+        let mut history = record(2, 1, 1, 20, AgentHistoryRole::User);
+        history.loop_iteration = i32::MAX;
+        let store = store_with(&[Event::AgentHistoryCreated {
+            instance_key: 42,
+            record: history,
+        }]);
+        let filter = AgentHistoryFilter {
+            agent_instance_key: Some(1),
+            commit_status: Some(vec![AgentHistoryCommitStatus::Pending]),
+            ..Default::default()
+        };
+        let rows = store.try_agent_history(&filter, None).unwrap();
+        assert_eq!(rows[0].loop_iteration, i32::MAX);
+    }
+
+    #[test]
+    fn lease_projection_schema_preserves_opaque_and_legacy_values() {
+        let store = ReadStore::open(None).unwrap();
+        let conn = store.conn.lock().unwrap();
+        for (table, column) in [
+            ("jobs", "lease_token"),
+            ("agent_instances", "job_lease"),
+            ("agent_history", "job_lease"),
+        ] {
+            let ty: String = conn
+                .query_row(
+                    "SELECT type FROM pragma_table_info(?1) WHERE name = ?2",
+                    rusqlite::params![table, column],
+                    |r| r.get(0),
+                )
+                .expect("lease column must exist");
+            assert_eq!(ty, "TEXT");
+        }
+    }
+
+    #[test]
+    fn agent_lease_projection_round_trips_opaque_and_legacy_numeric_rows() {
+        let mut agent = instance(1, "agent", AgentInstanceStatus::Thinking, 100);
+        agent.job_lease = "lease:opaque/0007".into();
+        let mut history = record(10, 1, 1, 100, AgentHistoryRole::User);
+        history.job_lease = agent.job_lease.clone();
+        let store = store_with(&[
+            Event::AgentInstanceCreated {
+                instance_key: 42,
+                agent_instance: agent,
+            },
+            Event::AgentHistoryCreated {
+                instance_key: 42,
+                record: history,
+            },
+        ]);
+        let filter = AgentHistoryFilter {
+            agent_instance_key: Some(1),
+            commit_status: Some(vec![AgentHistoryCommitStatus::Pending]),
+            ..Default::default()
+        };
+        assert_eq!(
+            store.agent_instance(1).unwrap().job_lease,
+            "lease:opaque/0007"
+        );
+        assert_eq!(
+            store.agent_history(&filter, None)[0].job_lease,
+            "lease:opaque/0007"
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            for table in ["agent_instances", "agent_history"] {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {table} RENAME COLUMN job_lease TO old_job_lease; \
+                     ALTER TABLE {table} ADD COLUMN job_lease INTEGER NOT NULL DEFAULT 0; \
+                     UPDATE {table} SET job_lease = 314;"
+                ))
+                .unwrap();
+            }
+        }
+        assert_eq!(store.agent_instance(1).unwrap().job_lease, "314");
+        assert_eq!(store.agent_history(&filter, None)[0].job_lease, "314");
+        {
+            let conn = store.conn.lock().unwrap();
+            super::reconcile_to_schema(&conn).unwrap();
+            for table in ["agent_instances", "agent_history"] {
+                conn.execute(&format!("UPDATE {table} SET job_lease = ?1"), ["0007"])
+                    .unwrap();
+            }
+        }
+        assert_eq!(store.agent_instance(1).unwrap().job_lease, "0007");
+        assert_eq!(store.agent_history(&filter, None)[0].job_lease, "0007");
+    }
+
+    #[test]
+    fn canonical_agent_and_history_filters_apply_every_supplied_identity() {
+        let mut agent = instance(1, "agent", AgentInstanceStatus::Thinking, 100);
+        agent.element_instance_keys.push(2002);
+        agent.process_definition_version_tag = Some("v1".into());
+        let mut history = record(10, 1, 3, 200, AgentHistoryRole::Assistant);
+        history.job_key = 700;
+        let store = store_with(&[
+            Event::AgentInstanceCreated {
+                instance_key: 42,
+                agent_instance: agent,
+            },
+            Event::AgentHistoryCreated {
+                instance_key: 42,
+                record: history,
+            },
+        ]);
+        let mut filter = AgentInstanceFilter {
+            process_definition_id: Some("proc".into()),
+            process_definition_version: Some(1),
+            process_definition_version_tag: Some("v1".into()),
+            element_instance_keys: vec![1001, 2002],
+            creation_date_ms: Some(100),
+            last_updated_date_ms: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(store.agent_instances(&filter, None).len(), 1);
+        filter.element_instance_keys.push(9999);
+        assert!(store.agent_instances(&filter, None).is_empty());
+        let mut filter = AgentHistoryFilter {
+            history_item_key: Some(10),
+            element_instance_key: Some(1001),
+            job_key: Some(700),
+            loop_iteration: Some(3),
+            produced_at_ms: Some(200),
+            role: Some(AgentHistoryRole::Assistant),
+            commit_status: Some(vec![AgentHistoryCommitStatus::Pending]),
+            ..Default::default()
+        };
+        assert_eq!(store.agent_history(&filter, None).len(), 1);
+        filter.job_key = Some(701);
+        assert!(store.agent_history(&filter, None).is_empty());
     }
 
     #[test]
@@ -8995,6 +9637,7 @@ mod agent_projection_tests {
                 agent_instance_key: Some(1),
                 process_instance_key: None,
                 commit_status: Some(vec![AgentHistoryCommitStatus::Pending]),
+                ..Default::default()
             },
             None,
         );
@@ -9012,6 +9655,7 @@ mod agent_projection_tests {
                 agent_instance_key: Some(1),
                 process_instance_key: None,
                 commit_status: Some(vec![AgentHistoryCommitStatus::Discarded]),
+                ..Default::default()
             },
             None,
         );
@@ -9029,6 +9673,7 @@ mod agent_projection_tests {
                 agent_instance_key: Some(1),
                 process_instance_key: None,
                 commit_status: Some(vec![]),
+                ..Default::default()
             },
             None,
         );
@@ -9153,6 +9798,7 @@ mod agent_projection_tests {
                 agent_instance_key: Some(1),
                 process_instance_key: None,
                 commit_status: Some(vec![AgentHistoryCommitStatus::Discarded]),
+                ..Default::default()
             },
             None,
         );

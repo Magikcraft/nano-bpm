@@ -438,28 +438,53 @@ impl ReadModel {
     /// pagination are applied by the REST handler (mirroring `element_instances`)
     /// so cross-shard ordering has a single home; the shared read store is the
     /// source of the rows.
+    /// Panics on query failure; request handlers use [`Self::try_agent_instances`].
     pub fn agent_instances(&self) -> Vec<AgentInstanceRow> {
-        self.shards
-            .iter()
-            .flat_map(|s| s.agent_instances(&AgentInstanceFilter::default(), None))
-            .collect()
+        self.try_agent_instances().expect("query agent_instances")
+    }
+
+    pub fn try_agent_instances(&self) -> rusqlite::Result<Vec<AgentInstanceRow>> {
+        let mut rows = Vec::new();
+        for shard in &self.shards {
+            rows.extend(shard.try_agent_instances(&AgentInstanceFilter::default(), None)?);
+        }
+        Ok(rows)
     }
 
     /// A single agent instance by its dedicated key, returning the first shard's
     /// match (keys are unique across shards, so at most one shard answers).
+    /// Panics on query failure; request handlers use [`Self::try_agent_instance`].
     pub fn agent_instance(&self, key: Key) -> Option<AgentInstanceRow> {
-        self.shards.iter().find_map(|s| s.agent_instance(key))
+        self.try_agent_instance(key).expect("query agent_instance")
+    }
+
+    pub fn try_agent_instance(&self, key: Key) -> rusqlite::Result<Option<AgentInstanceRow>> {
+        for shard in &self.shards {
+            if let Some(row) = shard.try_agent_instance(key)? {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
     }
 
     /// The agent history turns matching `filter` across all shards. The
     /// `commit_status` default (COMMITTED-only when unset) lives in
     /// [`AgentHistoryFilter`], so passing the filter through preserves it as the
     /// single source of truth; the REST handler sorts and paginates the result.
+    /// Panics on query failure; request handlers use [`Self::try_agent_history`].
     pub fn agent_history(&self, filter: &AgentHistoryFilter) -> Vec<AgentHistoryRow> {
-        self.shards
-            .iter()
-            .flat_map(|s| s.agent_history(filter, None))
-            .collect()
+        self.try_agent_history(filter).expect("query agent_history")
+    }
+
+    pub fn try_agent_history(
+        &self,
+        filter: &AgentHistoryFilter,
+    ) -> rusqlite::Result<Vec<AgentHistoryRow>> {
+        let mut rows = Vec::new();
+        for shard in &self.shards {
+            rows.extend(shard.try_agent_history(filter, None)?);
+        }
+        Ok(rows)
     }
 
     /// Every open message subscription across all shards (MESSAGE wait states).
@@ -598,6 +623,46 @@ mod tests {
 
     fn shard() -> Arc<ReadStore> {
         Arc::new(ReadStore::open(None).expect("open in-memory read store"))
+    }
+
+    #[test]
+    fn agent_read_conveniences_never_hide_a_broken_shard() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nano-agent-read-errors-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("read.sqlite");
+        let broken = Arc::new(ReadStore::open(Some(&path)).unwrap());
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE agent_instances; DROP TABLE agent_history;")
+            .unwrap();
+        let model = ReadModel::from_shards(vec![(0, shard()), (1, broken)]);
+        let filter = AgentHistoryFilter::default();
+        let fallible = [
+            model.try_agent_instances().is_err(),
+            model.try_agent_instance(1).is_err(),
+            model.try_agent_history(&filter).is_err(),
+        ];
+        let fail_loudly = [
+            catch_unwind(AssertUnwindSafe(|| model.agent_instances())).is_err(),
+            catch_unwind(AssertUnwindSafe(|| model.agent_instance(1))).is_err(),
+            catch_unwind(AssertUnwindSafe(|| model.agent_history(&filter))).is_err(),
+        ];
+        drop(model);
+        drop(connection);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(fallible, [true; 3]);
+        assert_eq!(
+            fail_loudly, [true; 3],
+            "query failures must not resemble absent data"
+        );
     }
 
     #[test]

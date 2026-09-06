@@ -12,7 +12,7 @@
 root      ::= ws "process" sp string sp "{" nl indent "start" sp id nl elements flows "}" ws
 elements  ::= element*
 flows     ::= flow*
-element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent | elem-agentTask
+element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
 
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
@@ -29,12 +29,13 @@ elem-terminateEndEvent  ::= indent "terminateEndEvent" sp id (sp string)? (sp at
 attrs-terminateEndEvent   ::= "{" nl (indent2 attr-line-terminateEndEvent nl)+ indent "}"
 attr-line-terminateEndEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
 
-# serviceTask — Job-based task. Creates a job of `jobType` and rests until completion.
+# serviceTask — Job-based task. Creates a job of `jobType` and rests until completion. Optional agent metadata does not change the job-worker lifecycle.
 elem-serviceTask  ::= indent "serviceTask" sp id (sp string)? (sp attrs-serviceTask)? nl
 attrs-serviceTask   ::= "{" nl (indent2 attr-line-serviceTask nl)+ indent "}"
-attr-line-serviceTask  ::= attr-serviceTask-jobType | attr-serviceTask-priority | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-serviceTask  ::= attr-serviceTask-jobType | attr-serviceTask-priority | attr-serviceTask-agentType | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
 attr-serviceTask-jobType  ::= "jobType" sp attr-str   # The `zeebe:taskDefinition type` a worker subscribes to.
 attr-serviceTask-priority  ::= "priority" sp attr-str   # Raw priority expression (literal or FEEL); higher activates first.
+attr-serviceTask-agentType  ::= "agentType" sp attr-str   # Optional `zeebe:agentDefinition` metadata: `aiAgentTask`, `external`, or `aiAgentSubProcess`. All create ordinary jobs. The compact IR retains this classification but does not represent an adHocSubProcess tool catalog.
 
 # businessRuleTask — DMN-bound task. Evaluates `decisionId` natively in-engine (no job) and merges the output.
 elem-businessRuleTask  ::= indent "businessRuleTask" sp id (sp string)? (sp attrs-businessRuleTask)? nl
@@ -192,12 +193,6 @@ attr-compensationBoundaryEvent-handler  ::= "handler" sp attr-id   # Id of the `
 elem-compensationThrowEvent  ::= indent "compensationThrowEvent" sp id (sp string)? (sp attrs-compensationThrowEvent)? nl
 attrs-compensationThrowEvent   ::= "{" nl (indent2 attr-line-compensationThrowEvent nl)+ indent "}"
 attr-line-compensationThrowEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
-
-# agentTask — Engine-native AI agent task (Camunda stable/8.10). A serviceTask bearing a `zeebe:agentDefinition` marker; on activation the engine mints a first-class AgentInstance instead of a job.
-elem-agentTask  ::= indent "agentTask" sp id (sp string)? (sp attrs-agentTask)? nl
-attrs-agentTask   ::= "{" nl (indent2 attr-line-agentTask nl)+ indent "}"
-attr-line-agentTask  ::= attr-agentTask-agentType | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
-attr-agentTask-agentType  ::= "agentType" sp attr-str   # The `zeebe:agentDefinition agentType`. An `agentTask` round-trips as a serviceTask, so only `aiAgentTask` or `external` are valid here (`aiAgentSubProcess` is an adHocSubProcess form).
 
 # --- Attribute value primitives ---
 attr-str      ::= string

@@ -9,9 +9,8 @@
 //!   * `engine-core` stays lean and untouched — all the binding glue lives here.
 //!   * The engine never reads a wall clock; we drive a *virtual* clock so the
 //!     simulation is fully deterministic and timers can be "fast-forwarded".
-//!   * Every mutating call returns a full [`Snapshot`] as JSON so the UI can
-//!     re-render the diagram (active tokens), variables, jobs and incidents from
-//!     a single round-trip.
+//!   * Execution mutators return a [`Snapshot`] for rendering; agent CREATE/UPDATE
+//!     return their canonical REST result with `createdHistory`.
 
 use std::collections::HashMap;
 
@@ -20,9 +19,9 @@ use nanobpmn_engine_core::{
     AgentDefinition, AgentHistoryContent, AgentHistoryContentType, AgentHistoryRole,
     AgentHistoryTurn, AgentInstanceLimits, AgentInstanceMetricsDelta, AgentInstanceStatus,
     AgentTool, BreakCondition, Command, DebugSession, Engine, Event, FormResource, GenericResource,
-    IncidentKind, IncidentState, JobState, MessageSubscriptionKind, MessageSubscriptionState,
-    ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState, Value,
-    AGENT_LIMIT_UNLIMITED,
+    IncidentKind, IncidentState, JobActivationOptions, JobState, MessageSubscriptionKind,
+    MessageSubscriptionState, ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState,
+    Value,
 };
 /// The shared read-model surface, compiled with its in-memory wasm SQLite
 /// backend. Behind the off-by-default `read-model` feature so the baseline engine
@@ -416,13 +415,21 @@ impl TestEngine {
     /// string) into the instance. The job is activated first if it has not been
     /// already, so the UI can complete a freshly-created job directly.
     #[wasm_bindgen(js_name = completeJob)]
-    pub fn complete_job(&mut self, job_key: &str, variables_json: &str) -> Result<String, JsValue> {
+    pub fn complete_job(
+        &mut self,
+        job_key: &str,
+        variables_json: &str,
+        lease_token: Option<String>,
+    ) -> Result<String, JsValue> {
         self.guard_paused()?;
         let key = parse_key(job_key)?;
         let variables = parse_vars(variables_json)?;
-        self.ensure_activated(key)?;
+        if lease_token.is_none() {
+            self.ensure_activated(key)?;
+        }
         self.apply(Command::CompleteJob {
             job_key: key,
+            lease_token,
             variables,
             adhoc_result: None,
             task_listener_result: None,
@@ -456,14 +463,18 @@ impl TestEngine {
         job_key: &str,
         variables_json: &str,
         agent_result_json: &str,
+        lease_token: Option<String>,
     ) -> Result<String, JsValue> {
         self.guard_paused()?;
         let key = parse_key(job_key)?;
         let variables = parse_vars(variables_json)?;
         let adhoc_result = parse_adhoc_result(agent_result_json)?;
-        self.ensure_activated(key)?;
+        if lease_token.is_none() {
+            self.ensure_activated(key)?;
+        }
         self.apply(Command::CompleteJob {
             job_key: key,
+            lease_token,
             variables,
             adhoc_result: Some(adhoc_result),
             task_listener_result: None,
@@ -480,12 +491,16 @@ impl TestEngine {
         job_key: &str,
         retries: i32,
         message: &str,
+        lease_token: Option<String>,
     ) -> Result<String, JsValue> {
         self.guard_paused()?;
         let key = parse_key(job_key)?;
-        self.ensure_activated(key)?;
+        if lease_token.is_none() {
+            self.ensure_activated(key)?;
+        }
         self.apply(Command::FailJob {
             job_key: key,
+            lease_token,
             retries,
             error_message: message.to_string(),
         })
@@ -570,6 +585,7 @@ impl TestEngine {
         max_jobs: u32,
         timeout_ms: f64,
         worker: &str,
+        with_lease: Option<bool>,
     ) -> Result<String, JsValue> {
         self.guard_paused()?;
         let now = self.now;
@@ -579,12 +595,16 @@ impl TestEngine {
             30_000
         };
         let events = self
-            .apply(Command::activate_jobs(
-                job_type.to_string(),
-                worker.to_string(),
+            .apply(Command::activate_jobs_with_options(
+                job_type,
+                worker,
                 (max_jobs.max(1)) as usize,
                 timeout,
                 now,
+                JobActivationOptions {
+                    with_lease: with_lease.unwrap_or(false),
+                    ..Default::default()
+                },
             ))
             .map_err(|e| js_err(&format!("activate error: {e}")))?;
         // Derive the returned job keys from the `JobActivated` events *this*
@@ -605,7 +625,7 @@ impl TestEngine {
             .iter()
             .filter_map(|k| self.engine.activated_job(*k))
             .map(|j| {
-                let mut obj = serde_json::json!({
+                serde_json::json!({
                     "key": j.key.to_string(),
                     "type": j.job_type,
                     "instanceKey": j.instance_key.to_string(),
@@ -622,15 +642,8 @@ impl TestEngine {
                     "tags": j.tags,
                     "businessId": j.business_id,
                     "variables": vars_to_json(&j.variables),
-                });
-                // Only external-agent jobs carry a lease token; omit `jobLease`
-                // entirely for lease-less activations (matching the FFI JSON and
-                // the generated `jobLease?: string` type) rather than emitting a
-                // JSON `null`.
-                if let Some(lease) = j.lease_token {
-                    obj["jobLease"] = serde_json::Value::String(lease.to_string());
-                }
-                obj
+                    "leaseToken": j.lease_token,
+                })
             })
             .collect();
         to_json(&serde_json::Value::Array(out))
@@ -647,15 +660,20 @@ impl TestEngine {
         job_key: &str,
         error_code: &str,
         error_message: &str,
+        lease_token: Option<String>,
     ) -> Result<String, JsValue> {
         self.guard_paused()?;
         let key = parse_key(job_key)?;
-        self.ensure_activated(key)?;
-        self.apply(Command::throw_job_error(
-            key,
-            error_code.to_string(),
-            error_message.to_string(),
-        ))
+        if lease_token.is_none() {
+            self.ensure_activated(key)?;
+        }
+        self.apply(Command::ThrowJobError {
+            job_key: key,
+            error_code: error_code.to_string(),
+            error_message: error_message.to_string(),
+            variables: HashMap::new(),
+            lease_token,
+        })
         .map_err(|e| js_err(&format!("throw error: {e}")))?;
         to_json(&self.snapshot_value(None))
     }
@@ -664,11 +682,41 @@ impl TestEngine {
     /// no-retries incident before resolving that incident; does not by itself
     /// unblock the job. Returns the snapshot.
     #[wasm_bindgen(js_name = updateRetries)]
-    pub fn update_retries(&mut self, job_key: &str, retries: i32) -> Result<String, JsValue> {
+    pub fn update_retries(
+        &mut self,
+        job_key: &str,
+        retries: i32,
+        lease_token: Option<String>,
+    ) -> Result<String, JsValue> {
         self.guard_paused()?;
         let key = parse_key(job_key)?;
-        self.apply(Command::update_job_retries(key, retries))
-            .map_err(|e| js_err(&format!("update retries error: {e}")))?;
+        self.apply(Command::UpdateJobRetries {
+            job_key: key,
+            retries,
+            lease_token,
+            operation_reference: None,
+        })
+        .map_err(|e| js_err(&format!("update retries error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Update an activated job's timeout, optionally checking its opaque lease.
+    #[wasm_bindgen(js_name = updateTimeout)]
+    pub fn update_timeout(
+        &mut self,
+        job_key: &str,
+        timeout_ms: f64,
+        lease_token: Option<String>,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let timeout = update_timeout_value(timeout_ms).map_err(|e| js_err(&e))?;
+        self.apply(Command::UpdateJobTimeout {
+            job_key: parse_key(job_key)?,
+            timeout,
+            lease_token,
+            operation_reference: None,
+        })
+        .map_err(|e| js_err(&format!("update timeout error: {e}")))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -910,119 +958,130 @@ impl TestEngine {
         to_json(&arr)
     }
 
+    /// Restore a complete trace returned by `events()`, using the core journal
+    /// decoder and replay engine. Replaces this simulation only after decoding succeeds.
+    #[wasm_bindgen(js_name = replayEvents)]
+    pub fn replay_events(&mut self, events_json: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let records = decode_trace(events_json).map_err(|e| js_err(&e))?;
+        let events: Vec<_> = records.iter().map(|record| record.event.clone()).collect();
+        let mut restored = Self::new();
+        restored.engine = Engine::replay(events);
+        for record in records {
+            restored.now = record.now;
+            restored.seq = record.seq;
+            restored.fold_history(&record.event);
+            #[cfg(feature = "read-model")]
+            restored.project_read_model(std::slice::from_ref(&record.event));
+            restored.log.push(record);
+        }
+        *self = restored;
+        to_json(&self.snapshot_value(None))
+    }
+
     // --- Engine-native AgentInstance drivers (Camunda 8.10 parity, Stage 3) ---
     //
     // These expose the AgentInstance CREATE/UPDATE/COMPLETE lifecycle commands
     // through the wasm `TestEngine`. Each accepts a small camelCase JSON request
     // mirroring the Camunda v2 `/agent-instances` wire shape (status/role are the
-    // REST spellings, e.g. `"INITIALIZING"`, `"ASSISTANT"`), applies the command,
-    // and returns the debug snapshot. The projected instance/history state is read
+    // REST spellings, e.g. `"THINKING"`, `"ASSISTANT"`), applies the command,
+    // and returns its canonical result. The projected instance/history state is read
     // back through `searchAgentInstances` / `searchAgentInstanceHistory` (the
     // read-model surface), which serialise the same REST shapes.
 
-    /// Reconcile / create an AgentInstance for an already-activated agent task.
-    /// `request_json` is `{ elementInstanceKey, jobKey?, jobLease?, definition?,
-    /// limits?, history? }` where `definition` is `{ model?, provider?,
-    /// systemPrompt? }`, `limits` is `{ maxTokens?, maxModelCalls?, maxToolCalls? }`
-    /// (omitted limits default to unlimited), and `history` is an initial batch of
-    /// turns (see the turn shape on `updateAgentInstance`). `jobKey`/`jobLease`
-    /// are the activation's job attribution: **required** for an `external`
-    /// (job-backed) agent element, where the CREATE is rejected unless they
-    /// reference that element's ACTIVATED job with a matching lease token and
-    /// `elementInstanceKey` (#1099); unused for the engine-native
-    /// `aiAgentTask`/`aiAgentSubProcess` variants. Returns the snapshot.
+    /// Create an agent using `{ elementInstanceKey, jobKey, jobLease, history }`.
+    /// History must establish its CONFIGURATION. Returns the canonical creation
+    /// result with `agentInstanceKey` and positionally correlated `createdHistory`.
     #[wasm_bindgen(js_name = createAgentInstance)]
     pub fn create_agent_instance(&mut self, request_json: &str) -> Result<String, JsValue> {
         self.guard_paused()?;
         let req: CreateAgentInstanceReq = serde_json::from_str(request_json)
             .map_err(|e| js_err(&format!("createAgentInstance: invalid request JSON: {e}")))?;
         let element_instance_key = parse_key(&req.element_instance_key)?;
-        // A present-but-unparsable jobKey/jobLease is rejected rather than
-        // coerced to 0 (mirroring the gateway's 400): for an `external` agent 0
-        // fails the lease gate, and for the engine-native variants it is unused.
-        let job_key =
-            parse_job_attribution("createAgentInstance", "jobKey", req.job_key.as_deref())
-                .map_err(|m| js_err(&m))?;
-        let job_lease =
-            parse_job_attribution("createAgentInstance", "jobLease", req.job_lease.as_deref())
-                .map_err(|m| js_err(&m))?;
-        let history = agent_turns_from(req.history, job_key, job_lease)?;
-        self.apply(Command::CreateAgentInstance {
-            element_instance_key,
-            job_key,
-            job_lease,
-            definition: req.definition.into(),
-            limits: req.limits.map(Into::into),
-            history,
-        })
-        .map_err(|e| js_err(&format!("create agent instance error: {e}")))?;
-        to_json(&self.snapshot_value(None))
+        let job_key = parse_key(&req.job_key)?;
+        let job_lease = req.job_lease;
+        let history = agent_turns_from(req.history, job_key, &job_lease)?;
+        let history_ids: Vec<_> = history
+            .iter()
+            .map(|t| t.history_item_id.clone().unwrap_or_default())
+            .collect();
+        let events = self
+            .apply(Command::CreateAgentInstance {
+                element_instance_key,
+                job_key,
+                job_lease,
+                definition: AgentDefinition::default(),
+                limits: None,
+                history,
+            })
+            .map_err(|e| js_err(&format!("create agent instance error: {e}")))?;
+        let key = events
+            .iter()
+            .find_map(|event| match event {
+                Event::AgentInstanceCreated { agent_instance, .. } => {
+                    Some(agent_instance.agent_instance_key)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| js_err("create agent instance produced no record"))?;
+        to_json(&serde_json::json!({
+            "agentInstanceKey": key.to_string(),
+            "createdHistory": self.created_history_result(key, &history_ids, &events)?,
+        }))
     }
 
-    /// Advance an AgentInstance: set its `status` (a REST spelling other than
-    /// `COMPLETED`, which is reachable only through `completeAgentInstance` and is
-    /// rejected here with a targeted error), accumulate `metrics`, optionally
-    /// replace `tools`, and append a `history` batch. `request_json` is
-    /// `{ agentInstanceKey, elementInstanceKey, elementId, processInstanceKey,
-    /// status?, metrics?, tools?, jobKey?, jobLease?, history? }`. `tools` is a
-    /// nullable changeset: omit it to leave the stored set unchanged, pass `null`
-    /// to clear it, or an array to replace it. `jobKey`/`jobLease` are the
-    /// activation's job attribution, stamped onto every appended turn (as the
-    /// gateway does). A turn is `{ loopIteration?, producedAt?, role?, content?,
-    /// systemPrompt?, historyItemId?, model?, provider? }`, where `producedAt` is
-    /// an RFC-3339 `date-time` string (the REST spelling; a bare epoch-millis
-    /// number is also accepted); `content` items are `{ contentType?, text?,
-    /// documentReference?, object? }`, where `object` is arbitrary JSON (the REST
-    /// wire shape). Returns the snapshot.
+    /// Update an agent with `{ elementInstanceKey, jobKey, jobLease, status?, history? }`.
+    /// Configuration and metrics are submitted through history, never top-level fields.
+    /// Returns `createdHistory`; the engine owns pending/commit/discard semantics.
     #[wasm_bindgen(js_name = updateAgentInstance)]
-    pub fn update_agent_instance(&mut self, request_json: &str) -> Result<String, JsValue> {
+    pub fn update_agent_instance(
+        &mut self,
+        agent_instance_key: &str,
+        request_json: &str,
+    ) -> Result<String, JsValue> {
         self.guard_paused()?;
         let req: UpdateAgentInstanceReq = serde_json::from_str(request_json)
             .map_err(|e| js_err(&format!("updateAgentInstance: invalid request JSON: {e}")))?;
-        let agent_instance_key = parse_key(&req.agent_instance_key)?;
+        let agent_instance_key = parse_key(agent_instance_key)?;
         let element_instance_key = parse_key(&req.element_instance_key)?;
-        let process_instance_key = parse_key(&req.process_instance_key)?;
+        let (element_id, process_instance_key) = self
+            .engine
+            .agent_instance_ownership(agent_instance_key)
+            .ok_or_else(|| js_err("no such agent instance"))?;
         reject_non_updatable_status(req.status.as_deref()).map_err(|m| js_err(&m))?;
         let status = match req.status.as_deref() {
             Some(s) => Some(parse_agent_status(s)?),
             None => None,
         };
-        // Mirror the gateway's nullable `tools` changeset: an absent field leaves
-        // the stored set unchanged (`None`); an explicit `null` clears it (an
-        // empty replacement); a present array replaces it.
-        let tools = match req.tools {
-            None => None,
-            Some(None) => Some(Vec::new()),
-            Some(Some(list)) => Some(list.into_iter().map(Into::into).collect()),
-        };
-        // A present-but-unparsable jobKey/jobLease is rejected rather than
-        // coerced to 0 (which would change attribution and defeat dedupe),
-        // mirroring the gateway's 400. Absent = 0 (no attribution).
-        let job_key =
-            parse_job_attribution("updateAgentInstance", "jobKey", req.job_key.as_deref())
-                .map_err(|m| js_err(&m))?;
-        let job_lease =
-            parse_job_attribution("updateAgentInstance", "jobLease", req.job_lease.as_deref())
-                .map_err(|m| js_err(&m))?;
-        let history = agent_turns_from(req.history, job_key, job_lease)?;
-        self.apply(Command::UpdateAgentInstance {
-            agent_instance_key,
-            element_instance_key,
-            element_id: req.element_id,
-            process_instance_key,
-            job_key,
-            job_lease,
-            status,
-            metrics: req.metrics.into(),
-            tools,
-            history,
-        })
-        .map_err(|e| js_err(&format!("update agent instance error: {e}")))?;
-        to_json(&self.snapshot_value(None))
+        let job_key = parse_key(&req.job_key)?;
+        let job_lease = req.job_lease;
+        let history = agent_turns_from(req.history.unwrap_or_default(), job_key, &job_lease)?;
+        let history_ids: Vec<_> = history
+            .iter()
+            .map(|t| t.history_item_id.clone().unwrap_or_default())
+            .collect();
+        let events = self
+            .apply(Command::UpdateAgentInstance {
+                agent_instance_key,
+                element_instance_key,
+                element_id,
+                process_instance_key,
+                job_key,
+                job_lease,
+                status,
+                metrics: AgentInstanceMetricsDelta::default(),
+                tools: None,
+                history,
+            })
+            .map_err(|e| js_err(&format!("update agent instance error: {e}")))?;
+        to_json(&serde_json::json!({
+            "createdHistory": self.created_history_result(agent_instance_key, &history_ids, &events)?,
+        }))
     }
 
-    /// Complete an AgentInstance by its dedicated key, driving it to the terminal
-    /// `COMPLETED` status. Returns the snapshot.
+    /// Legacy embedded-only completion extension. It neither commits history nor
+    /// advances BPMN; canonical workers complete their owning job instead.
+    /// Returns the snapshot.
     #[wasm_bindgen(js_name = completeAgentInstance)]
     pub fn complete_agent_instance(&mut self, agent_instance_key: &str) -> Result<String, JsValue> {
         self.guard_paused()?;
@@ -1154,10 +1213,12 @@ impl TestEngine {
         let filter = parse_agent_instance_filter(filter_json)?;
         let items: Vec<serde_json::Value> = self
             .read_model
-            .agent_instances(&filter, None)
+            .try_agent_instances(&filter, None)
+            .map_err(|e| js_err(&e.to_string()))?
             .iter()
             .map(agent_instance_result)
-            .collect();
+            .collect::<Result<_, _>>()
+            .map_err(|e| js_err(&e))?;
         to_json(&search_result(items))
     }
 
@@ -1180,10 +1241,12 @@ impl TestEngine {
         let filter = parse_agent_history_filter(key, filter_json)?;
         let items: Vec<serde_json::Value> = self
             .read_model
-            .agent_history(&filter, None)
+            .try_agent_history(&filter, None)
+            .map_err(|e| js_err(&e.to_string()))?
             .iter()
             .map(agent_history_result)
-            .collect();
+            .collect::<Result<_, _>>()
+            .map_err(|e| js_err(&e))?;
         to_json(&search_result(items))
     }
 }
@@ -1510,7 +1573,7 @@ fn parse_agent_instance_filter(filter_json: &str) -> Result<AgentInstanceFilter,
     filter.process_instance_key = agent_filter_key(map, "processInstanceKey")?;
     filter.root_process_instance_key = agent_filter_key(map, "rootProcessInstanceKey")?;
     filter.process_definition_key = agent_filter_key(map, "processDefinitionKey")?;
-    if let Some(v) = map.get("status") {
+    if let Some(v) = agent_filter_scalar(map.get("status"))? {
         if !v.is_null() {
             let s = v
                 .as_str()
@@ -1518,8 +1581,30 @@ fn parse_agent_instance_filter(filter_json: &str) -> Result<AgentInstanceFilter,
             filter.status = Some(parse_agent_status(s)?);
         }
     }
-    filter.element_id = agent_filter_string(map, "elementId");
-    filter.tenant_id = agent_filter_string(map, "tenantId");
+    filter.element_id = agent_filter_string(map, "elementId")?;
+    filter.tenant_id = agent_filter_string(map, "tenantId")?;
+    filter.process_definition_id = agent_filter_string(map, "processDefinitionId")?;
+    filter.process_definition_version_tag =
+        agent_filter_string(map, "processDefinitionVersionTag")?;
+    filter.process_definition_version = agent_filter_integer(map, "processDefinitionVersion")?;
+    filter.creation_date_ms = agent_filter_date(map, "creationDate")?;
+    filter.last_updated_date_ms = agent_filter_date(map, "lastUpdatedDate")?;
+    filter.completion_date_ms = agent_filter_date(map, "completionDate")?;
+    if let Some(value) = map.get("elementInstanceKeys").filter(|v| !v.is_null()) {
+        let values = value
+            .as_array()
+            .ok_or_else(|| js_err("elementInstanceKeys must be an array"))?;
+        filter.element_instance_keys = values
+            .iter()
+            .map(|value| {
+                let value = agent_filter_scalar(Some(value))?
+                    .ok_or_else(|| js_err("elementInstanceKeys cannot contain null"))?;
+                parse_key(value.as_str().ok_or_else(|| {
+                    js_err("elementInstanceKeys must contain decimal string keys")
+                })?)
+            })
+            .collect::<Result<_, _>>()?;
+    }
     Ok(filter)
 }
 
@@ -1553,11 +1638,26 @@ fn parse_agent_history_filter(
         _ => {
             return Err(js_err(
                 "searchAgentInstanceHistory filter must be a JSON object",
-            ))
+            ));
         }
     };
     let map = rest_filter_target(map).map_err(|e| js_err(&e))?;
+    filter.history_item_key = agent_filter_key(map, "historyItemKey")?;
+    filter.element_instance_key = agent_filter_key(map, "elementInstanceKey")?;
+    filter.job_key = agent_filter_key(map, "jobKey")?;
+    filter.loop_iteration = agent_filter_integer(map, "loopIteration")?;
+    filter.produced_at_ms = agent_filter_date(map, "producedAt")?;
+    if let Some(role) = agent_filter_string(map, "role")? {
+        filter.role = Some(parse_agent_role(&role)?);
+    }
     if let Some(v) = map.get("commitStatus") {
+        let v = match v {
+            serde_json::Value::Object(map) if map.len() == 1 => map
+                .get("$eq")
+                .or_else(|| map.get("$in"))
+                .ok_or_else(|| js_err("unsupported commitStatus filter operator"))?,
+            _ => v,
+        };
         let spellings: Vec<&str> = match v {
             serde_json::Value::Null => Vec::new(),
             serde_json::Value::String(s) => vec![s.as_str()],
@@ -1571,7 +1671,7 @@ fn parse_agent_history_filter(
             _ => {
                 return Err(js_err(
                     "`commitStatus` must be a string or an array of strings",
-                ))
+                ));
             }
         };
         if !spellings.is_empty() {
@@ -1607,7 +1707,7 @@ fn agent_filter_key(
     map: &serde_json::Map<String, serde_json::Value>,
     field: &str,
 ) -> Result<Option<u64>, JsValue> {
-    match map.get(field) {
+    match agent_filter_scalar(map.get(field))? {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(s)) => Ok(Some(parse_key(s)?)),
         Some(_) => Err(js_err(&format!(
@@ -1621,20 +1721,60 @@ fn agent_filter_key(
 fn agent_filter_string(
     map: &serde_json::Map<String, serde_json::Value>,
     field: &str,
-) -> Option<String> {
-    match map.get(field) {
-        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+) -> Result<Option<String>, JsValue> {
+    agent_filter_scalar(map.get(field))?
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| js_err(&format!("{field} must be a string")))
+        })
+        .transpose()
+}
+
+#[cfg(feature = "read-model")]
+fn agent_filter_scalar(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<&serde_json::Value>, JsValue> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Object(map)) if map.len() == 1 && map.contains_key("$eq") => {
+            Ok(map.get("$eq").filter(|v| !v.is_null()))
+        }
+        Some(serde_json::Value::Object(_)) => Err(js_err("unsupported agent filter operator")),
+        value => Ok(value),
     }
+}
+
+#[cfg(feature = "read-model")]
+fn agent_filter_integer(
+    map: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<i32>, JsValue> {
+    agent_filter_scalar(map.get(field))?
+        .map(|v| {
+            v.as_i64()
+                .and_then(|v| i32::try_from(v).ok())
+                .ok_or_else(|| js_err(&format!("{field} must be an integer")))
+        })
+        .transpose()
+}
+
+#[cfg(feature = "read-model")]
+fn agent_filter_date(
+    map: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<u64>, JsValue> {
+    agent_filter_string(map, field)?
+        .map(|v| ms_from_rfc3339(&v).map_err(|e| js_err(&e)))
+        .transpose()
 }
 
 /// Serialise an [`AgentInstanceRow`] as the gateway's `AgentInstanceResult` JSON
 /// shape (Camunda v2 `/agent-instances`). Keys are decimal strings; dates are
 /// RFC-3339; `tools` is decoded from the row's projected JSON.
 #[cfg(feature = "read-model")]
-fn agent_instance_result(row: &AgentInstanceRow) -> serde_json::Value {
-    let tools: serde_json::Value =
-        serde_json::from_str(&row.tools_json).unwrap_or(serde_json::Value::Array(Vec::new()));
+fn agent_instance_result(row: &AgentInstanceRow) -> Result<serde_json::Value, String> {
+    let tools: Vec<AgentTool> = projected_agent_json(&row.tools_json)?;
     let completion_date = match row.completion_date_ms {
         Some(ms) => serde_json::Value::String(iso8601_from_ms(ms)),
         None => serde_json::Value::Null,
@@ -1643,22 +1783,18 @@ fn agent_instance_result(row: &AgentInstanceRow) -> serde_json::Value {
         Some(tag) => serde_json::Value::String(tag.clone()),
         None => serde_json::Value::Null,
     };
-    serde_json::json!({
+    Ok(serde_json::json!({
         "agentInstanceKey": row.agent_instance_key.to_string(),
         "agentDefinitionKey": row.agent_definition_key.to_string(),
         "status": row.status.as_str(),
-        "agentType": row.agent_type,
         "definition": {
-            "model": row.model,
-            "provider": row.provider,
-            "systemPrompt": row.system_prompt,
+            "model": row.model.as_deref().ok_or("agent definition is missing its required model")?,
+            "provider": row.provider.as_deref().ok_or("agent definition is missing its required provider")?,
+            "systemPrompt": agent_prompt_result(row.system_prompt.as_deref())?,
         },
         "metrics": {
             "inputTokens": row.input_tokens,
             "outputTokens": row.output_tokens,
-            "reasoningTokenCount": row.reasoning_token_count,
-            "cacheCreationTokenCount": row.cache_creation_token_count,
-            "cacheReadTokenCount": row.cache_read_token_count,
             "modelCalls": row.model_calls,
             "toolCalls": row.tool_calls,
         },
@@ -1667,9 +1803,8 @@ fn agent_instance_result(row: &AgentInstanceRow) -> serde_json::Value {
             "maxModelCalls": row.max_model_calls,
             "maxToolCalls": row.max_tool_calls,
         },
-        "tools": tools,
+        "tools": tools.iter().map(agent_tool_result).collect::<Vec<_>>(),
         "elementId": row.element_id,
-        "elementInstanceKey": row.element_instance_key.to_string(),
         "processInstanceKey": row.process_instance_key.to_string(),
         "rootProcessInstanceKey": row.root_process_instance_key.to_string(),
         "processDefinitionKey": row.process_definition_key.to_string(),
@@ -1681,104 +1816,143 @@ fn agent_instance_result(row: &AgentInstanceRow) -> serde_json::Value {
         "lastUpdatedDate": iso8601_from_ms(row.last_updated_date_ms),
         "completionDate": completion_date,
         "elementInstanceKeys": row.element_instance_keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
-    })
+    }))
 }
 
 #[cfg(feature = "read-model")]
 use nanobpmn_engine_core::AgentHistoryToolCall;
 
+#[cfg(feature = "read-model")]
+fn projected_agent_json<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, String> {
+    serde_json::from_str(json).map_err(|e| format!("invalid projected agent JSON: {e}"))
+}
+
 /// Serialise an [`AgentHistoryRow`] as the gateway's `AgentInstanceHistoryItemResult`
-/// JSON shape. Per-call `metrics` are present on ASSISTANT turns only (null
-/// otherwise, mirroring the REST contract); `content`, `toolCalls` and `tools`
+/// JSON shape. Per-call `metrics` retain their recorded presence and null values;
+/// `content`, `toolCalls` and `tools`
 /// are decoded from the row's projected JSON columns and re-serialised into the
 /// REST wire shape (camelCase keys, REST enum spellings, and the opaque
 /// `object`/`arguments` JSON strings re-parsed to structured JSON) exactly as the
 /// gateway does — never dumped in the engine's internal snake_case layout.
 #[cfg(feature = "read-model")]
-fn agent_history_result(row: &AgentHistoryRow) -> serde_json::Value {
-    use nanobpmn_engine_core::AgentHistoryRole;
-    let content = serde_json::from_str::<Vec<AgentHistoryContent>>(&row.content_json)
-        .map(|items| serde_json::Value::Array(items.iter().map(agent_content_result).collect()))
-        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
-    let tool_calls = serde_json::from_str::<Vec<AgentHistoryToolCall>>(&row.tool_calls_json)
-        .map(|items| serde_json::Value::Array(items.iter().map(agent_tool_call_result).collect()))
-        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
-    let tools = serde_json::from_str::<Vec<AgentTool>>(&row.tools_json)
-        .map(|items| serde_json::Value::Array(items.iter().map(agent_tool_result).collect()))
-        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
-    let metrics = match row.role {
-        AgentHistoryRole::Assistant => serde_json::json!({
-            "inputTokens": row.input_tokens,
-            "outputTokens": row.output_tokens,
-            "reasoningTokenCount": row.reasoning_token_count,
-            "cacheCreationTokenCount": row.cache_creation_token_count,
-            "cacheReadTokenCount": row.cache_read_token_count,
-            "durationMs": row.duration_ms,
-        }),
-        _ => serde_json::Value::Null,
-    };
-    serde_json::json!({
+fn agent_history_result(row: &AgentHistoryRow) -> Result<serde_json::Value, String> {
+    let content = projected_agent_json::<Vec<AgentHistoryContent>>(&row.content_json)?
+        .iter()
+        .map(agent_content_result)
+        .collect::<Result<Vec<_>, _>>()?;
+    let tool_calls = projected_agent_json::<Vec<AgentHistoryToolCall>>(&row.tool_calls_json)?
+        .iter()
+        .map(agent_tool_call_result)
+        .collect::<Result<Vec<_>, _>>()?;
+    let tools = projected_agent_json::<Vec<AgentTool>>(&row.tools_json)?
+        .iter()
+        .map(agent_tool_result)
+        .collect::<Vec<_>>();
+    let metrics = row
+        .metrics_json
+        .as_deref()
+        .map(projected_agent_json::<Option<nanobpmn_engine_core::AgentHistoryMetrics>>)
+        .transpose()?
+        .flatten();
+    let limits = row
+        .limits_json
+        .as_deref()
+        .map(projected_agent_json::<AgentInstanceLimits>)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(serde_json::json!({
         "historyItemKey": row.agent_history_key.to_string(),
         "historyItemId": row.history_item_id.clone().unwrap_or_default(),
         "agentInstanceKey": row.agent_instance_key.to_string(),
         "elementInstanceKey": row.element_instance_key.to_string(),
-        "processInstanceKey": row.process_instance_key.to_string(),
-        "rootProcessInstanceKey": row.root_process_instance_key.to_string(),
-        "processDefinitionKey": row.process_definition_key.to_string(),
-        "processDefinitionId": row.process_definition_id,
-        "tenantId": row.tenant_id,
         "jobKey": row.job_key.to_string(),
+        "jobLease": row.job_lease,
         "loopIteration": row.loop_iteration,
         "role": row.role.as_str(),
         "content": content,
         "toolCalls": tool_calls,
-        "metrics": metrics,
+        "metrics": agent_metrics_result(&metrics),
         "commitStatus": row.commit_status.as_str(),
         "producedAt": iso8601_from_ms(row.produced_at_ms),
         "tools": tools,
         "model": row.model,
         "provider": row.provider,
-        "isDuplicate": row.is_duplicate,
-    })
+        "limits": {
+            "maxTokens": limits.max_tokens, "maxModelCalls": limits.max_model_calls,
+            "maxToolCalls": limits.max_tool_calls,
+        },
+        "systemPrompt": agent_prompt_result(row.system_prompt.as_deref())?,
+    }))
+}
+
+#[cfg(any(feature = "read-model", test))]
+fn agent_metrics_result(
+    metrics: &Option<nanobpmn_engine_core::AgentHistoryMetrics>,
+) -> serde_json::Value {
+    metrics
+        .as_ref()
+        .map(|metrics| {
+            serde_json::json!({
+                "inputTokens": metrics.input_tokens,
+                "outputTokens": metrics.output_tokens,
+                "durationMs": metrics.duration_ms,
+            })
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(feature = "read-model")]
+fn agent_prompt_result(
+    prompt: Option<&[AgentHistoryContent]>,
+) -> Result<Vec<serde_json::Value>, String> {
+    prompt
+        .unwrap_or_default()
+        .iter()
+        .map(agent_content_result)
+        .collect()
 }
 
 /// Map an engine [`AgentHistoryContent`] block to the gateway's
 /// `AgentInstanceMessageContent` JSON shape (camelCase keys, REST `contentType`
 /// enum spelling). The engine stores `object` as an opaque JSON string; it is
 /// re-parsed into structured JSON so the wire carries JSON, not a JSON-in-a-string
-/// — mirroring the server's `agent_message_content`. An `object` string that is
-/// not valid JSON falls back to a JSON string, never an error.
+/// — mirroring the server's `agent_message_content`.
 #[cfg(feature = "read-model")]
-fn agent_content_result(c: &AgentHistoryContent) -> serde_json::Value {
-    let object = c.object.as_ref().map(|s| {
-        serde_json::from_str::<serde_json::Value>(s)
-            .unwrap_or_else(|_| serde_json::Value::String(s.clone()))
-    });
-    serde_json::json!({
-        "contentType": c.content_type.as_str(),
-        "text": c.text,
-        "documentReference": c.document_reference,
-        "object": object,
+fn agent_content_result(c: &AgentHistoryContent) -> Result<serde_json::Value, String> {
+    Ok(match c.content_type {
+        AgentHistoryContentType::Text => serde_json::json!({
+            "contentType": "TEXT", "text": c.text.as_deref().ok_or("TEXT content is missing text")?,
+        }),
+        AgentHistoryContentType::Document => serde_json::json!({
+            "contentType": "DOCUMENT",
+            "documentReference": projected_agent_json::<serde_json::Map<String, serde_json::Value>>(
+                c.document_reference.as_deref().ok_or("DOCUMENT content is missing documentReference")?)?,
+        }),
+        AgentHistoryContentType::Object => serde_json::json!({
+            "contentType": "OBJECT",
+            "object": projected_agent_json::<serde_json::Value>(
+                c.object.as_deref().ok_or("OBJECT content is missing object")?)?,
+        }),
     })
 }
 
 /// Map an engine [`AgentHistoryToolCall`] to the gateway's
 /// `AgentInstanceToolCall` JSON shape (camelCase keys). `arguments` is stored as
 /// an opaque JSON string and re-parsed into structured JSON (mirroring the
-/// server's `agent_tool_call_result`); an unparseable string falls back to a JSON
-/// string, and an absent one to `null`.
+/// server's `agent_tool_call_result`); an absent one becomes `null`.
 #[cfg(feature = "read-model")]
-fn agent_tool_call_result(c: &AgentHistoryToolCall) -> serde_json::Value {
-    let arguments = c.arguments.as_ref().map(|s| {
-        serde_json::from_str::<serde_json::Value>(s)
-            .unwrap_or_else(|_| serde_json::Value::String(s.clone()))
-    });
-    serde_json::json!({
+fn agent_tool_call_result(c: &AgentHistoryToolCall) -> Result<serde_json::Value, String> {
+    let arguments = c
+        .arguments
+        .as_deref()
+        .map(projected_agent_json::<serde_json::Map<String, serde_json::Value>>)
+        .transpose()?;
+    Ok(serde_json::json!({
         "toolCallId": c.tool_call_id,
         "toolName": c.tool_name,
         "elementId": c.element_id,
         "arguments": arguments,
-    })
+    }))
 }
 
 /// Map an engine [`AgentTool`] to the gateway's `AgentTool` JSON shape (camelCase
@@ -1958,6 +2132,35 @@ impl Default for TestEngine {
     }
 }
 
+fn decode_trace(json: &str) -> Result<Vec<LogEntry>, String> {
+    let records: Vec<serde_json::Map<String, serde_json::Value>> =
+        serde_json::from_str(json).map_err(|e| format!("invalid event trace: {e}"))?;
+    records
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut record)| {
+            let seq = record
+                .remove("seq")
+                .and_then(|v| v.as_u64())
+                .filter(|seq| *seq == index as u64 + 1)
+                .ok_or_else(|| "event trace must be complete and sequential".to_string())?;
+            let now = record
+                .remove("now")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| "event trace requires an unsigned clock".to_string())?;
+            let kind = record
+                .remove("type")
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .ok_or_else(|| "event trace requires an event type".to_string())?;
+            let event = nanobpmn_engine_core::decode_event_json(
+                &serde_json::json!({kind: record}).to_string(),
+            )
+            .map_err(|e| format!("invalid replay event: {e}"))?;
+            Ok(LogEntry { seq, now, event })
+        })
+        .collect()
+}
+
 impl TestEngine {
     /// Reject a state-mutating call while a debug run is paused mid-command. The
     /// paused engine holds an *intermediate* state — a partially-applied command
@@ -2108,28 +2311,67 @@ impl TestEngine {
         }
     }
 
+    fn created_history_result(
+        &self,
+        agent_key: u64,
+        ids: &[String],
+        events: &[Event],
+    ) -> Result<Vec<serde_json::Value>, JsValue> {
+        let mut created: std::collections::HashSet<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::AgentHistoryCreated { record, .. } => Some(record.agent_history_key),
+                _ => None,
+            })
+            .collect();
+        let history = self
+            .engine
+            .state()
+            .instances
+            .values()
+            .find_map(|instance| instance.agent_history.get(&agent_key));
+        ids.iter()
+            .map(|id| {
+                let record = history
+                    .and_then(|records| {
+                        records
+                            .iter()
+                            .rev()
+                            .find(|record| record.history_item_id.as_deref() == Some(id))
+                    })
+                    .ok_or_else(|| js_err("history response record missing"))?;
+                Ok(serde_json::json!({
+                    "historyItemId": id,
+                    "historyItemKey": record.agent_history_key.to_string(),
+                    "isDuplicate": !created.remove(&record.agent_history_key),
+                }))
+            })
+            .collect()
+    }
+
     /// Activate the job's type so a `Created` job can be completed/failed. A job
     /// that has already been activated is left as-is.
     fn ensure_activated(&mut self, job_key: u64) -> Result<(), JsValue> {
-        let job_type = self
+        let (state, leased) = self
             .engine
             .state()
             .jobs
             .get(&job_key)
-            .map(|j| (j.job_type.clone(), j.state))
+            .map(|j| (j.state, j.lease_token.is_some()))
             .ok_or_else(|| js_err(&format!("no such job: {job_key}")))?;
         // Already activated (or terminal) — nothing to do; completion is by key.
-        if job_type.1 != JobState::Created {
+        if state != JobState::Created || leased {
             return Ok(());
         }
         let now = self.now;
-        self.apply(Command::activate_jobs(
-            job_type.0,
-            "modeler".to_string(),
-            1024,
-            u64::MAX / 4,
+        self.apply(Command::ActivateJobsByKey {
+            job_keys: vec![job_key],
+            worker: "modeler".to_string(),
+            timeout: u64::MAX / 4,
             now,
-        ))
+            fetch_variables: Vec::new(),
+            with_lease: false,
+        })
         .map_err(|e| js_err(&format!("activate error: {e}")))?;
         Ok(())
     }
@@ -2587,22 +2829,15 @@ fn parse_key(s: &str) -> Result<u64, JsValue> {
         .map_err(|_| js_err(&format!("invalid key: {s}")))
 }
 
-/// Parse an optional request-level job-attribution field (`jobKey`/`jobLease`)
-/// carried as a REST string. An absent field is `0` (no attribution); a present
-/// value must parse as a `u64`, otherwise it is rejected — mirroring the
-/// gateway, which returns a 400 rather than silently coercing a malformed value
-/// to `0` (which would change ownership/attribution and defeat retry dedupe).
-/// Returns the `&str`-typed error so the reject path is natively testable (the
-/// `JsValue` wrapper aborts off the wasm target); the caller lifts it via
-/// [`js_err`].
-fn parse_job_attribution(op: &str, field: &str, value: Option<&str>) -> Result<u64, String> {
-    match value {
-        None => Ok(0),
-        Some(s) => s
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| format!("{op}: invalid {field}: {s}")),
+fn update_timeout_value(timeout_ms: f64) -> Result<i64, String> {
+    if !timeout_ms.is_finite()
+        || timeout_ms < i64::MIN as f64
+        || timeout_ms.fract() != 0.0
+        || timeout_ms >= i64::MAX as f64
+    {
+        return Err("update timeout must be an int64 number".into());
     }
+    Ok(timeout_ms as i64)
 }
 
 // --- AgentInstance driver request shapes (Camunda 8.10 REST-parity JSON) ------
@@ -2613,85 +2848,21 @@ fn parse_job_attribution(op: &str, field: &str, value: Option<&str>) -> Result<u
 // These request structs deserialize that JSON and convert into the engine-core
 // agent types the lifecycle commands take.
 
-/// `definition` block of a create request: `{ model?, provider?, systemPrompt? }`.
-#[derive(Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentDefinitionReq {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    system_prompt: Option<String>,
-}
-
-impl From<AgentDefinitionReq> for AgentDefinition {
-    fn from(r: AgentDefinitionReq) -> Self {
-        AgentDefinition {
-            model: r.model,
-            provider: r.provider,
-            system_prompt: r.system_prompt,
-        }
-    }
-}
-
-/// `limits` block of a create request. An omitted limit defaults to unlimited
-/// (`-1`), matching the engine's [`AgentInstanceLimits`] default.
+/// A supplied canonical `limits` block requires all three members.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentLimitsReq {
-    #[serde(default = "agent_unlimited")]
     max_tokens: i64,
-    #[serde(default = "agent_unlimited")]
-    max_model_calls: i64,
-    #[serde(default = "agent_unlimited")]
-    max_tool_calls: i64,
-}
-
-fn agent_unlimited() -> i64 {
-    AGENT_LIMIT_UNLIMITED
+    max_model_calls: i32,
+    max_tool_calls: i32,
 }
 
 impl From<AgentLimitsReq> for AgentInstanceLimits {
     fn from(r: AgentLimitsReq) -> Self {
         AgentInstanceLimits {
             max_tokens: r.max_tokens,
-            max_model_calls: r.max_model_calls,
-            max_tool_calls: r.max_tool_calls,
-        }
-    }
-}
-
-/// `metrics` delta of an update request; every counter defaults to zero.
-#[derive(Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentMetricsDeltaReq {
-    #[serde(default)]
-    input_tokens: i64,
-    #[serde(default)]
-    output_tokens: i64,
-    #[serde(default)]
-    reasoning_token_count: i64,
-    #[serde(default)]
-    cache_creation_token_count: i64,
-    #[serde(default)]
-    cache_read_token_count: i64,
-    #[serde(default)]
-    model_calls: i64,
-    #[serde(default)]
-    tool_calls: i64,
-}
-
-impl From<AgentMetricsDeltaReq> for AgentInstanceMetricsDelta {
-    fn from(r: AgentMetricsDeltaReq) -> Self {
-        AgentInstanceMetricsDelta {
-            input_tokens: r.input_tokens,
-            output_tokens: r.output_tokens,
-            reasoning_token_count: r.reasoning_token_count,
-            cache_creation_token_count: r.cache_creation_token_count,
-            cache_read_token_count: r.cache_read_token_count,
-            model_calls: r.model_calls,
-            tool_calls: r.tool_calls,
+            max_model_calls: r.max_model_calls.into(),
+            max_tool_calls: r.max_tool_calls.into(),
         }
     }
 }
@@ -2701,10 +2872,27 @@ impl From<AgentMetricsDeltaReq> for AgentInstanceMetricsDelta {
 #[serde(rename_all = "camelCase")]
 struct AgentToolReq {
     name: String,
-    #[serde(default)]
+    #[serde(deserialize_with = "required_nullable")]
     description: Option<String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "required_nullable")]
     element_id: Option<String>,
+}
+
+fn required_nullable<'de, T: serde::Deserialize<'de>, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Option<T>, D::Error> {
+    serde::Deserialize::deserialize(de)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentToolCallReq {
+    tool_call_id: String,
+    tool_name: String,
+    #[serde(deserialize_with = "required_nullable")]
+    element_id: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    arguments: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl From<AgentToolReq> for AgentTool {
@@ -2713,35 +2901,6 @@ impl From<AgentToolReq> for AgentTool {
             name: r.name,
             description: r.description,
             element_id: r.element_id,
-        }
-    }
-}
-
-/// The `producedAt` field of a history turn. REST/OpenAPI types it as an
-/// RFC-3339 `date-time` string, so that is the parity spelling accepted here; a
-/// bare numeric epoch-millis is additionally tolerated as a convenience for
-/// programmatic TestEngine callers. Absent ⇒ epoch 0.
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum ProducedAt {
-    /// Epoch milliseconds (the convenience form).
-    Ms(u64),
-    /// An RFC-3339 `date-time` string (the REST wire spelling).
-    Iso(String),
-}
-
-impl Default for ProducedAt {
-    fn default() -> Self {
-        ProducedAt::Ms(0)
-    }
-}
-
-impl ProducedAt {
-    /// Resolve to epoch milliseconds, parsing the RFC-3339 spelling if given.
-    fn to_ms(&self) -> Result<u64, JsValue> {
-        match self {
-            ProducedAt::Ms(ms) => Ok(*ms),
-            ProducedAt::Iso(s) => ms_from_rfc3339(s).map_err(|m| js_err(&m)),
         }
     }
 }
@@ -2757,7 +2916,7 @@ impl ProducedAt {
 fn ms_from_rfc3339(s: &str) -> Result<u64, String> {
     let err = || {
         format!(
-            "invalid producedAt {s:?}; expected epoch millis or an RFC-3339 \
+            "invalid producedAt {s:?}; expected an RFC-3339 \
              date-time string (e.g. \"2026-01-02T03:04:05Z\")"
         )
     };
@@ -2876,19 +3035,23 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// A `content[]` block of a history turn:
-/// `{ contentType?, text?, documentReference?, object? }`.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentContentReq {
-    #[serde(default)]
-    content_type: Option<String>,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    document_reference: Option<String>,
-    #[serde(default)]
-    object: Option<serde_json::Value>,
+#[serde(
+    tag = "contentType",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+enum AgentContentReq {
+    Text {
+        text: String,
+    },
+    Document {
+        #[serde(rename = "documentReference")]
+        document_reference: serde_json::Map<String, serde_json::Value>,
+    },
+    Object {
+        object: serde_json::Value,
+    },
 }
 
 /// A single history turn of a create/update request. Only the turn-specific
@@ -2897,90 +3060,92 @@ struct AgentContentReq {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentTurnReq {
-    #[serde(default)]
+    #[serde(deserialize_with = "positive_loop_iteration")]
     loop_iteration: i32,
-    #[serde(default)]
-    produced_at: ProducedAt,
-    #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
+    produced_at: String,
+    role: String,
     content: Vec<AgentContentReq>,
     #[serde(default)]
-    system_prompt: Option<String>,
-    #[serde(default)]
-    history_item_id: Option<String>,
+    system_prompt: Option<Vec<AgentContentReq>>,
+    history_item_id: String,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     provider: Option<String>,
+    #[serde(default)]
+    tools: Option<Vec<AgentToolReq>>,
+    #[serde(default)]
+    limits: Option<AgentLimitsReq>,
+    #[serde(default)]
+    tool_calls: Option<Vec<AgentToolCallReq>>,
+    #[serde(default)]
+    metrics: Option<AgentMetricsReq>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentMetricsReq {
+    #[serde(deserialize_with = "required_nullable")]
+    input_tokens: Option<i64>,
+    #[serde(deserialize_with = "required_nullable")]
+    output_tokens: Option<i64>,
+    #[serde(deserialize_with = "required_nullable")]
+    duration_ms: Option<i64>,
+}
+
+impl From<AgentMetricsReq> for nanobpmn_engine_core::AgentHistoryMetrics {
+    fn from(metrics: AgentMetricsReq) -> Self {
+        Self {
+            input_tokens: metrics.input_tokens,
+            output_tokens: metrics.output_tokens,
+            duration_ms: metrics.duration_ms,
+            ..Self::default()
+        }
+    }
+}
+
+fn positive_loop_iteration<'de, D: serde::Deserializer<'de>>(de: D) -> Result<i32, D::Error> {
+    let value = <i32 as serde::Deserialize>::deserialize(de)?;
+    if value < 1 {
+        return Err(serde::de::Error::custom("loopIteration must be positive"));
+    }
+    Ok(value)
 }
 
 /// The `createAgentInstance` request body.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateAgentInstanceReq {
     element_instance_key: String,
-    /// The agent job whose ACTIVATED lease authorizes this create. Required for
-    /// an `external` (job-backed) agent element (#1099); absent/`0` for the
-    /// engine-native `aiAgentTask`/`aiAgentSubProcess` variants. Also stamped on
-    /// any initial `history` turns.
-    #[serde(default)]
-    job_key: Option<String>,
-    /// The per-activation lease token (a staleness handle, not a
-    /// cryptographically unguessable secret) of `jobKey`, distinct from the
-    /// job's deadline (#1106).
-    #[serde(default)]
-    job_lease: Option<String>,
-    #[serde(default)]
-    definition: AgentDefinitionReq,
-    #[serde(default)]
-    limits: Option<AgentLimitsReq>,
-    #[serde(default)]
+    job_key: String,
+    job_lease: String,
+    #[serde(deserialize_with = "nonempty_agent_history")]
     history: Vec<AgentTurnReq>,
 }
 
-/// A serde `deserialize_with` that distinguishes an explicit JSON `null` from an
-/// absent field for an optional value: an omitted field is `None`, an explicit
-/// `null` is `Some(None)`, and a present value is `Some(Some(value))`. Mirrors
-/// the gateway's `Nullable` changeset handling (`server/src/main.rs`
-/// `update_agent_instance_impl`) so a REST `"tools": null` clears the tool set
-/// while an omitted `tools` leaves the stored set unchanged.
-fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
-where
-    T: serde::Deserialize<'de>,
-    D: serde::Deserializer<'de>,
-{
-    serde::Deserialize::deserialize(de).map(Some)
+fn nonempty_agent_history<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Vec<AgentTurnReq>, D::Error> {
+    let history = <Vec<AgentTurnReq> as serde::Deserialize>::deserialize(de)?;
+    if history.is_empty() {
+        return Err(serde::de::Error::custom(
+            "history must contain at least one item",
+        ));
+    }
+    Ok(history)
 }
 
 /// The `updateAgentInstance` request body.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateAgentInstanceReq {
-    agent_instance_key: String,
     element_instance_key: String,
-    element_id: String,
-    process_instance_key: String,
     #[serde(default)]
     status: Option<String>,
+    job_key: String,
+    job_lease: String,
     #[serde(default)]
-    metrics: AgentMetricsDeltaReq,
-    /// The replacement tool set. Absent leaves the stored set unchanged;
-    /// an explicit `null` clears it (an empty replacement); a present array
-    /// replaces it — mirroring the gateway's nullable `tools` changeset.
-    #[serde(default, deserialize_with = "double_option")]
-    tools: Option<Option<Vec<AgentToolReq>>>,
-    /// The agent job key whose activation produced this batch of turns; the
-    /// gateway attributes it to every appended turn (`0`/absent = none).
-    #[serde(default)]
-    job_key: Option<String>,
-    /// The agent job's per-activation lease token (a staleness handle) for this
-    /// batch; attributed to every appended turn alongside `jobKey`
-    /// (`0`/absent = none).
-    #[serde(default)]
-    job_lease: Option<String>,
-    #[serde(default)]
-    history: Vec<AgentTurnReq>,
+    history: Option<Vec<AgentTurnReq>>,
 }
 
 /// Convert a batch of request turns into engine [`AgentHistoryTurn`]s, resolving
@@ -2990,7 +3155,7 @@ struct UpdateAgentInstanceReq {
 fn agent_turns_from(
     turns: Vec<AgentTurnReq>,
     job_key: u64,
-    job_lease: u64,
+    job_lease: &str,
 ) -> Result<Vec<AgentHistoryTurn>, JsValue> {
     turns
         .into_iter()
@@ -3001,61 +3166,110 @@ fn agent_turns_from(
 fn agent_turn_from(
     t: AgentTurnReq,
     job_key: u64,
-    job_lease: u64,
+    job_lease: &str,
 ) -> Result<AgentHistoryTurn, JsValue> {
-    let role = match t.role.as_deref() {
-        Some(s) => parse_agent_role(s)?,
-        None => AgentHistoryRole::default(),
-    };
+    let role = parse_agent_role(&t.role)?;
     let content = t
         .content
         .into_iter()
         .map(agent_content_from)
         .collect::<Result<Vec<_>, _>>()?;
+    let mut changed_attributes = Vec::new();
+    for (name, supplied) in [
+        ("systemPrompt", t.system_prompt.is_some()),
+        ("tools", t.tools.is_some()),
+        ("model", t.model.is_some()),
+        ("provider", t.provider.is_some()),
+        ("maxTokens", t.limits.is_some()),
+        ("maxModelCalls", t.limits.is_some()),
+        ("maxToolCalls", t.limits.is_some()),
+    ] {
+        if supplied {
+            changed_attributes.push(name.into());
+        }
+    }
+    let system_prompt = t
+        .system_prompt
+        .map(|blocks| {
+            blocks
+                .into_iter()
+                .map(agent_content_from)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
     Ok(AgentHistoryTurn {
+        changed_attributes,
         loop_iteration: t.loop_iteration,
-        produced_at: t.produced_at.to_ms()?,
+        produced_at: ms_from_rfc3339(&t.produced_at).map_err(|e| js_err(&e))?,
         role,
         content,
-        system_prompt: t.system_prompt,
-        history_item_id: t.history_item_id,
+        system_prompt,
+        history_item_id: Some(t.history_item_id),
         model: t.model,
         provider: t.provider,
         job_key,
-        job_lease,
+        tools: t
+            .tools
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        limits: t.limits.map(Into::into),
+        metrics: t.metrics.map(Into::into),
+        tool_calls: t
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(|call| nanobpmn_engine_core::AgentHistoryToolCall {
+                tool_call_id: call.tool_call_id,
+                tool_name: call.tool_name,
+                element_id: call.element_id,
+                arguments: call
+                    .arguments
+                    .map(|v| serde_json::Value::Object(v).to_string()),
+            })
+            .collect(),
+        job_lease: job_lease.to_owned(),
         ..Default::default()
     })
 }
 
 fn agent_content_from(c: AgentContentReq) -> Result<AgentHistoryContent, JsValue> {
-    let content_type = match c.content_type.as_deref() {
-        Some(s) => parse_agent_content_type(s)?,
-        None => AgentHistoryContentType::Text,
-    };
-    Ok(AgentHistoryContent {
-        content_type,
-        text: c.text,
-        document_reference: c.document_reference,
-        object: c.object.map(|v| v.to_string()),
+    Ok(match c {
+        AgentContentReq::Text { text } => AgentHistoryContent {
+            content_type: AgentHistoryContentType::Text,
+            text: Some(text),
+            document_reference: None,
+            object: None,
+        },
+        AgentContentReq::Document { document_reference } => AgentHistoryContent {
+            content_type: AgentHistoryContentType::Document,
+            text: None,
+            document_reference: Some(serde_json::Value::Object(document_reference).to_string()),
+            object: None,
+        },
+        AgentContentReq::Object { object } => AgentHistoryContent {
+            content_type: AgentHistoryContentType::Object,
+            text: None,
+            document_reference: None,
+            object: Some(object.to_string()),
+        },
     })
 }
 
-/// Reject a `status` that `updateAgentInstance` must not set. `COMPLETED` is the
-/// terminal status and is reachable only through `completeAgentInstance`; the
-/// driver rejects it up-front with a targeted message rather than forwarding it
-/// to the engine (which would yield a less-specific error, or an invalid
-/// transition if engine validation ever loosens). Returns the rejection message
-/// as a `String` — kept pure so it is unit-testable on the host, where `JsValue`
-/// errors cannot be inspected.
+/// Validate the narrower update-status enum before converting it to core state.
 fn reject_non_updatable_status(status: Option<&str>) -> Result<(), String> {
-    if status == Some("COMPLETED") {
-        return Err(
+    match status {
+        None | Some("IDLE" | "THINKING" | "TOOL_CALLING" | "TOOL_DISCOVERY") => Ok(()),
+        Some("COMPLETED") => Err(
             "updateAgentInstance: status COMPLETED is not settable via UPDATE; \
-                    drive the instance to COMPLETED with completeAgentInstance"
+             complete the owning job with completeJob"
                 .to_string(),
-        );
+        ),
+        Some(status) => Err(format!(
+            "updateAgentInstance: status {status} is not settable via UPDATE"
+        )),
     }
-    Ok(())
 }
 
 /// Parse a REST `AgentInstanceStatusEnum` spelling into the engine status.
@@ -3088,18 +3302,6 @@ fn parse_agent_role(s: &str) -> Result<AgentHistoryRole, JsValue> {
     }
 }
 
-/// Parse a REST content-type spelling into the engine content type.
-fn parse_agent_content_type(s: &str) -> Result<AgentHistoryContentType, JsValue> {
-    match s {
-        "TEXT" => Ok(AgentHistoryContentType::Text),
-        "OBJECT" => Ok(AgentHistoryContentType::Object),
-        "DOCUMENT" => Ok(AgentHistoryContentType::Document),
-        other => Err(js_err(&format!(
-            "invalid agent content type {other:?}; expected one of TEXT, OBJECT, DOCUMENT"
-        ))),
-    }
-}
-
 /// Parse the `activate_instructions_json` argument of [`TestEngine::modify`]: a
 /// JSON array of `{ elementId: string, variables?: object }`. Empty/whitespace
 /// ⇒ no activations.
@@ -3123,7 +3325,7 @@ fn parse_activate_instructions(s: &str) -> Result<Vec<ActivateElementInstruction
             _ => {
                 return Err(js_err(
                     "activate instruction requires a non-empty elementId",
-                ))
+                ));
             }
         };
         let variables = match map.get("variables") {
@@ -3135,7 +3337,7 @@ fn parse_activate_instructions(s: &str) -> Result<Vec<ActivateElementInstruction
             Some(_) => {
                 return Err(js_err(
                     "activate instruction variables must be a JSON object",
-                ))
+                ));
             }
         };
         out.push(ActivateElementInstruction {
@@ -3176,7 +3378,7 @@ fn parse_adhoc_result(s: &str) -> Result<AdHocJobResult, JsValue> {
                     _ => {
                         return Err(js_err(
                             "activateElements entry requires a non-empty elementId",
-                        ))
+                        ));
                     }
                 };
                 let variables = match obj.get("variables") {
@@ -3188,7 +3390,7 @@ fn parse_adhoc_result(s: &str) -> Result<AdHocJobResult, JsValue> {
                     Some(_) => {
                         return Err(js_err(
                             "activateElements entry variables must be a JSON object",
-                        ))
+                        ));
                     }
                 };
                 out.push(AdHocActivateElement {
@@ -3506,6 +3708,79 @@ mod tests {
     }
 
     #[test]
+    fn update_timeout_accepts_signed_int64_values() {
+        for value in [-5, 0, 5] {
+            assert_eq!(update_timeout_value(value as f64).unwrap(), value);
+        }
+        assert_eq!(update_timeout_value(i64::MIN as f64).unwrap(), i64::MIN);
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1.5,
+            i64::MAX as f64,
+            (i64::MIN as f64) * 2.0,
+        ] {
+            assert!(update_timeout_value(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn signed_update_timeout_preserves_the_current_lease() {
+        for timeout in [-5, 0, 5] {
+            let mut eng = TestEngine::new();
+            eng.deploy(include_str!(
+                "../../engine-core/tests/fixtures/external-agent-job-type.bpmn"
+            ))
+            .unwrap();
+            eng.create_instance("external-agent-routing", "{}", None)
+                .unwrap();
+            eng.advance_time(10.0).unwrap();
+            let jobs = parse(
+                &eng.activate_jobs("senior:rebase", 1, 100.0, "W", Some(true))
+                    .unwrap(),
+            );
+            let key = jobs[0]["key"].as_str().unwrap();
+            let lease = jobs[0]["leaseToken"].as_str().unwrap();
+            eng.update_timeout(key, timeout as f64, Some(lease.into()))
+                .unwrap();
+            assert_eq!(
+                eng.engine.state().jobs[&key.parse::<u64>().unwrap()].deadline,
+                Some((10 + timeout) as u64)
+            );
+            eng.advance_time(0.0).unwrap();
+            let job = &eng.engine.state().jobs[&key.parse::<u64>().unwrap()];
+            assert_eq!(
+                job.state,
+                if timeout <= 0 {
+                    JobState::Created
+                } else {
+                    JobState::Activated
+                }
+            );
+            assert_eq!(job.lease_token.as_deref(), Some(lease));
+            eng.complete_job(key, "{}", Some(lease.into())).unwrap();
+        }
+    }
+
+    #[test]
+    fn implicit_activation_does_not_lock_other_jobs_of_the_same_type() {
+        let mut eng = TestEngine::new();
+        eng.deploy(include_str!(
+            "../../engine-core/tests/fixtures/external-agent-job-type.bpmn"
+        ))
+        .unwrap();
+        for _ in 0..2 {
+            eng.create_instance("external-agent-routing", "{}", None)
+                .unwrap();
+        }
+        let keys: Vec<_> = eng.engine.state().jobs.keys().copied().collect();
+        assert_eq!(keys.len(), 2);
+        eng.complete_job(&keys[1].to_string(), "{}", None).unwrap();
+        assert_eq!(eng.engine.state().jobs[&keys[0]].state, JobState::Created);
+    }
+
+    #[test]
     fn user_task_lifecycle_and_snapshot() {
         let mut eng = TestEngine::new();
         eng.deploy(USER_TASK_XML).unwrap();
@@ -3571,6 +3846,96 @@ mod tests {
     }
 
     #[test]
+    fn generic_lease_options_are_sticky_and_survive_trace_replay() {
+        let source = include_str!("../../engine-core/tests/fixtures/external-agent-job-type.bpmn");
+        for marker in [
+            None,
+            Some("external"),
+            Some("aiAgentTask"),
+            Some("listener"),
+        ] {
+            let mut xml = source.replace(
+                "<zeebe:agentDefinition agentType=\"external\"/>",
+                &marker
+                    .filter(|m| *m != "listener")
+                    .map(|m| format!("<zeebe:agentDefinition agentType=\"{m}\"/>"))
+                    .unwrap_or_default(),
+            );
+            let job_type = if marker == Some("listener") {
+                xml = xml.replace("<zeebe:taskDefinition type=\"senior:rebase\"/>",
+                    "<zeebe:taskDefinition type=\"senior:rebase\"/><zeebe:executionListeners><zeebe:executionListener eventType=\"start\" type=\"before\"/></zeebe:executionListeners>");
+                "before"
+            } else {
+                "senior:rebase"
+            };
+            let mut engine = TestEngine::new();
+            engine.deploy(&xml).unwrap();
+            engine
+                .create_instance("external-agent-routing", "{}", None)
+                .unwrap();
+            let jobs = parse(&engine.activate_jobs(job_type, 1, 100.0, "W", None).unwrap());
+            assert!(jobs[0].get("leaseToken").unwrap().is_null());
+            assert!(jobs[0].get("jobLease").is_none());
+            let key = jobs[0]["key"].as_str().unwrap();
+            engine.fail_job(key, 2, "retry", None).unwrap();
+            let jobs = parse(
+                &engine
+                    .activate_jobs(job_type, 1, 100.0, "W", Some(true))
+                    .unwrap(),
+            );
+            let first = jobs[0]["leaseToken"].as_str().unwrap();
+            engine
+                .fail_job(key, 2, "retry", Some(first.into()))
+                .unwrap();
+            let mut replayed = TestEngine::new();
+            replayed.replay_events(&engine.events().unwrap()).unwrap();
+            assert_eq!(
+                parse(
+                    &engine
+                        .activate_jobs(job_type, 1, 100.0, "W", Some(false))
+                        .unwrap()
+                ),
+                serde_json::json!([])
+            );
+            assert_eq!(
+                parse(
+                    &replayed
+                        .activate_jobs(job_type, 1, 100.0, "W", None)
+                        .unwrap()
+                ),
+                serde_json::json!([])
+            );
+            let jobs = parse(
+                &engine
+                    .activate_jobs(job_type, 1, 100.0, "W", Some(true))
+                    .unwrap(),
+            );
+            let replayed_jobs = parse(
+                &replayed
+                    .activate_jobs(job_type, 1, 100.0, "W", Some(true))
+                    .unwrap(),
+            );
+            assert_eq!(jobs[0]["leaseToken"], replayed_jobs[0]["leaseToken"]);
+            assert!(
+                jobs[0]["leaseToken"].is_string(),
+                "{marker:?}: sticky activation lost lease: {jobs}"
+            );
+            let second = jobs[0]["leaseToken"].as_str().unwrap();
+            assert_ne!(first, second);
+            engine.complete_job(key, "{}", Some(second.into())).unwrap();
+            replayed
+                .complete_job(key, "{}", Some(second.into()))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn trace_replay_rejects_unknown_events_and_missing_prefix() {
+        assert!(decode_trace(r#"[{"seq":1,"now":0,"type":"UnknownFutureEvent"}]"#).is_err());
+        assert!(decode_trace(r#"[{"seq":2,"now":0,"type":"UnknownFutureEvent"}]"#).is_err());
+    }
+
+    #[test]
     fn throw_error_without_boundary_raises_incident() {
         let mut eng = TestEngine::new();
         eng.deploy(SERVICE_TASK_XML).unwrap();
@@ -3579,7 +3944,7 @@ mod tests {
 
         // Throwing an uncaught business error consumes the job and raises an
         // incident visible on the `work` element.
-        let snap = parse(&eng.throw_error(&job_key, "BOOM", "kaboom").unwrap());
+        let snap = parse(&eng.throw_error(&job_key, "BOOM", "kaboom", None).unwrap());
         let incidents = snap["incidents"].as_array().unwrap();
         assert_eq!(incidents.len(), 1, "expected one incident: {snap}");
         assert_eq!(incidents[0]["elementId"], "work");
@@ -3598,11 +3963,11 @@ mod tests {
         let job_key = snap["jobs"][0]["key"].as_str().unwrap().to_string();
 
         // Fail with no retries left → incident.
-        let snap = parse(&eng.fail_job(&job_key, 0, "nope").unwrap());
+        let snap = parse(&eng.fail_job(&job_key, 0, "nope", None).unwrap());
         let incident_key = snap["incidents"][0]["key"].as_str().unwrap().to_string();
 
         // Give the job a retry, then resolve the incident to re-create the job.
-        eng.update_retries(&job_key, 1).unwrap();
+        eng.update_retries(&job_key, 1, None).unwrap();
         let snap = parse(&eng.resolve_incident(&incident_key).unwrap());
         assert!(
             snap["incidents"].as_array().unwrap().is_empty(),
@@ -3623,9 +3988,11 @@ mod tests {
         eng.create_instance("p", "{}", None).unwrap();
 
         // First activation with the same worker locks exactly one job.
-        let first: Vec<J> =
-            serde_json::from_str(&eng.activate_jobs("do-work", 1, 30_000.0, "w1").unwrap())
-                .unwrap();
+        let first: Vec<J> = serde_json::from_str(
+            &eng.activate_jobs("do-work", 1, 30_000.0, "w1", None)
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             first.len(),
             1,
@@ -3637,9 +4004,11 @@ mod tests {
         // newly locks — not the one already locked by the first call. Scanning
         // all `Activated` jobs for the worker would leak `first_key` back and
         // exceed `max_jobs`.
-        let second: Vec<J> =
-            serde_json::from_str(&eng.activate_jobs("do-work", 1, 30_000.0, "w1").unwrap())
-                .unwrap();
+        let second: Vec<J> = serde_json::from_str(
+            &eng.activate_jobs("do-work", 1, 30_000.0, "w1", None)
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             second.len(),
             1,
@@ -3830,6 +4199,7 @@ mod tests {
                 &agent,
                 "{}",
                 r#"{"activateElements":[{"elementId":"toolA"},{"elementId":"toolB"}]}"#,
+                None,
             )
             .unwrap(),
         );
@@ -3838,8 +4208,12 @@ mod tests {
         let tool_b = job_key(&snap, "toolB", "tool");
 
         // Drain both tool jobs, each producing a `result` captured via outputElement.
-        eng.complete_job(&tool_a, r#"{"result":"A"}"#).unwrap();
-        let snap = parse(&eng.complete_job(&tool_b, r#"{"result":"B"}"#).unwrap());
+        eng.complete_job(&tool_a, r#"{"result":"A"}"#, None)
+            .unwrap();
+        let snap = parse(
+            &eng.complete_job(&tool_b, r#"{"result":"B"}"#, None)
+                .unwrap(),
+        );
         assert!(
             !snap["jobs"]
                 .as_array()
@@ -3855,8 +4229,13 @@ mod tests {
         // Turn 2: the agent signals completion → the container completes, writing
         // its `outputCollection`, and the instance finishes.
         let snap = parse(
-            &eng.complete_agent_job(&agent2, "{}", r#"{"completionConditionFulfilled":true}"#)
-                .unwrap(),
+            &eng.complete_agent_job(
+                &agent2,
+                "{}",
+                r#"{"completionConditionFulfilled":true}"#,
+                None,
+            )
+            .unwrap(),
         );
         assert!(
             !snap["instances"]
@@ -3881,7 +4260,7 @@ mod tests {
         let snap = parse(&eng.create_instance("p", "{}", None).unwrap());
         let agent = job_key(&snap, "agent", "agent-worker");
 
-        let snap = parse(&eng.complete_agent_job(&agent, "{}", "").unwrap());
+        let snap = parse(&eng.complete_agent_job(&agent, "{}", "", None).unwrap());
         assert!(
             !snap["instances"]
                 .as_array()
@@ -4055,41 +4434,62 @@ mod tests {
         );
     }
 
-    // `updateAgentInstance` must reject `status: "COMPLETED"` — the terminal
-    // status is reachable only through the dedicated `completeAgentInstance`
-    // command, and the driver must not forward it to yield a less-specific engine
-    // error (or, if engine validation ever loosens, an invalid transition). The
-    // rejection message is asserted at the pure layer (`JsValue` errors cannot be
-    // constructed or inspected on the host target); the driver wrapper's
-    // end-to-end rejection is covered by the wasm agent-instance-e2e probe.
     #[test]
     fn update_agent_instance_rejects_completed_status() {
         let msg = reject_non_updatable_status(Some("COMPLETED"))
             .expect_err("status COMPLETED must be rejected");
         assert!(
-            msg.contains("COMPLETED") && msg.contains("completeAgentInstance"),
-            "the rejection names the terminal status and points at the dedicated \
-             completeAgentInstance command: {msg}"
+            msg.contains("COMPLETED") && msg.contains("completeJob"),
+            "the rejection names the terminal status and points at job completion: {msg}"
         );
         // Non-terminal statuses (and absence) are settable via UPDATE.
         assert!(reject_non_updatable_status(Some("THINKING")).is_ok());
         assert!(reject_non_updatable_status(None).is_ok());
     }
 
-    // `producedAt` accepts the REST RFC-3339 `date-time` spelling and parses it to
-    // epoch millis; a bare numeric epoch-millis is also tolerated. `object`
+    #[test]
+    fn agent_update_status_is_limited_to_canonical_enum() {
+        for status in ["UNKNOWN", "INITIALIZING", "COMPLETED", "not-a-status"] {
+            assert!(
+                reject_non_updatable_status(Some(status)).is_err(),
+                "{status}"
+            );
+        }
+        for status in ["IDLE", "THINKING", "TOOL_CALLING", "TOOL_DISCOVERY"] {
+            assert!(
+                reject_non_updatable_status(Some(status)).is_ok(),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_configuration_attributes_name_individual_limits() {
+        let request = serde_json::json!({
+            "historyItemId":"limits", "loopIteration":1, "producedAt":"2026-01-02T03:04:05Z",
+            "role":"CONFIGURATION", "content":[], "tools":[],
+            "limits":{"maxTokens":20,"maxModelCalls":2,"maxToolCalls":3},
+        });
+        let turn = agent_turn_from(serde_json::from_value(request).unwrap(), 42, "opaque").unwrap();
+        assert_eq!(
+            turn.changed_attributes,
+            ["tools", "maxTokens", "maxModelCalls", "maxToolCalls"]
+        );
+    }
+
+    // `producedAt` accepts the REST RFC-3339 `date-time` spelling. `object`
     // content accepts arbitrary JSON (the REST wire shape), stored as the engine's
     // opaque JSON string.
     #[test]
     fn agent_turn_from_parses_rest_produced_at_and_json_object() {
         let iso = agent_turn_from(
             serde_json::from_str::<AgentTurnReq>(
-                r#"{"producedAt":"2026-01-02T03:04:05.250Z","role":"USER",
+                r#"{"historyItemId":"object-test","loopIteration":1,"producedAt":"2026-01-02T03:04:05.250Z","role":"USER",
                     "content":[{"contentType":"OBJECT","object":{"a":1,"b":[2,3]}}]}"#,
             )
             .unwrap(),
-            0,
-            0,
+            42,
+            "opaque:lease/0009",
         )
         .unwrap();
         assert_eq!(
@@ -4102,21 +4502,128 @@ mod tests {
             "a JSON object is stored as the engine's opaque JSON string"
         );
 
-        let numeric = agent_turn_from(
-            serde_json::from_str::<AgentTurnReq>(r#"{"producedAt":100,"role":"USER"}"#).unwrap(),
-            42,
-            99,
-        )
-        .unwrap();
         assert_eq!(
-            numeric.produced_at, 100,
-            "a bare numeric epoch-millis is still accepted"
-        );
-        assert_eq!(
-            (numeric.job_key, numeric.job_lease),
-            (42, 99),
+            (iso.job_key, iso.job_lease),
+            (42, "opaque:lease/0009".into()),
             "the request job attribution is stamped onto the turn"
         );
+    }
+
+    #[test]
+    fn agent_prompt_request_serializes_as_content_array() {
+        let request = serde_json::json!({
+            "historyItemId":"configuration", "loopIteration":1,
+            "producedAt":"2026-01-02T03:04:05Z", "role":"CONFIGURATION", "content":[],
+            "systemPrompt":[{"contentType":"TEXT","text":"[not JSON]"},
+                {"contentType":"OBJECT","object":{"nested":true}}],
+        });
+        let turn = agent_turn_from(serde_json::from_value(request).unwrap(), 42, "opaque").unwrap();
+        let encoded = serde_json::to_value(turn).unwrap();
+        assert!(
+            encoded["system_prompt"].is_array(),
+            "new prompts must not be double encoded"
+        );
+        assert_eq!(encoded["system_prompt"][0]["text"], "[not JSON]");
+    }
+
+    #[test]
+    #[cfg(feature = "read-model")]
+    fn agent_content_corruption_does_not_panic() {
+        for content_type in [
+            AgentHistoryContentType::Document,
+            AgentHistoryContentType::Object,
+        ] {
+            let content = AgentHistoryContent {
+                content_type,
+                text: None,
+                document_reference: Some("broken JSON".into()),
+                object: Some("broken JSON".into()),
+            };
+            assert!(agent_content_result(&content).is_err());
+        }
+    }
+
+    #[test]
+    fn agent_history_metrics_preserve_nullable_values() {
+        let request = serde_json::json!({
+            "historyItemId":"metrics", "loopIteration":1, "producedAt":"2026-01-02T03:04:05Z",
+            "role":"ASSISTANT", "content":[],
+            "metrics":{"inputTokens":2,"outputTokens":null,"durationMs":7},
+        });
+        let turn = agent_turn_from(
+            serde_json::from_value(request.clone()).unwrap(),
+            42,
+            "opaque",
+        )
+        .unwrap();
+        assert_eq!(agent_metrics_result(&turn.metrics), request["metrics"]);
+        let mut zero = request.clone();
+        zero["metrics"] = serde_json::json!({"inputTokens":0,"outputTokens":0,"durationMs":0});
+        let turn =
+            agent_turn_from(serde_json::from_value(zero.clone()).unwrap(), 42, "opaque").unwrap();
+        assert_eq!(agent_metrics_result(&turn.metrics), zero["metrics"]);
+        for metrics in [
+            serde_json::json!({"inputTokens":null,"outputTokens":null,"durationMs":null}),
+            serde_json::json!({"inputTokens":-1,"outputTokens":-2,"durationMs":-1}),
+        ] {
+            let mut present = request.clone();
+            present["metrics"] = metrics.clone();
+            let turn =
+                agent_turn_from(serde_json::from_value(present).unwrap(), 42, "opaque").unwrap();
+            assert_eq!(agent_metrics_result(&turn.metrics), metrics);
+        }
+        let mut omitted = request.clone();
+        omitted.as_object_mut().unwrap().remove("metrics");
+        let turn = agent_turn_from(serde_json::from_value(omitted).unwrap(), 42, "opaque").unwrap();
+        assert_eq!(agent_metrics_result(&turn.metrics), serde_json::Value::Null);
+        for missing in ["inputTokens", "outputTokens", "durationMs"] {
+            let mut invalid = request.clone();
+            invalid["metrics"].as_object_mut().unwrap().remove(missing);
+            assert!(
+                serde_json::from_value::<AgentTurnReq>(invalid).is_err(),
+                "{missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_history_requests_enforce_required_fields_and_content_union() {
+        let valid = serde_json::json!({
+            "historyItemId":"id", "loopIteration":1, "producedAt":"2026-01-02T03:04:05Z",
+            "role":"USER", "content":[{"contentType":"TEXT","text":"hello"}],
+        });
+        for field in [
+            "historyItemId",
+            "loopIteration",
+            "producedAt",
+            "role",
+            "content",
+        ] {
+            let mut request = valid.clone();
+            request.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<AgentTurnReq>(request).is_err(),
+                "{field}"
+            );
+        }
+        for bad in [
+            serde_json::json!({"contentType":"TEXT","text":"hello","object":{}}),
+            serde_json::json!({"contentType":"OBJECT"}),
+            serde_json::json!({"contentType":"DOCUMENT","documentReference":"not-an-object"}),
+        ] {
+            let mut request = valid.clone();
+            request["content"] = serde_json::json!([bad]);
+            assert!(serde_json::from_value::<AgentTurnReq>(request).is_err());
+        }
+        let mut request = valid.clone();
+        request["loopIteration"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<AgentTurnReq>(request).is_err());
+        let mut request = valid.clone();
+        request["loopIteration"] = serde_json::json!(u32::MAX);
+        assert!(serde_json::from_value::<AgentTurnReq>(request).is_err());
+        let mut request = valid;
+        request["producedAt"] = serde_json::json!(100);
+        assert!(serde_json::from_value::<AgentTurnReq>(request).is_err());
     }
 
     #[test]
@@ -4917,21 +5424,23 @@ mod read_channel_tests {
         assert_eq!(rfc3339_or_null(&None), serde_json::Value::Null);
     }
 
-    const AGENT_TASK_XML: &str = r#"
-      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
-        <bpmn:process id="p" isExecutable="true">
-          <bpmn:startEvent id="s" />
-          <bpmn:serviceTask id="agent">
-            <bpmn:extensionElements>
-              <zeebe:agentDefinition agentType="aiAgentTask" />
-            </bpmn:extensionElements>
-          </bpmn:serviceTask>
-          <bpmn:endEvent id="e" />
-          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="agent" />
-          <bpmn:sequenceFlow id="b" sourceRef="agent" targetRef="e" />
-        </bpmn:process>
-      </bpmn:definitions>"#;
+    #[test]
+    fn agent_definition_projection_rejects_missing_required_values() {
+        let mut eng = TestEngine::new();
+        let minted = mint_agent_instance(&mut eng);
+        let key = minted["agentInstanceKey"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut row = eng.read_model.agent_instance(key).unwrap();
+        assert!(agent_instance_result(&row).is_ok());
+        let model = row.model.take();
+        assert!(agent_instance_result(&row).is_err());
+        row.model = model;
+        row.provider = None;
+        assert!(agent_instance_result(&row).is_err());
+    }
 
     // The read-model history output must mirror the gateway's
     // `AgentInstanceHistoryItemResult` wire shape, not dump the engine's internal
@@ -4943,16 +5452,14 @@ mod read_channel_tests {
     #[test]
     fn agent_history_output_is_rest_shaped_and_round_trips_json_object() {
         let mut eng = TestEngine::new();
-        eng.deploy(AGENT_TASK_XML).unwrap();
-        eng.create_instance("p", "{}", None).unwrap();
-        let minted = parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone();
+        let minted = mint_agent_instance(&mut eng);
         let req = serde_json::json!({
-            "agentInstanceKey": minted["agentInstanceKey"],
             "elementInstanceKey": minted["elementInstanceKey"],
-            "elementId": minted["elementId"],
-            "processInstanceKey": minted["processInstanceKey"],
+            "jobKey": minted["jobKey"],
+            "jobLease": minted["jobLease"],
             "status": "THINKING",
             "history": [{
+                "historyItemId": "assistant-json",
                 "loopIteration": 1,
                 "producedAt": "2026-01-02T03:04:05.250Z",
                 "role": "ASSISTANT",
@@ -4962,11 +5469,18 @@ mod read_channel_tests {
                 ],
             }],
         });
-        eng.update_agent_instance(&req.to_string()).unwrap();
+        eng.update_agent_instance(
+            minted["agentInstanceKey"].as_str().unwrap(),
+            &req.to_string(),
+        )
+        .unwrap();
 
         let history = parse(
-            &eng.search_agent_instance_history(minted["agentInstanceKey"].as_str().unwrap(), "{}")
-                .unwrap(),
+            &eng.search_agent_instance_history(
+                minted["agentInstanceKey"].as_str().unwrap(),
+                r#"{"commitStatus":"PENDING"}"#,
+            )
+            .unwrap(),
         );
         let turn = history["items"]
             .as_array()
@@ -4987,9 +5501,9 @@ mod read_channel_tests {
             "no snake_case content_type leaks: {obj_block}"
         );
         assert!(
-            obj_block.get("documentReference").is_some()
+            obj_block.get("documentReference").is_none()
                 && obj_block.get("document_reference").is_none(),
-            "documentReference is camelCase, not snake_case: {obj_block}"
+            "OBJECT contains no unrelated union fields: {obj_block}"
         );
         // The `object` payload round-trips as structured JSON, not a JSON string.
         assert_eq!(
@@ -5001,12 +5515,47 @@ mod read_channel_tests {
         assert!(turn["toolCalls"].is_array() && turn["tools"].is_array());
     }
 
-    /// Mints an agent instance for `AGENT_TASK_XML` and returns its minted
-    /// identity JSON (`agentInstanceKey`, `elementInstanceKey`, …).
+    /// Registers an agent instance through the worker job and returns its
+    /// identity JSON together with the activated job's attribution.
     fn mint_agent_instance(eng: &mut TestEngine) -> J {
-        eng.deploy(AGENT_TASK_XML).unwrap();
-        eng.create_instance("p", "{}", None).unwrap();
-        parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone()
+        let xml = include_str!("../../engine-core/tests/fixtures/external-agent-job-type.bpmn")
+            .replace("agentType=\"external\"", "agentType=\"aiAgentTask\"");
+        eng.deploy(&xml).unwrap();
+        eng.create_instance(
+            "external-agent-routing",
+            r#"{"route":"senior:rebase"}"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            parse(&eng.search_agent_instances("{}").unwrap())["items"],
+            serde_json::json!([])
+        );
+        let jobs = parse(
+            &eng.activate_jobs("senior:rebase", 1, 60_000.0, "W", Some(true))
+                .unwrap(),
+        );
+        let job = &jobs[0];
+        eng.create_agent_instance(
+            &serde_json::json!({
+                "elementInstanceKey": job["elementInstanceKey"],
+                "jobKey": job["key"],
+                "jobLease": job["leaseToken"],
+                "history": [{
+                    "historyItemId": "initial-config", "loopIteration": 1,
+                    "producedAt": "2026-01-02T03:04:05Z", "role": "CONFIGURATION",
+                    "content": [], "model": "gpt", "provider": "openai",
+                    "systemPrompt": [{"contentType":"TEXT", "text":"Be helpful"}],
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut agent = parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone();
+        agent["elementInstanceKey"] = job["elementInstanceKey"].clone();
+        agent["jobKey"] = job["key"].clone();
+        agent["jobLease"] = job["leaseToken"].clone();
+        agent
     }
 
     /// The instance's current `tools` array via the read channel.
@@ -5019,72 +5568,33 @@ mod read_channel_tests {
         inst["tools"].as_array().cloned().unwrap_or_default()
     }
 
-    // `updateAgentInstance` must treat `tools` as a nullable changeset, exactly
-    // like the gateway (`server/src/main.rs` `update_agent_instance_impl`): an
-    // absent field leaves the stored set unchanged, an explicit `null` clears it,
-    // and a present array replaces it. Without distinguishing `null` from absent,
-    // a wasm caller could never clear a tool set through the TestEngine — a
-    // parity gap with the REST surface.
     #[test]
-    fn update_agent_instance_treats_tools_as_a_nullable_changeset() {
+    fn update_agent_instance_stages_tools_in_configuration_history() {
         let mut eng = TestEngine::new();
         let minted = mint_agent_instance(&mut eng);
         let key = minted["agentInstanceKey"].as_str().unwrap().to_string();
-        let base = |extra: serde_json::Value| {
-            let mut req = serde_json::json!({
-                "agentInstanceKey": minted["agentInstanceKey"],
-                "elementInstanceKey": minted["elementInstanceKey"],
-                "elementId": minted["elementId"],
-                "processInstanceKey": minted["processInstanceKey"],
-                "status": "THINKING",
-            });
-            let obj = req.as_object_mut().unwrap();
-            for (k, v) in extra.as_object().unwrap() {
-                obj.insert(k.clone(), v.clone());
-            }
-            req.to_string()
-        };
-
-        // A present array replaces the tool set.
-        eng.update_agent_instance(&base(serde_json::json!({
-            "tools": [{ "name": "search", "description": "web search", "elementId": "toolA" }],
-        })))
-        .unwrap();
-        let tools = instance_tools(&eng, &key);
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "search");
-
-        // An absent `tools` leaves the stored set unchanged.
-        eng.update_agent_instance(&base(serde_json::json!({ "status": "THINKING" })))
-            .unwrap();
-        assert_eq!(
-            instance_tools(&eng, &key).len(),
-            1,
-            "absent tools = no change"
-        );
-
-        // An explicit `null` clears the tool set (an empty replacement).
-        eng.update_agent_instance(&base(
-            serde_json::json!({ "tools": serde_json::Value::Null }),
-        ))
-        .unwrap();
-        assert!(
-            instance_tools(&eng, &key).is_empty(),
-            "explicit null tools clears the set"
-        );
-
-        // A present empty array is also an explicit clear.
-        eng.update_agent_instance(&base(serde_json::json!({
-            "tools": [{ "name": "x" }],
-        })))
-        .unwrap();
-        assert_eq!(instance_tools(&eng, &key).len(), 1);
-        eng.update_agent_instance(&base(serde_json::json!({ "tools": [] })))
+        let request = serde_json::json!({
+            "elementInstanceKey": minted["elementInstanceKey"],
+            "jobKey": minted["jobKey"], "jobLease": minted["jobLease"],
+            "history": [{
+                "historyItemId": "new-tools", "loopIteration": 1, "role":"CONFIGURATION",
+                "producedAt": "2026-01-02T03:04:06Z", "content": [],
+                "tools": [{"name":"search", "description":null, "elementId":null}],
+            }],
+        });
+        eng.update_agent_instance(&key, &request.to_string())
             .unwrap();
         assert!(
             instance_tools(&eng, &key).is_empty(),
-            "empty array clears too"
+            "uncommitted tools are pending"
         );
+        eng.complete_job(
+            minted["jobKey"].as_str().unwrap(),
+            "{}",
+            Some(minted["jobLease"].as_str().unwrap().to_owned()),
+        )
+        .unwrap();
+        assert_eq!(instance_tools(&eng, &key)[0]["name"], "search");
     }
 
     // The request-level `jobKey`/`jobLease` must be attributed to every appended
@@ -5098,21 +5608,20 @@ mod read_channel_tests {
         let minted = mint_agent_instance(&mut eng);
         let key = minted["agentInstanceKey"].as_str().unwrap().to_string();
         let req = serde_json::json!({
-            "agentInstanceKey": minted["agentInstanceKey"],
             "elementInstanceKey": minted["elementInstanceKey"],
-            "elementId": minted["elementId"],
-            "processInstanceKey": minted["processInstanceKey"],
             "status": "THINKING",
-            "jobKey": "7788990011",
-            "jobLease": "123456",
+            "jobKey": minted["jobKey"],
+            "jobLease": minted["jobLease"],
             "history": [
                 {
+                    "historyItemId": "assistant-a",
                     "loopIteration": 1,
                     "producedAt": "2026-01-02T03:04:05.250Z",
                     "role": "ASSISTANT",
                     "content": [{ "contentType": "TEXT", "text": "a" }],
                 },
                 {
+                    "historyItemId": "assistant-b",
                     "loopIteration": 1,
                     "producedAt": "2026-01-02T03:04:06.250Z",
                     "role": "ASSISTANT",
@@ -5120,9 +5629,12 @@ mod read_channel_tests {
                 },
             ],
         });
-        eng.update_agent_instance(&req.to_string()).unwrap();
+        eng.update_agent_instance(&key, &req.to_string()).unwrap();
 
-        let history = parse(&eng.search_agent_instance_history(&key, "{}").unwrap());
+        let history = parse(
+            &eng.search_agent_instance_history(&key, r#"{"commitStatus":"PENDING"}"#)
+                .unwrap(),
+        );
         let assistant: Vec<&J> = history["items"]
             .as_array()
             .unwrap()
@@ -5132,55 +5644,39 @@ mod read_channel_tests {
         assert_eq!(assistant.len(), 2, "both pushed turns are present");
         for turn in assistant {
             assert_eq!(
-                turn["jobKey"], "7788990011",
+                turn["jobKey"], minted["jobKey"],
                 "each turn carries the request jobKey: {turn}"
             );
+            assert_eq!(turn["jobLease"], minted["jobLease"]);
         }
     }
 
-    // A present-but-malformed `jobKey`/`jobLease` is rejected rather than coerced
-    // to 0 (which would silently change attribution), mirroring the gateway's 400.
-    // Asserted against the `&str`-typed core `parse_job_attribution` — the
-    // `#[wasm_bindgen]` mutator's `JsValue` reject path aborts off the wasm target.
     #[test]
-    fn update_agent_instance_rejects_malformed_job_attribution() {
-        // Absent = 0 (no attribution); a well-formed decimal parses.
-        assert_eq!(
-            parse_job_attribution("updateAgentInstance", "jobKey", None).unwrap(),
-            0
-        );
-        assert_eq!(
-            parse_job_attribution("updateAgentInstance", "jobKey", Some(" 42 ")).unwrap(),
-            42
-        );
-        // A malformed value is rejected with a message naming the offending field
-        // and the originating operation (so a create-side error reads
-        // `createAgentInstance:`, not a misleading `updateAgentInstance:`).
-        let key_err = parse_job_attribution("createAgentInstance", "jobKey", Some("not-a-number"))
-            .expect_err("a malformed jobKey is rejected");
-        assert!(key_err.contains("jobKey"), "names the field: {key_err}");
-        assert!(
-            key_err.contains("createAgentInstance"),
-            "names the operation: {key_err}"
-        );
-        let lease_err = parse_job_attribution("updateAgentInstance", "jobLease", Some("nope"))
-            .expect_err("a malformed jobLease is rejected");
-        assert!(
-            lease_err.contains("jobLease"),
-            "names the field: {lease_err}"
-        );
-        assert!(
-            lease_err.contains("updateAgentInstance"),
-            "names the operation: {lease_err}"
-        );
+    fn update_agent_instance_requires_keys_but_treats_lease_as_opaque() {
+        let request = serde_json::json!({
+            "elementInstanceKey":"1", "jobKey":"2", "jobLease":"opaque:token/0009",
+        });
+        let parsed: UpdateAgentInstanceReq = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(parsed.job_lease, "opaque:token/0009");
+        for key in ["elementInstanceKey", "jobKey", "jobLease"] {
+            let mut missing = request.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<UpdateAgentInstanceReq>(missing).is_err());
+            let mut null = request.clone();
+            null[key] = J::Null;
+            assert!(serde_json::from_value::<UpdateAgentInstanceReq>(null).is_err());
+        }
+        for field in ["definition", "limits", "metrics", "tools"] {
+            let mut old_shape = request.clone();
+            old_shape[field] = J::Null;
+            assert!(serde_json::from_value::<UpdateAgentInstanceReq>(old_shape).is_err());
+        }
     }
 
     #[test]
     fn agent_instance_search_honours_the_nested_rest_filter_shape() {
         let mut eng = TestEngine::new();
-        eng.deploy(AGENT_TASK_XML).unwrap();
-        eng.create_instance("p", "{}", None).unwrap();
-        let minted = parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone();
+        let minted = mint_agent_instance(&mut eng);
         let key = minted["agentInstanceKey"].as_str().unwrap().to_string();
 
         let count = |body: &str| {
@@ -5207,24 +5703,22 @@ mod read_channel_tests {
     #[test]
     fn agent_history_search_honours_the_nested_rest_filter_shape() {
         let mut eng = TestEngine::new();
-        eng.deploy(AGENT_TASK_XML).unwrap();
-        eng.create_instance("p", "{}", None).unwrap();
-        let minted = parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone();
+        let minted = mint_agent_instance(&mut eng);
         let key = minted["agentInstanceKey"].as_str().unwrap().to_string();
         let req = serde_json::json!({
-            "agentInstanceKey": minted["agentInstanceKey"],
             "elementInstanceKey": minted["elementInstanceKey"],
-            "elementId": minted["elementId"],
-            "processInstanceKey": minted["processInstanceKey"],
+            "jobKey": minted["jobKey"],
+            "jobLease": minted["jobLease"],
             "status": "THINKING",
             "history": [{
+                "historyItemId":"filter-test",
                 "loopIteration": 1,
                 "producedAt": "2026-01-02T03:04:05.250Z",
                 "role": "ASSISTANT",
                 "content": [{ "contentType": "TEXT", "text": "hello" }],
             }],
         });
-        eng.update_agent_instance(&req.to_string()).unwrap();
+        eng.update_agent_instance(&key, &req.to_string()).unwrap();
 
         let has_assistant = |body: &str| {
             parse(&eng.search_agent_instance_history(&key, body).unwrap())["items"]
@@ -5234,14 +5728,9 @@ mod read_channel_tests {
                 .any(|t| t["role"] == "ASSISTANT")
         };
 
-        // The pushed turn is COMMITTED, so the COMMITTED default surfaces it.
-        assert!(has_assistant("{}"));
-        // A nested `commitStatus` filter is honoured: asking for PENDING only
-        // excludes the COMMITTED turn. Without the unwrap the nested body would be
-        // ignored and the COMMITTED default would still surface it.
-        assert!(!has_assistant(r#"{"filter":{"commitStatus":["PENDING"]}}"#));
-        // The top-level shorthand keeps working.
-        assert!(!has_assistant(r#"{"commitStatus":["PENDING"]}"#));
+        assert!(!has_assistant("{}"), "default excludes pending history");
+        assert!(has_assistant(r#"{"filter":{"commitStatus":"PENDING"}}"#));
+        assert!(has_assistant(r#"{"commitStatus":"PENDING"}"#));
     }
 
     #[test]

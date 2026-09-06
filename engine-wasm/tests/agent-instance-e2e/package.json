@@ -3,9 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "End-to-end probe of the engine-native AgentInstance/AgentHistory surface through @nanobpm/engine-wasm's read-model TestEngine: deploy an aiAgentTask serviceTask, mint/reconcile an AgentInstance (INITIALIZING), push a turn via UPDATE (status advances), history-search returns that COMMITTED turn, and COMPLETE drives COMPLETED.",
+  "description": "Real-WASM probes for canonical opt-in job leases, fenced mutations, replay, history-based agent requests, pending-history commitment, and routing metadata in both entrypoints.",
   "scripts": {
-    "test": "node verify.mjs"
+    "test": "node lease-fencing.mjs && node verify.mjs && node external-routing.mjs"
   },
   "dependencies": {
     "@nanobpm/engine-wasm": "file:../../pkg"

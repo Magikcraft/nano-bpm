@@ -1393,8 +1393,21 @@ impl Journal {
             | Command::FailJob { job_key, .. }
             | Command::ThrowJobError { job_key, .. }
             | Command::UpdateJobRetries { job_key, .. }
-            | Command::UpdateJobTimeout { job_key, .. } => {
+            | Command::UpdateJobTimeout { job_key, .. }
+            | Command::UpdateJob { job_key, .. } => {
                 targets.extend(cold.index.instance_for_job(*job_key));
+            }
+            Command::ActivateJobs {
+                job_type, max_jobs, ..
+            } => {
+                targets.extend(cold.index.instances_for_job_type(job_type, *max_jobs));
+            }
+            Command::ActivateJobsByKey { job_keys, .. } => {
+                targets.extend(
+                    job_keys
+                        .iter()
+                        .filter_map(|key| cold.index.instance_for_job(*key)),
+                );
             }
             Command::AssignUserTask { user_task_key, .. }
             | Command::UnassignUserTask { user_task_key }
@@ -1814,6 +1827,14 @@ impl Journal {
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
         self.ensure_resident_for_command(&command);
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
+        let mut activated: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::JobActivated { job_key, .. } => self.engine.activated_job(*job_key),
+                _ => None,
+            })
+            .collect();
+        self.rehydrate_activated_variables(&mut activated);
         let commit = self.persist(&events);
         self.maybe_spill();
         Ok((events, commit))
@@ -2081,6 +2102,32 @@ impl Journal {
         fetch_variables: Vec<String>,
     ) -> Vec<ActivatedJob> {
         let job_type = job_type.into();
+        self.rehydrate_activation_candidates(&job_type, max_jobs);
+        let mut activated = self.engine.activate_jobs_with_fetch(
+            &job_type,
+            worker,
+            max_jobs,
+            timeout,
+            now,
+            fetch_variables,
+        );
+        self.rehydrate_activated_variables(&mut activated);
+        activated
+    }
+
+    pub fn select_activatable_job_keys(
+        &mut self,
+        job_type: &str,
+        max_jobs: usize,
+        now: u64,
+        with_lease: bool,
+    ) -> Vec<Key> {
+        self.rehydrate_activation_candidates(job_type, max_jobs);
+        self.engine
+            .select_activatable_job_keys(job_type, max_jobs, now, with_lease)
+    }
+
+    fn rehydrate_activation_candidates(&mut self, job_type: &str, max_jobs: usize) {
         // Rehydrate up to `max_jobs` cold instances holding an activatable job of
         // this type, so a worker poll can reach a parked-then-cold backlog. Only
         // pays a SQLite read when something of this type is actually cold.
@@ -2090,19 +2137,14 @@ impl Journal {
                 .as_ref()
                 .expect("cold set")
                 .index
-                .instances_for_job_type(&job_type, max_jobs);
+                .instances_for_job_type(job_type, max_jobs);
             for key in candidates {
                 self.rehydrate_cold(key);
             }
         }
-        let mut activated = self.engine.activate_jobs_with_fetch(
-            &job_type,
-            worker,
-            max_jobs,
-            timeout,
-            now,
-            fetch_variables,
-        );
+    }
+
+    fn rehydrate_activated_variables(&mut self, activated: &mut [ActivatedJob]) {
         // Rehydrate any spilled variables the activated jobs need. In lean mode
         // the authoritative store is read **non-destructively** (`get`) — the row
         // must survive for the next recovery; the spilled flag is cleared so the
@@ -2135,7 +2177,6 @@ impl Journal {
                 }
             }
         }
-        activated
     }
 
     /// Fires every due timer at logical instant `now`, journaling the resulting
@@ -2161,12 +2202,10 @@ impl Journal {
         (events, commit)
     }
 
-    /// Releases expired activation locks at logical instant `now`, **without**
-    /// journaling: like activation, lock expiry is volatile lease state. Mirrors
-    /// [`Engine::expire_jobs`]. Returns the reclaimed-job events so the caller can
-    /// wake dispatch when a lease frees a job for redelivery.
+    /// Releases only token-free, volatile activation locks without journaling.
+    /// Token-bearing leases must expire through a durable command.
     pub fn expire_jobs(&mut self, now: u64) -> Vec<Event> {
-        self.engine.expire_jobs(now)
+        self.engine.expire_jobs_by_durability(now, false)
     }
 
     /// Read-only access to the underlying engine (for projections that take an
@@ -2351,6 +2390,47 @@ mod tests {
     }
 
     #[test]
+    fn volatile_expiry_never_mutates_durable_leases() {
+        let mut journal = Journal::in_memory();
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        for _ in 0..2 {
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+        }
+        let (events, _) = journal
+            .apply_command_at(
+                Command::activate_jobs_with_options(
+                    "demo-work",
+                    "leased",
+                    1,
+                    10,
+                    0,
+                    nanobpmn_engine_core::JobActivationOptions {
+                        with_lease: true,
+                        ..Default::default()
+                    },
+                ),
+                0,
+            )
+            .unwrap();
+        let leased = events
+            .iter()
+            .find_map(|event| match event {
+                Event::JobActivated { job_key, .. } => Some(*job_key),
+                _ => None,
+            })
+            .unwrap();
+        let soft = journal.activate_jobs("demo-work", "soft", 1, 10, 0)[0].key;
+        let expired = journal.expire_jobs(10);
+        assert_eq!(expired.len(), 1);
+        assert!(journal.state().jobs[&leased].deadline.is_some());
+        assert!(journal.state().jobs[&soft].deadline.is_none());
+    }
+
+    #[test]
     fn reopening_a_journal_replays_persisted_state() {
         // given a journal file in a temp dir with a deploy + an instance
         let dir = std::env::temp_dir().join(format!("nanobpmn-journal-{}", std::process::id()));
@@ -2426,6 +2506,31 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::ProcessInstanceCompleted { instance_key } if *instance_key == key)));
+    }
+
+    #[test]
+    fn durable_activation_rehydrates_cold_jobs() {
+        let mut journal = cold_journal();
+        let key = deploy_and_create(&mut journal);
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        let (events, _) = journal
+            .apply_command_at(
+                Command::activate_jobs_with_options(
+                    "demo-work",
+                    "leased",
+                    1,
+                    1000,
+                    0,
+                    nanobpmn_engine_core::JobActivationOptions {
+                        with_lease: true,
+                        ..Default::default()
+                    },
+                ),
+                0,
+            )
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(event,
+            Event::JobActivated { instance_key, lease_token: Some(_), .. } if *instance_key == key)));
     }
 
     #[test]

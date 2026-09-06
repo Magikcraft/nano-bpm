@@ -11,6 +11,24 @@
 #   append: <list>      appends items to a list node (e.g. a `required` array),
 #                       de-duplicated.
 
+# --- updateAgentInstance: upstream runtime conflict response ---------------
+#
+# Camunda 04530c058589e3ea3f7873bb469ae2c0d7cc6003's
+# AgentInstanceUpdateProcessor rejects an active-writer conflict with
+# INVALID_STATE, mapped to HTTP 409 by GatewayErrorMapper. Its REST response
+# table omits that status. Keep the vendored specification unchanged, but let
+# the generated server represent the actual upstream error without converting
+# it into a misleading 400, 404, or 500.
+- file: agent-instances.yaml
+  target: paths./agent-instances/{agentInstanceKey}.patch.responses
+  merge:
+    "409":
+      description: The agent instance has a conflicting active writer.
+      content:
+        application/problem+json:
+          schema:
+            $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+
 # --- createProcessInstance: processCompleted -------------------------------
 #
 # nanobpmn extends CreateProcessInstanceResult with `processCompleted`. With the

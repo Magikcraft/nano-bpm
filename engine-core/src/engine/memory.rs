@@ -30,13 +30,21 @@ impl Engine {
     /// counterpart to [`Engine::replay_partition`], restoring the exact
     /// materialized state and generator position in one step (no replay).
     #[cfg(feature = "serde")]
-    pub fn from_snapshot(snapshot: EngineSnapshot) -> Self {
+    pub fn from_snapshot(mut snapshot: EngineSnapshot) -> Self {
         assert!(
             snapshot.partition_id <= state::MAX_PARTITION_ID,
             "partition id {} exceeds MAX_PARTITION_ID {}",
             snapshot.partition_id,
             state::MAX_PARTITION_ID
         );
+        for deployed in snapshot
+            .state
+            .processes
+            .values_mut()
+            .chain(snapshot.state.process_versions.values_mut())
+        {
+            deployed.definition.normalize_legacy_agent_tasks();
+        }
         Self {
             state: snapshot.state,
             partition_id: snapshot.partition_id,

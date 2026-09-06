@@ -89,7 +89,8 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
     },
     KindSpec {
         keyword: "serviceTask",
-        doc: "Job-based task. Creates a job of `jobType` and rests until completion.",
+        doc: "Job-based task. Creates a job of `jobType` and rests until completion. \
+              Optional agent metadata does not change the job-worker lifecycle.",
         attrs: &[
             AttrSpec {
                 key: "jobType",
@@ -102,6 +103,14 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
                 required: false,
                 ty: AttrType::Str,
                 doc: "Raw priority expression (literal or FEEL); higher activates first.",
+            },
+            AttrSpec {
+                key: "agentType",
+                required: false,
+                ty: AttrType::Str,
+                doc: "Optional `zeebe:agentDefinition` metadata: `aiAgentTask`, `external`, \
+                      or `aiAgentSubProcess`. All create ordinary jobs. The compact IR retains \
+                      this classification but does not represent an adHocSubProcess tool catalog.",
             },
         ],
     },
@@ -488,18 +497,6 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
               compensable activities in scope (reverse completion order).",
         attrs: &[],
     },
-    KindSpec {
-        keyword: "agentTask",
-        doc: "Engine-native AI agent task (Camunda stable/8.10). A serviceTask bearing a \
-              `zeebe:agentDefinition` marker; on activation the engine mints a first-class \
-              AgentInstance instead of a job.",
-        attrs: &[AttrSpec {
-            key: "agentType",
-            required: true,
-            ty: AttrType::Str,
-            doc: "The `zeebe:agentDefinition agentType`. An `agentTask` round-trips as a serviceTask, so only `aiAgentTask` or `external` are valid here (`aiAgentSubProcess` is an adHocSubProcess form).",
-        }],
-    },
 ];
 
 /// Element-level attributes shared across every kind (they are emitted by
@@ -878,13 +875,13 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         ConditionalBoundaryEvent { .. } => "conditionalBoundaryEvent",
         CompensationBoundaryEvent { .. } => "compensationBoundaryEvent",
         CompensationThrowEvent => "compensationThrowEvent",
-        AgentTask { .. } => "agentTask",
+        AgentTask { .. } => "serviceTask",
     }
 }
 
-/// One dummy instance per `ElementKind` variant, tagged with the IR keyword we expect the
+/// One dummy instance per canonical `ElementKind` variant, tagged with the IR keyword we expect the
 /// pretty-printer to render for it. Field values are placeholders — enough to survive round-trip
-/// and produce every declared attribute line.
+/// and produce every declared attribute line. Historical `AgentTask` values normalize to ServiceTask.
 #[cfg(test)]
 pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKind)> {
     use nanobpmn_engine_core::{ElementKind, UserTaskProps};
@@ -895,6 +892,7 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
         (
             "serviceTask",
             ElementKind::ServiceTask {
+                agent_type: Some(nanobpmn_engine_core::AgentType::External),
                 job_type: "worker".into(),
                 priority: Some("50".into()),
                 custom_headers: std::collections::BTreeMap::new(),
@@ -1040,14 +1038,6 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
             "compensationThrowEvent",
             ElementKind::CompensationThrowEvent,
         ),
-        (
-            "agentTask",
-            ElementKind::AgentTask {
-                agent_type: nanobpmn_engine_core::AgentType::AiAgentTask,
-                definition: nanobpmn_engine_core::AgentDefinition::default(),
-                limits: None,
-            },
-        ),
     ]
 }
 
@@ -1167,6 +1157,7 @@ mod tests {
         let el = Element {
             id: "svc_1".into(),
             kind: ElementKind::ServiceTask {
+                agent_type: None,
                 job_type: "worker".into(),
                 priority: None,
                 custom_headers: std::collections::BTreeMap::new(),

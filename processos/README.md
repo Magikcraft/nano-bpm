@@ -490,6 +490,22 @@ instead of picking from a fixed menu.
   authoring primitive (rung 0 of its iterate-cheaply ladder). *(DI is intentionally omitted — these
   are candidate models for simulation, and the cockpit renders DI-less variants.)*
 
+Agent-marked job workers use canonical IR `serviceTask` with a required `jobType`
+and optional `agentType` (`aiAgentTask`, `external`, or `aiAgentSubProcess`). Every
+marker is metadata on an ordinary job, not a separate native-agent activation.
+Historical `agentTask` IR remains accepted and lowers to this form; omitted legacy
+job types retain the element-id fallback. XML emission preserves the marker alongside
+priority, task headers, linked resources, retries, I/O mappings, and multi-instance
+configuration. XML container tagging follows the retained ad-hoc definition and tool
+catalog, not the marker: both `external` and `aiAgentSubProcess` can mark an
+`adHocSubProcess`. XML emission restores the catalog's authored tools and their DI,
+including retained embedded sub-process bodies. It does not invent tools for empty
+containers. The compact IR retains agent classification but does **not** represent
+ad-hoc catalogs/bodies or linked resources; it therefore cannot round-trip a complete
+ad-hoc BPMN model. Catalog-only leaf tools preserve the fields retained by the engine
+(kind, name, job type or user/call configuration, and I/O), not arbitrary source XML
+extensions discarded during parsing.
+
 ```bash
 # Point the configured LLM at a workspace process bound to a dataset:
 curl -XPOST .../api/workspaces/{workspace}/processes/{process}/investigate \

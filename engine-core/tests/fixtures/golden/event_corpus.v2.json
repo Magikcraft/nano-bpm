@@ -1,0 +1,342 @@
+[
+  {
+    "DeploymentCreated": {
+      "deployment_key": 1
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 1,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "charge": {
+            "end_listeners": [],
+            "id": "charge",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "ServiceTask": {
+                "custom_headers": {},
+                "job_type": "payment",
+                "linked_resources": [],
+                "priority": null
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "end"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "end": {
+            "end_listeners": [],
+            "id": "end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "start": {
+            "end_listeners": [],
+            "id": "start",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "charge"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "order",
+        "name": null,
+        "start_event": "start",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 2,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000001,
+      "instance_key": 3,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 2,
+      "process_id": "order",
+      "tags": [],
+      "variables": {
+        "amount": {
+          "Int": 4200
+        },
+        "currency": {
+          "Str": "EUR"
+        }
+      },
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "start",
+      "element_instance_key": 4,
+      "instance_key": 3
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "start",
+      "element_instance_key": 4,
+      "instance_key": 3,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "start",
+      "element_instance_key": 4,
+      "instance_key": 3
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "start",
+      "element_instance_key": 4,
+      "instance_key": 3
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "start",
+      "instance_key": 3,
+      "to": "charge"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "charge",
+      "element_instance_key": 5,
+      "instance_key": 3
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "charge",
+      "element_instance_key": 5,
+      "instance_key": 3,
+      "scope": 0
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000001,
+      "element_id": "charge",
+      "element_instance_key": 5,
+      "instance_key": 3,
+      "job_key": 6,
+      "job_type": "payment",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "JobActivated": {
+      "activated_at": 1700000000002,
+      "deadline": 1700000030002,
+      "durable": true,
+      "instance_key": 3,
+      "job_key": 6,
+      "worker": "worker-1"
+    }
+  },
+  {
+    "JobCompleted": {
+      "created_at": 1700000000001,
+      "instance_key": 3,
+      "job_key": 6,
+      "job_type": "payment"
+    }
+  },
+  {
+    "VariablesUpdated": {
+      "instance_key": 3,
+      "variables": {
+        "approved": {
+          "Bool": true
+        }
+      }
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "charge",
+      "element_instance_key": 5,
+      "instance_key": 3
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "charge",
+      "element_instance_key": 5,
+      "instance_key": 3
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "charge",
+      "instance_key": 3,
+      "to": "end"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "end",
+      "element_instance_key": 7,
+      "instance_key": 3
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "end",
+      "element_instance_key": 7,
+      "instance_key": 3,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "end",
+      "element_instance_key": 7,
+      "instance_key": 3
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "end",
+      "element_instance_key": 7,
+      "instance_key": 3
+    }
+  },
+  {
+    "ProcessInstanceCompleted": {
+      "instance_key": 3
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000004,
+      "instance_key": 8,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 2,
+      "process_id": "order",
+      "tags": [],
+      "variables": {
+        "amount": {
+          "Int": 999
+        }
+      },
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "start",
+      "element_instance_key": 9,
+      "instance_key": 8
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "start",
+      "element_instance_key": 9,
+      "instance_key": 8,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "start",
+      "element_instance_key": 9,
+      "instance_key": 8
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "start",
+      "element_instance_key": 9,
+      "instance_key": 8
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "start",
+      "instance_key": 8,
+      "to": "charge"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "charge",
+      "element_instance_key": 10,
+      "instance_key": 8
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "charge",
+      "element_instance_key": 10,
+      "instance_key": 8,
+      "scope": 0
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000004,
+      "element_id": "charge",
+      "element_instance_key": 10,
+      "instance_key": 8,
+      "job_key": 11,
+      "job_type": "payment",
+      "priority": 50,
+      "retries": 3
+    }
+  }
+]

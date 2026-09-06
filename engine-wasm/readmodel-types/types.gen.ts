@@ -78,27 +78,26 @@ export type AdvancedAgentInstanceStatusFilter = {
 };
 
 /**
- * The type of a single content block.
- */
-export type AgentInstanceContentTypeEnum = 'TEXT' | 'DOCUMENT' | 'OBJECT';
-
-/**
- * The outcome of appending a single history item from an update request's history batch.
+ * The outcome of appending a single history item from an update request's
+ * history batch.
+ *
  */
 export type AgentInstanceCreatedHistoryItem = {
     /**
-     * The historyItemId of the corresponding request item, echoed back for correlation.
+     * The historyItemId of the corresponding item in the request, echoed back
+     * so callers can correlate response entries with request items by id.
+     *
      */
     historyItemId: string;
     /**
-     * The system-generated key for the history item. When isDuplicate is true, this is
-     * the key of the original entry, not a new one.
+     * The system-generated key for the history item. When isDuplicate is true,
+     * this is the key of the original entry, not a new one.
      *
      */
-    historyItemKey: AgentHistoryKey;
+    historyItemKey: AgentHistoryItemKey;
     /**
-     * True if this item had already been recorded and no new AGENT_HISTORY event was
-     * created for it; false if a new event was created.
+     * True if this item had already been recorded and no new AGENT_HISTORY event
+     * was created for it; false if a new event was created.
      *
      */
     isDuplicate: boolean;
@@ -109,44 +108,35 @@ export type AgentInstanceCreatedHistoryItem = {
  */
 export type AgentInstanceCreationRequest = {
     /**
-     * The key of the AHSP or AI Agent Task element instance.
+     * The key of the AI Agent Sub-process or AI Agent Task element instance.
      * The engine uses this key to infer processInstanceKey, elementId,
      * processDefinitionKey, and tenantId.
      *
      */
     elementInstanceKey: ElementInstanceKey;
     /**
-     * Static definition set once at creation.
-     */
-    definition: AgentInstanceDefinition;
-    /**
-     * Limits for the agent execution. When omitted, all limits default to -1
-     * (no limit).
+     * The key of the job activation during which this creation is being made.
+     * A creation must always be attributed to the active job that produced it.
      *
      */
-    limits?: AgentInstanceLimits;
+    jobKey: JobKey;
     /**
-     * The key of the agent job whose activation authorizes this create. Optional:
-     * supply it for an `external` (job-backed) agent element to lease-gate the
-     * create, and the server then rejects the create unless it references that
-     * element's ACTIVATED job with a matching lease token and elementInstanceKey.
-     * A jobless create (omit, or `0`) is always allowed on this REST create surface,
-     * which carries no history batch; when supplied it is always validated. Omit (or `0`) for the engine-native
-     * `aiAgentTask` / `aiAgentSubProcess` variants, whose AgentInstance is auto-minted
-     * at activation.
+     * Opaque lease token received from the job activation response. Disambiguates
+     * this activation from any other activation of the same job: if the job is
+     * later retried, history items submitted under a superseded lease are discarded
+     * rather than committed.
      *
      */
-    jobKey?: JobKey;
+    jobLease: string;
     /**
-     * Lease token received from the job activation response, disambiguating this
-     * activation from any other of the same job. A per-activation staleness handle
-     * (a monotonic value distinct from the job's lease deadline, not a
-     * cryptographically unguessable secret), serialized as a decimal string (an
-     * unsigned 64-bit integer), so the server rejects any non-numeric value with 400.
-     * Required alongside `jobKey` whenever a `jobKey` is supplied.
+     * A batch of history items to append to the agent instance's conversation
+     * history, in request order. Each created item is echoed back in the
+     * response's createdHistory, positionally correlated. Must include a
+     * CONFIGURATION item establishing model, provider, and systemPrompt (and,
+     * if needed, limits).
      *
      */
-    jobLease?: string;
+    history: Array<AgentInstanceHistoryItem>;
 };
 
 /**
@@ -157,12 +147,19 @@ export type AgentInstanceCreationResult = {
      * The system-generated key for the created agent instance.
      */
     agentInstanceKey: AgentInstanceKey;
+    /**
+     * One entry per history item submitted in the request, in request order.
+     *
+     */
+    createdHistory: Array<AgentInstanceCreatedHistoryItem>;
 };
 
 /**
- * The static definition of an agent instance, set once at creation.
+ * The definition of an agent instance. Set at creation, but can change later via a
+ * CONFIGURATION history item.
+ *
  */
-export type AgentInstanceDefinition = {
+export type AgentInstanceDefinitionResult = {
     /**
      * The LLM model identifier (for example, gpt-4o).
      */
@@ -172,9 +169,25 @@ export type AgentInstanceDefinition = {
      */
     provider: string;
     /**
-     * The system prompt configured for this agent instance.
+     * The system prompt configured for this agent instance, as content blocks.
      */
-    systemPrompt: string;
+    systemPrompt: Array<AgentInstanceMessageContent>;
+};
+
+/**
+ * Document content
+ *
+ * A Camunda Document Store reference content block.
+ */
+export type AgentInstanceDocumentContent = {
+    /**
+     * The content type discriminator.
+     */
+    contentType: string;
+    /**
+     * A reference to a document stored in the Camunda Document Store.
+     */
+    documentReference: DocumentReference;
 };
 
 /**
@@ -185,6 +198,10 @@ export type AgentInstanceFilter = {
      * The unique key of the agent instance.
      */
     agentInstanceKey?: AgentInstanceKeyFilterProperty;
+    /**
+     * The key of the agent definition this agent instance is an instance of.
+     */
+    agentDefinitionKey?: AgentDefinitionKeyFilterProperty;
     /**
      * The current status of the agent instance.
      */
@@ -197,6 +214,13 @@ export type AgentInstanceFilter = {
      * The key of the process instance that owns this agent instance.
      */
     processInstanceKey?: ProcessInstanceKeyFilterProperty;
+    /**
+     * The key of the root process instance. Filters agent instances belonging to a specific
+     * call hierarchy. The root process instance is the top-level ancestor in the process
+     * instance hierarchy.
+     *
+     */
+    rootProcessInstanceKey?: ProcessInstanceKeyFilterProperty;
     /**
      * The key of the process definition associated with this agent instance.
      */
@@ -238,6 +262,10 @@ export type AgentInstanceFilter = {
 
 /**
  * The commit status of a history item.
+ * COMMITTED: the producing job completed successfully.
+ * PENDING: the producing job is still active (in-flight).
+ * DISCARDED: the producing job failed; this item was superseded by a later activation.
+ *
  */
 export type AgentInstanceHistoryCommitStatusEnum = 'COMMITTED' | 'PENDING' | 'DISCARDED';
 
@@ -247,15 +275,25 @@ export type AgentInstanceHistoryCommitStatusEnum = 'COMMITTED' | 'PENDING' | 'DI
 export type AgentInstanceHistoryCommitStatusFilterProperty = AgentInstanceHistoryCommitStatusEnum | AdvancedAgentInstanceHistoryCommitStatusFilter;
 
 /**
- * Agent instance history item search filter. When commitStatus is omitted, only
- * COMMITTED history items are returned.
- *
+ * Agent instance history item search filter.
  */
 export type AgentInstanceHistoryFilter = {
+    /**
+     * The unique key of the history item.
+     */
+    historyItemKey?: AgentHistoryItemKeyFilterProperty;
     /**
      * The role of the history item.
      */
     role?: AgentInstanceHistoryRoleFilterProperty;
+    /**
+     * The key of the element instance under which the history item was produced.
+     */
+    elementInstanceKey?: ElementInstanceKeyFilterProperty;
+    /**
+     * The key of the job activation that produced the history item.
+     */
+    jobKey?: JobKeyFilterProperty;
     /**
      * Filter by loop iteration number.
      */
@@ -279,15 +317,17 @@ export type AgentInstanceHistoryFilter = {
  */
 export type AgentInstanceHistoryItem = {
     /**
-     * Caller-assigned identifier used to detect and dedupe retries of the same item.
-     * Must be non-blank.
+     * Caller-assigned identifier used to detect and dedupe retries of the same
+     * item. For example, when a retried job activation resubmits history items
+     * it already sent in an earlier attempt, those items are not rejected; they
+     * are flagged via isDuplicate in the response instead. Must be non-blank.
      *
      */
     historyItemId: string;
     /**
      * The loop iteration this item belongs to.
      */
-    loopIteration: number;
+    loopIteration: LoopIterationId;
     /**
      * The role of this history item in the conversation.
      */
@@ -298,6 +338,10 @@ export type AgentInstanceHistoryItem = {
     content: Array<AgentInstanceMessageContent>;
     /**
      * Tool calls associated with this history item.
+     * For ASSISTANT items: tool calls dispatched by this LLM response.
+     * For TOOL_RESULT items: single-entry array referencing the originating tool call.
+     * Omit for USER items.
+     *
      */
     toolCalls?: Array<AgentInstanceToolCall> | null;
     /**
@@ -309,25 +353,36 @@ export type AgentInstanceHistoryItem = {
      */
     producedAt: string;
     /**
-     * The complete list of tools available to the agent as of this entry. CONFIGURATION items only.
+     * The complete list of tools available to the agent as of this entry. CONFIGURATION
+     * items only; omit for other roles. Omit to leave the tool list unchanged; send an
+     * empty array to clear it.
+     *
      */
     tools?: Array<AgentTool> | null;
     /**
-     * The LLM model identifier as of this entry. CONFIGURATION items only.
+     * The LLM model identifier as of this entry. CONFIGURATION items only; omit for other
+     * roles.
+     *
      */
-    model?: string | null;
+    model?: string;
     /**
-     * The LLM provider as of this entry. CONFIGURATION items only.
+     * The LLM provider as of this entry. CONFIGURATION items only; omit for other roles.
+     *
      */
-    provider?: string | null;
+    provider?: string;
     /**
-     * The operational limits as of this entry. CONFIGURATION items only.
+     * The operational limits as of this entry. CONFIGURATION items only; omit for other
+     * roles.
+     *
      */
     limits?: AgentInstanceLimits;
     /**
-     * The system prompt as of this entry. CONFIGURATION items only.
+     * The system prompt, as content blocks, as of this entry. CONFIGURATION items only;
+     * omit for other roles. Omit to leave the system prompt unchanged; when present, must
+     * be non-empty.
+     *
      */
-    systemPrompt?: string | null;
+    systemPrompt?: Array<AgentInstanceMessageContent> | null;
 };
 
 /**
@@ -335,15 +390,15 @@ export type AgentInstanceHistoryItem = {
  */
 export type AgentInstanceHistoryItemMetrics = {
     /**
-     * Input tokens consumed by this LLM call.
+     * Input tokens consumed by this LLM call. Null when not provided.
      */
     inputTokens: number | null;
     /**
-     * Output tokens produced by this LLM call.
+     * Output tokens produced by this LLM call. Null when not provided.
      */
     outputTokens: number | null;
     /**
-     * Wall-clock duration of the LLM call in milliseconds.
+     * Wall-clock duration of the LLM call in milliseconds. Null when not provided.
      */
     durationMs: number | null;
 };
@@ -355,9 +410,11 @@ export type AgentInstanceHistoryItemResult = {
     /**
      * The unique key for this history item. Stable and sortable by creation order.
      */
-    historyItemKey: AgentHistoryKey;
+    historyItemKey: AgentHistoryItemKey;
     /**
-     * The client-supplied identifier this item was created with. Empty when none.
+     * The client-supplied identifier this item was created with. Empty for items that don't
+     * carry one.
+     *
      */
     historyItemId: string;
     /**
@@ -365,37 +422,21 @@ export type AgentInstanceHistoryItemResult = {
      */
     agentInstanceKey: AgentInstanceKey;
     /**
-     * The element instance under which this item was produced.
+     * The key of the AI Agent Task or ad-hoc sub-process element instance under which this item was produced.
      */
     elementInstanceKey: ElementInstanceKey;
-    /**
-     * The owning process instance key.
-     */
-    processInstanceKey: ProcessInstanceKey;
-    /**
-     * The root process instance key.
-     */
-    rootProcessInstanceKey: ProcessInstanceKey;
-    /**
-     * The process definition key.
-     */
-    processDefinitionKey: ProcessDefinitionKey;
-    /**
-     * The BPMN process ID of the process definition.
-     */
-    processDefinitionId: ProcessDefinitionId;
-    /**
-     * The tenant ID of this history item.
-     */
-    tenantId: TenantId;
     /**
      * The key of the job activation during which this item was produced.
      */
     jobKey: JobKey;
     /**
+     * The lease token of the activation that produced this item.
+     */
+    jobLease: string;
+    /**
      * The loop iteration this item belongs to.
      */
-    loopIteration: number;
+    loopIteration: LoopIterationId;
     /**
      * The role of this history item in the conversation.
      */
@@ -405,11 +446,14 @@ export type AgentInstanceHistoryItemResult = {
      */
     content: Array<AgentInstanceMessageContent>;
     /**
-     * Tool calls for this item.
+     * Tool calls for this item. Empty for USER items and ASSISTANT items with no tool dispatches.
+     * ASSISTANT items: dispatched tool calls.
+     * TOOL_RESULT items: single-entry array referencing the originating tool call.
+     *
      */
     toolCalls: Array<AgentInstanceToolCall>;
     /**
-     * Per-call token and latency metrics. Present on ASSISTANT items (zeroed when the request omitted metrics at creation time); null for USER, TOOL_RESULT, and CONFIGURATION turns.
+     * Per-call token and latency metrics. Null when metrics were not provided at creation time.
      */
     metrics: AgentInstanceHistoryItemMetrics | null;
     /**
@@ -421,21 +465,34 @@ export type AgentInstanceHistoryItemResult = {
      */
     producedAt: string;
     /**
-     * The complete list of tools available to the agent as of this entry.
+     * The complete list of tools available to the agent as of this entry. CONFIGURATION
+     * items only; empty for other roles.
+     *
      */
     tools: Array<AgentTool>;
     /**
-     * The LLM model identifier as of this entry.
+     * The LLM model identifier as of this entry. CONFIGURATION items only; null for other
+     * roles.
+     *
      */
     model: string | null;
     /**
-     * The LLM provider as of this entry.
+     * The LLM provider as of this entry. CONFIGURATION items only; null for other roles.
+     *
      */
     provider: string | null;
     /**
-     * Whether this item was recorded as a duplicate of an earlier one.
+     * The operational limits as of this entry. CONFIGURATION items only; -1 on any field
+     * means "no limit configured" for other roles.
+     *
      */
-    isDuplicate: boolean;
+    limits: AgentInstanceLimits;
+    /**
+     * The system prompt, as content blocks, as of this entry. CONFIGURATION items only;
+     * empty for other roles.
+     *
+     */
+    systemPrompt: Array<AgentInstanceMessageContent>;
 };
 
 /**
@@ -499,29 +556,15 @@ export type AgentInstanceLimits = {
 };
 
 /**
- * A single content block within a history item. The `contentType` discriminator selects which
- * payload field carries the content: TEXT → `text`, DOCUMENT → `documentReference`,
- * OBJECT → `object`.
- *
+ * A single content block within a history item. Discriminated by `contentType`.
  */
-export type AgentInstanceMessageContent = {
-    /**
-     * Which payload field carries this block's content.
-     */
-    contentType: AgentInstanceContentTypeEnum;
-    /**
-     * The plain-text payload. Present when contentType is TEXT.
-     */
-    text?: string | null;
-    /**
-     * An opaque reference to a stored document. Present when contentType is DOCUMENT.
-     */
-    documentReference?: string | null;
-    /**
-     * Arbitrary structured content (any valid JSON value). Present when contentType is OBJECT.
-     */
-    object?: unknown;
-};
+export type AgentInstanceMessageContent = ({
+    contentType: 'TEXT';
+} & AgentInstanceTextContent) | ({
+    contentType: 'DOCUMENT';
+} & AgentInstanceDocumentContent) | ({
+    contentType: 'OBJECT';
+} & AgentInstanceObjectContent);
 
 /**
  * Aggregated metrics for an agent instance across all model calls.
@@ -546,28 +589,23 @@ export type AgentInstanceMetrics = {
 };
 
 /**
- * Metric increments to apply to the agent instance aggregate counters. The engine
- * accumulates these deltas into running totals on each UPDATED event. All fields
- * are optional; omit a field to leave the corresponding counter unchanged.
+ * Object content
+ *
+ * An arbitrary structured content block. Accepts any valid JSON value:
+ * objects, arrays, numbers, booleans, or strings.
+ * Use TEXT content for human-readable natural language;
+ * use OBJECT content for machine-readable structured data.
  *
  */
-export type AgentInstanceMetricsDelta = {
+export type AgentInstanceObjectContent = {
     /**
-     * Increment to apply to the total input token counter.
+     * The content type discriminator.
      */
-    inputTokens?: number;
+    contentType: string;
     /**
-     * Increment to apply to the total output token counter.
+     * Arbitrary structured content — any valid JSON value (object, array, number, boolean, or string).
      */
-    outputTokens?: number;
-    /**
-     * Increment to apply to the total model call counter.
-     */
-    modelCalls?: number;
-    /**
-     * Increment to apply to the total tool call counter.
-     */
-    toolCalls?: number;
+    object: unknown;
 };
 
 export type AgentInstanceResult = {
@@ -575,13 +613,19 @@ export type AgentInstanceResult = {
      * The unique key for this agent instance.
      */
     agentInstanceKey: AgentInstanceKey;
+    /**
+     * The key of the agent definition this agent instance is an instance of.
+     */
+    agentDefinitionKey: AgentDefinitionKey;
     status: AgentInstanceStatusEnum;
     /**
-     * The static definition of the agent, including model, provider, and system prompt.
+     * The definition of the agent, including model, provider, and system prompt. Set at
+     * creation, but can change later via a CONFIGURATION history item.
+     *
      */
-    definition: AgentInstanceDefinition;
+    definition: AgentInstanceDefinitionResult;
     /**
-     * Aggregated metrics across all iterations of this agent instance.
+     * Aggregated metrics across all loopIterations of this agent instance.
      */
     metrics: AgentInstanceMetrics;
     /**
@@ -687,11 +731,28 @@ export type AgentInstanceStatusEnum = 'UNKNOWN' | 'COMPLETED' | 'IDLE' | 'INITIA
 export type AgentInstanceStatusFilterProperty = AgentInstanceStatusEnum | AdvancedAgentInstanceStatusFilter;
 
 /**
- * A tool call associated with a history item.
+ * Text content
+ *
+ * A plain-text content block.
+ */
+export type AgentInstanceTextContent = {
+    /**
+     * The content type discriminator.
+     */
+    contentType: string;
+    /**
+     * The text content.
+     */
+    text: string;
+};
+
+/**
+ * A tool call associated with a history item. Used in both ASSISTANT and TOOL_RESULT items.
+ *
  */
 export type AgentInstanceToolCall = {
     /**
-     * The LLM-assigned tool call ID.
+     * The LLM-assigned tool call ID. Correlates ASSISTANT items to their matching TOOL_RESULT items.
      */
     toolCallId: string;
     /**
@@ -703,7 +764,9 @@ export type AgentInstanceToolCall = {
      */
     elementId: string | null;
     /**
-     * The tool call arguments as provided by the LLM.
+     * The tool call arguments as provided by the LLM. May be null or populated on
+     * any item, including TOOL_RESULT.
+     *
      */
     arguments: {
         [key: string]: unknown;
@@ -711,9 +774,7 @@ export type AgentInstanceToolCall = {
 };
 
 /**
- * Request to update the mutable state of an agent instance: advance its status and
- * append a batch of history items to its conversation history. Each created history
- * item is echoed back in the response's createdHistory, positionally correlated.
+ * Request to update the mutable state of an agent instance.
  *
  */
 export type AgentInstanceUpdateRequest = {
@@ -722,7 +783,10 @@ export type AgentInstanceUpdateRequest = {
      * Used for ownership/equality validation against the stored agent instance
      * and, when the supplied key differs from the previous association (re-entry
      * of an ad-hoc sub-process or AI Agent task), appended to elementInstanceKeys
-     * with the reverse link updated on the supplied element instance.
+     * with the reverse link updated on the supplied element instance. Only one
+     * element instance may hold this write claim at a time: any update from a
+     * different element instance is rejected while the current writer's job is
+     * still active.
      *
      */
     elementInstanceKey: ElementInstanceKey;
@@ -731,45 +795,23 @@ export type AgentInstanceUpdateRequest = {
      */
     status?: AgentInstanceUpdateStatusEnum;
     /**
-     * The key of the job activation during which this update is being made. Attributed
-     * to each appended history item so a later retry can supersede in-flight items.
-     * Required when the request carries a history batch (a history-bearing update needs
-     * a job context); may be omitted for a history-free update (a pure status/metrics
-     * advance). When supplied it is always validated against the element's ACTIVATED
-     * job and matching lease token.
+     * The key of the job activation during which this update is being made.
+     * An update must always be attributed to the active job that produced it.
      *
      */
-    jobKey?: JobKey;
+    jobKey: JobKey;
     /**
-     * Lease token received from the job activation response, disambiguating this
-     * activation from any other of the same job. A per-activation staleness handle
-     * (a monotonic value distinct from the job's lease deadline, not a
-     * cryptographically unguessable secret), serialized as a decimal string (an
-     * unsigned 64-bit integer), so the server rejects any non-numeric value with 400.
-     * Required alongside `jobKey` whenever a `jobKey` is supplied, and validated then.
+     * Opaque lease token received from the job activation response. Disambiguates
+     * this activation from any other activation of the same job: if the job is
+     * later retried, history items submitted under a superseded lease are discarded
+     * rather than committed.
      *
      */
-    jobLease?: string;
+    jobLease: string;
     /**
-     * Metric increments to apply to the aggregate counters.
-     */
-    metrics?: AgentInstanceMetricsDelta;
-    /**
-     * The complete list of tools available to the agent. Interpreted as a nullable
-     * changeset with three distinct cases:
-     * * omitted (field absent) — no change; the stored tool list is left untouched.
-     * * null — clears the tool set, replacing any previously stored tools with an
-     * empty list.
-     * * array — replaces the existing tool list with exactly this value.
-     * Note that null and an empty array are equivalent (both clear the set); omitting
-     * the field is the only way to leave the existing tools unchanged.
-     *
-     */
-    tools?: Array<AgentTool> | null;
-    /**
-     * A batch of history items to append to the agent instance's conversation history,
-     * in request order. Each created item is echoed back in the response's createdHistory,
-     * positionally correlated.
+     * A batch of history items to append to the agent instance's conversation
+     * history, in request order. Each created item is echoed back in the
+     * response's createdHistory, positionally correlated.
      *
      */
     history?: Array<AgentInstanceHistoryItem> | null;
@@ -4670,6 +4712,18 @@ export type GlobalListenerId = string;
 export type GroupId = string;
 
 /**
+ * A client-provided sequential integer identifying a loop iteration: one pass
+ * through an AI agent's loop, during which the model reasons, selects tools,
+ * evaluates the result, and decides whether to continue. One iteration covers
+ * the input for the LLM call, the call itself, and the tools it dispatches;
+ * the results of those tool calls are input to the next iteration. Must be a
+ * positive integer, increasing with each loopIteration. Established by the
+ * connector when appending the first history item of a loopIteration.
+ *
+ */
+export type LoopIterationId = number;
+
+/**
  * The unique identifier of a mapping rule.
  */
 export type MappingRuleId = string;
@@ -5410,6 +5464,11 @@ export type ActivatedJobResult = {
      *
      */
     priority: number;
+    /**
+     * The lease token identifying this activation. This is null when the job was activated without a lease.
+     *
+     */
+    leaseToken: string | null;
 };
 
 /**
@@ -5523,6 +5582,11 @@ export type JobActivationRequest = {
      *
      */
     tenantFilter?: TenantFilterEnum;
+    /**
+     * Whether to activate the jobs with a lease. When true, each activated job is assigned a distinct, opaque lease token, returned as ActivatedJobResult.leaseToken. The lease fences the complete, fail, and throw-error commands against a superseded activation of the same job. Once a job has been activated with a lease, it is served only to leasing workers of that job type. Omit or set to false to activate jobs without a lease.
+     *
+     */
+    withLease?: boolean | null;
 };
 
 /**
@@ -5571,6 +5635,11 @@ export type JobCompletionRequest = {
         [key: string]: unknown;
     } | null;
     result?: JobResult;
+    /**
+     * The token identifying a leased job's activation, obtained from ActivatedJobResult.leaseToken. A leased job requires its matching token; missing or stale tokens are rejected. A job activated without a lease requires no token.
+     *
+     */
+    leaseToken?: string | null;
 };
 
 export type JobErrorRequest = {
@@ -5591,6 +5660,11 @@ export type JobErrorRequest = {
     variables?: {
         [key: string]: unknown;
     } | null;
+    /**
+     * The token identifying a leased job's activation, obtained from ActivatedJobResult.leaseToken. A leased job requires its matching token; missing or stale tokens are rejected. A job activated without a lease requires no token.
+     *
+     */
+    leaseToken?: string | null;
 };
 
 export type JobFailRequest = {
@@ -5613,6 +5687,11 @@ export type JobFailRequest = {
     variables?: {
         [key: string]: unknown;
     };
+    /**
+     * The token identifying a leased job's activation, obtained from ActivatedJobResult.leaseToken. A leased job requires its matching token; missing or stale tokens are rejected. A job activated without a lease requires no token.
+     *
+     */
+    leaseToken?: string | null;
 };
 
 /**
@@ -6018,6 +6097,11 @@ export type JobUpdateBatchOperationRequest = {
 export type JobUpdateRequest = {
     changeset: JobChangeset;
     operationReference?: OperationReference;
+    /**
+     * The token identifying a leased job's activation, obtained from ActivatedJobResult.leaseToken. A supplied token is validated against the current lease. An update without a token applies to support operator and bulk updates, unlike complete, fail, and throw-error requests, which require a token for leased jobs.
+     *
+     */
+    leaseToken?: string | null;
 };
 
 /**
@@ -6085,6 +6169,62 @@ export type _1Jobs1JobKey1Completion = unknown;
 export type _1Jobs1JobKey1Error = unknown;
 
 export type _1Jobs1JobKey1Failure = unknown;
+
+/**
+ * Advanced filter
+ *
+ * Advanced AgentDefinitionKey filter.
+ */
+export type AdvancedAgentDefinitionKeyFilter = {
+    /**
+     * Checks for equality with the provided value.
+     */
+    $eq?: AgentDefinitionKey;
+    /**
+     * Checks for inequality with the provided value.
+     */
+    $neq?: AgentDefinitionKey;
+    /**
+     * Checks if the current property exists.
+     */
+    $exists?: boolean;
+    /**
+     * Checks if the property matches any of the provided values.
+     */
+    $in?: Array<AgentDefinitionKey>;
+    /**
+     * Checks if the property matches none of the provided values.
+     */
+    $notIn?: Array<AgentDefinitionKey>;
+};
+
+/**
+ * Advanced filter
+ *
+ * Advanced AgentHistoryItemKey filter.
+ */
+export type AdvancedAgentHistoryItemKeyFilter = {
+    /**
+     * Checks for equality with the provided value.
+     */
+    $eq?: AgentHistoryItemKey;
+    /**
+     * Checks for inequality with the provided value.
+     */
+    $neq?: AgentHistoryItemKey;
+    /**
+     * Checks if the current property exists.
+     */
+    $exists?: boolean;
+    /**
+     * Checks if the property matches any of the provided values.
+     */
+    $in?: Array<AgentHistoryItemKey>;
+    /**
+     * Checks if the property matches none of the provided values.
+     */
+    $notIn?: Array<AgentHistoryItemKey>;
+};
 
 /**
  * Advanced filter
@@ -6451,9 +6591,24 @@ export type AdvancedVariableKeyFilter = {
 };
 
 /**
- * System-generated key for an agent instance history item.
+ * System-generated key for an agent definition.
  */
-export type AgentHistoryKey = LongKey;
+export type AgentDefinitionKey = LongKey;
+
+/**
+ * AgentDefinitionKey property with full advanced search capabilities.
+ */
+export type AgentDefinitionKeyFilterProperty = AgentDefinitionKey | AdvancedAgentDefinitionKeyFilter;
+
+/**
+ * System-generated key for an agent history item.
+ */
+export type AgentHistoryItemKey = LongKey;
+
+/**
+ * AgentHistoryItemKey property with full advanced search capabilities.
+ */
+export type AgentHistoryItemKeyFilterProperty = AgentHistoryItemKey | AdvancedAgentHistoryItemKeyFilter;
 
 /**
  * System-generated key for an agent instance.
@@ -10065,12 +10220,15 @@ export type CreateAgentInstanceErrors = {
      */
     403: ProblemDetail;
     /**
-     * The elementInstanceKey does not correspond to an active element instance, or —
-     * for a lease-gated `external` create — the referenced job is not active or its
-     * lease token does not match. More details are provided in the response body.
+     * The elementInstanceKey does not correspond to an active element instance.
+     * More details are provided in the response body.
      *
      */
     404: ProblemDetail;
+    /**
+     * An agent instance already exists for the given element instance.
+     */
+    409: ProblemDetail;
     /**
      * An internal error occurred while processing the request.
      */
@@ -10172,9 +10330,8 @@ export type UpdateAgentInstanceErrors = {
      */
     403: ProblemDetail;
     /**
-     * The agent instance with the given key was not found, or the job context
-     * supplied with the update references a job that is not active or whose lease
-     * token does not match. More details are provided in the response body.
+     * The agent instance with the given key was not found.
+     * More details are provided in the response body.
      *
      */
     404: ProblemDetail;
@@ -10257,6 +10414,12 @@ export type SearchAgentInstanceHistoryErrors = {
      * Forbidden. The request is not allowed.
      */
     403: ProblemDetail;
+    /**
+     * The agent instance with the given key was not found.
+     * More details are provided in the response body.
+     *
+     */
+    404: ProblemDetail;
     /**
      * An internal error occurred while processing the request.
      */

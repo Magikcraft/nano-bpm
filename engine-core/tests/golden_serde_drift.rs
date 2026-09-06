@@ -201,7 +201,13 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     // the corpus — keeping it a faithful, replayable journal for #1070/#1071.
     let activated_a = engine
         .apply_command_at(
-            Command::activate_jobs("payment", "worker-1", 1, 30_000, T0 + 2),
+            Command::activate_jobs_by_key(
+                engine.select_activatable_job_keys("payment", 1, T0 + 2, false),
+                "worker-1",
+                30_000,
+                T0 + 2,
+                Default::default(),
+            ),
             T0 + 2,
         )
         .expect("activate job A");

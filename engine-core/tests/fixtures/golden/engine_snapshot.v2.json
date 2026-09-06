@@ -1,0 +1,319 @@
+{
+  "next_local": 11,
+  "now": 1700000000004,
+  "num_partitions": 1,
+  "partition_id": 0,
+  "start_dispatch_rr": 0,
+  "state": {
+    "activatable_jobs": {
+      "payment": [
+        [
+          -50,
+          11
+        ]
+      ]
+    },
+    "activated_jobs": [],
+    "conditional_subscriptions": {},
+    "created_by_process": {
+      "order": 2
+    },
+    "decision_requirements": {},
+    "decision_requirements_versions": {},
+    "decision_versions": {},
+    "decisions": {},
+    "form_versions": {},
+    "forms": {},
+    "incidents": {},
+    "inflight_by_process": {
+      "order": 1
+    },
+    "instances": {
+      "3": {
+        "active": {},
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000001,
+        "incidents": [],
+        "join_counts": {},
+        "join_instances": {},
+        "key": 3,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "process_definition_key": 2,
+        "process_id": "order",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Completed",
+        "tags": [],
+        "variables": {},
+        "variables_spilled": false
+      },
+      "8": {
+        "active": {
+          "10": "charge"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000004,
+        "incidents": [],
+        "join_counts": {},
+        "join_instances": {},
+        "key": 8,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "process_definition_key": 2,
+        "process_id": "order",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Active",
+        "tags": [],
+        "variables": {
+          "amount": {
+            "Int": 999
+          }
+        },
+        "variables_spilled": false
+      }
+    },
+    "jobs": {
+      "11": {
+        "activated": false,
+        "activated_at": null,
+        "activation_timeout": null,
+        "created_at": 1700000000004,
+        "deadline": null,
+        "element_id": "charge",
+        "element_instance_key": 10,
+        "instance_key": 8,
+        "job_type": "payment",
+        "key": 11,
+        "kind": "BpmnElement",
+        "lease_token": null,
+        "priority": 50,
+        "retries": 3,
+        "state": "Created",
+        "worker": null
+      },
+      "6": {
+        "activated": true,
+        "activated_at": null,
+        "activation_timeout": null,
+        "created_at": 1700000000001,
+        "deadline": null,
+        "durable_activation": true,
+        "element_id": "charge",
+        "element_instance_key": 5,
+        "instance_key": 3,
+        "job_type": "payment",
+        "key": 6,
+        "kind": "BpmnElement",
+        "lease_token": null,
+        "priority": 50,
+        "retries": 3,
+        "state": "Completed",
+        "worker": null
+      }
+    },
+    "jobs_by_instance": {
+      "3": [
+        6
+      ],
+      "8": [
+        11
+      ]
+    },
+    "message_start_subscriptions": {},
+    "message_subscriptions": {},
+    "process_versions": {
+      "2": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "charge": {
+              "end_listeners": [],
+              "id": "charge",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "ServiceTask": {
+                  "custom_headers": {},
+                  "job_type": "payment",
+                  "linked_resources": [],
+                  "priority": null
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "end"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "end": {
+              "end_listeners": [],
+              "id": "end",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "start": {
+              "end_listeners": [],
+              "id": "start",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "charge"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "order",
+          "name": null,
+          "start_event": "start",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 2,
+        "version": 1
+      }
+    },
+    "processes": {
+      "order": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "charge": {
+              "end_listeners": [],
+              "id": "charge",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "ServiceTask": {
+                  "custom_headers": {},
+                  "job_type": "payment",
+                  "linked_resources": [],
+                  "priority": null
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "end"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "end": {
+              "end_listeners": [],
+              "id": "end",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "start": {
+              "end_listeners": [],
+              "id": "start",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "charge"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "order",
+          "name": null,
+          "start_event": "start",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 2,
+        "version": 1
+      }
+    },
+    "resource_versions": {},
+    "resources": {},
+    "signal_subscriptions": {},
+    "start_timers": {},
+    "timers": {},
+    "user_tasks": {}
+  }
+}

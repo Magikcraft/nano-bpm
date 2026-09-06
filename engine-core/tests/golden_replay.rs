@@ -125,6 +125,32 @@ fn golden_journal_decodes_through_typed_decoder() {
     }
 }
 
+#[test]
+fn archived_format_journals_remain_replayable_after_version_bumps() {
+    for version in 1..SNAPSHOT_FORMAT_VERSION {
+        let raw =
+            std::fs::read_to_string(golden_path(&format!("event_corpus.v{version}.json"))).unwrap();
+        let frames: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
+        let journal = frames
+            .into_iter()
+            .map(|frame| decode_event_json(&frame.to_string()).unwrap());
+        let raw = std::fs::read_to_string(golden_path(&format!("engine_snapshot.v{version}.json")))
+            .unwrap();
+        let expected: EngineSnapshot = serde_json::from_str(&raw).unwrap();
+        let replayed = Engine::replay_partition(expected.partition_id, journal);
+        assert_eq!(
+            replayed.state(),
+            &expected.state,
+            "archived format {version}"
+        );
+        assert_eq!(
+            replayed.snapshot().next_local,
+            expected.next_local,
+            "archived allocator {version}"
+        );
+    }
+}
+
 /// **Forward-compat of additive fields.** An OLD record written before a field
 /// gained `#[serde(default)]` has no such key; it must still decode (defaulting
 /// the field) and replay, confirming the `serde(default)` contract that makes

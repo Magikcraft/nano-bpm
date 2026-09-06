@@ -75,52 +75,41 @@ describe('EmbeddedEngine (nano_engine.wasm FFI)', () => {
     expect(() => host!.deploy(TRIVIAL_BPMN)).toThrow(/closed/);
   });
 
-  // AgentInstance smoke (Camunda 8.10 parity, Stage 3): nano-bernd is an
-  // element-agnostic C-ABI pass-through — it does NOT enumerate engine commands.
-  // This proves the engine-native AgentInstance surface is reachable through the
-  // freshly-rebuilt FFI wasm: a serviceTask carrying
-  // `zeebe:agentDefinition agentType="aiAgentTask"` deploys, an instance is
-  // created (a valid response round-trips), and the token parks at the agent —
-  // an engine-native agent task mints an AgentInstance and creates NO job, so the
-  // instance neither completes straight-through nor exposes a `do-work` job.
-  it('round-trips an aiAgentTask through the FFI pass-through (agent task parks, no job)', async () => {
+  it.each(['external', 'aiAgentTask'])('runs %s as an ordinary job through the FFI pass-through', async (agentType) => {
     host = await EmbeddedEngine.create();
-    const AGENT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
-  <bpmn:process id="agent-proc" isExecutable="true">
-    <bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
-    <bpmn:serviceTask id="agent" name="AI Agent">
-      <bpmn:extensionElements><zeebe:agentDefinition agentType="aiAgentTask" /></bpmn:extensionElements>
-      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
-    </bpmn:serviceTask>
-    <bpmn:endEvent id="e"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
-    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
-    <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
-  </bpmn:process>
-</bpmn:definitions>`;
-
-    const { count } = host.deploy(AGENT_BPMN);
+    const fixture = await readFile(
+      join(HERE, '../../../engine-core/tests/fixtures/external-agent-job-type.bpmn'),
+      'utf8',
+    );
+    const { count } = host.deploy(
+      fixture.replace('agentType="external"', `agentType="${agentType}"`),
+    );
     expect(count).toBeGreaterThanOrEqual(1);
 
-    // A valid response round-trips: a non-zero process instance key.
-    const { processInstanceKey } = host.createInstance('agent-proc', 1000);
+    const { processInstanceKey } = host.createInstance('external-agent-routing', 1000);
     expect(processInstanceKey).toMatch(/^\d+$/);
     expect(processInstanceKey).not.toBe('0');
     expect(host.instanceCount()).toBe(1);
 
-    // The engine-native agent task parks its token (it does not complete
-    // straight-through) and creates NO worker job.
     expect(host.isCompleted(processInstanceKey)).toBe(false);
-    expect(
-      host.activateJobs({
-        type: 'agent',
-        worker: 'w1',
-        maxJobs: 10,
-        timeoutMs: 30_000,
-        now: 1000,
-      }),
-    ).toHaveLength(0);
+    const jobs = host.activateJobs({
+      type: 'senior:rebase',
+      worker: 'w1',
+      maxJobs: 10,
+      timeoutMs: 30_000,
+      now: 1000,
+    });
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({
+      type: 'senior:rebase',
+      instanceKey: processInstanceKey,
+      elementId: 'agent',
+      worker: 'w1',
+      deadline: 31000,
+      leaseToken: null,
+    });
+    host.completeJob(jobs[0]!.key);
+    expect(host.isCompleted(processInstanceKey)).toBe(true);
   });
 
   it('drives the full job worker lifecycle: activate → complete', async () => {
