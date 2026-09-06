@@ -58,8 +58,8 @@ impl Engine {
             .collect()
     }
 
-    /// The currently-held activation leases as `(job_key, deadline)` pairs — every
-    /// job in [`state::JobState::Activated`] with a deadline. Used by the
+    /// The currently-held soft locks as `(job_key, deadline)` pairs.
+    /// Durable activations, including unleased ones, are excluded. Used by the
     /// best-effort **lease digest** (leader-local activation, `digest` mode): a
     /// partition leader periodically broadcasts these so a future leader can
     /// recover them on takeover ([`Engine::recover_lease`]) and honour the
@@ -69,13 +69,16 @@ impl Engine {
         self.state
             .jobs
             .values()
-            .filter(|j| j.state == state::JobState::Activated)
+            .filter(|j| {
+                j.state == state::JobState::Activated
+                    && !self.job_requires_durable_activation(j.key)
+            })
             .filter_map(|j| j.deadline.map(|d| (j.key, d)))
             .collect()
     }
 
     /// Recovers a soft activation lease from a digest: if `job_key` is currently
-    /// [`state::JobState::Created`] and `deadline` is still in the future, marks
+    /// [`state::JobState::Created`], requires no durable activation, and `deadline` is still in the future, marks
     /// it [`state::JobState::Activated`] until `deadline` under a synthetic worker.
     /// Returns `true` if a lease was set.
     ///
@@ -88,16 +91,67 @@ impl Engine {
     /// rather than redelivering the instant it takes over. Idempotent: a job that
     /// is already activated (e.g. re-leased by this leader) is left untouched.
     pub fn recover_lease(&mut self, job_key: Key, deadline: u64, now: u64) -> bool {
+        if self.job_requires_durable_activation(job_key) {
+            return false;
+        }
         if let Some(job) = self.state.jobs.get_mut(&job_key) {
-            if job.state == state::JobState::Created && deadline > now {
+            if job.state == state::JobState::Created && job.lease_token.is_none() && deadline > now
+            {
                 job.state = state::JobState::Activated;
                 job.worker = Some(LEASE_DIGEST_WORKER.to_string());
                 job.deadline = Some(deadline);
                 job.activated = true;
+                self.state.activated_jobs.insert(job_key);
                 return true;
             }
         }
         false
+    }
+
+    /// Whether this job's element supports agent registration, using the same
+    /// model eligibility check as CREATE. Hosts use this to keep agent activation
+    /// context durable even when no lease token is requested.
+    pub fn job_supports_agent_instance(&self, job_key: Key) -> bool {
+        self.state.jobs.get(&job_key).is_some_and(|job| {
+            self.agent_type_for_element(job.instance_key, &job.element_id, job.element_instance_key)
+                .is_ok()
+        })
+    }
+
+    /// The shared host routing, expiry and recovery boundary. An authoritative
+    /// batch can include ordinary unleased jobs alongside agent jobs.
+    pub fn job_requires_durable_activation(&self, job_key: Key) -> bool {
+        self.state.jobs.get(&job_key).is_some_and(|job| {
+            job.durable_activation
+                || job.lease_token.is_some()
+                || self.job_supports_agent_instance(job_key)
+        })
+    }
+
+    /// Side-effect-free activation planning in priority-descending, key-ascending
+    /// order. The host must serialize selection through replicated plan commit
+    /// against every local activation; followers must apply the planned keys,
+    /// never reselect from their potentially different soft-lock state.
+    pub fn select_activatable_job_keys(
+        &self,
+        job_type: &str,
+        max_jobs: usize,
+        now: u64,
+        with_lease: bool,
+    ) -> Vec<Key> {
+        self.state
+            .activatable_jobs
+            .get(job_type)
+            .into_iter()
+            .flat_map(|set| set.iter())
+            .map(|&(_, key)| key)
+            .filter(|key| {
+                self.state.jobs.get(key).is_some_and(|job| {
+                    super::job_activatable(job, now) && (with_lease || job.lease_token.is_none())
+                })
+            })
+            .take(max_jobs)
+            .collect()
     }
 
     /// Activates up to `max_jobs` activatable jobs of `job_type` for `worker`,
@@ -130,15 +184,33 @@ impl Engine {
         now: u64,
         fetch_variables: Vec<String>,
     ) -> Vec<ActivatedJob> {
+        self.activate_jobs_with_options(
+            job_type,
+            worker,
+            max_jobs,
+            timeout,
+            now,
+            crate::JobActivationOptions {
+                fetch_variables,
+                with_lease: false,
+            },
+        )
+    }
+
+    /// Activate any job kind with explicit worker leasing options.
+    pub fn activate_jobs_with_options(
+        &mut self,
+        job_type: impl Into<String>,
+        worker: impl Into<String>,
+        max_jobs: usize,
+        timeout: u64,
+        now: u64,
+        options: crate::JobActivationOptions,
+    ) -> Vec<ActivatedJob> {
         let events = self
             .apply_command_at(
-                Command::activate_jobs_with_fetch(
-                    job_type,
-                    worker,
-                    max_jobs,
-                    timeout,
-                    now,
-                    fetch_variables,
+                Command::activate_jobs_with_options(
+                    job_type, worker, max_jobs, timeout, now, options,
                 ),
                 now,
             )
@@ -243,7 +315,7 @@ impl Engine {
             process_definition_version,
             worker,
             deadline,
-            lease_token: job.lease_token,
+            lease_token: job.lease_token.clone(),
             retries: job.retries,
             priority: job.priority,
             custom_headers,
@@ -306,6 +378,44 @@ impl Engine {
     pub fn expire_jobs(&mut self, now: u64) -> Vec<Event> {
         self.apply_command_at(Command::ExpireJobs { now }, now)
             .expect("ExpireJobs never fails")
+    }
+
+    /// Expire only durable activations, or only leader-local soft locks.
+    pub fn expire_jobs_by_durability(&mut self, now: u64, durable: bool) -> Vec<Event> {
+        self.apply_command_at(Command::ExpireJobsByDurability { now, durable }, now)
+            .expect("ExpireJobsByDurability never fails")
+    }
+
+    pub(super) fn expire_job_locks(
+        &mut self,
+        log: &mut Vec<Event>,
+        now: u64,
+        durable: Option<bool>,
+    ) {
+        let mut expired: Vec<(Key, Key)> = self
+            .state
+            .activated_jobs
+            .iter()
+            .filter_map(|key| {
+                let job = self.state.jobs.get(key)?;
+                (job.state == state::JobState::Activated
+                    && job.deadline.is_some_and(|deadline| deadline <= now)
+                    && durable.is_none_or(|durable| {
+                        durable == self.job_requires_durable_activation(*key)
+                    }))
+                .then_some((job.key, job.instance_key))
+            })
+            .collect();
+        expired.sort_unstable();
+        for (job_key, instance_key) in expired {
+            self.emit(
+                log,
+                Event::JobLockExpired {
+                    job_key,
+                    instance_key,
+                },
+            );
+        }
     }
 
     /// Fires every armed timer whose due instant is at or before `now`, resuming

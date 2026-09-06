@@ -9,9 +9,10 @@ Date: 2026-07-30.
 > service-task markers use ordinary worker jobs, as do job-backed
 > `aiAgentSubProcess` containers. Workers explicitly CREATE/UPDATE AgentInstances;
 > activation never creates one automatically. The engine persists lifecycle and
-> history, while the worker runs the reasoning loop. History requires an
-> activated job and matching lease for every agent type; AgentInstance COMPLETE
-> remains separate from job completion. See the current
+> history, while the worker runs the reasoning loop. Leasing is explicitly
+> requested through `withLease`, independently of the marker. Agent requests use
+> job attribution, history is resolved with the job, and agent completion follows
+> process-instance cleanup. See the current
 > [compatibility guide](../camunda-compatibility.md#3-agentic--ai-agent-elements).
 
 Relates to:

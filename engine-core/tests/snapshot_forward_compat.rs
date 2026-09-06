@@ -161,7 +161,10 @@ fn historical_agent_deployment_frames_replay_through_the_canonical_job_model() {
                 .any(|e| matches!(e, Event::AgentInstanceCreated { .. })));
             let jobs = restored.activate_jobs(job_type.unwrap_or("agent"), "W", 1, 1_000, 0);
             assert_eq!(jobs.len(), 1);
-            assert!(jobs[0].lease_token.is_some());
+            assert!(
+                jobs[0].lease_token.is_none(),
+                "legacy markers do not implicitly request a lease"
+            );
         }
     }
 }
@@ -198,7 +201,7 @@ fn legacy_jobless_agent_snapshot_preserves_live_state_without_inventing_jobs() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             definition: AgentDefinition {
                 model: Some("legacy-model".into()),
                 ..Default::default()

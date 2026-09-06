@@ -3,9 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "End-to-end probe of AgentInstance/AgentHistory through @nanobpm/engine-wasm: activate an ordinary agent-marked job, explicitly CREATE an AgentInstance using its jobKey/jobLease, append and search committed history, and complete the agent independently of the job. Covers routing and prompt metadata for both WASM entrypoints.",
+  "description": "Real-WASM probes for canonical opt-in job leases, fenced mutations, replay, history-based agent requests, pending-history commitment, and routing metadata in both entrypoints.",
   "scripts": {
-    "test": "node verify.mjs && node external-routing.mjs"
+    "test": "node lease-fencing.mjs && node verify.mjs && node external-routing.mjs"
   },
   "dependencies": {
     "@nanobpm/engine-wasm": "file:../../pkg"

@@ -6355,9 +6355,14 @@ fn should_reject_a_lock_extension_once_the_lock_has_expired() {
         .apply_command_at(Command::update_job_timeout(job_key, 5_000), 1_600)
         .unwrap_err();
 
-    // then it is a wrong-state error, not a silent success — a job must be
-    // activated to have a lock to extend
-    assert_eq!(err, EngineError::JobNotActive { job_key });
+    // Camunda validates the requested property after its live-job gate.
+    assert_eq!(
+        err,
+        EngineError::JobUpdateInvalid {
+            job_key,
+            reason: "timeout requires an active job deadline".into(),
+        }
+    );
 }
 
 #[test]
@@ -6501,6 +6506,7 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
 
     // (b) The empty/absent form must not appear on the wire (byte-unchanged).
     let throw_empty = Command::ThrowJobError {
+        lease_token: None,
         job_key: 7,
         error_code: "E".into(),
         error_message: "m".into(),
@@ -18750,7 +18756,7 @@ fn agent_task_activation_creates_a_job_then_worker_registers_agent_instance() {
 
     let job = &engine.state.jobs[&agent_instance.job_key];
     assert_eq!(job.element_instance_key, agent_eik);
-    assert_eq!(job.lease_token, Some(agent_instance.job_lease));
+    assert_eq!(job.lease_token, Some(agent_instance.job_lease.clone()));
 
     let events = engine
         .apply_command(Command::CompleteAgentInstance {
@@ -18766,7 +18772,9 @@ fn agent_task_activation_creates_a_job_then_worker_registers_agent_instance() {
     assert!(engine.state.jobs.contains_key(&agent_instance.job_key));
 
     let events = engine
-        .apply_command(Command::complete_job(agent_instance.job_key))
+        .apply_command(
+            Command::complete_job(agent_instance.job_key).with_job_lease(agent_instance.job_lease),
+        )
         .unwrap();
     assert!(events
         .iter()
@@ -18883,7 +18891,7 @@ fn external_agent_lease_gated_create_mints_on_a_valid_job_lease() {
     // The worker activates the agent job (standard job loop) and learns its
     // lease deadline — the lease "token".
     let job = engine
-        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .activate_jobs_with_options("agent", "W", 1, 1_000, 100, lease_options())
         .pop()
         .expect("the external agent's job is activatable");
 
@@ -18893,7 +18901,10 @@ fn external_agent_lease_gated_create_mints_on_a_valid_job_lease() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job.key,
-            job_lease: job.lease_token.expect("external agent job carries a lease"),
+            job_lease: job
+                .lease_token
+                .clone()
+                .expect("external agent job carries a lease"),
             definition: AgentDefinition {
                 model: Some("gpt-4o".to_string()),
                 ..Default::default()
@@ -18916,7 +18927,9 @@ fn external_agent_lease_gated_create_mints_on_a_valid_job_lease() {
     assert_eq!(created.job_key, job.key);
     assert_eq!(
         created.job_lease,
-        job.lease_token.expect("external agent job carries a lease")
+        job.lease_token
+            .clone()
+            .expect("external agent job carries a lease")
     );
     assert_eq!(
         stored_agent_instance(&engine, pi, created.agent_instance_key).status,
@@ -18941,7 +18954,7 @@ fn external_agent_create_without_an_activated_job_is_rejected() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key,
-            job_lease: 12_345,
+            job_lease: "not-activated".to_string(),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -18967,7 +18980,7 @@ fn external_agent_create_with_a_stale_lease_token_is_rejected() {
     use crate::agent::AgentDefinition;
     let (mut engine, _pi, eik) = external_agent_instance();
     let job = engine
-        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .activate_jobs_with_options("agent", "W", 1, 1_000, 100, lease_options())
         .pop()
         .expect("activatable");
 
@@ -18976,7 +18989,7 @@ fn external_agent_create_with_a_stale_lease_token_is_rejected() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job.key,
-            job_lease: job.lease_token.expect("external agent job carries a lease") + 1,
+            job_lease: "stale-lease".to_string(),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -18993,7 +19006,7 @@ fn external_agent_create_with_a_foreign_element_instance_is_rejected() {
     use crate::agent::AgentDefinition;
     let (mut engine, _pi, eik) = external_agent_instance();
     let job = engine
-        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .activate_jobs_with_options("agent", "W", 1, 1_000, 100, lease_options())
         .pop()
         .expect("activatable");
 
@@ -19004,7 +19017,10 @@ fn external_agent_create_with_a_foreign_element_instance_is_rejected() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik + 777,
             job_key: job.key,
-            job_lease: job.lease_token.expect("external agent job carries a lease"),
+            job_lease: job
+                .lease_token
+                .clone()
+                .expect("external agent job carries a lease"),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19022,11 +19038,11 @@ fn external_agent_create_with_a_foreign_element_instance_is_rejected() {
 }
 
 #[test]
-fn external_agent_reactivation_reconciles_into_one_agent_instance() {
+fn external_agent_repeat_create_preserves_the_existing_agent_instance() {
     use crate::agent::AgentDefinition;
     let (mut engine, pi, eik) = external_agent_instance();
     let job = engine
-        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .activate_jobs_with_options("agent", "W", 1, 1_000, 100, lease_options())
         .pop()
         .expect("activatable");
 
@@ -19035,7 +19051,10 @@ fn external_agent_reactivation_reconciles_into_one_agent_instance() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job.key,
-            job_lease: job.lease_token.expect("external agent job carries a lease"),
+            job_lease: job
+                .lease_token
+                .clone()
+                .expect("external agent job carries a lease"),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19051,13 +19070,15 @@ fn external_agent_reactivation_reconciles_into_one_agent_instance() {
         })
         .expect("first CREATE mints");
 
-    // A second CREATE for the same element instance reconciles (idempotent
-    // upsert on element_instance_key) rather than minting a duplicate.
+    // A second CREATE conflicts without changing the existing registration.
     let second = engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job.key,
-            job_lease: job.lease_token.expect("external agent job carries a lease"),
+            job_lease: job
+                .lease_token
+                .clone()
+                .expect("external agent job carries a lease"),
             definition: AgentDefinition {
                 model: Some("gpt-4o".to_string()),
                 ..Default::default()
@@ -19065,17 +19086,14 @@ fn external_agent_reactivation_reconciles_into_one_agent_instance() {
             limits: None,
             history: vec![],
         })
-        .unwrap();
-    let aik2 = second
-        .iter()
-        .find_map(|e| match e {
-            Event::AgentInstanceCreated { agent_instance, .. } => {
-                Some(agent_instance.agent_instance_key)
-            }
-            _ => None,
-        })
-        .expect("second CREATE re-emits");
-    assert_eq!(aik, aik2, "reconciles into one AgentInstance, no duplicate");
+        .unwrap_err();
+    assert!(
+        matches!(second, EngineError::AgentInstanceAlreadyExists { agent_instance_key, .. } if agent_instance_key == aik)
+    );
+    assert_eq!(
+        stored_agent_instance(&engine, pi, aik).definition.model,
+        None
+    );
     assert_eq!(
         engine
             .state
@@ -19093,14 +19111,17 @@ fn external_agent_job_completion_advances_the_token() {
     use crate::agent::AgentDefinition;
     let (mut engine, _pi, eik) = external_agent_instance();
     let job = engine
-        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .activate_jobs_with_options("agent", "W", 1, 1_000, 100, lease_options())
         .pop()
         .expect("activatable");
     engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job.key,
-            job_lease: job.lease_token.expect("external agent job carries a lease"),
+            job_lease: job
+                .lease_token
+                .clone()
+                .expect("external agent job carries a lease"),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19110,7 +19131,7 @@ fn external_agent_job_completion_advances_the_token() {
     // Completing the agent job resumes the parked token and routes the outgoing
     // flow, exactly like a service task — the harness drives the standard loop.
     let events = engine
-        .apply_command(Command::complete_job(job.key))
+        .apply_command(Command::complete_job(job.key).with_job_lease(job.lease_token.unwrap()))
         .unwrap();
     assert!(
         events.iter().any(
@@ -19131,14 +19152,17 @@ fn external_agent_history_bearing_update_is_lease_gated() {
     use crate::agent::{AgentDefinition, AgentHistoryRole};
     let (mut engine, pi, eik) = external_agent_instance();
     let job = engine
-        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .activate_jobs_with_options("agent", "W", 1, 1_000, 100, lease_options())
         .pop()
         .expect("activatable");
     let created = engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job.key,
-            job_lease: job.lease_token.expect("external agent job carries a lease"),
+            job_lease: job
+                .lease_token
+                .clone()
+                .expect("external agent job carries a lease"),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19162,7 +19186,7 @@ fn external_agent_history_bearing_update_is_lease_gated() {
             element_id: "agent".to_string(),
             process_instance_key: pi,
             job_key: job.key,
-            job_lease: job.lease_token.expect("external agent job carries a lease") + 1,
+            job_lease: "stale-lease".to_string(),
             status: None,
             metrics: Default::default(),
             tools: None,
@@ -19182,7 +19206,7 @@ fn external_agent_history_bearing_update_is_lease_gated() {
             element_id: "agent".to_string(),
             process_instance_key: pi,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             status: Some(crate::agent::AgentInstanceStatus::Thinking),
             metrics: Default::default(),
             tools: None,
@@ -19198,11 +19222,14 @@ fn external_agent_history_bearing_update_is_lease_gated() {
             element_id: "agent".to_string(),
             process_instance_key: pi,
             job_key: job.key,
-            job_lease: job.lease_token.expect("external agent job carries a lease"),
+            job_lease: job
+                .lease_token
+                .clone()
+                .expect("external agent job carries a lease"),
             status: None,
             metrics: Default::default(),
             tools: None,
-            history: vec![history_turn(1, 300, AgentHistoryRole::Assistant)],
+            history: vec![worker_history_turn(1, 300, AgentHistoryRole::Assistant)],
         })
         .expect("a history-bearing UPDATE with a valid lease is accepted");
     assert!(
@@ -19219,14 +19246,17 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
 
     // First activation → lease token L1; a lease-gated CREATE records it.
     let job1 = engine
-        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .activate_jobs_with_options("agent", "W", 1, 1_000, 100, lease_options())
         .pop()
         .expect("activatable");
     let created = engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job1.key,
-            job_lease: job1.lease_token.expect("first activation carries a lease"),
+            job_lease: job1
+                .lease_token
+                .clone()
+                .expect("first activation carries a lease"),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19243,7 +19273,9 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
         .expect("CREATE mints");
     assert_eq!(
         stored_agent_instance(&engine, pi, aik).job_lease,
-        job1.lease_token.expect("first activation carries a lease")
+        job1.lease_token
+            .clone()
+            .expect("first activation carries a lease")
     );
 
     // The lease expires and the worker re-activates the SAME job, learning a
@@ -19253,7 +19285,7 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
         .apply_command(Command::ExpireJobs { now: job1.deadline })
         .unwrap();
     let job2 = engine
-        .activate_jobs("agent", "W", 1, 1_000, 5_000)
+        .activate_jobs_with_options("agent", "W", 1, 1_000, 5_000, lease_options())
         .pop()
         .expect("re-activatable after lease expiry");
     assert_eq!(job2.key, job1.key, "same job, fresh lease");
@@ -19262,23 +19294,30 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
         "re-activation mints a fresh lease token"
     );
 
-    // A repeat CREATE under L2 must REFRESH the recorded lease, not preserve the
-    // stale L1 (else a later lease check keyed off the snapshot's token wrongly
-    // rejects a valid update).
-    engine
+    // CREATE still conflicts after reactivation; UPDATE owns reassociation.
+    let err = engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: job2.key,
-            job_lease: job2.lease_token.expect("second activation carries a lease"),
+            job_lease: job2
+                .lease_token
+                .clone()
+                .expect("second activation carries a lease"),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
         })
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::AgentInstanceAlreadyExists { .. }
+    ));
     assert_eq!(
         stored_agent_instance(&engine, pi, aik).job_lease,
-        job2.lease_token.expect("second activation carries a lease"),
-        "a repeat CREATE refreshes the snapshot's stale lease token"
+        job1.lease_token
+            .clone()
+            .expect("first activation carries a lease"),
+        "a rejected CREATE must not change the registration"
     );
 
     // A history-bearing UPDATE under L2 is accepted AND likewise records the
@@ -19290,16 +19329,21 @@ fn external_agent_refreshes_job_lease_across_reactivation() {
             element_id: "agent".to_string(),
             process_instance_key: pi,
             job_key: job2.key,
-            job_lease: job2.lease_token.expect("second activation carries a lease"),
+            job_lease: job2
+                .lease_token
+                .clone()
+                .expect("second activation carries a lease"),
             status: None,
             metrics: Default::default(),
             tools: None,
-            history: vec![history_turn(0, 200, AgentHistoryRole::Assistant)],
+            history: vec![worker_history_turn(1, 200, AgentHistoryRole::Assistant)],
         })
         .expect("a history-bearing UPDATE under the fresh lease is accepted");
     assert_eq!(
         stored_agent_instance(&engine, pi, aik).job_lease,
-        job2.lease_token.expect("second activation carries a lease"),
+        job2.lease_token
+            .clone()
+            .expect("second activation carries a lease"),
         "a history-bearing UPDATE records the validated lease token"
     );
 }
@@ -19316,14 +19360,15 @@ fn external_agent_lease_token_is_distinct_from_the_deadline() {
     // equal it — the assertion below checks semantic distinctness, not a value
     // collision.
     let job = engine
-        .activate_jobs("agent", "W", 1, 1_000_000_000, 100)
+        .activate_jobs_with_options("agent", "W", 1, 1_000_000_000, 100, lease_options())
         .pop()
         .expect("activatable");
     let token = job
         .lease_token
         .expect("an external agent job activates with a lease token");
     assert_ne!(
-        token, job.deadline,
+        token,
+        job.deadline.to_string(),
         "the opaque lease token must not be the activation deadline"
     );
 }
@@ -19338,7 +19383,7 @@ fn external_agent_lease_survives_a_job_timeout_extension() {
     use crate::agent::AgentDefinition;
     let (mut engine, _pi, eik) = external_agent_instance();
     let job = engine
-        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .activate_jobs_with_options("agent", "W", 1, 1_000, 100, lease_options())
         .pop()
         .expect("activatable");
     let lease = job.lease_token.expect("lease token");
@@ -19380,7 +19425,7 @@ fn external_agent_create_is_jobless_only_without_history() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -19394,11 +19439,12 @@ fn external_agent_create_is_jobless_only_without_history() {
 
     // Jobless CREATE + a history batch → rejected: a batch must be attributed to
     // the active job that produced it.
+    let (mut engine, _pi, eik) = external_agent_instance();
     let err = engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![history_turn(0, 200, AgentHistoryRole::Assistant)],
@@ -19420,7 +19466,7 @@ fn external_agent_history_free_update_validates_a_supplied_job() {
     use crate::agent::AgentDefinition;
     let (mut engine, pi, eik) = external_agent_instance();
     let job = engine
-        .activate_jobs("agent", "W", 1, 1_000, 100)
+        .activate_jobs_with_options("agent", "W", 1, 1_000, 100, lease_options())
         .pop()
         .expect("activatable");
     let lease = job.lease_token.expect("lease token");
@@ -19452,7 +19498,7 @@ fn external_agent_history_free_update_validates_a_supplied_job() {
             element_id: "agent".to_string(),
             process_instance_key: pi,
             job_key: job.key,
-            job_lease: lease + 1,
+            job_lease: "stale-lease".to_string(),
             status: Some(crate::agent::AgentInstanceStatus::Thinking),
             metrics: Default::default(),
             tools: None,
@@ -19472,7 +19518,7 @@ fn external_agent_history_free_update_validates_a_supplied_job() {
             element_id: "agent".to_string(),
             process_instance_key: pi,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             status: Some(crate::agent::AgentInstanceStatus::Thinking),
             metrics: Default::default(),
             tools: None,
@@ -19548,10 +19594,25 @@ fn agent_instance_for_history() -> (Engine, Key, Key) {
     (engine, instance_key, agent_instance_key)
 }
 
+fn lease_options() -> crate::JobActivationOptions {
+    crate::JobActivationOptions {
+        with_lease: true,
+        ..Default::default()
+    }
+}
+
 /// Activate the fixture's job and explicitly register its agent using that lease.
 fn register_job_backed_agent(engine: &mut Engine, job_type: &str) -> crate::agent::AgentInstance {
+    register_job_backed_agent_with_history(engine, job_type, Vec::new())
+}
+
+fn register_job_backed_agent_with_history(
+    engine: &mut Engine,
+    job_type: &str,
+    history: Vec<crate::agent::AgentHistoryTurn>,
+) -> crate::agent::AgentInstance {
     let job = engine
-        .activate_jobs(job_type, "W", 1, 60_000, 0)
+        .activate_jobs_with_options(job_type, "W", 1, 60_000, 0, lease_options())
         .pop()
         .expect("the agent job should be available for activation");
     engine
@@ -19561,7 +19622,7 @@ fn register_job_backed_agent(engine: &mut Engine, job_type: &str) -> crate::agen
             job_lease: job.lease_token.expect("an activated job has a lease"),
             definition: crate::agent::AgentDefinition::default(),
             limits: None,
-            history: vec![],
+            history,
         })
         .unwrap()
         .into_iter()
@@ -19570,6 +19631,33 @@ fn register_job_backed_agent(engine: &mut Engine, job_type: &str) -> crate::agen
             _ => None,
         })
         .expect("worker registration should mint an AgentInstance")
+}
+
+fn worker_history_turn(
+    iteration: i32,
+    produced_at: u64,
+    role: crate::agent::AgentHistoryRole,
+) -> crate::agent::AgentHistoryTurn {
+    let mut turn = history_turn(iteration, produced_at, role);
+    turn.history_item_id = Some(format!("{iteration}-{produced_at}"));
+    if role == crate::agent::AgentHistoryRole::Configuration {
+        turn.model = Some("gpt-4o".into());
+        turn.provider = Some("test-provider".into());
+        turn.system_prompt = Some(vec![crate::agent::AgentHistoryContent {
+            content_type: crate::agent::AgentHistoryContentType::Text,
+            text: Some("test-prompt".into()),
+            document_reference: None,
+            object: None,
+        }]);
+    }
+    turn
+}
+
+fn agent_with_initial_history(history: Vec<crate::agent::AgentHistoryTurn>) -> (Engine, Key, Key) {
+    let (mut engine, pi, _) = external_agent_instance();
+    let aik =
+        register_job_backed_agent_with_history(&mut engine, "agent", history).agent_instance_key;
+    (engine, pi, aik)
 }
 
 /// A minimal AgentHistory turn carrying only the ordering-relevant fields.
@@ -19995,7 +20083,7 @@ fn stored_agent_instance(
 }
 
 #[test]
-fn agent_instance_create_from_active_agent_element_reconciles_to_initializing() {
+fn agent_instance_create_from_active_agent_element_rejects_re_registration() {
     use crate::agent::{
         AgentDefinition, AgentHistoryRole, AgentInstanceLimits, AgentInstanceStatus,
     };
@@ -20008,7 +20096,8 @@ fn agent_instance_create_from_active_agent_element_reconciles_to_initializing() 
         max_model_calls: 10,
         max_tool_calls: 5,
     };
-    let events = engine
+    let before = stored_agent_instance(&engine, pi, aik);
+    let err = engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: registered.job_key,
@@ -20020,75 +20109,42 @@ fn agent_instance_create_from_active_agent_element_reconciles_to_initializing() 
             limits: Some(limits),
             history: vec![history_turn(0, 10, AgentHistoryRole::Configuration)],
         })
-        .unwrap();
-
-    // Reconciles with the worker-registered record (same key), status INITIALIZING,
-    // carrying the CREATE-time configuration.
-    let created = events
-        .iter()
-        .find_map(|e| match e {
-            Event::AgentInstanceCreated { agent_instance, .. } => Some(agent_instance.clone()),
-            _ => None,
-        })
-        .expect("CREATE emits AgentInstanceCreated");
-    assert_eq!(
-        created.agent_instance_key, aik,
-        "reconciles, no duplicate key"
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::AgentInstanceAlreadyExists { agent_instance_key, .. } if agent_instance_key == aik)
     );
-    assert_eq!(created.status, AgentInstanceStatus::Initializing);
-    assert_eq!(created.limits, limits);
-    assert_eq!(created.definition.model.as_deref(), Some("gpt-4o"));
-
-    // The initial history batch became one committed AGENT_HISTORY record.
-    let hist = stored_history(&engine, pi, aik);
-    assert_eq!(hist.len(), 1, "one record per initial-batch turn");
-    assert_eq!(
-        hist[0].commit_status,
-        crate::agent::AgentHistoryCommitStatus::Committed
-    );
-    assert_eq!(stored_agent_instance(&engine, pi, aik).limits, limits);
+    assert_eq!(stored_agent_instance(&engine, pi, aik), before);
+    assert_eq!(before.status, AgentInstanceStatus::Initializing);
+    assert!(stored_history(&engine, pi, aik).is_empty());
 }
 
 #[test]
 fn agent_instance_create_rejects_invalid_caller_supplied_job_attribution() {
     use crate::agent::{AgentDefinition, AgentHistoryRole, AgentInstanceLimits};
-    let (mut engine, pi, aik) = agent_instance_for_history();
-    let eik = agent_element_instance_key(&engine, pi, aik);
-
-    let before = stored_agent_instance(&engine, pi, aik);
+    let (mut engine, pi, eik) = external_agent_instance();
     let err = engine
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: 999_999,
-            job_lease: 888_888,
+            job_lease: "invalid-lease".to_string(),
             definition: AgentDefinition::default(),
             limits: Some(AgentInstanceLimits::default()),
             history: vec![history_turn(0, 10, AgentHistoryRole::Configuration)],
         })
         .unwrap_err();
     assert!(matches!(err, EngineError::AgentInstanceJobNotActive { .. }));
-    let stored = stored_agent_instance(&engine, pi, aik);
-    assert_eq!(stored.job_key, before.job_key);
-    assert_eq!(stored.job_lease, before.job_lease);
-    assert!(stored_history(&engine, pi, aik).is_empty());
+    assert!(engine.state.instances[&pi].agent_instances.is_empty());
+    assert!(engine.state.instances[&pi].agent_history.is_empty());
 }
 
 #[test]
 fn agent_instance_create_without_explicit_limits_defaults_to_unlimited() {
-    use crate::agent::{AgentDefinition, AgentInstanceLimits};
-    let (mut engine, pi, aik) = agent_instance_for_history();
-    let eik = agent_element_instance_key(&engine, pi, aik);
-
-    engine
-        .apply_command(Command::CreateAgentInstance {
-            element_instance_key: eik,
-            job_key: 0,
-            job_lease: 0,
-            definition: AgentDefinition::default(),
-            limits: None,
-            history: vec![],
-        })
-        .unwrap();
+    use crate::agent::{AgentHistoryRole, AgentInstanceLimits};
+    let (engine, pi, aik) = agent_with_initial_history(vec![worker_history_turn(
+        1,
+        1,
+        AgentHistoryRole::Configuration,
+    )]);
     assert_eq!(
         stored_agent_instance(&engine, pi, aik).limits,
         AgentInstanceLimits::default(),
@@ -20098,28 +20154,16 @@ fn agent_instance_create_without_explicit_limits_defaults_to_unlimited() {
 
 #[test]
 fn agent_instance_create_takes_limits_from_configuration_history_item() {
-    use crate::agent::{AgentDefinition, AgentHistoryRole, AgentInstanceLimits};
-    let (mut engine, pi, aik) = agent_instance_for_history();
-    let eik = agent_element_instance_key(&engine, pi, aik);
-    let registered = stored_agent_instance(&engine, pi, aik);
+    use crate::agent::{AgentHistoryRole, AgentInstanceLimits};
 
     let cfg_limits = AgentInstanceLimits {
         max_tokens: 42,
         max_model_calls: -1,
         max_tool_calls: 7,
     };
-    let mut cfg_turn = history_turn(0, 5, AgentHistoryRole::Configuration);
+    let mut cfg_turn = worker_history_turn(1, 5, AgentHistoryRole::Configuration);
     cfg_turn.limits = Some(cfg_limits);
-    engine
-        .apply_command(Command::CreateAgentInstance {
-            element_instance_key: eik,
-            job_key: registered.job_key,
-            job_lease: registered.job_lease,
-            definition: AgentDefinition::default(),
-            limits: None,
-            history: vec![cfg_turn],
-        })
-        .unwrap();
+    let (engine, pi, aik) = agent_with_initial_history(vec![cfg_turn]);
     assert_eq!(
         stored_agent_instance(&engine, pi, aik).limits,
         cfg_limits,
@@ -20129,30 +20173,21 @@ fn agent_instance_create_takes_limits_from_configuration_history_item() {
 
 #[test]
 fn agent_instance_create_ignores_limits_from_non_configuration_history_item() {
-    use crate::agent::{AgentDefinition, AgentHistoryRole, AgentInstanceLimits};
-    let (mut engine, pi, aik) = agent_instance_for_history();
-    let eik = agent_element_instance_key(&engine, pi, aik);
-    let registered = stored_agent_instance(&engine, pi, aik);
+    use crate::agent::{AgentHistoryRole, AgentInstanceLimits};
 
     // An ASSISTANT turn carrying `limits` must NOT seed the record's limits:
     // only a CONFIGURATION turn may. With no CONFIGURATION turn and no explicit
     // limits, the record must fall back to the unlimited default.
-    let mut assistant_turn = history_turn(0, 5, AgentHistoryRole::Assistant);
+    let mut assistant_turn = worker_history_turn(2, 5, AgentHistoryRole::Assistant);
     assistant_turn.limits = Some(AgentInstanceLimits {
         max_tokens: 42,
         max_model_calls: 3,
         max_tool_calls: 7,
     });
-    engine
-        .apply_command(Command::CreateAgentInstance {
-            element_instance_key: eik,
-            job_key: registered.job_key,
-            job_lease: registered.job_lease,
-            definition: AgentDefinition::default(),
-            limits: None,
-            history: vec![assistant_turn],
-        })
-        .unwrap();
+    let (engine, pi, aik) = agent_with_initial_history(vec![
+        worker_history_turn(1, 1, AgentHistoryRole::Configuration),
+        assistant_turn,
+    ]);
     assert_eq!(
         stored_agent_instance(&engine, pi, aik).limits,
         AgentInstanceLimits::default(),
@@ -20162,10 +20197,7 @@ fn agent_instance_create_ignores_limits_from_non_configuration_history_item() {
 
 #[test]
 fn agent_instance_create_takes_limits_from_last_configuration_not_later_turn() {
-    use crate::agent::{AgentDefinition, AgentHistoryRole, AgentInstanceLimits};
-    let (mut engine, pi, aik) = agent_instance_for_history();
-    let eik = agent_element_instance_key(&engine, pi, aik);
-    let registered = stored_agent_instance(&engine, pi, aik);
+    use crate::agent::{AgentHistoryRole, AgentInstanceLimits};
 
     // CONFIGURATION seeds limits; a LATER ASSISTANT turn carrying different
     // limits must not override the CONFIGURATION-supplied value.
@@ -20174,24 +20206,15 @@ fn agent_instance_create_takes_limits_from_last_configuration_not_later_turn() {
         max_model_calls: 5,
         max_tool_calls: 9,
     };
-    let mut cfg_turn = history_turn(0, 5, AgentHistoryRole::Configuration);
+    let mut cfg_turn = worker_history_turn(1, 5, AgentHistoryRole::Configuration);
     cfg_turn.limits = Some(cfg_limits);
-    let mut later_assistant = history_turn(1, 10, AgentHistoryRole::Assistant);
+    let mut later_assistant = worker_history_turn(2, 10, AgentHistoryRole::Assistant);
     later_assistant.limits = Some(AgentInstanceLimits {
         max_tokens: 1,
         max_model_calls: 1,
         max_tool_calls: 1,
     });
-    engine
-        .apply_command(Command::CreateAgentInstance {
-            element_instance_key: eik,
-            job_key: registered.job_key,
-            job_lease: registered.job_lease,
-            definition: AgentDefinition::default(),
-            limits: None,
-            history: vec![cfg_turn, later_assistant],
-        })
-        .unwrap();
+    let (engine, pi, aik) = agent_with_initial_history(vec![cfg_turn, later_assistant]);
     assert_eq!(
         stored_agent_instance(&engine, pi, aik).limits,
         cfg_limits,
@@ -20207,7 +20230,7 @@ fn agent_instance_create_on_inactive_element_instance_is_rejected() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: 999_999_999,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -20261,7 +20284,7 @@ fn agent_instance_create_on_plain_service_task_missing_agent_definition_is_rejec
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -20314,7 +20337,7 @@ fn agent_instance_create_on_non_eligible_element_is_rejected() {
         .apply_command(Command::CreateAgentInstance {
             element_instance_key: eik,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             definition: AgentDefinition::default(),
             limits: None,
             history: vec![],
@@ -20338,7 +20361,7 @@ fn update_agent(
     history: Vec<crate::agent::AgentHistoryTurn>,
 ) -> Command {
     let (job_key, job_lease) = if history.is_empty() {
-        (0, 0)
+        (0, String::new())
     } else {
         let job = engine
             .state
@@ -20348,7 +20371,9 @@ fn update_agent(
             .expect("history-bearing UPDATE requires the agent's job");
         (
             job.key,
-            job.lease_token.expect("the agent job must be activated"),
+            job.lease_token
+                .clone()
+                .expect("the agent job must be activated"),
         )
     };
     Command::UpdateAgentInstance {
@@ -20371,13 +20396,6 @@ fn agent_instance_update_advances_status_appends_history_and_accumulates_metrics
     let (mut engine, pi, aik) = agent_instance_for_history();
     let eik = agent_element_instance_key(&engine, pi, aik);
 
-    let delta = AgentInstanceMetricsDelta {
-        input_tokens: 100,
-        output_tokens: 20,
-        model_calls: 1,
-        tool_calls: 1,
-        ..Default::default()
-    };
     // Advance through each active state, appending one turn per update.
     let steps = [
         AgentInstanceStatus::ToolDiscovery,
@@ -20386,6 +20404,19 @@ fn agent_instance_update_advances_status_appends_history_and_accumulates_metrics
         AgentInstanceStatus::Idle,
     ];
     for (i, status) in steps.iter().enumerate() {
+        let mut turn =
+            worker_history_turn(i as i32 + 1, (i as u64) * 10, AgentHistoryRole::Assistant);
+        turn.metrics = Some(crate::agent::AgentHistoryMetrics {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            ..Default::default()
+        });
+        turn.tool_calls.push(crate::agent::AgentHistoryToolCall {
+            tool_call_id: format!("call-{i}"),
+            tool_name: "tool".into(),
+            element_id: None,
+            arguments: None,
+        });
         let events = engine
             .apply_command(update_agent(
                 &engine,
@@ -20393,12 +20424,8 @@ fn agent_instance_update_advances_status_appends_history_and_accumulates_metrics
                 eik,
                 pi,
                 *status,
-                delta,
-                vec![history_turn(
-                    i as i32,
-                    (i as u64) * 10,
-                    AgentHistoryRole::Assistant,
-                )],
+                AgentInstanceMetricsDelta::default(),
+                vec![turn],
             ))
             .unwrap();
         assert!(
@@ -20410,7 +20437,7 @@ fn agent_instance_update_advances_status_appends_history_and_accumulates_metrics
         assert_eq!(stored_agent_instance(&engine, pi, aik).status, *status);
     }
 
-    // Metrics accumulated across the four updates; four committed history turns.
+    // Metrics accumulate immediately; history remains pending until job completion.
     let stored = stored_agent_instance(&engine, pi, aik);
     assert_eq!(stored.metrics.input_tokens, 400);
     assert_eq!(stored.metrics.output_tokens, 80);
@@ -20419,6 +20446,12 @@ fn agent_instance_update_advances_status_appends_history_and_accumulates_metrics
     let hist = stored_history(&engine, pi, aik);
     assert_eq!(hist.len(), 4);
     assert!(hist
+        .iter()
+        .all(|r| r.commit_status == crate::agent::AgentHistoryCommitStatus::Pending));
+    engine
+        .apply_command(Command::complete_job(stored.job_key).with_job_lease(stored.job_lease))
+        .unwrap();
+    assert!(stored_history(&engine, pi, aik)
         .iter()
         .all(|r| r.commit_status == crate::agent::AgentHistoryCommitStatus::Committed));
 }
@@ -20441,7 +20474,7 @@ fn agent_instance_update_replaces_tools() {
             element_id: "agent".to_string(),
             process_instance_key: pi,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             status: Some(AgentInstanceStatus::ToolDiscovery),
             metrics: AgentInstanceMetricsDelta::default(),
             tools: Some(vec![tool.clone()]),
@@ -20486,7 +20519,7 @@ fn agent_instance_update_with_wrong_element_id_or_process_instance_is_rejected()
             element_id: "not-agent".to_string(),
             process_instance_key: pi,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             status: Some(AgentInstanceStatus::Thinking),
             metrics: AgentInstanceMetricsDelta::default(),
             tools: None,
@@ -20505,7 +20538,7 @@ fn agent_instance_update_with_wrong_element_id_or_process_instance_is_rejected()
             element_id: "agent".to_string(),
             process_instance_key: 424_242,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             status: Some(AgentInstanceStatus::Thinking),
             metrics: AgentInstanceMetricsDelta::default(),
             tools: None,
@@ -20542,12 +20575,18 @@ fn agent_instance_update_on_inactive_element_instance_is_rejected() {
 #[test]
 fn agent_instance_update_with_conflicting_instance_is_rejected() {
     use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus};
-    // Two process instances of the same agent process: each owns an AgentInstance
-    // on element "agent". Updating instance A while referencing instance B's
-    // element instance (owned by B) is a conflict.
+    // Two activations of the same element in one process each own an agent.
+    // Referencing the second activation from the first agent conflicts.
     let (mut engine, pi_a, aik_a) = agent_instance_for_history();
     let events_b = engine
-        .apply_command(Command::create_instance("agent-proc"))
+        .apply_command(Command::ModifyInstance {
+            instance_key: pi_a,
+            activate_instructions: vec![crate::command::ActivateElementInstruction {
+                element_id: "agent".into(),
+                variables: HashMap::new(),
+            }],
+            terminate_instructions: vec![],
+        })
         .unwrap();
     let pi_b = events_b.iter().find_map(|e| e.instance_key()).unwrap();
     let aik_b = register_job_backed_agent(&mut engine, "agent").agent_instance_key;
@@ -20560,7 +20599,7 @@ fn agent_instance_update_with_conflicting_instance_is_rejected() {
             element_id: "agent".to_string(),
             process_instance_key: pi_a,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             status: Some(AgentInstanceStatus::Thinking),
             metrics: AgentInstanceMetricsDelta::default(),
             tools: None,
@@ -20621,7 +20660,7 @@ fn agent_instance_update_with_foreign_process_element_instance_is_rejected() {
             element_id: "agent".to_string(),
             process_instance_key: pi,
             job_key: 0,
-            job_lease: 0,
+            job_lease: String::new(),
             status: Some(AgentInstanceStatus::Thinking),
             metrics: AgentInstanceMetricsDelta::default(),
             tools: None,
@@ -20635,7 +20674,7 @@ fn agent_instance_update_with_foreign_process_element_instance_is_rejected() {
 }
 
 #[test]
-fn agent_instance_update_clamps_negative_metric_deltas() {
+fn agent_instance_update_rejects_negative_metric_deltas() {
     use crate::agent::{AgentInstanceMetricsDelta, AgentInstanceStatus};
     // First accumulate some real usage.
     let (mut engine, pi, aik) = agent_instance_for_history();
@@ -20658,10 +20697,8 @@ fn agent_instance_update_clamps_negative_metric_deltas() {
         ))
         .unwrap();
 
-    // A negative delta must NOT decrease the (monotonic) counters: each field is
-    // clamped to >= 0, so the totals are unchanged. This keeps limit enforcement
-    // impossible to bypass by "refunding" prior usage.
-    engine
+    // Invalid negative deltas reject atomically rather than refund prior usage.
+    let err = engine
         .apply_command(update_agent(
             &engine,
             aik,
@@ -20677,7 +20714,8 @@ fn agent_instance_update_clamps_negative_metric_deltas() {
             },
             vec![],
         ))
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(err, EngineError::AgentHistoryInvalid { .. }));
     let stored = stored_agent_instance(&engine, pi, aik);
     assert_eq!(stored.metrics.input_tokens, 100);
     assert_eq!(stored.metrics.output_tokens, 40);
@@ -20705,9 +20743,9 @@ fn agent_instance_update_on_unknown_instance_is_rejected() {
 }
 
 #[test]
-fn agent_instance_update_over_budget_batch_is_rejected_but_unlimited_passes() {
+fn agent_instance_update_records_usage_even_when_it_exceeds_configured_limits() {
     use crate::agent::{
-        AgentDefinition, AgentInstanceLimits, AgentInstanceMetricsDelta, AgentInstanceStatus,
+        AgentHistoryRole, AgentInstanceLimits, AgentInstanceMetricsDelta, AgentInstanceStatus,
     };
     // Unlimited (-1) instance: a large batch is accepted.
     let (mut engine, pi, aik) = agent_instance_for_history();
@@ -20733,54 +20771,36 @@ fn agent_instance_update_over_budget_batch_is_rejected_but_unlimited_passes() {
         10_000
     );
 
-    // Tighten the token limit via CREATE, then an over-budget batch is rejected
-    // and nothing is applied.
-    let (mut engine, pi, aik) = agent_instance_for_history();
+    // The worker enforces execution limits; recording observed usage must remain possible.
+    let mut configuration = worker_history_turn(1, 1, AgentHistoryRole::Configuration);
+    configuration.limits = Some(AgentInstanceLimits {
+        max_tokens: 50,
+        max_model_calls: -1,
+        max_tool_calls: -1,
+    });
+    let (mut engine, pi, aik) = agent_with_initial_history(vec![configuration]);
     let eik = agent_element_instance_key(&engine, pi, aik);
+    let mut turn = worker_history_turn(2, 2, AgentHistoryRole::Assistant);
+    turn.metrics = Some(crate::agent::AgentHistoryMetrics {
+        input_tokens: Some(100),
+        ..Default::default()
+    });
     engine
-        .apply_command(Command::CreateAgentInstance {
-            element_instance_key: eik,
-            job_key: 0,
-            job_lease: 0,
-            definition: AgentDefinition::default(),
-            limits: Some(AgentInstanceLimits {
-                max_tokens: 50,
-                max_model_calls: -1,
-                max_tool_calls: -1,
-            }),
-            history: vec![],
-        })
-        .unwrap();
-    let before = stored_agent_instance(&engine, pi, aik);
-    let err = engine
         .apply_command(update_agent(
             &engine,
             aik,
             eik,
             pi,
             AgentInstanceStatus::Thinking,
-            AgentInstanceMetricsDelta {
-                input_tokens: 100,
-                ..Default::default()
-            },
-            vec![history_turn(
-                0,
-                1,
-                crate::agent::AgentHistoryRole::Assistant,
-            )],
+            AgentInstanceMetricsDelta::default(),
+            vec![turn],
         ))
-        .unwrap_err();
-    match err {
-        EngineError::AgentInstanceLimitExceeded { limit, .. } => {
-            assert_eq!(limit, crate::agent::AgentLimitKind::Tokens)
-        }
-        other => panic!("expected AgentInstanceLimitExceeded, got {other:?}"),
-    }
-    // Rejected atomically: neither metrics nor history changed.
+        .unwrap();
     let after = stored_agent_instance(&engine, pi, aik);
-    assert_eq!(after.metrics, before.metrics);
-    assert_eq!(after.status, before.status);
-    assert!(stored_history(&engine, pi, aik).is_empty());
+    assert_eq!(after.metrics.input_tokens, 100);
+    assert_eq!(after.limits.max_tokens, 50);
+    assert_eq!(after.status, AgentInstanceStatus::Thinking);
+    assert_eq!(stored_history(&engine, pi, aik).len(), 2);
 }
 
 /// Deploy a fork/join process with two parallel agent tasks and start it,
@@ -20977,6 +20997,7 @@ fn declaration_free_job_activated_is_byte_identical() {
     let undeclared = Event::JobActivated {
         job_key: 7,
         instance_key: 3,
+        durable: false,
         worker: "w".to_string(),
         deadline: 60_000,
         activated_at: Some(1),
@@ -20997,6 +21018,7 @@ fn declaration_free_job_activated_is_byte_identical() {
     let declared = Event::JobActivated {
         job_key: 7,
         instance_key: 3,
+        durable: false,
         worker: "w".to_string(),
         deadline: 60_000,
         activated_at: Some(1),

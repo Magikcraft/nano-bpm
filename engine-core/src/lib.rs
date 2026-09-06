@@ -105,12 +105,14 @@ pub use agent::{
 pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT};
 #[cfg(feature = "serde")]
 pub use command::form_id_of;
+pub use command::JobActivationOptions;
 pub use command::{
     ActivateElementInstruction, Command, FormResource, GenericResource, UserTaskChangeset,
 };
 #[cfg(feature = "serde")]
 pub use engine::EngineSnapshot;
 pub use engine::SNAPSHOT_FORMAT_VERSION;
+mod lease;
 pub use engine::{adhoc_inner_instance_id, ADHOC_INNER_INSTANCE_ID_POSTFIX};
 pub use engine::{ActivatedJob, DecisionEvaluation, Engine, EngineError};
 pub use engine::{BreakCondition, DebugSession};

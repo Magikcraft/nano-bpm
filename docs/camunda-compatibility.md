@@ -130,18 +130,39 @@ its task-definition routing, retries, priority, custom headers and linked
 resources (including prompts). An `aiAgentSubProcess` marker likewise does not
 replace the ad-hoc container's ordinary job-worker behavior.
 
-Activation creates the job, **not** an AgentInstance. The worker activates the
-job and explicitly calls CREATE, then UPDATE to record status, metrics and
-history. All agent types validate supplied `jobKey`/`jobLease` against the
-element's activated job. History requires this attribution; history-free
-CREATE/UPDATE may omit it. A supplied UPDATE job refreshes attribution for every
-agent type. AgentInstance COMPLETE is separate from completing the worker job:
-the latter advances BPMN execution.
+The canonical public contract is the REST specification on Camunda's
+`stable/8.10` branch, not the asynchronously published documentation. This
+alignment uses [revision 04530c058589e3ea3f7873bb469ae2c0d7cc6003](https://github.com/camunda/camunda/tree/04530c058589e3ea3f7873bb469ae2c0d7cc6003/zeebe/gateway-protocol/src/main/proto/v2).
 
-Agent-marked BPMN-element jobs carry an opaque per-activation lease token;
-execution-listener jobs do not. Legacy serialized `AgentTask` elements remain
-readable and are normalized to marked service tasks on deployment, replay and
-snapshot loading.
+Activation creates the job, **not** an AgentInstance. Job leasing is independent
+of the agent marker: a worker requests `withLease: true` to receive a fresh,
+opaque `leaseToken`. Omission, `null`, or `false` selects non-leasing activation,
+whose response contains `leaseToken: null`. This applies to all job kinds,
+including execution and task listeners. Once leased, a job remains eligible only
+for leasing workers, including after failure or timeout.
+
+For a leased job, completion, failure, and error commands require its matching
+`leaseToken`; missing or stale tokens are rejected with HTTP 409. Job property
+updates may omit the token for operator updates, but a supplied token is checked.
+Expiry alone does not supersede the token: the previous worker can finish until
+a subsequent activation replaces it.
+
+Agent CREATE requires `elementInstanceKey`, `jobKey`, `jobLease`, and nonempty
+`history`. CONFIGURATION history establishes the definition and limits; there
+are no top-level CREATE definition/limits fields. Repeated CREATE is a conflict,
+not an upsert. UPDATE requires the three attribution fields and permits status
+and history changes, rather than top-level metric/tool patches. The agent
+request's `jobLease` carries the activation's opaque token; it is not a deadline
+or a client-parsed number.
+
+History remains pending until job resolution. Completion commits the winning
+attempt and discards superseded attempts; failure and timeout do not themselves
+commit or discard it. Metrics derive from accepted history, with duplicates
+excluded. Agent completion follows process-instance cleanup, not a worker-facing
+REST completion operation.
+
+Legacy serialized `AgentTask` elements remain readable and are normalized to
+marked service tasks on deployment, replay and snapshot loading.
 
 ---
 

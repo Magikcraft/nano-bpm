@@ -18,6 +18,55 @@ use nanobpmn_engine_core::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+#[cfg(test)]
+mod lease_contract_tests {
+    use super::*;
+
+    #[test]
+    fn atomic_job_updates_preserve_empty_changesets_and_lease() {
+        let wire = serde_json::json!({
+            "type": "updateJob", "corr": 1, "jobKey": "42", "leaseToken": "opaque"
+        });
+        let frame: ClientFrame = serde_json::from_value(wire).unwrap();
+        let decoded = serde_json::to_value(frame).unwrap();
+        assert_eq!(decoded["leaseToken"], "opaque");
+        assert!(decoded["retries"].is_null());
+        assert!(decoded["timeout"].is_null());
+    }
+
+    #[test]
+    fn activation_frames_preserve_lease_opt_in() {
+        for value in [
+            serde_json::json!({"type":"subscribe","jobType":"work","withLease":true}),
+            serde_json::json!({"type":"activateJobs","corr":1,"jobType":"work","worker":"W","maxJobs":1,"withLease":true}),
+        ] {
+            let frame: ClientFrame = serde_json::from_value(value).unwrap();
+            assert_eq!(serde_json::to_value(frame).unwrap()["withLease"], true);
+        }
+    }
+
+    #[test]
+    fn mutation_frames_preserve_opaque_lease_tokens() {
+        for kind in [
+            "completeJob",
+            "failJob",
+            "throwError",
+            "updateJobRetries",
+            "updateJobTimeout",
+        ] {
+            let frame: ClientFrame = serde_json::from_value(serde_json::json!({
+                "type":kind,"corr":1,"jobKey":"42","errorCode":"ERR","retries":2,"timeout":1000,
+                "leaseToken":"opaque:not-a-number",
+            }))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(frame).unwrap()["leaseToken"],
+                "opaque:not-a-number"
+            );
+        }
+    }
+}
+
 /// `serde` `skip_serializing_if` predicate: omit a `bool` field when it is `false`.
 fn is_false(b: &bool) -> bool {
     !*b
@@ -35,6 +84,8 @@ pub enum ClientFrame {
     #[serde(rename_all = "camelCase")]
     Subscribe {
         job_type: String,
+        #[serde(default)]
+        with_lease: bool,
         #[serde(default)]
         job_credits: i64,
         #[serde(default)]
@@ -72,6 +123,8 @@ pub enum ClientFrame {
     CompleteJob {
         corr: u64,
         job_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease_token: Option<String>,
         #[serde(default)]
         variables: Option<Map<String, Value>>,
         /// Optional agentic ad-hoc sub-process result (Camunda `JobResult`),
@@ -90,6 +143,8 @@ pub enum ClientFrame {
     FailJob {
         corr: u64,
         job_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease_token: Option<String>,
         #[serde(default)]
         retries: Option<i32>,
         #[serde(default)]
@@ -100,6 +155,8 @@ pub enum ClientFrame {
     ThrowError {
         corr: u64,
         job_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease_token: Option<String>,
         error_code: String,
         #[serde(default)]
         error_message: Option<String>,
@@ -203,6 +260,8 @@ pub enum ClientFrame {
     UpdateJobRetries {
         corr: u64,
         job_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease_token: Option<String>,
         retries: i32,
         #[serde(default)]
         operation_reference: Option<i64>,
@@ -214,9 +273,33 @@ pub enum ClientFrame {
     UpdateJobTimeout {
         corr: u64,
         job_key: String,
-        timeout: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease_token: Option<String>,
+        timeout: i64,
         #[serde(default)]
         operation_reference: Option<i64>,
+    },
+    /// Atomically forwards all property changes and their optional lease fence.
+    #[serde(rename_all = "camelCase")]
+    UpdateJob {
+        corr: u64,
+        job_key: String,
+        #[serde(default)]
+        retries: Option<i32>,
+        #[serde(default)]
+        timeout: Option<i64>,
+        #[serde(default)]
+        operation_reference: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease_token: Option<String>,
+    },
+    /// Forwards a canonical agent CREATE or UPDATE request to its partition leader.
+    #[serde(rename_all = "camelCase")]
+    ForwardAgentInstance {
+        corr: u64,
+        #[serde(default)]
+        agent_instance_key: Option<String>,
+        body: Value,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key incident resolution to
     /// the peer that owns the incident's partition. Answered by a `CommandResult`.
@@ -250,6 +333,8 @@ pub enum ClientFrame {
     ActivateJobs {
         corr: u64,
         job_type: String,
+        #[serde(default)]
+        with_lease: bool,
         worker: String,
         max_jobs: i64,
         #[serde(default)]

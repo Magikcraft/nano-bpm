@@ -113,6 +113,7 @@ pub(crate) use nano_falcon_protocol::*;
 /// A live job-push subscription for one (connection, job type).
 struct Subscription {
     worker: String,
+    with_lease: bool,
     timeout: u64,
     fetch_variable: Option<Vec<String>>,
     /// Outstanding job-delivery demand: push only while > 0.
@@ -769,6 +770,8 @@ async fn handle_client_frame(
         ClientFrame::RouteSubscription { .. } => "route_subscription",
         ClientFrame::UpdateJobRetries { .. } => "update_job_retries",
         ClientFrame::UpdateJobTimeout { .. } => "update_job_timeout",
+        ClientFrame::UpdateJob { .. } => "update_job",
+        ClientFrame::ForwardAgentInstance { .. } => "forward_agent_instance",
         ClientFrame::ResolveIncident { .. } => "resolve_incident",
         ClientFrame::SetVariables { .. } => "set_variables",
         ClientFrame::ActivateJobs { .. } => "activate_jobs",
@@ -795,12 +798,14 @@ async fn handle_client_frame(
     match frame {
         ClientFrame::Subscribe {
             job_type,
+            with_lease,
             job_credits,
             fetch_variable,
             timeout,
             worker,
         } => {
             let sub = Arc::new(Subscription {
+                with_lease,
                 worker: worker.unwrap_or_else(|| {
                     if default_worker.is_empty() {
                         format!("stream-{}", conn.id)
@@ -1077,6 +1082,7 @@ async fn handle_client_frame(
         ClientFrame::CompleteJob {
             corr,
             job_key,
+            lease_token,
             variables,
             adhoc_result,
             task_result,
@@ -1095,6 +1101,7 @@ async fn handle_client_frame(
                         .forward_complete_job_stream(
                             node,
                             key,
+                            lease_token,
                             variables,
                             adhoc_result,
                             task_result,
@@ -1116,7 +1123,13 @@ async fn handle_client_frame(
                         conn,
                         corr,
                         server
-                            .complete_job_for_stream(key, vars, adhoc_result, task_result)
+                            .complete_job_for_stream_with_lease(
+                                key,
+                                lease_token,
+                                vars,
+                                adhoc_result,
+                                task_result,
+                            )
                             .await,
                     );
                 } else {
@@ -1127,7 +1140,13 @@ async fn handle_client_frame(
                     let conn = conn.clone();
                     tokio::spawn(async move {
                         let outcome = server
-                            .complete_job_for_stream(key, vars, adhoc_result, task_result)
+                            .complete_job_for_stream_with_lease(
+                                key,
+                                lease_token,
+                                vars,
+                                adhoc_result,
+                                task_result,
+                            )
                             .await;
                         pipeline_job_command(&server, &conn, corr, outcome);
                     });
@@ -1137,6 +1156,7 @@ async fn handle_client_frame(
         ClientFrame::FailJob {
             corr,
             job_key,
+            lease_token,
             retries,
             error_message,
         } => {
@@ -1149,7 +1169,7 @@ async fn handle_client_frame(
                 let error_message = error_message.unwrap_or_default();
                 spawn_forward_stream_reply(conn, corr, async move {
                     server
-                        .forward_fail_job_stream(node, key, retries, error_message)
+                        .forward_fail_job_stream(node, key, lease_token, retries, error_message)
                         .await
                 });
             } else {
@@ -1157,7 +1177,7 @@ async fn handle_client_frame(
                 let error_message = error_message.unwrap_or_default();
                 if server.raft_registry().is_empty() {
                     let outcome = server
-                        .fail_job_for_stream(key, retries, error_message)
+                        .fail_job_for_stream_with_lease(key, lease_token, retries, error_message)
                         .await;
                     pipeline_job_command(server, conn, corr, outcome);
                 } else {
@@ -1165,7 +1185,12 @@ async fn handle_client_frame(
                     let conn = conn.clone();
                     tokio::spawn(async move {
                         let outcome = server
-                            .fail_job_for_stream(key, retries, error_message)
+                            .fail_job_for_stream_with_lease(
+                                key,
+                                lease_token,
+                                retries,
+                                error_message,
+                            )
                             .await;
                         pipeline_job_command(&server, &conn, corr, outcome);
                     });
@@ -1175,6 +1200,7 @@ async fn handle_client_frame(
         ClientFrame::ThrowError {
             corr,
             job_key,
+            lease_token,
             error_code,
             error_message,
             variables,
@@ -1188,7 +1214,14 @@ async fn handle_client_frame(
                 let error_message = error_message.clone().unwrap_or_default();
                 spawn_forward_stream_reply(conn, corr, async move {
                     server
-                        .forward_throw_error_stream(node, key, error_code, error_message, variables)
+                        .forward_throw_error_stream(
+                            node,
+                            key,
+                            lease_token,
+                            error_code,
+                            error_message,
+                            variables,
+                        )
                         .await
                 });
             } else {
@@ -1196,7 +1229,13 @@ async fn handle_client_frame(
                 let vars = to_engine_vars(variables);
                 if server.raft_registry().is_empty() {
                     let outcome = server
-                        .throw_error_for_stream(key, error_code, error_message, vars)
+                        .throw_error_for_stream_with_lease(
+                            key,
+                            lease_token,
+                            error_code,
+                            error_message,
+                            vars,
+                        )
                         .await;
                     pipeline_job_command(server, conn, corr, outcome);
                 } else {
@@ -1204,7 +1243,13 @@ async fn handle_client_frame(
                     let conn = conn.clone();
                     tokio::spawn(async move {
                         let outcome = server
-                            .throw_error_for_stream(key, error_code, error_message, vars)
+                            .throw_error_for_stream_with_lease(
+                                key,
+                                lease_token,
+                                error_code,
+                                error_message,
+                                vars,
+                            )
                             .await;
                         pipeline_job_command(&server, &conn, corr, outcome);
                     });
@@ -1341,12 +1386,18 @@ async fn handle_client_frame(
         ClientFrame::UpdateJobRetries {
             corr,
             job_key,
+            lease_token,
             retries,
             operation_reference,
         } => {
             forward_by_key_reply(conn, corr, &job_key, |key| async move {
                 server
-                    .update_job_retries_local(key, retries, operation_reference)
+                    .update_job_retries_local_with_lease(
+                        key,
+                        lease_token,
+                        retries,
+                        operation_reference,
+                    )
                     .await
             })
             .await;
@@ -1354,12 +1405,18 @@ async fn handle_client_frame(
         ClientFrame::UpdateJobTimeout {
             corr,
             job_key,
+            lease_token,
             timeout,
             operation_reference,
         } => {
             forward_by_key_reply(conn, corr, &job_key, |key| async move {
                 server
-                    .update_job_timeout_local(key, timeout, operation_reference)
+                    .update_job_timeout_local_with_lease(
+                        key,
+                        lease_token,
+                        timeout,
+                        operation_reference,
+                    )
                     .await
             })
             .await;
@@ -1443,6 +1500,56 @@ async fn handle_client_frame(
                 };
             });
         }
+        ClientFrame::UpdateJob {
+            corr,
+            job_key,
+            retries,
+            timeout,
+            operation_reference,
+            lease_token,
+        } => {
+            let server = server.clone();
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                let outcome = match job_key.parse() {
+                    Ok(key) => {
+                        server
+                            .update_job_core(
+                                key,
+                                retries,
+                                timeout,
+                                operation_reference,
+                                lease_token,
+                            )
+                            .await
+                    }
+                    Err(_) => Err((404, "Invalid job key".into())),
+                };
+                let (status, body) = match outcome {
+                    Ok(()) => (204, None),
+                    Err((status, detail)) => (status, Some(Value::String(detail))),
+                };
+                conn.send(ServerFrame::CommandResult { corr, status, body });
+            });
+        }
+        ClientFrame::ForwardAgentInstance {
+            corr,
+            agent_instance_key,
+            body,
+        } => {
+            let server = server.clone();
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                let (status, body) = match server
+                    .agent_instance_forwarded(agent_instance_key, body)
+                    .await
+                {
+                    Ok(body) => (200, Some(body)),
+                    Err((status, detail)) => (status, Some(Value::String(detail))),
+                };
+                conn.send(ServerFrame::CommandResult { corr, status, body });
+            });
+        }
         ClientFrame::ActivateJobs {
             corr,
             job_type,
@@ -1450,6 +1557,7 @@ async fn handle_client_frame(
             max_jobs,
             timeout,
             fetch_variable,
+            with_lease,
         } => {
             // Peer-side of job aggregation: activate on THIS node's own partitions
             // for a worker attached to the requesting gateway, and answer with the
@@ -1471,12 +1579,13 @@ async fn handle_client_frame(
                     Vec::new()
                 } else {
                     server
-                        .activate_for_stream(
+                        .activate_for_stream_with_lease(
                             &job_type,
                             &worker,
                             want,
                             timeout.filter(|&t| t > 0).unwrap_or(DEFAULT_JOB_LOCK_MS),
                             fetch_variable.as_deref().filter(|names| !names.is_empty()),
+                            with_lease,
                         )
                         .await
                 };
@@ -2129,12 +2238,13 @@ async fn dispatch_to_connection(
 
             // 1. Local partitions first — the hot path, no network hop.
             let local = server
-                .activate_for_stream(
+                .activate_for_stream_with_lease(
                     &job_type,
                     &sub.worker,
                     want,
                     sub.timeout,
                     sub.fetch_variable.as_deref(),
+                    sub.with_lease,
                 )
                 .await;
             for job in local {
@@ -2168,6 +2278,7 @@ async fn dispatch_to_connection(
                             ask,
                             sub.timeout,
                             sub.fetch_variable.as_deref(),
+                            sub.with_lease,
                         )
                         .await;
                     for job in jobs {
@@ -2246,12 +2357,13 @@ async fn dispatch_to_connection(
                 }
                 let jobs = if src == 0 {
                     server
-                        .activate_for_stream(
+                        .activate_for_stream_with_lease(
                             &job_type,
                             &sub.worker,
                             ask,
                             sub.timeout,
                             sub.fetch_variable.as_deref(),
+                            sub.with_lease,
                         )
                         .await
                 } else {
@@ -2265,6 +2377,7 @@ async fn dispatch_to_connection(
                             ask,
                             sub.timeout,
                             sub.fetch_variable.as_deref(),
+                            sub.with_lease,
                         )
                         .await
                 };
@@ -2715,6 +2828,7 @@ mod registry_tests {
                 worker: "review-agent".to_string(),
                 timeout: 0,
                 fetch_variable: None,
+                with_lease: false,
                 credits: AtomicI64::new(0),
             }),
         );
@@ -2808,6 +2922,7 @@ mod registry_tests {
                 worker: format!("w{}", conn.id),
                 timeout: 0,
                 fetch_variable: None,
+                with_lease: false,
                 credits: AtomicI64::new(credits),
             }),
         );

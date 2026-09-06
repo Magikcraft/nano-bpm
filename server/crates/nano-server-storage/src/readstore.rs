@@ -439,16 +439,30 @@ impl ReadModel {
     /// so cross-shard ordering has a single home; the shared read store is the
     /// source of the rows.
     pub fn agent_instances(&self) -> Vec<AgentInstanceRow> {
-        self.shards
-            .iter()
-            .flat_map(|s| s.agent_instances(&AgentInstanceFilter::default(), None))
-            .collect()
+        self.try_agent_instances().unwrap_or_default()
+    }
+
+    pub fn try_agent_instances(&self) -> rusqlite::Result<Vec<AgentInstanceRow>> {
+        let mut rows = Vec::new();
+        for shard in &self.shards {
+            rows.extend(shard.try_agent_instances(&AgentInstanceFilter::default(), None)?);
+        }
+        Ok(rows)
     }
 
     /// A single agent instance by its dedicated key, returning the first shard's
     /// match (keys are unique across shards, so at most one shard answers).
     pub fn agent_instance(&self, key: Key) -> Option<AgentInstanceRow> {
-        self.shards.iter().find_map(|s| s.agent_instance(key))
+        self.try_agent_instance(key).ok().flatten()
+    }
+
+    pub fn try_agent_instance(&self, key: Key) -> rusqlite::Result<Option<AgentInstanceRow>> {
+        for shard in &self.shards {
+            if let Some(row) = shard.try_agent_instance(key)? {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
     }
 
     /// The agent history turns matching `filter` across all shards. The
@@ -456,10 +470,18 @@ impl ReadModel {
     /// [`AgentHistoryFilter`], so passing the filter through preserves it as the
     /// single source of truth; the REST handler sorts and paginates the result.
     pub fn agent_history(&self, filter: &AgentHistoryFilter) -> Vec<AgentHistoryRow> {
-        self.shards
-            .iter()
-            .flat_map(|s| s.agent_history(filter, None))
-            .collect()
+        self.try_agent_history(filter).unwrap_or_default()
+    }
+
+    pub fn try_agent_history(
+        &self,
+        filter: &AgentHistoryFilter,
+    ) -> rusqlite::Result<Vec<AgentHistoryRow>> {
+        let mut rows = Vec::new();
+        for shard in &self.shards {
+            rows.extend(shard.try_agent_history(filter, None)?);
+        }
+        Ok(rows)
     }
 
     /// Every open message subscription across all shards (MESSAGE wait states).

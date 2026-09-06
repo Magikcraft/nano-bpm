@@ -644,11 +644,7 @@ fn run_path(
             });
             if failed {
                 let _ = engine.apply_command_at(
-                    Command::FailJob {
-                        job_key,
-                        retries: 0,
-                        error_message: format!("mock worker '{}' failed", job_type),
-                    },
+                    Command::fail_job(job_key, 0, format!("mock worker '{}' failed", job_type)),
                     clock,
                 );
             } else {

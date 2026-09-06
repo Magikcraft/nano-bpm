@@ -1,6 +1,22 @@
 # Common identifier schemas (string-based IDs)
 components:
   schemas:
+    LoopIterationId:
+      description: |
+        A client-provided sequential integer identifying a loop iteration: one pass
+        through an AI agent's loop, during which the model reasons, selects tools,
+        evaluates the result, and decides whether to continue. One iteration covers
+        the input for the LLM call, the call itself, and the tools it dispatches;
+        the results of those tool calls are input to the next iteration. Must be a
+        positive integer, increasing with each loopIteration. Established by the
+        connector when appending the first history item of a loopIteration.
+      type: integer
+      format: int32
+      minimum: 1
+      x-semantic-type: LoopIterationId
+      x-semantic-client-minted: true
+      example: 1
+
     ProcessDefinitionId:
       description: Id of a process definition, from the model. Only ids of process definitions that are deployed are useful.
       format: ProcessDefinitionId

@@ -96,7 +96,10 @@ fn agent_markers_preserve_the_entire_worker_job_contract() {
             "{marker}"
         );
         assert_eq!(resources[0]["linkName"], "prompt");
-        assert_eq!(job.lease_token.is_some(), !marker.is_empty(), "{marker}");
+        assert_eq!(
+            job.lease_token, None,
+            "{marker}: leasing is an activation option, not classification"
+        );
     }
 }
 
@@ -171,7 +174,17 @@ fn multi_instance_agent_tasks_keep_per_child_jobs_and_leases() {
                 HashMap::from([("route".into(), Value::Str("senior:rebase".into()))]),
             ))
             .unwrap();
-        let jobs = engine.activate_jobs("senior:rebase", "W", 10, 1_000, 0);
+        let jobs = engine.activate_jobs_with_options(
+            "senior:rebase",
+            "W",
+            10,
+            1_000,
+            0,
+            nanobpmn_engine_core::JobActivationOptions {
+                with_lease: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(jobs.len(), 2, "{marker}");
         assert_ne!(jobs[0].element_instance_key, jobs[1].element_instance_key);
         assert_ne!(jobs[0].lease_token, jobs[1].lease_token);
@@ -180,7 +193,7 @@ fn multi_instance_agent_tasks_keep_per_child_jobs_and_leases() {
                 .apply_command(Command::CreateAgentInstance {
                     element_instance_key: job.element_instance_key,
                     job_key: job.key,
-                    job_lease: job.lease_token.unwrap(),
+                    job_lease: job.lease_token.clone().unwrap(),
                     definition: AgentDefinition::default(),
                     limits: None,
                     history: vec![],
@@ -191,7 +204,9 @@ fn multi_instance_agent_tasks_keep_per_child_jobs_and_leases() {
         for job in jobs {
             events.extend(
                 engine
-                    .apply_command(Command::complete_job(job.key))
+                    .apply_command(
+                        Command::complete_job(job.key).with_job_lease(job.lease_token.unwrap()),
+                    )
                     .unwrap(),
             );
         }
@@ -246,23 +261,37 @@ fn assert_external_job_lifecycle(xml: &str, expected_type: &str) {
         history: vec![],
     };
     assert!(matches!(
-        engine.apply_command(create_agent(0)).unwrap_err(),
+        engine
+            .apply_command(create_agent(String::new()))
+            .unwrap_err(),
         EngineError::AgentInstanceJobNotActive { .. }
     ));
     if expected_type != "agent" {
         assert!(engine.activate_jobs("agent", "W", 1, 1_000, 0).is_empty());
     }
     let job = engine
-        .activate_jobs(expected_type, "W", 1, 1_000, 0)
+        .activate_jobs_with_options(
+            expected_type,
+            "W",
+            1,
+            1_000,
+            0,
+            nanobpmn_engine_core::JobActivationOptions {
+                with_lease: true,
+                ..Default::default()
+            },
+        )
         .pop()
         .expect("worker subscribed by job type activates the agent");
     assert_eq!(job.key, job_key);
     let lease = job.lease_token.expect("external job is lease-gated");
     assert!(matches!(
-        engine.apply_command(create_agent(lease + 1)).unwrap_err(),
+        engine
+            .apply_command(create_agent("stale-lease".to_string()))
+            .unwrap_err(),
         EngineError::AgentInstanceJobLeaseMismatch { .. }
     ));
-    let events = engine.apply_command(create_agent(lease)).unwrap();
+    let events = engine.apply_command(create_agent(lease.clone())).unwrap();
     assert!(events.iter().any(|event| matches!(
         event,
         Event::AgentInstanceCreated { agent_instance, .. }
@@ -271,7 +300,7 @@ fn assert_external_job_lifecycle(xml: &str, expected_type: &str) {
                 && agent_instance.job_lease == lease
     )));
     let events = engine
-        .apply_command(Command::complete_job(job_key))
+        .apply_command(Command::complete_job(job_key).with_job_lease(lease))
         .unwrap();
     assert!(events
         .iter()

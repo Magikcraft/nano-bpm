@@ -115,9 +115,13 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   type (`ActivateJobs`), locking each until `now + timeout`. A job must be
   activated before it can be completed. Locks expire — either lazily on the next
   activation or via an explicit `ExpireJobs` tick — making the job activatable
-  again. Completion is by key alone (no worker check), so a slow worker whose
-  lock expired and whose job was re-activated by another worker can still
-  complete it; the first completion wins. The engine is **clock-free**: the
+  again. `JobActivationOptions.with_lease` defaults to false; setting it true
+  gives every job kind an opaque string token. Leased complete/fail/throw-error
+  commands require the matching token (`Command::with_job_lease`); retries/timeout
+  updates may omit it, but a supplied stale token is rejected. Failure and timeout
+  retain the token: late completion is allowed until another leasing activation
+  supersedes it, and non-leasing workers skip previously leased jobs. Unleased
+  jobs retain first-completion-wins behavior. The engine is **clock-free**: the
   caller supplies `now` (a logical instant) on `ActivateJobs`/`ExpireJobs`.
 - **Job failure** (`FailJob`) sets a job's remaining retries. With retries left
   the job returns to the activatable pool; with none it parks (`JobState::Failed`)
@@ -330,11 +334,18 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > **normal jobs**, retaining their headers, linked resources, priority, retries,
 > input/output mappings, and multi-instance behavior. The worker explicitly
 > registers the `AgentInstance`; none is automatically minted on activation.
-> Advancing the BPMN task still requires ordinary job completion; marking the
-> agent instance completed only updates its persisted agent state.
-> CREATE/UPDATE validate supplied job attribution for every agent type, and
-> history-bearing requests require the matching ACTIVATED job and opaque lease.
-> History-free requests may omit job attribution.
+> Advancing BPMN requires ordinary job completion. Process completion/termination
+> cleans up its agents. Repeated CREATE is a conflict, not an upsert. Canonical
+> REST CREATE/UPDATE require job attribution; CREATE derives its definition from
+> CONFIGURATION history. New history remains pending until job completion commits
+> the winning activation's items and discards superseded attempts. UPDATE configuration
+> applies at commit; usage metrics accumulate when new history is recorded.
+> System prompts are typed content-block arrays. Persistence decoders convert
+> every historical string into one literal TEXT block, never interpreting it as
+> JSON. Per-turn metrics preserve absent objects and null counters separately
+> from every submitted integer, including `-1` and zero.
+> History-free jobless calls and per-agent completion are legacy embedded extensions,
+> not the canonical REST contract.
 > A co-located `zeebe:taskDefinition type="..."` supplies the agent's
 > job type (literal or FEEL, evaluated after input mappings); without one it
 > defaults to the element id. Adding the external marker therefore preserves

@@ -13,7 +13,7 @@ export class TestEngine {
      * (key, type, instance/element, retries, variables) for the dispatch loop to
      * hand to worker handlers. The host owns the wall clock via `tickNow`.
      */
-    activateJobs(job_type: string, max_jobs: number, timeout_ms: number, worker: string): string;
+    activateJobs(job_type: string, max_jobs: number, timeout_ms: number, worker: string, with_lease?: boolean | null): string;
     /**
      * Advance the virtual clock by `by_ms` milliseconds, firing any timers that
      * become due and expiring any lapsed job locks.
@@ -39,8 +39,9 @@ export class TestEngine {
      */
     cancelInstance(instance_key: string): string;
     /**
-     * Complete an AgentInstance by its dedicated key, driving it to the terminal
-     * `COMPLETED` status. Returns the snapshot.
+     * Legacy embedded-only completion extension. It neither commits history nor
+     * advances BPMN; canonical workers complete their owning job instead.
+     * Returns the snapshot.
      */
     completeAgentInstance(agent_instance_key: string): string;
     /**
@@ -64,13 +65,13 @@ export class TestEngine {
      * like `completeJob` — e.g. the agent's final
      * decision when it signals `completionConditionFulfilled`.
      */
-    completeAgentJob(job_key: string, variables_json: string, agent_result_json: string): string;
+    completeAgentJob(job_key: string, variables_json: string, agent_result_json: string, lease_token?: string | null): string;
     /**
      * Complete a waiting job by key, merging `variables_json` (a JSON object
      * string) into the instance. The job is activated first if it has not been
      * already, so the UI can complete a freshly-created job directly.
      */
-    completeJob(job_key: string, variables_json: string): string;
+    completeJob(job_key: string, variables_json: string, lease_token?: string | null): string;
     /**
      * Complete a waiting user task by key, merging `variables_json` into the
      * instance before the parked token resumes. The task must be in the
@@ -87,17 +88,9 @@ export class TestEngine {
      */
     correlateMessage(message_name: string, correlation_key: string, variables_json: string): string;
     /**
-     * Reconcile / create an AgentInstance for an already-activated agent task.
-     * `request_json` is `{ elementInstanceKey, jobKey?, jobLease?, definition?,
-     * limits?, history? }` where `definition` is `{ model?, provider?,
-     * systemPrompt? }`, `limits` is `{ maxTokens?, maxModelCalls?, maxToolCalls? }`
-     * (omitted limits default to unlimited), and `history` is an initial batch of
-     * turns (see the turn shape on `updateAgentInstance`). `jobKey`/`jobLease`
-     * are the activation's job attribution: when supplied, they must reference
-     * that element's ACTIVATED job with a matching lease token for every agent
-     * type. History requires this attribution; history-free requests may omit
-     * it. Agent-marked elements create ordinary jobs, not AgentInstances:
-     * workers explicitly register them through this command. Returns the snapshot.
+     * Create an agent using `{ elementInstanceKey, jobKey, jobLease, history }`.
+     * History must establish its CONFIGURATION. Returns the canonical creation
+     * result with `agentInstanceKey` and positionally correlated `createdHistory`.
      */
     createAgentInstance(request_json: string): string;
     /**
@@ -191,7 +184,7 @@ export class TestEngine {
      * Fail a waiting job by key with the given remaining `retries` and message.
      * With no retries left this raises an incident (visible in the snapshot).
      */
-    failJob(job_key: string, retries: number, message: string): string;
+    failJob(job_key: string, retries: number, message: string, lease_token?: string | null): string;
     /**
      * The latest deployed form for `form_key`, as a `FormResult` JSON object
      * (`{ tenantId, formId, schema, version, formKey }`), or JSON `null` when no
@@ -228,6 +221,11 @@ export class TestEngine {
      * Create a fresh, empty simulated engine. The virtual clock starts at 0.
      */
     constructor();
+    /**
+     * Restore a complete trace returned by `events()`, using the core journal
+     * decoder and replay engine. Replaces this simulation only after decoding succeeds.
+     */
+    replayEvents(events_json: string): string;
     /**
      * Discard all engine state (deployed definitions, instances, jobs, timers,
      * the event log and the virtual clock), returning the engine to the same
@@ -308,7 +306,7 @@ export class TestEngine {
      * raised. The job is activated first if needed, so the UI can throw an
      * error directly from a freshly-created job. Returns the snapshot.
      */
-    throwError(job_key: string, error_code: string, error_message: string): string;
+    throwError(job_key: string, error_code: string, error_message: string, lease_token?: string | null): string;
     /**
      * Set the engine clock to a wall-clock instant (ms), then trigger due timers
      * and expire lapsed job locks. The embedded host calls this with `Date.now()`
@@ -322,30 +320,21 @@ export class TestEngine {
      */
     unassignUserTask(user_task_key: string): string;
     /**
-     * Advance an AgentInstance: set its `status` (a REST spelling other than
-     * `COMPLETED`, which is reachable only through `completeAgentInstance` and is
-     * rejected here with a targeted error), accumulate `metrics`, optionally
-     * replace `tools`, and append a `history` batch. `request_json` is
-     * `{ agentInstanceKey, elementInstanceKey, elementId, processInstanceKey,
-     * status?, metrics?, tools?, jobKey?, jobLease?, history? }`. `tools` is a
-     * nullable changeset: omit it to leave the stored set unchanged, pass `null`
-     * to clear it, or an array to replace it. `jobKey`/`jobLease` are the
-     * activation's validated job attribution, required for and stamped onto
-     * every appended turn (as the gateway does). A turn is
-     * `{ loopIteration?, producedAt?, role?, content?,
-     * systemPrompt?, historyItemId?, model?, provider? }`, where `producedAt` is
-     * an RFC-3339 `date-time` string (the REST spelling; a bare epoch-millis
-     * number is also accepted); `content` items are `{ contentType?, text?,
-     * documentReference?, object? }`, where `object` is arbitrary JSON (the REST
-     * wire shape). Returns the snapshot.
+     * Update an agent with `{ elementInstanceKey, jobKey, jobLease, status?, history? }`.
+     * Configuration and metrics are submitted through history, never top-level fields.
+     * Returns `createdHistory`; the engine owns pending/commit/discard semantics.
      */
-    updateAgentInstance(request_json: string): string;
+    updateAgentInstance(agent_instance_key: string, request_json: string): string;
     /**
      * Set a job's remaining retries by key. Used to recover a job parked on a
      * no-retries incident before resolving that incident; does not by itself
      * unblock the job. Returns the snapshot.
      */
-    updateRetries(job_key: string, retries: number): string;
+    updateRetries(job_key: string, retries: number, lease_token?: string | null): string;
+    /**
+     * Update an activated job's timeout, optionally checking its opaque lease.
+     */
+    updateTimeout(job_key: string, timeout_ms: number, lease_token?: string | null): string;
     /**
      * Update a user task's attributes from a JSON changeset object. Recognised
      * keys (all optional): `candidateGroups` / `candidateUsers` (string arrays),
@@ -369,14 +358,14 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_testengine_free: (a: number, b: number) => void;
-    readonly testengine_activateJobs: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly testengine_activateJobs: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly testengine_advanceTime: (a: number, b: number, c: number) => void;
     readonly testengine_assignUserTask: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly testengine_broadcastSignal: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_cancelInstance: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_completeAgentInstance: (a: number, b: number, c: number, d: number) => void;
-    readonly testengine_completeAgentJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
-    readonly testengine_completeJob: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly testengine_completeAgentJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => void;
+    readonly testengine_completeJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_completeUserTask: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_correlateMessage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_createAgentInstance: (a: number, b: number, c: number, d: number) => void;
@@ -390,13 +379,14 @@ export interface InitOutput {
     readonly testengine_deployForm: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_deployResource: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_events: (a: number, b: number) => void;
-    readonly testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly testengine_getFormByKey: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_getResourceByKey: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_migrate: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_modify: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_new: () => number;
     readonly testengine_now: (a: number) => number;
+    readonly testengine_replayEvents: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_reset: (a: number) => void;
     readonly testengine_resolveIncident: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_searchAgentInstanceHistory: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
@@ -406,11 +396,12 @@ export interface InitOutput {
     readonly testengine_searchVariables: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_setVariables: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly testengine_snapshot: (a: number, b: number) => void;
-    readonly testengine_throwError: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly testengine_throwError: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => void;
     readonly testengine_tickNow: (a: number, b: number, c: number) => void;
     readonly testengine_unassignUserTask: (a: number, b: number, c: number, d: number) => void;
-    readonly testengine_updateAgentInstance: (a: number, b: number, c: number, d: number) => void;
-    readonly testengine_updateRetries: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly testengine_updateAgentInstance: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly testengine_updateRetries: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly testengine_updateTimeout: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly testengine_updateUserTask: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly sqlite3_os_init: () => number;
     readonly sqlite3_os_end: () => number;

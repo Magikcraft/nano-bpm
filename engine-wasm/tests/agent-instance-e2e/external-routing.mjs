@@ -40,7 +40,7 @@ for (const variant of ["lean", "readmodel"]) {
       if (type !== null) {
         assert.deepEqual(JSON.parse(engine.activateJobs("agent", 1, 1000, "W")), []);
       }
-      const jobs = JSON.parse(engine.activateJobs(expected, 1, 1000, "W"));
+      const jobs = JSON.parse(engine.activateJobs(expected, 1, 1000, "W", true));
       assert.equal(jobs.length, 1, `${variant}: ${agentType}: ${type ?? "element-id fallback"}`);
       const job = jobs[0];
       assert.equal(job.type, expected);
@@ -57,39 +57,46 @@ for (const variant of ["lean", "readmodel"]) {
         assert.equal(resolved.resourceId, "prompt.md");
         assert.equal(resolved.version, 2);
       }
-      assert.equal(typeof job.jobLease, "string");
+      assert.equal(typeof job.leaseToken, "string");
       const request = {
         elementInstanceKey: job.elementInstanceKey,
         jobKey: job.key,
-        jobLease: job.jobLease,
+        jobLease: job.leaseToken,
+        history: [{
+          historyItemId: "configuration", loopIteration: 1,
+          producedAt: "2026-01-02T03:04:05Z", role: "CONFIGURATION",
+          content: [], model: "gpt", provider: "openai",
+          systemPrompt: [{ contentType: "TEXT", text: "Use the linked prompt" }],
+        }],
       };
       assert.throws(() => engine.createAgentInstance(JSON.stringify({
         ...request,
-        jobLease: String(BigInt(job.jobLease) + 1n),
+        jobLease: `${job.leaseToken}:stale`,
       })));
-      engine.createAgentInstance(JSON.stringify(request));
+      const created = JSON.parse(engine.createAgentInstance(JSON.stringify(request)));
+      assert.equal(created.createdHistory.length, 1);
       if (variant === "readmodel") {
         const agents = JSON.parse(engine.searchAgentInstances("{}")).items;
         assert.equal(agents.length, 1);
-        assert.equal(agents[0].elementInstanceKey, job.elementInstanceKey);
+        assert.deepEqual(agents[0].elementInstanceKeys, [job.elementInstanceKey]);
         const update = {
-          ...request,
-          agentInstanceKey: agents[0].agentInstanceKey,
-          elementId: job.elementId,
-          processInstanceKey: job.instanceKey,
+          elementInstanceKey: job.elementInstanceKey,
+          jobKey: job.key, jobLease: job.leaseToken,
         };
-        assert.throws(() => engine.updateAgentInstance(JSON.stringify({
+        assert.throws(() => engine.updateAgentInstance(created.agentInstanceKey, JSON.stringify({
           ...update,
           jobKey: "7788990011",
         })), "supplied unknown job attribution must not be ignored");
-        assert.throws(() => engine.updateAgentInstance(JSON.stringify({
+        assert.throws(() => engine.updateAgentInstance(created.agentInstanceKey, JSON.stringify({
           ...update,
-          jobLease: String(BigInt(job.jobLease) + 1n),
+          jobLease: `${job.leaseToken}:stale`,
         })), "supplied stale lease must not be ignored");
-        engine.completeAgentInstance(agents[0].agentInstanceKey);
       }
-      const completed = JSON.parse(engine.completeJob(job.key, "{}"));
+      const completed = JSON.parse(engine.completeJob(job.key, "{}", job.leaseToken));
       assert.equal(completed.instances[0].state, "Completed");
+      if (variant === "readmodel") {
+        assert.equal(JSON.parse(engine.searchAgentInstances("{}")).items[0].status, "COMPLETED");
+      }
     } finally {
       engine.free();
     }

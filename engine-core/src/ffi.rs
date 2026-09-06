@@ -400,10 +400,11 @@ pub unsafe extern "C" fn nbpmn_activate_jobs(
             use core::fmt::Write as _;
             let _ = write!(json, "{}", job.deadline);
         }
-        if let Some(lease) = job.lease_token {
-            json.push_str(",\"jobLease\":\"");
-            push_u64(&mut json, lease);
-            json.push('"');
+        if let Some(lease) = &job.lease_token {
+            json.push_str(",\"leaseToken\":");
+            write_json_string(&mut json, lease);
+        } else {
+            json.push_str(",\"leaseToken\":null");
         }
         json.push_str(",\"retries\":");
         {
@@ -507,6 +508,7 @@ pub unsafe extern "C" fn nbpmn_complete_job(engine: *mut Engine, job_key: u64) -
     }
     let cmd = Command::CompleteJob {
         job_key,
+        lease_token: None,
         variables: Default::default(),
         adhoc_result: None,
         task_listener_result: None,
@@ -549,6 +551,7 @@ pub unsafe extern "C" fn nbpmn_fail_job(
     };
     let cmd = Command::FailJob {
         job_key,
+        lease_token: None,
         retries,
         error_message,
     };

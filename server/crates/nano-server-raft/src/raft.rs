@@ -276,7 +276,7 @@ pub struct ReplicatedResponse {
 
 /// Maps an engine rejection to the `(http_status, message)` the client sees,
 /// matching the direct (non-Raft) write path's status codes.
-fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, String) {
+pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, String) {
     use nanobpmn_engine_core::EngineError as E;
     match e {
         E::ProcessNotFound { process_id } => {
@@ -285,6 +285,24 @@ fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, String) {
         E::JobNotFound { job_key } => (404, format!("No job with key {job_key}.")),
         E::JobNotActive { job_key } => (409, format!("Job {job_key} is not active.")),
         E::JobNotActivated { job_key } => (409, format!("Job {job_key} has not been activated.")),
+        E::JobLeaseMismatch { .. } => (409, e.to_string()),
+        E::JobUpdateInvalid { .. } => (400, e.to_string()),
+        E::AgentInstanceNotFound { .. }
+        | E::AgentInstanceElementInstanceInactive { .. }
+        | E::AgentInstanceJobNotActive { .. }
+        | E::AgentInstanceJobLeaseMismatch { .. } => (404, e.to_string()),
+        E::AgentInstanceAlreadyExists { .. }
+        | E::AgentInstanceActiveWriter { .. }
+        | E::AgentInstanceConflict { .. } => (409, e.to_string()),
+        E::AgentHistoryInvalid { .. }
+        | E::AgentInstanceElementNotEligible { .. }
+        | E::AgentInstanceMissingAgentDefinition { .. }
+        | E::AgentInstanceJobRequiredForHistory { .. }
+        | E::AgentInstanceJobElementMismatch { .. }
+        | E::AgentInstanceOwnershipMismatch { .. }
+        | E::AgentInstanceStatusNotSettable { .. }
+        | E::AgentInstanceAlreadyCompleted { .. }
+        | E::AgentInstanceLimitExceeded { .. } => (400, e.to_string()),
         other => (500, other.to_string()),
     }
 }
