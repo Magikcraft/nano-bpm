@@ -14,24 +14,49 @@ for (const variant of ["lean", "readmodel"]) {
   initSync({
     module: readFileSync(require.resolve(`@nanobpm/engine-wasm/${variant}/nanobpmn_engine_bg.wasm`)),
   });
-  for (const type of ["senior:rebase", "= localRoute", null]) {
+  const cases = ["external", "aiAgentTask"].flatMap((agentType) =>
+    ["senior:rebase", "= localRoute", null].map((type) => [agentType, type]));
+  for (const [agentType, type] of cases) {
     const engine = new TestEngine();
     try {
-      const xml = model.replace(
+      const xml = model.replace('agentType="external"', `agentType="${agentType}"`).replace(
         '<zeebe:taskDefinition type="senior:rebase"/>',
-        type === null ? "" : `<zeebe:taskDefinition type="${type}"/>`,
+        `${type === null ? "" : `<zeebe:taskDefinition type="${type}" retries="= attempts"/>`}
+        <zeebe:priorityDefinition priority="= importance"/>
+        <zeebe:taskHeaders><zeebe:header key="channel" value="agent"/></zeebe:taskHeaders>
+        <zeebe:linkedResources>
+          <zeebe:linkedResource resourceId="prompt.md" bindingType="latest"
+            resourceType="GenericScript" linkName="systemPrompt"/>
+        </zeebe:linkedResources>`,
       );
       engine.deploy(xml);
-      engine.createInstance("external-agent-routing", '{"route":"senior:rebase"}');
+      engine.deployResource("prompt.md", "first prompt");
+      const prompt = JSON.parse(engine.deployResource("prompt.md", "latest prompt"));
+      engine.createInstance("external-agent-routing", '{"route":"senior:rebase","attempts":7,"importance":80}');
+      if (variant === "readmodel") {
+        assert.deepEqual(JSON.parse(engine.searchAgentInstances("{}")).items, []);
+      }
       const expected = type === null ? "agent" : "senior:rebase";
       if (type !== null) {
         assert.deepEqual(JSON.parse(engine.activateJobs("agent", 1, 1000, "W")), []);
       }
       const jobs = JSON.parse(engine.activateJobs(expected, 1, 1000, "W"));
-      assert.equal(jobs.length, 1, `${variant}: ${type ?? "element-id fallback"}`);
+      assert.equal(jobs.length, 1, `${variant}: ${agentType}: ${type ?? "element-id fallback"}`);
       const job = jobs[0];
       assert.equal(job.type, expected);
       assert.equal(job.elementId, "agent");
+      assert.equal(job.priority, 80);
+      assert.equal(job.retries, type === null ? 3 : 7);
+      assert.equal(job.customHeaders.channel, "agent");
+      const resources = JSON.parse(job.customHeaders.linkedResources);
+      assert.equal(resources.length, 1);
+      assert.equal(resources[0].resourceKey, prompt.resourceKey);
+      assert.equal(resources[0].linkName, "systemPrompt");
+      if (variant === "readmodel") {
+        const resolved = JSON.parse(engine.getResourceByKey(prompt.resourceKey));
+        assert.equal(resolved.resourceId, "prompt.md");
+        assert.equal(resolved.version, 2);
+      }
       assert.equal(typeof job.jobLease, "string");
       const request = {
         elementInstanceKey: job.elementInstanceKey,
@@ -47,6 +72,21 @@ for (const variant of ["lean", "readmodel"]) {
         const agents = JSON.parse(engine.searchAgentInstances("{}")).items;
         assert.equal(agents.length, 1);
         assert.equal(agents[0].elementInstanceKey, job.elementInstanceKey);
+        const update = {
+          ...request,
+          agentInstanceKey: agents[0].agentInstanceKey,
+          elementId: job.elementId,
+          processInstanceKey: job.instanceKey,
+        };
+        assert.throws(() => engine.updateAgentInstance(JSON.stringify({
+          ...update,
+          jobKey: "7788990011",
+        })), "supplied unknown job attribution must not be ignored");
+        assert.throws(() => engine.updateAgentInstance(JSON.stringify({
+          ...update,
+          jobLease: String(BigInt(job.jobLease) + 1n),
+        })), "supplied stale lease must not be ignored");
+        engine.completeAgentInstance(agents[0].agentInstanceKey);
       }
       const completed = JSON.parse(engine.completeJob(job.key, "{}"));
       assert.equal(completed.instances[0].state, "Completed");
@@ -55,4 +95,4 @@ for (const variant of ["lean", "readmodel"]) {
     }
   }
 }
-console.log("External agent routing passed for both WASM entrypoints.");
+console.log("External and aiAgentTask routing and metadata passed for both WASM entrypoints.");

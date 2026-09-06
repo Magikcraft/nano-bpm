@@ -9,10 +9,11 @@ stable/8.10 parity, Stage 3) is reachable end-to-end through the
 
 1. **deploy** a `bpmn:serviceTask` bearing
    `<zeebe:agentDefinition agentType="aiAgentTask" />`;
-2. **create an instance** — activating the agent task **mints an AgentInstance**
-   in `INITIALIZING` (no job is created for an engine-native agent task);
-3. **`createAgentInstance`** reconciles that record with a CREATE-time
-   definition/limits (still `INITIALIZING`, same key — no duplicate);
+2. **create an instance** and **activate its ordinary worker job** — no
+   AgentInstance exists yet;
+3. **`createAgentInstance`** explicitly registers an `INITIALIZING` record with
+   CREATE-time definition/limits and history, using the activated job's
+   `jobKey` and opaque `jobLease`;
 4. **`updateAgentInstance`** advances the status (`THINKING`) and pushes a turn;
    it also **rejects the terminal `status: "COMPLETED"`** (reachable only through
    `completeAgentInstance`), and accepts a `producedAt` as an **RFC-3339 string**
@@ -22,7 +23,15 @@ stable/8.10 parity, Stage 3) is reachable end-to-end through the
    `COMMITTED`) in the gateway's REST JSON shape — camelCase keys, the REST
    `contentType` enum spelling, `producedAt` as an RFC-3339 string, and an
    `OBJECT` item's `object` round-tripped as a JSON object (not a string);
-6. **`completeAgentInstance`** drives the instance to `COMPLETED`.
+6. **`completeAgentInstance`** drives the instance to `COMPLETED`; the worker
+   completes its job separately to advance the BPMN token.
+
+`external-routing.mjs` covers both `external` and `aiAgentTask` markers on both
+the lean and read-model entrypoints. It checks configured and expression-based
+routing, element-id fallback, priority/retries, custom headers, and linked prompt
+resources resolved to the latest deployed version. Supplied invalid job
+attribution is rejected for both markers. All agent types require a valid
+activated job and lease for history; history-free CREATE/UPDATE may omit them.
 
 Run:
 

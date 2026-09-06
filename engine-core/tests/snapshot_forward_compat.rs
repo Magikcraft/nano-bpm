@@ -89,7 +89,13 @@ fn agent_job_type_survives_snapshot_and_legacy_snapshots_default_to_element_id()
         let mut json = serde_json::to_value(engine.snapshot()).unwrap();
         assert!(json.to_string().contains("\"job_type\":\"senior:rebase\""));
         if legacy {
-            strip_keys(&mut json, &["job_type"]);
+            for index in ["processes", "process_versions"] {
+                for deployed in json["state"][index].as_object_mut().unwrap().values_mut() {
+                    deployed["definition"]["elements"]["agent"]["kind"] = serde_json::json!({
+                        "AgentTask": { "agent_type": "External" }
+                    });
+                }
+            }
         }
         let snapshot: EngineSnapshot = serde_json::from_value(json).unwrap();
         let mut engine = Engine::from_snapshot(snapshot);
@@ -105,6 +111,127 @@ fn agent_job_type_survives_snapshot_and_legacy_snapshots_default_to_element_id()
         let expected = if legacy { "agent" } else { "senior:rebase" };
         assert_eq!(engine.activate_jobs(expected, "W", 1, 1_000, 0).len(), 1);
     }
+}
+
+#[test]
+fn historical_agent_deployment_frames_replay_through_the_canonical_job_model() {
+    use nanobpmn_engine_core::{bpmn::parse_bpmn, decode_event_json, Event, Value};
+    for marker in ["External", "AiAgentTask"] {
+        for job_type in [None, Some("senior:rebase")] {
+            let def = parse_bpmn(include_str!("fixtures/external-agent-job-type.bpmn"))
+                .unwrap()
+                .remove(0);
+            let mut engine = Engine::new();
+            let events = engine.apply_command(Command::DeployProcess(def)).unwrap();
+            let mut frames = Vec::new();
+            for event in events {
+                let mut json = serde_json::to_value(event).unwrap();
+                if let Some(deployment) = json.get_mut("ProcessDeployed") {
+                    let mut legacy = serde_json::json!({"agent_type": marker});
+                    if let Some(job_type) = job_type {
+                        legacy["job_type"] = serde_json::json!(job_type);
+                    }
+                    deployment["process"]["elements"]["agent"]["kind"] =
+                        serde_json::json!({"AgentTask": legacy});
+                }
+                frames.push(decode_event_json(&serde_json::to_string(&json).unwrap()).unwrap());
+            }
+            let mut restored = Engine::replay(frames);
+            assert!(matches!(
+                restored.state().processes["external-agent-routing"]
+                    .definition
+                    .elements["agent"]
+                    .kind,
+                ElementKind::ServiceTask {
+                    agent_type: Some(_),
+                    ..
+                }
+            ));
+            let events = restored
+                .apply_command(Command::create_instance_with(
+                    "external-agent-routing",
+                    std::collections::HashMap::from([(
+                        "route".into(),
+                        Value::Str("senior:rebase".into()),
+                    )]),
+                ))
+                .unwrap();
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e, Event::AgentInstanceCreated { .. })));
+            let jobs = restored.activate_jobs(job_type.unwrap_or("agent"), "W", 1, 1_000, 0);
+            assert_eq!(jobs.len(), 1);
+            assert!(jobs[0].lease_token.is_some());
+        }
+    }
+}
+
+#[test]
+fn legacy_jobless_agent_snapshot_preserves_live_state_without_inventing_jobs() {
+    use nanobpmn_engine_core::{AgentDefinition, AgentType, Event};
+
+    let def = ProcessBuilder::new("legacy-live")
+        .start_event("start")
+        .agent_task("agent", "worker", AgentType::AiAgentTask)
+        .end_event("end")
+        .connect("start", "agent")
+        .connect("agent", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("legacy-live"))
+        .unwrap();
+    let element_instance_key = events
+        .iter()
+        .find_map(|event| match event {
+            Event::ElementActivated {
+                element_instance_key,
+                element_id,
+                ..
+            } if element_id == "agent" => Some(*element_instance_key),
+            _ => None,
+        })
+        .unwrap();
+    engine
+        .apply_command(Command::CreateAgentInstance {
+            element_instance_key,
+            job_key: 0,
+            job_lease: 0,
+            definition: AgentDefinition {
+                model: Some("legacy-model".into()),
+                ..Default::default()
+            },
+            limits: None,
+            history: Vec::new(),
+        })
+        .unwrap();
+    let mut json = serde_json::to_value(engine.snapshot()).unwrap();
+    let live_instances = json["state"]["instances"].clone();
+    json["state"]["jobs"] = serde_json::json!({});
+    for index in ["processes", "process_versions"] {
+        for deployed in json["state"][index].as_object_mut().unwrap().values_mut() {
+            deployed["definition"]["elements"]["agent"]["kind"] =
+                serde_json::json!({"AgentTask": {"agent_type": "AiAgentTask"}});
+        }
+    }
+    let restored = Engine::from_snapshot(serde_json::from_value(json).unwrap());
+    assert!(restored.state().jobs.is_empty());
+    assert_eq!(
+        serde_json::to_value(&restored.state().instances).unwrap(),
+        live_instances,
+    );
+    assert!(matches!(
+        restored.state().processes["legacy-live"]
+            .definition
+            .elements["agent"]
+            .kind,
+        ElementKind::ServiceTask {
+            agent_type: Some(AgentType::AiAgentTask),
+            ..
+        }
+    ));
 }
 
 /// Builds a one-element process whose only flow node is a `CallActivity`, deploys

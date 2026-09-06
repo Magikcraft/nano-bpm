@@ -8,6 +8,99 @@ use nanobpmn_engine_core::{
 const MODEL: &str = include_str!("fixtures/external-agent-job-type.bpmn");
 
 #[test]
+fn agent_markers_are_metadata_on_ordinary_service_tasks() {
+    for marker in ["external", "aiAgentTask"] {
+        let xml = MODEL.replace("agentType=\"external\"", &format!("agentType=\"{marker}\""));
+        let def = parse_bpmn(&xml).unwrap().remove(0);
+        assert!(
+            matches!(def.elements["agent"].kind, ElementKind::ServiceTask { .. }),
+            "{marker} must not replace the ordinary job-worker element"
+        );
+    }
+}
+
+#[test]
+fn agent_markers_preserve_the_entire_worker_job_contract() {
+    use nanobpmn_engine_core::GenericResource;
+    for marker in ["", "external", "aiAgentTask"] {
+        let marker_xml = if marker.is_empty() {
+            String::new()
+        } else {
+            format!("<zeebe:agentDefinition agentType=\"{marker}\"/>")
+        };
+        let xml = MODEL
+            .replace(
+                "<zeebe:agentDefinition agentType=\"external\"/>",
+                &marker_xml,
+            )
+            .replace(
+                "<zeebe:taskDefinition type=\"senior:rebase\"/>",
+                r#"<zeebe:taskDefinition type="senior:rebase" retries="= retries"/>
+                <zeebe:priorityDefinition priority="= priority"/>
+                <zeebe:taskHeaders><zeebe:header key="channel" value="agent"/></zeebe:taskHeaders>
+                <zeebe:linkedResources>
+                  <zeebe:linkedResource resourceId="prompt.md" bindingType="latest"
+                    resourceType="GenericScript" linkName="prompt"/>
+                </zeebe:linkedResources>"#,
+            );
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(parse_bpmn(&xml).unwrap().remove(0)))
+            .unwrap();
+        for content in ["first", "latest"] {
+            engine
+                .apply_command(Command::DeployGenericResources(vec![GenericResource {
+                    resource_id: "prompt.md".into(),
+                    resource_name: "prompt.md".into(),
+                    content: content.into(),
+                }]))
+                .unwrap();
+        }
+        let latest_key = engine.state().resources["prompt.md"].key;
+        let events = engine
+            .apply_command(Command::create_instance_with(
+                "external-agent-routing",
+                HashMap::from([
+                    ("route".into(), Value::Str("senior:rebase".into())),
+                    ("retries".into(), Value::Int(7)),
+                    ("priority".into(), Value::Int(42)),
+                ]),
+            ))
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::AgentInstanceCreated { .. })),
+            "{marker}: agent registration belongs to the worker"
+        );
+        let job = engine
+            .activate_jobs("senior:rebase", "W", 1, 1_000, 0)
+            .pop()
+            .unwrap_or_else(|| panic!("{marker}: a normal worker job must be created"));
+        assert_eq!(job.retries, 7, "{marker}");
+        assert_eq!(job.priority, 42, "{marker}");
+        assert_eq!(
+            job.custom_headers.get("channel").map(String::as_str),
+            Some("agent"),
+            "{marker}"
+        );
+        let resources: serde_json::Value = serde_json::from_str(
+            job.custom_headers
+                .get("linkedResources")
+                .expect("prompt resource header"),
+        )
+        .unwrap();
+        assert_eq!(
+            resources[0]["resourceKey"],
+            latest_key.to_string(),
+            "{marker}"
+        );
+        assert_eq!(resources[0]["linkName"], "prompt");
+        assert_eq!(job.lease_token.is_some(), !marker.is_empty(), "{marker}");
+    }
+}
+
+#[test]
 fn parser_preserves_agent_job_type_independently_of_extension_order() {
     for job_type in [Some("senior:rebase"), Some("= localRoute"), None] {
         let declaration = job_type
@@ -22,33 +115,101 @@ fn parser_preserves_agent_job_type_independently_of_extension_order() {
             let def = parse_bpmn(&xml).unwrap().remove(0);
             assert!(matches!(
                 &def.elements["agent"].kind,
-                ElementKind::AgentTask { agent_type: AgentType::External, job_type: actual, .. }
-                    if actual.as_deref() == job_type
+                ElementKind::ServiceTask { agent_type: Some(AgentType::External), job_type: actual, .. }
+                    if actual == job_type.unwrap_or("agent")
             ));
         }
     }
 }
 
 #[test]
-fn native_agent_with_task_definition_still_creates_no_job() {
+fn ai_agent_task_uses_the_same_worker_registered_lifecycle() {
     let xml = MODEL.replace("agentType=\"external\"", "agentType=\"aiAgentTask\"");
-    let def = parse_bpmn(&xml).unwrap().remove(0);
-    let mut engine = Engine::new();
-    engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let events = engine
-        .apply_command(Command::create_instance_with(
-            "external-agent-routing",
-            HashMap::from([("route".into(), Value::Str("senior:rebase".into()))]),
-        ))
-        .unwrap();
-    assert!(!events.iter().any(|e| matches!(e, Event::JobCreated { .. })));
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, Event::AgentInstanceCreated { .. })));
+    assert_external_job_lifecycle(&xml, "senior:rebase");
+}
+
+#[test]
+fn ad_hoc_agent_markers_use_the_same_worker_registered_lifecycle() {
+    for marker in ["external", "aiAgentSubProcess"] {
+        let xml = MODEL
+            .replace("bpmn:serviceTask", "bpmn:adHocSubProcess")
+            .replace(
+                "</bpmn:adHocSubProcess>",
+                "<bpmn:serviceTask id=\"tool\"/></bpmn:adHocSubProcess>",
+            )
+            .replace(
+                "</bpmndi:BPMNPlane>",
+                r#"<bpmndi:BPMNShape id="tool_di" bpmnElement="tool">
+                <dc:Bounds x="210" y="88" width="80" height="60"/>
+              </bpmndi:BPMNShape></bpmndi:BPMNPlane>"#,
+            )
+            .replace("agentType=\"external\"", &format!("agentType=\"{marker}\""));
+        assert_external_job_lifecycle(&xml, "senior:rebase");
+    }
+}
+
+#[test]
+fn multi_instance_agent_tasks_keep_per_child_jobs_and_leases() {
+    for marker in ["external", "aiAgentTask"] {
+        let xml = MODEL
+            .replace("agentType=\"external\"", &format!("agentType=\"{marker}\""))
+            .replace(
+                "</bpmn:serviceTask>",
+                r#"<bpmn:multiInstanceLoopCharacteristics>
+                <bpmn:extensionElements>
+                  <zeebe:loopCharacteristics inputCollection="= [1,2]" inputElement="item"/>
+                </bpmn:extensionElements>
+              </bpmn:multiInstanceLoopCharacteristics></bpmn:serviceTask>"#,
+            );
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(parse_bpmn(&xml).unwrap().remove(0)))
+            .unwrap();
+        engine
+            .apply_command(Command::create_instance_with(
+                "external-agent-routing",
+                HashMap::from([("route".into(), Value::Str("senior:rebase".into()))]),
+            ))
+            .unwrap();
+        let jobs = engine.activate_jobs("senior:rebase", "W", 10, 1_000, 0);
+        assert_eq!(jobs.len(), 2, "{marker}");
+        assert_ne!(jobs[0].element_instance_key, jobs[1].element_instance_key);
+        assert_ne!(jobs[0].lease_token, jobs[1].lease_token);
+        for job in &jobs {
+            engine
+                .apply_command(Command::CreateAgentInstance {
+                    element_instance_key: job.element_instance_key,
+                    job_key: job.key,
+                    job_lease: job.lease_token.unwrap(),
+                    definition: AgentDefinition::default(),
+                    limits: None,
+                    history: vec![],
+                })
+                .unwrap();
+        }
+        let mut events = Vec::new();
+        for job in jobs {
+            events.extend(
+                engine
+                    .apply_command(Command::complete_job(job.key))
+                    .unwrap(),
+            );
+        }
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
+    }
 }
 
 fn assert_external_job_lifecycle(xml: &str, expected_type: &str) {
     let def = parse_bpmn(xml).unwrap().remove(0);
+    let ElementKind::ServiceTask {
+        agent_type: Some(expected_agent_type),
+        ..
+    } = def.elements["agent"].kind
+    else {
+        panic!("expected marked service task")
+    };
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
     let events = engine
@@ -105,7 +266,7 @@ fn assert_external_job_lifecycle(xml: &str, expected_type: &str) {
     assert!(events.iter().any(|event| matches!(
         event,
         Event::AgentInstanceCreated { agent_instance, .. }
-            if agent_instance.agent_type == AgentType::External
+            if agent_instance.agent_type == expected_agent_type
                 && agent_instance.job_key == job_key
                 && agent_instance.job_lease == lease
     )));
@@ -167,6 +328,10 @@ fn job_type_expressions_see_task_inputs_with_and_without_start_listeners() {
                     .activate_jobs("before", "W", 1, 1_000, 0)
                     .pop()
                     .unwrap();
+                assert!(
+                    job.lease_token.is_none(),
+                    "execution listeners are not agent jobs"
+                );
                 engine
                     .apply_command(Command::complete_job(job.key))
                     .unwrap();

@@ -324,19 +324,29 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > scope, then completes that scope). Instances carry JSON-like variables (`null`, booleans, numbers,
 > strings, lists and contexts) evaluated by an in-house FEEL engine ([`feel`])
 > for gateway conditions, job types and message correlation. It also supports
-> **engine-native AI agent tasks** (Camunda stable/8.10 AgentInstance parity): a
-> `serviceTask` bearing a `zeebe:agentDefinition agentType="aiAgentTask"` marker
-> activates into a first-class **`AgentInstance`** — keyed by its own dedicated
-> key, linked to the element instance, in status `INITIALIZING` — that the engine
-> holds as the system-of-record, rather than creating a job. An
-> `agentType="external"` agent instead activates as a **normal job** (no
-> AgentInstance is auto-minted); a worker activates that job and self-registers
-> the `AgentInstance` via a **lease-gated** create/update that must reference the
-> element's ACTIVATED job with the matching lease token and element-instance key.
-> A co-located `zeebe:taskDefinition type="..."` supplies the external agent's
+> **persisted AgentInstance state** (Camunda stable/8.10 parity): agent markers
+> classify ordinary job-worker elements rather than replacing their behavior.
+> Both `agentType="aiAgentTask"` and `agentType="external"` service tasks create
+> **normal jobs**, retaining their headers, linked resources, priority, retries,
+> input/output mappings, and multi-instance behavior. The worker explicitly
+> registers the `AgentInstance`; none is automatically minted on activation.
+> Advancing the BPMN task still requires ordinary job completion; marking the
+> agent instance completed only updates its persisted agent state.
+> CREATE/UPDATE validate supplied job attribution for every agent type, and
+> history-bearing requests require the matching ACTIVATED job and opaque lease.
+> History-free requests may omit job attribution.
+> A co-located `zeebe:taskDefinition type="..."` supplies the agent's
 > job type (literal or FEEL, evaluated after input mappings); without one it
 > defaults to the element id. Adding the external marker therefore preserves
 > an existing worker's task-definition-based routing.
+> This replaces Nano's earlier no-job `aiAgentTask` behavior: workers must now
+> register the agent explicitly. Historical `AgentTask` deployment frames and
+> snapshots remain readable and are normalized to the shared service-task model;
+> replay preserves existing runtime state and does not fabricate agent records
+> or jobs for already-active elements. Existing jobless native activations cannot
+> acquire a job lease after restoration; cancel/restart those instances against
+> a redeployed model to use the job-backed lifecycle. Redeploy models to recover
+> metadata that older parsers discarded, such as linked prompt resources.
 > Placement mirrors Camunda's `AgentDefinitionValidator` (`aiAgentTask` only on a
 > `serviceTask`, `aiAgentSubProcess` only on an `adHocSubProcess`); the wrong
 > placement is rejected at deploy. Processes can be

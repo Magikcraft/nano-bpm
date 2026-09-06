@@ -390,19 +390,13 @@ pub enum Command {
     CreateAgentInstance {
         /// The key of the AI Agent Sub-process / AI Agent Task element instance.
         element_instance_key: Key,
-        /// The agent job whose ACTIVATED lease authorizes this create. Required
-        /// for an `external` (job-backed) agent element (#1099): the referenced
-        /// job must be `ACTIVATED`, its `element_instance_key` must match, and
-        /// its lease deadline must equal `job_lease` — mirroring Camunda's
-        /// `AgentHistoryBatchBehavior.validateJobContext`. Ignored (`0`) for the
-        /// engine-native `aiAgentTask`/`aiAgentSubProcess` variants, which have
-        /// no external worker and whose AgentInstance is auto-minted at
-        /// activation.
+        /// Job attribution for any agent type. A supplied job must be ACTIVATED,
+        /// belong to this element instance, and have the matching opaque lease.
+        /// History requires a job; a history-free request may omit it (`0`),
+        /// mirroring Camunda's `AgentHistoryBatchBehavior.validateJobContext`.
         #[cfg_attr(feature = "serde", serde(default))]
         job_key: Key,
-        /// The activation lease deadline (the "lease token") of `job_key`. Must
-        /// equal the referenced job's current lease deadline for an `external`
-        /// agent; ignored (`0`) otherwise.
+        /// The opaque activation lease token of `job_key`, not its deadline.
         #[cfg_attr(feature = "serde", serde(default))]
         job_lease: u64,
         /// Static definition set once at creation (model/provider/systemPrompt).
@@ -446,16 +440,12 @@ pub enum Command {
         /// instance; must match the stored instance.
         #[cfg_attr(feature = "serde", serde(default))]
         process_instance_key: Key,
-        /// The agent job whose ACTIVATED lease authorizes an appended history
-        /// batch for an `external` (job-backed) agent element (#1099). When this
-        /// update carries `history` for an `external` agent, the referenced job
-        /// must be `ACTIVATED`, match `element_instance_key`, and its lease
-        /// deadline must equal `job_lease` (parity with Camunda's
-        /// `validateJobContext`). Ignored (`0`) for the engine-native variants
-        /// and for history-free updates.
+        /// A supplied job is always lease-validated, for every agent type.
+        /// History requires an ACTIVATED job belonging to this element instance;
+        /// a history-free update may omit job attribution (`0`).
         #[cfg_attr(feature = "serde", serde(default))]
         job_key: Key,
-        /// The activation lease deadline (the "lease token") of `job_key`; see
+        /// The opaque activation lease token of `job_key`; see
         /// `job_key`.
         #[cfg_attr(feature = "serde", serde(default))]
         job_lease: u64,

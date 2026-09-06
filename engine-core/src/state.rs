@@ -1553,10 +1553,12 @@ pub fn apply(state: &mut State, event: &Event) {
             process,
             ..
         } => {
+            let mut definition = process.clone();
+            definition.normalize_legacy_agent_tasks();
             let deployed = DeployedProcess {
                 key: *process_definition_key,
                 version: *version,
-                definition: process.clone(),
+                definition,
             };
             // Retain every version, keyed by its unique definition key, so a
             // running instance can always resolve the version it was created on.

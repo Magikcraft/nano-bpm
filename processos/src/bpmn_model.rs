@@ -67,7 +67,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::ConditionalBoundaryEvent { .. } => "conditionalBoundaryEvent",
         ElementKind::CompensationBoundaryEvent { .. } => "compensationBoundaryEvent",
         ElementKind::CompensationThrowEvent => "compensationThrowEvent",
-        ElementKind::AgentTask { .. } => "agentTask",
+        ElementKind::AgentTask { .. } => "serviceTask",
     }
 }
 
@@ -2096,12 +2096,21 @@ fn emit_element(
             // the MI block is a direct child of the callActivity).
             out.push_str(&format!("    <bpmn:callActivity id=\"{eid}\"{na}>\n"));
             out.push_str("      <bpmn:extensionElements>\n");
-            out.push_str(&format!(
-                "        <zeebe:calledElement processId=\"{}\" \
+            let unbound_tool = def.adhoc.iter().flat_map(|a| &a.tools).any(|tool| {
+                tool.element_id == id
+                    && matches!(
+                        tool.kind,
+                        nanobpmn_engine_core::AdHocToolKind::CallActivity { process_id: None }
+                    )
+            });
+            if !unbound_tool {
+                out.push_str(&format!(
+                    "        <zeebe:calledElement processId=\"{}\" \
 propagateAllParentVariables=\"{propagate_all_parent_variables}\" \
 propagateAllChildVariables=\"{propagate_all_child_variables}\"/>\n",
-                xml_escape(called_process_id)
-            ));
+                    xml_escape(called_process_id)
+                ));
+            }
             emit_io_mapping(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             emit_multi_instance(el, out);
@@ -2127,18 +2136,59 @@ propagateAllChildVariables=\"{propagate_all_child_variables}\"/>\n",
             priority,
             custom_headers,
             linked_resources,
+            agent_type,
         } => {
-            out.push_str(&format!("    <bpmn:serviceTask id=\"{eid}\"{na}>\n"));
-            out.push_str("      <bpmn:extensionElements>\n");
-            let retries_attr = el
-                .retries
-                .as_deref()
-                .map(|r| format!(" retries=\"{}\"", xml_escape(r)))
+            let adhoc = def.adhoc.iter().find(|a| a.container_id == id);
+            let tag = if adhoc.is_some() {
+                "adHocSubProcess"
+            } else {
+                "serviceTask"
+            };
+            let cancel_attr = adhoc
+                .map(|a| {
+                    format!(
+                        " cancelRemainingInstances=\"{}\"",
+                        a.cancel_remaining_instances
+                    )
+                })
                 .unwrap_or_default();
-            out.push_str(&format!(
-                "        <zeebe:taskDefinition type=\"{}\"{retries_attr}/>\n",
-                xml_escape(job_type)
-            ));
+            out.push_str(&format!("    <bpmn:{tag} id=\"{eid}\"{na}{cancel_attr}>\n"));
+            out.push_str("      <bpmn:extensionElements>\n");
+            if let Some(adhoc) = adhoc {
+                out.push_str("        <zeebe:adHoc");
+                for (key, value) in [
+                    (
+                        "activeElementsCollection",
+                        &adhoc.active_elements_collection,
+                    ),
+                    ("outputCollection", &adhoc.output_collection),
+                    ("outputElement", &adhoc.output_element),
+                ] {
+                    if let Some(value) = value {
+                        out.push_str(&format!(" {key}=\"{}\"", xml_escape(value)));
+                    }
+                }
+                out.push_str("/>\n");
+            }
+            if let Some(agent_type) = agent_type {
+                out.push_str(&format!(
+                    "        <zeebe:agentDefinition agentType=\"{}\"/>\n",
+                    xml_escape(agent_type.as_str())
+                ));
+            }
+            if adhoc.is_none_or(|a| {
+                a.impl_type == nanobpmn_engine_core::AdHocImplementationType::JobWorker
+            }) {
+                let retries_attr = el
+                    .retries
+                    .as_deref()
+                    .map(|r| format!(" retries=\"{}\"", xml_escape(r)))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "        <zeebe:taskDefinition type=\"{}\"{retries_attr}/>\n",
+                    xml_escape(job_type)
+                ));
+            }
             if let Some(p) = priority {
                 out.push_str(&format!(
                     "        <zeebe:priorityDefinition priority=\"{}\"/>\n",
@@ -2183,7 +2233,28 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             emit_io_mapping(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             emit_multi_instance(el, out);
-            out.push_str("    </bpmn:serviceTask>\n");
+            if let Some(adhoc) = adhoc {
+                for tool in &adhoc.tools {
+                    emit_element(
+                        def,
+                        &tool.element_id,
+                        errors,
+                        messages,
+                        signals,
+                        children_by_parent,
+                        labels,
+                        default_flows,
+                        out,
+                    );
+                }
+                if let Some(condition) = &adhoc.completion_condition {
+                    out.push_str(&format!(
+                        "      <bpmn:completionCondition>{}</bpmn:completionCondition>\n",
+                        xml_escape(condition)
+                    ));
+                }
+            }
+            out.push_str(&format!("    </bpmn:{tag}>\n"));
         }
         ElementKind::BusinessRuleTask {
             decision_id,
@@ -2512,29 +2583,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             }
             out.push_str("    </bpmn:subProcess>\n");
         }
-        ElementKind::AgentTask {
-            agent_type,
-            job_type,
-            ..
-        } => {
-            // Runtime definition/limits are supplied at CREATE, not model structure.
-            out.push_str(&format!("    <bpmn:serviceTask id=\"{eid}\"{na}>\n"));
-            out.push_str("      <bpmn:extensionElements>\n");
-            out.push_str(&format!(
-                "        <zeebe:agentDefinition agentType=\"{}\"/>\n",
-                xml_escape(agent_type.as_str())
-            ));
-            if let Some(job_type) = job_type {
-                out.push_str(&format!(
-                    "        <zeebe:taskDefinition type=\"{}\"/>\n",
-                    xml_escape(job_type)
-                ));
-            }
-            emit_io_mapping(el, out);
-            out.push_str("      </bpmn:extensionElements>\n");
-            emit_multi_instance(el, out);
-            out.push_str("    </bpmn:serviceTask>\n");
-        }
+        ElementKind::AgentTask { .. } => unreachable!("legacy agent tasks are normalized"),
     }
 }
 
@@ -2699,12 +2748,66 @@ pub fn definition_to_xml_with_row_bias(
     preserve_nano_extensions_in(emitted, &extensions)
 }
 
+/// Restore pruned catalog entries only in the emission copy, so XML and DI share the
+/// same authored tool nodes. Retained sub-process tools already carry their executable body.
+fn restore_adhoc_catalog_elements(def: &mut ProcessDefinition) {
+    use nanobpmn_engine_core::AdHocToolKind;
+
+    for adhoc in &def.adhoc {
+        for tool in &adhoc.tools {
+            if def.elements.contains_key(&tool.element_id) {
+                continue;
+            }
+            let kind = match &tool.kind {
+                AdHocToolKind::ServiceTask { job_type } => ElementKind::ServiceTask {
+                    job_type: job_type.clone(),
+                    priority: None,
+                    agent_type: None,
+                    custom_headers: BTreeMap::new(),
+                    linked_resources: Vec::new(),
+                },
+                AdHocToolKind::UserTask(props) => ElementKind::UserTask(props.clone()),
+                AdHocToolKind::CallActivity { process_id } => ElementKind::CallActivity {
+                    called_process_id: process_id.clone().unwrap_or_default(),
+                    propagate_all_parent_variables: true,
+                    propagate_all_child_variables: true,
+                },
+                AdHocToolKind::SubProcess { start_event } => ElementKind::SubProcess {
+                    start_event: start_event.clone(),
+                },
+                AdHocToolKind::Other => ElementKind::Task,
+            };
+            def.elements.insert(
+                tool.element_id.clone(),
+                Element {
+                    id: tool.element_id.clone(),
+                    kind,
+                    name: Some(tool.name.clone()),
+                    parent: Some(adhoc.container_id.clone()),
+                    outgoing: Vec::new(),
+                    io: tool.io.clone(),
+                    timer: None,
+                    retries: None,
+                    multi_instance: None,
+                    start_listeners: Vec::new(),
+                    end_listeners: Vec::new(),
+                    task_listeners: Vec::new(),
+                },
+            );
+        }
+    }
+}
+
 fn serialize_definition(
     def: &ProcessDefinition,
     overrides: &HashMap<String, String>,
     di: Option<&PreservedDi>,
     row_bias: Option<&HashMap<String, f64>>,
 ) -> String {
+    let mut normalized = def.clone();
+    normalized.normalize_legacy_agent_tasks();
+    restore_adhoc_catalog_elements(&mut normalized);
+    let def = &normalized;
     let errors = collect_error_ids(def);
     let (messages, msg_lookup) = collect_messages(def);
     let signals = collect_signals(def);
@@ -2716,6 +2819,13 @@ fn serialize_definition(
         let label = overrides
             .get(id)
             .cloned()
+            .or_else(|| {
+                def.adhoc
+                    .iter()
+                    .flat_map(|a| &a.tools)
+                    .find(|tool| &tool.element_id == id)
+                    .map(|tool| tool.name.clone())
+            })
             .unwrap_or_else(|| humanize_id(id));
         labels.insert(id.clone(), label);
     }
@@ -3448,6 +3558,7 @@ fn apply_edit_op(
                 Element {
                     id: id.to_string(),
                     kind: ElementKind::ServiceTask {
+                        agent_type: None,
                         job_type: job_type.to_string(),
                         priority: None,
                         custom_headers: std::collections::BTreeMap::new(),
@@ -4190,17 +4301,210 @@ mod tests {
             );
             let (def, _) = first_def(&model).unwrap();
             let xml = definition_to_xml(&def);
-            assert_eq!(
-                xml.contains("<zeebe:taskDefinition"),
-                !declaration.is_empty()
-            );
+            assert!(xml.contains("<zeebe:taskDefinition"));
             assert!(xml.contains(declaration), "{xml}");
             let ir = crate::model_ir::definition_to_ir(&def, &HashMap::new());
-            assert_eq!(ir.contains("jobType"), !declaration.is_empty(), "{ir}");
+            assert!(ir.contains("jobType"), "{ir}");
             let restored = crate::model_ir::ir_to_definition(&ir).unwrap();
             let xml = definition_to_xml(&restored.definition);
             assert!(xml.contains(declaration), "{xml}");
             assert_same_structure(&def, &parse_bpmn(&xml).unwrap()[0]);
+        }
+    }
+
+    #[test]
+    fn agent_metadata_xml_preserves_all_job_configuration() {
+        use nanobpmn_engine_core::{AgentType, IoMapping, Mapping, MultiInstance};
+
+        for marker in [AgentType::AiAgentTask, AgentType::External] {
+            let mut def = nanobpmn_engine_core::ProcessBuilder::new("AgentConfig")
+                .start_event("Start")
+                .agent_task("Agent", "= workerType", marker)
+                .end_event("End")
+                .connect("Start", "Agent")
+                .connect("Agent", "End")
+                .build()
+                .unwrap();
+            let el = def.elements.get_mut("Agent").unwrap();
+            el.retries = Some("= maxRetries".into());
+            el.io = IoMapping {
+                inputs: vec![Mapping {
+                    source: "= item".into(),
+                    target: "in".into(),
+                }],
+                outputs: vec![Mapping {
+                    source: "= result".into(),
+                    target: "out".into(),
+                }],
+            };
+            el.multi_instance = Some(MultiInstance {
+                input_collection: "= items".into(),
+                input_element: Some("item".into()),
+                output_collection: Some("results".into()),
+                output_element: Some("= result".into()),
+                sequential: true,
+                completion_condition: None,
+            });
+            let ElementKind::ServiceTask {
+                priority,
+                custom_headers,
+                linked_resources,
+                ..
+            } = &mut el.kind
+            else {
+                panic!("agent marker must be ordinary job metadata");
+            };
+            *priority = Some("= urgency".into());
+            custom_headers.insert("model".into(), "a&b".into());
+            linked_resources.push(nanobpmn_engine_core::LinkedResource {
+                resource_id: "prompt.md".into(),
+                binding_type: BindingType::VersionTag,
+                resource_type: "GenericScript".into(),
+                version_tag: Some("v3".into()),
+                link_name: "agentPrompt".into(),
+            });
+            let xml = definition_to_xml(&def);
+            assert!(xml.contains("<bpmndi:BPMNDiagram"));
+            assert!(xml.contains(&format!("agentType=\"{}\"", marker.as_str())));
+            assert!(xml.contains("<bpmn:serviceTask id=\"Agent\""));
+            let mut parsed = parse_bpmn(&xml).unwrap();
+            parsed[0].elements.get_mut("Agent").unwrap().name = None;
+            assert_eq!(parsed[0].elements["Agent"], def.elements["Agent"]);
+        }
+    }
+
+    fn authored_adhoc_catalog_xml() -> String {
+        let source = include_str!("../../engine-core/tests/fixtures/external-agent-job-type.bpmn");
+        let tools = r#"
+      <bpmn:serviceTask id="Lookup" name="Look up account">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="lookup"/>
+          <zeebe:ioMapping><zeebe:input source="= account" target="id"/><zeebe:output source="= result" target="accountResult"/></zeebe:ioMapping>
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:userTask id="Review" name="Review account">
+        <bpmn:extensionElements><zeebe:userTask/><zeebe:assignmentDefinition assignee="alice"/></bpmn:extensionElements>
+      </bpmn:userTask>
+      <bpmn:callActivity id="Escalate"><bpmn:extensionElements><zeebe:calledElement processId="escalation"/></bpmn:extensionElements></bpmn:callActivity>
+      <bpmn:callActivity id="UnboundCall"/>
+      <bpmn:task id="Note"/>
+      <bpmn:subProcess id="Investigate" name="Investigate">
+        <bpmn:startEvent id="ToolStart"/><bpmn:serviceTask id="ToolWork"><bpmn:extensionElements><zeebe:taskDefinition type="investigate"/></bpmn:extensionElements></bpmn:serviceTask><bpmn:endEvent id="ToolEnd"/>
+        <bpmn:sequenceFlow id="tool_f1" sourceRef="ToolStart" targetRef="ToolWork"/><bpmn:sequenceFlow id="tool_f2" sourceRef="ToolWork" targetRef="ToolEnd"/>
+      </bpmn:subProcess>
+      <bpmn:completionCondition>= done</bpmn:completionCondition>
+    </bpmn:adHocSubProcess>"#;
+        let mut source = source
+            .replace("<bpmn:serviceTask id=\"agent\">", "<bpmn:adHocSubProcess id=\"agent\" cancelRemainingInstances=\"false\">")
+            .replace("</bpmn:serviceTask>", tools)
+            .replace("<dc:Bounds x=\"200\" y=\"78\" width=\"100\" height=\"80\"/>", "<dc:Bounds x=\"200\" y=\"78\" width=\"900\" height=\"400\"/>")
+            .replace("bpmnElement=\"agent\">", "bpmnElement=\"agent\" isExpanded=\"true\">")
+            .replace("x=\"300\"", "x=\"1100\"")
+            .replace("x=\"364\"", "x=\"1164\"")
+            .replace("<zeebe:taskDefinition type=\"senior:rebase\"/>", "<zeebe:taskDefinition type=\"senior:rebase\" retries=\"7\"/><zeebe:adHoc outputCollection=\"results\" outputElement=\"= result\"/><zeebe:priorityDefinition priority=\"= urgency\"/><zeebe:taskHeaders><zeebe:header key=\"model\" value=\"gpt\"/></zeebe:taskHeaders><zeebe:linkedResources><zeebe:linkedResource linkName=\"prompt\" resourceId=\"prompt.md\" resourceType=\"GenericScript\" bindingType=\"latest\"/></zeebe:linkedResources>");
+        let mut shapes = String::new();
+        for (id, x, y, width, height) in [
+            ("Lookup", 220, 140, 100, 80),
+            ("Review", 350, 140, 100, 80),
+            ("Escalate", 480, 140, 100, 80),
+            ("UnboundCall", 610, 140, 100, 80),
+            ("Note", 740, 140, 100, 80),
+            ("Investigate", 220, 260, 500, 160),
+            ("ToolStart", 250, 320, 36, 36),
+            ("ToolWork", 350, 298, 100, 80),
+            ("ToolEnd", 500, 320, 36, 36),
+        ] {
+            let expanded = if id == "Investigate" {
+                " isExpanded=\"true\""
+            } else {
+                ""
+            };
+            shapes.push_str(&format!(
+                "<bpmndi:BPMNShape id=\"{id}_di\" bpmnElement=\"{id}\"{expanded}><dc:Bounds x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{height}\"/></bpmndi:BPMNShape>"
+            ));
+        }
+        for (id, from, to) in [("tool_f1", 286, 350), ("tool_f2", 450, 500)] {
+            shapes.push_str(&format!(
+                "<bpmndi:BPMNEdge id=\"{id}_di\" bpmnElement=\"{id}\"><di:waypoint x=\"{from}\" y=\"338\"/><di:waypoint x=\"{to}\" y=\"338\"/></bpmndi:BPMNEdge>"
+            ));
+        }
+        source = source.replace(
+            "</bpmndi:BPMNPlane>",
+            &format!("{shapes}</bpmndi:BPMNPlane>"),
+        );
+        source
+    }
+
+    #[test]
+    fn agent_adhoc_xml_preserves_authored_catalog_and_di() {
+        let source = authored_adhoc_catalog_xml();
+        for marker in ["external", "aiAgentSubProcess"] {
+            let source =
+                source.replace("agentType=\"external\"", &format!("agentType=\"{marker}\""));
+            let original = parse_bpmn(&source)
+                .expect("valid authored adHoc model")
+                .remove(0);
+            assert_eq!(original.adhoc[0].tools.len(), 6);
+            let emitted = definition_to_xml(&original);
+            assert!(
+                emitted.contains("<bpmn:adHocSubProcess id=\"agent\""),
+                "{emitted}"
+            );
+            let restored = parse_bpmn(&emitted)
+                .expect("emitted catalog is valid")
+                .remove(0);
+            assert_eq!(restored.adhoc, original.adhoc);
+            assert_same_structure(&restored, &original);
+            for tool in &original.adhoc[0].tools {
+                assert!(emitted.contains(&format!("bpmnElement=\"{}\"", tool.element_id)));
+            }
+            assert!(emitted.contains("bpmnElement=\"ToolWork\""));
+            let preserved =
+                definition_to_xml_preserving_di(&original, &HashMap::new(), Some(&source));
+            let authored_di = extract_preserved_di(&source).unwrap();
+            assert!(preserved.contains(&authored_di.diagram_block));
+            assert_eq!(parse_bpmn(&preserved).unwrap()[0].adhoc, original.adhoc);
+        }
+    }
+
+    #[test]
+    fn declarative_adhoc_xml_does_not_gain_a_job_worker() {
+        use nanobpmn_engine_core::AdHocImplementationType;
+
+        let source = authored_adhoc_catalog_xml()
+            .replace(
+                "<zeebe:taskDefinition type=\"senior:rebase\" retries=\"7\"/>",
+                "",
+            )
+            .replace("<zeebe:agentDefinition agentType=\"external\"/>", "")
+            .replace(
+                "<zeebe:adHoc ",
+                "<zeebe:adHoc activeElementsCollection=\"=[&quot;Lookup&quot;]\" ",
+            );
+        let original = parse_bpmn(&source)
+            .expect("valid declarative adHoc")
+            .remove(0);
+        assert_eq!(
+            original.adhoc[0].impl_type,
+            AdHocImplementationType::BpmnTask
+        );
+        for emitted in [
+            definition_to_xml(&original),
+            definition_to_xml_preserving_di(&original, &HashMap::new(), Some(&source)),
+        ] {
+            let container_extensions = emitted
+                .split("<bpmn:adHocSubProcess")
+                .nth(1)
+                .unwrap()
+                .split("</bpmn:extensionElements>")
+                .next()
+                .unwrap();
+            assert!(!container_extensions.contains("<zeebe:taskDefinition"));
+            let restored = parse_bpmn(&emitted)
+                .expect("declarative XML remains valid")
+                .remove(0);
+            assert_eq!(restored.adhoc, original.adhoc);
+            assert_same_structure(&restored, &original);
         }
     }
 
@@ -4220,6 +4524,7 @@ mod tests {
     <bpmn:serviceTask id="Agent">
       <bpmn:extensionElements>
         <zeebe:agentDefinition agentType="aiAgentTask"/>
+        <zeebe:taskDefinition type="agent-worker"/>
         <zeebe:ioMapping>
           <zeebe:input source="= item" target="in"/>
           <zeebe:output source="= result" target="out"/>
@@ -4244,7 +4549,10 @@ mod tests {
         let (orig, _) = first_def(AGENT_MI_BPMN).expect("parse agent multi-instance model");
         assert!(matches!(
             orig.elements["Agent"].kind,
-            ElementKind::AgentTask { .. }
+            ElementKind::ServiceTask {
+                agent_type: Some(_),
+                ..
+            }
         ));
         let xml = definition_to_xml(&orig);
         assert!(

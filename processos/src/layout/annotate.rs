@@ -547,6 +547,7 @@ mod tests {
         let role = classify_role(
             "send review reminder email",
             &ElementKind::ServiceTask {
+                agent_type: None,
                 job_type: "notify".into(),
                 priority: None,
                 custom_headers: std::collections::BTreeMap::new(),

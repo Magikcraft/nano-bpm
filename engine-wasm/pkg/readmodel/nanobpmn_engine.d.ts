@@ -93,11 +93,11 @@ export class TestEngine {
      * systemPrompt? }`, `limits` is `{ maxTokens?, maxModelCalls?, maxToolCalls? }`
      * (omitted limits default to unlimited), and `history` is an initial batch of
      * turns (see the turn shape on `updateAgentInstance`). `jobKey`/`jobLease`
-     * are the activation's job attribution: **required** for an `external`
-     * (job-backed) agent element, where the CREATE is rejected unless they
-     * reference that element's ACTIVATED job with a matching lease token and
-     * `elementInstanceKey` (#1099); unused for the engine-native
-     * `aiAgentTask`/`aiAgentSubProcess` variants. Returns the snapshot.
+     * are the activation's job attribution: when supplied, they must reference
+     * that element's ACTIVATED job with a matching lease token for every agent
+     * type. History requires this attribution; history-free requests may omit
+     * it. Agent-marked elements create ordinary jobs, not AgentInstances:
+     * workers explicitly register them through this command. Returns the snapshot.
      */
     createAgentInstance(request_json: string): string;
     /**
@@ -330,8 +330,9 @@ export class TestEngine {
      * status?, metrics?, tools?, jobKey?, jobLease?, history? }`. `tools` is a
      * nullable changeset: omit it to leave the stored set unchanged, pass `null`
      * to clear it, or an array to replace it. `jobKey`/`jobLease` are the
-     * activation's job attribution, stamped onto every appended turn (as the
-     * gateway does). A turn is `{ loopIteration?, producedAt?, role?, content?,
+     * activation's validated job attribution, required for and stamped onto
+     * every appended turn (as the gateway does). A turn is
+     * `{ loopIteration?, producedAt?, role?, content?,
      * systemPrompt?, historyItemId?, model?, provider? }`, where `producedAt` is
      * an RFC-3339 `date-time` string (the REST spelling; a bare epoch-millis
      * number is also accepted); `content` items are `{ contentType?, text?,

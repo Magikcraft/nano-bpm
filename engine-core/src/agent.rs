@@ -2,18 +2,17 @@
 //!
 //! The engine is the system-of-record for AgentInstance state. This module
 //! holds the *shape* of that state: the `zeebe:agentDefinition` marker
-//! ([`AgentType`]), the static per-element agent definition
-//! ([`AgentDefinition`]) and its optional limits ([`AgentInstanceLimits`]) that
-//! ride on [`crate::model::ElementKind::AgentTask`], and the runtime
+//! ([`AgentType`]) on [`crate::model::ElementKind::ServiceTask`], the definition
+//! ([`AgentDefinition`]) and optional limits ([`AgentInstanceLimits`]) supplied
+//! by the worker at registration, and the runtime
 //! [`AgentInstance`] record — a first-class object keyed by its own dedicated
 //! `agent_instance_key`, linked to the activating `element_instance_key`, and
 //! driven through the [`AgentInstanceStatus`] state machine.
 //!
 //! LLM calls / prompt assembly / tool dispatch are deliberately **out of
 //! scope**: those live in the worker layer. Here we only model the state the
-//! engine owns. The lifecycle *processors* (CREATE/UPDATE/COMPLETE) are a later
-//! slice; this slice makes a `CREATED` AgentInstance (status `INITIALIZING`)
-//! representable and defines the full intent enum downstream slices reuse.
+//! engine owns. Every agent marker retains the normal job-worker lifecycle;
+//! CREATE/UPDATE/COMPLETE explicitly manage the persisted agent state.
 
 use crate::model::ElementId;
 use crate::state::Key;

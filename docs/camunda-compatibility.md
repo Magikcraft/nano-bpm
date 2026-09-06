@@ -123,28 +123,25 @@ When a native DMN engine milestone is signed, it is dedicated to Sebastian Mensk
 
 ## 3. Agentic / AI-Agent elements
 
-Camunda is moving the AI Agent **into the engine** via the `AgentInstance` record
-family (an engine-hosted reasoning loop whose tools are modeled inner elements of an
-`adHocSubProcess`).
+Nano supports the Camunda `AgentInstance` and `AgentHistory` record lifecycle
+without hosting the worker's reasoning loop. A `serviceTask` marked
+`aiAgentTask` or `external` remains an ordinary job-backed service task, preserving
+its task-definition routing, retries, priority, custom headers and linked
+resources (including prompts). An `aiAgentSubProcess` marker likewise does not
+replace the ad-hoc container's ordinary job-worker behavior.
 
-**Today's answer: engine-native `AgentInstance` is not implemented** — there is no
-`AgentInstance` symbol in `engine-core`. A Camunda user who brings a diagram with an
-AI-Agent ad-hoc sub-process will find the ad-hoc container handled only at the
-**partial** level above (collapsed to a job), and the agentic loop **not** run by the
-engine.
+Activation creates the job, **not** an AgentInstance. The worker activates the
+job and explicitly calls CREATE, then UPDATE to record status, metrics and
+history. All agent types validate supplied `jobKey`/`jobLease` against the
+element's activated job. History requires this attribution; history-free
+CREATE/UPDATE may omit it. A supplied UPDATE job refreshes attribution for every
+agent type. AgentInstance COMPLETE is separate from completing the worker job:
+the latter advances BPMN execution.
 
-This is a deliberate, documented position, not an oversight. [ADR 0046](adr/0046-agent-as-worker-vs-agent-in-the-node.md)
-distinguishes two topologies:
-
-- **Agent-as-worker** (Nano-native, differentiated): the agent is an external job
-  worker; the engine routes to and awaits it. This is what `c8ctl nano hire`/`work`
-  produces today and is Nano's leading model for open-ended, long-running agents.
-- **Agent-in-the-node** (Camunda `AgentInstance`): the engine hosts the loop. Nano
-  treats this as a **planned compatibility target** — a drop-in obligation — **not**
-  the authoring model, and it is **not built yet**.
-
-So: **agent-as-worker = supported today; engine-native `AgentInstance` = planned
-(compat), unbuilt.**
+Agent-marked BPMN-element jobs carry an opaque per-activation lease token;
+execution-listener jobs do not. Legacy serialized `AgentTask` elements remain
+readable and are normalized to marked service tasks on deployment, replay and
+snapshot loading.
 
 ---
 

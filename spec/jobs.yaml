@@ -519,6 +519,13 @@ components:
           allOf:
             - $ref: 'keys.yaml#/components/schemas/JobKey'
           description: The key, a unique identifier for the job.
+        jobLease:
+          description: |
+            The opaque token for this activation of an agent-marked BPMN job.
+            Omitted for unmarked tasks and listener jobs. Echo it with jobKey
+            when registering or updating an agent instance.
+          allOf:
+            - $ref: 'keys.yaml#/components/schemas/JobLease'
         processInstanceKey:
           allOf:
             - $ref: 'keys.yaml#/components/schemas/ProcessInstanceKey'

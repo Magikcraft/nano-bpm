@@ -62,14 +62,11 @@
 //!   logic, member access — not just equality). A condition that fails to
 //!   evaluate to a boolean raises an `ExpressionEvaluation` incident.
 //! * A `serviceTask` bearing a `zeebe:agentDefinition agentType="aiAgentTask"`
-//!   (or `"external"`) extension marker becomes an engine-native
-//!   [`AgentTask`](crate::model::ElementKind::AgentTask). For `aiAgentTask` the
-//!   engine mints a first-class `AgentInstance` (dedicated key, linked to the
-//!   element instance) in status `INITIALIZING` on activation, rather than
-//!   creating a job. An `"external"` agent is job-backed (Camunda parity #1099):
-//!   on activation it creates a **normal job** (activatable through the standard
-//!   job loop) and its `AgentInstance` is minted lazily by the worker via a
-//!   lease-gated `CreateAgentInstance`. Its job type comes from a co-located
+//!   (or `"external"`) extension marker remains an ordinary
+//!   [`ServiceTask`](crate::model::ElementKind::ServiceTask), with agent metadata.
+//!   It creates a normal job; the worker explicitly registers its AgentInstance
+//!   via `CreateAgentInstance`. Supplied job attribution is lease-validated,
+//!   and history-bearing requests require it. Its job type comes from a co-located
 //!   `zeebe:taskDefinition type` (literal or FEEL), or the element id when absent.
 //!   Placement mirrors Camunda's
 //!   `AgentDefinitionValidator`: `aiAgentTask` is only valid on a `serviceTask`
@@ -2032,8 +2029,8 @@ struct NodeAcc {
     /// disambiguate) which association endpoint is the real handler.
     is_for_compensation: bool,
     /// The `agentType` from a `zeebe:agentDefinition` extension marker on this
-    /// activity, if present. Makes a `serviceTask` an engine-native
-    /// [`AgentTask`](crate::model::ElementKind::AgentTask). Placement is validated
+    /// activity, if present. Classifies the ordinary job-worker element.
+    /// Placement is validated
     /// at build (`aiAgentTask` only on a `serviceTask`, `aiAgentSubProcess` only
     /// on an `adHocSubProcess`), mirroring Camunda's `AgentDefinitionValidator`.
     agent_type: Option<crate::agent::AgentType>,
@@ -2898,8 +2895,7 @@ impl ProcessAcc {
                 NodeKind::Parallel => builder.parallel_gateway(node.id),
                 NodeKind::EventBased => builder.event_based_gateway(node.id),
                 NodeKind::Service => {
-                    // A zeebe:agentDefinition marker makes this an engine-native
-                    // AgentInstance host (Camunda stable/8.10). Placement rules
+                    // Agent classification is metadata on the job worker. Placement rules
                     // (from AgentDefinitionValidator): aiAgentTask only on a
                     // serviceTask, aiAgentSubProcess only on an adHocSubProcess.
                     // Reject the wrong placement here. An `external` agent is
@@ -2924,28 +2920,15 @@ impl ProcessAcc {
                             }
                             _ => {}
                         }
-                        // S1 hosts the AgentInstance on the serviceTask surface.
-                        // An aiAgentSubProcess stays on the existing ad-hoc
-                        // machinery (only its placement is validated here); its
-                        // engine-native hosting arrives in a later slice.
-                        if node.is_adhoc {
-                            let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
-                            builder.service_task_with_links(
-                                node.id,
-                                job_type,
-                                node.job_priority,
-                                node.task_headers,
-                                node.linked_resources,
-                            )
-                        } else {
-                            builder.agent_task_with_job_type(
-                                node.id,
-                                agent_type,
-                                crate::agent::AgentDefinition::default(),
-                                None,
-                                node.job_type,
-                            )
-                        }
+                        let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
+                        builder.service_task_with_links_and_agent(
+                            node.id,
+                            job_type,
+                            node.job_priority,
+                            node.task_headers,
+                            node.linked_resources,
+                            Some(agent_type),
+                        )
                     } else if let (Some(expr), Some(rv)) = (
                         node.script_expression.clone(),
                         node.script_result_variable.clone(),
@@ -4067,6 +4050,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "payment".to_string(),
                 priority: None,
+                agent_type: None,
                 custom_headers: std::collections::BTreeMap::new(),
                 linked_resources: Vec::new(),
             }
@@ -4135,6 +4119,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "do-work".to_string(),
                 priority: None,
+                agent_type: None,
                 custom_headers: std::collections::BTreeMap::new(),
                 linked_resources: Vec::new(),
             }
@@ -4196,6 +4181,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "ruler".to_string(),
                 priority: None,
+                agent_type: None,
                 custom_headers: std::collections::BTreeMap::new(),
                 linked_resources: Vec::new(),
             }
@@ -4258,6 +4244,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "run-script".to_string(),
                 priority: None,
+                agent_type: None,
                 custom_headers: std::collections::BTreeMap::new(),
                 linked_resources: Vec::new(),
             }
@@ -4305,6 +4292,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "io.camunda.agenticai:aiagent-job-worker:1".to_string(),
                 priority: None,
+                agent_type: None,
                 custom_headers: std::collections::BTreeMap::new(),
                 linked_resources: Vec::new(),
             }
@@ -4857,6 +4845,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "payment".to_string(),
                 priority: None,
+                agent_type: None,
                 custom_headers: expected,
                 linked_resources: Vec::new(),
             }
@@ -4995,6 +4984,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "payment".to_string(),
                 priority: Some("=urgency".to_string()),
+                agent_type: None,
                 custom_headers: std::collections::BTreeMap::new(),
                 linked_resources: Vec::new(),
             }
@@ -5025,6 +5015,7 @@ mod tests {
                 job_type: "payment".to_string(),
                 priority: None,
                 custom_headers: std::collections::BTreeMap::new(),
+                agent_type: None,
                 linked_resources: Vec::new(),
             }
         );
@@ -5053,6 +5044,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "work".to_string(),
                 priority: None,
+                agent_type: None,
                 custom_headers: std::collections::BTreeMap::new(),
                 linked_resources: Vec::new(),
             }
@@ -6486,8 +6478,7 @@ mod feel_timer_tests {
     #[test]
     fn should_parse_an_ai_agent_task_service_task() {
         // A `serviceTask` bearing a `zeebe:agentDefinition agentType="aiAgentTask"`
-        // marker becomes an engine-native AgentTask element rather than a
-        // job-based service task (Camunda stable/8.10 AgentInstance parity).
+        // marker classifies the ordinary job-based service task.
         let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -6507,10 +6498,10 @@ mod feel_timer_tests {
         let def = &parse_bpmn(xml).unwrap()[0];
         let kind = &def.element("agent").unwrap().kind;
         match kind {
-            crate::model::ElementKind::AgentTask { agent_type, .. } => {
-                assert_eq!(*agent_type, crate::agent::AgentType::AiAgentTask);
+            crate::model::ElementKind::ServiceTask { agent_type, .. } => {
+                assert_eq!(*agent_type, Some(crate::agent::AgentType::AiAgentTask));
             }
-            other => panic!("expected AgentTask, got {other:?}"),
+            other => panic!("expected marked ServiceTask, got {other:?}"),
         }
     }
 
@@ -6572,9 +6563,8 @@ mod feel_timer_tests {
     #[test]
     fn should_accept_ai_agent_subprocess_on_an_ad_hoc_sub_process() {
         // The valid placement: `agentType="aiAgentSubProcess"` on a
-        // `bpmn:adHocSubProcess`. Unlike `aiAgentTask` (which becomes an
-        // engine-native `AgentTask`), the ad-hoc variant reuses the existing
-        // ad-hoc container machinery in S1 — so the container parses into a
+        // `bpmn:adHocSubProcess`. The ad-hoc variant reuses the existing
+        // ad-hoc container machinery — so the container parses into a
         // single job-bearing `ServiceTask` at the parent token-flow level, and
         // its contained "tool" activities are pruned from the executable graph
         // (invoked out-of-band by the worker, not by token flow).
@@ -6600,7 +6590,13 @@ mod feel_timer_tests {
         // NOT an engine-native AgentTask.
         let kind = &def.element("agent").unwrap().kind;
         assert!(
-            matches!(kind, crate::model::ElementKind::ServiceTask { .. }),
+            matches!(
+                kind,
+                crate::model::ElementKind::ServiceTask {
+                    agent_type: Some(crate::agent::AgentType::AiAgentSubProcess),
+                    ..
+                }
+            ),
             "expected the ad-hoc agent container to be a ServiceTask, got {kind:?}"
         );
         // The contained tool activity is pruned from the executable graph.

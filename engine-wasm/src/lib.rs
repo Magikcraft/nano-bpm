@@ -623,7 +623,7 @@ impl TestEngine {
                     "businessId": j.business_id,
                     "variables": vars_to_json(&j.variables),
                 });
-                // Only external-agent jobs carry a lease token; omit `jobLease`
+                // Only agent-marked element jobs carry a lease token; omit `jobLease`
                 // entirely for lease-less activations (matching the FFI JSON and
                 // the generated `jobLease?: string` type) rather than emitting a
                 // JSON `null`.
@@ -926,11 +926,11 @@ impl TestEngine {
     /// systemPrompt? }`, `limits` is `{ maxTokens?, maxModelCalls?, maxToolCalls? }`
     /// (omitted limits default to unlimited), and `history` is an initial batch of
     /// turns (see the turn shape on `updateAgentInstance`). `jobKey`/`jobLease`
-    /// are the activation's job attribution: **required** for an `external`
-    /// (job-backed) agent element, where the CREATE is rejected unless they
-    /// reference that element's ACTIVATED job with a matching lease token and
-    /// `elementInstanceKey` (#1099); unused for the engine-native
-    /// `aiAgentTask`/`aiAgentSubProcess` variants. Returns the snapshot.
+    /// are the activation's job attribution: when supplied, they must reference
+    /// that element's ACTIVATED job with a matching lease token for every agent
+    /// type. History requires this attribution; history-free requests may omit
+    /// it. Agent-marked elements create ordinary jobs, not AgentInstances:
+    /// workers explicitly register them through this command. Returns the snapshot.
     #[wasm_bindgen(js_name = createAgentInstance)]
     pub fn create_agent_instance(&mut self, request_json: &str) -> Result<String, JsValue> {
         self.guard_paused()?;
@@ -938,8 +938,8 @@ impl TestEngine {
             .map_err(|e| js_err(&format!("createAgentInstance: invalid request JSON: {e}")))?;
         let element_instance_key = parse_key(&req.element_instance_key)?;
         // A present-but-unparsable jobKey/jobLease is rejected rather than
-        // coerced to 0 (mirroring the gateway's 400): for an `external` agent 0
-        // fails the lease gate, and for the engine-native variants it is unused.
+        // coerced to 0 (mirroring the gateway's 400): doing so would silently
+        // remove supplied attribution.
         let job_key =
             parse_job_attribution("createAgentInstance", "jobKey", req.job_key.as_deref())
                 .map_err(|m| js_err(&m))?;
@@ -967,8 +967,9 @@ impl TestEngine {
     /// status?, metrics?, tools?, jobKey?, jobLease?, history? }`. `tools` is a
     /// nullable changeset: omit it to leave the stored set unchanged, pass `null`
     /// to clear it, or an array to replace it. `jobKey`/`jobLease` are the
-    /// activation's job attribution, stamped onto every appended turn (as the
-    /// gateway does). A turn is `{ loopIteration?, producedAt?, role?, content?,
+    /// activation's validated job attribution, required for and stamped onto
+    /// every appended turn (as the gateway does). A turn is
+    /// `{ loopIteration?, producedAt?, role?, content?,
     /// systemPrompt?, historyItemId?, model?, provider? }`, where `producedAt` is
     /// an RFC-3339 `date-time` string (the REST spelling; a bare epoch-millis
     /// number is also accepted); `content` items are `{ contentType?, text?,
@@ -2920,10 +2921,9 @@ struct AgentTurnReq {
 #[serde(rename_all = "camelCase")]
 struct CreateAgentInstanceReq {
     element_instance_key: String,
-    /// The agent job whose ACTIVATED lease authorizes this create. Required for
-    /// an `external` (job-backed) agent element (#1099); absent/`0` for the
-    /// engine-native `aiAgentTask`/`aiAgentSubProcess` variants. Also stamped on
-    /// any initial `history` turns.
+    /// The agent job whose ACTIVATED lease attributes this create for every
+    /// agent type. Optional without history; required and stamped onto any
+    /// initial `history` turns.
     #[serde(default)]
     job_key: Option<String>,
     /// The per-activation lease token (a staleness handle, not a
@@ -4917,22 +4917,6 @@ mod read_channel_tests {
         assert_eq!(rfc3339_or_null(&None), serde_json::Value::Null);
     }
 
-    const AGENT_TASK_XML: &str = r#"
-      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
-        <bpmn:process id="p" isExecutable="true">
-          <bpmn:startEvent id="s" />
-          <bpmn:serviceTask id="agent">
-            <bpmn:extensionElements>
-              <zeebe:agentDefinition agentType="aiAgentTask" />
-            </bpmn:extensionElements>
-          </bpmn:serviceTask>
-          <bpmn:endEvent id="e" />
-          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="agent" />
-          <bpmn:sequenceFlow id="b" sourceRef="agent" targetRef="e" />
-        </bpmn:process>
-      </bpmn:definitions>"#;
-
     // The read-model history output must mirror the gateway's
     // `AgentInstanceHistoryItemResult` wire shape, not dump the engine's internal
     // snake_case layout: content blocks use camelCase keys + REST `contentType`
@@ -4943,14 +4927,14 @@ mod read_channel_tests {
     #[test]
     fn agent_history_output_is_rest_shaped_and_round_trips_json_object() {
         let mut eng = TestEngine::new();
-        eng.deploy(AGENT_TASK_XML).unwrap();
-        eng.create_instance("p", "{}", None).unwrap();
-        let minted = parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone();
+        let minted = mint_agent_instance(&mut eng);
         let req = serde_json::json!({
             "agentInstanceKey": minted["agentInstanceKey"],
             "elementInstanceKey": minted["elementInstanceKey"],
             "elementId": minted["elementId"],
             "processInstanceKey": minted["processInstanceKey"],
+            "jobKey": minted["jobKey"],
+            "jobLease": minted["jobLease"],
             "status": "THINKING",
             "history": [{
                 "loopIteration": 1,
@@ -5001,12 +4985,40 @@ mod read_channel_tests {
         assert!(turn["toolCalls"].is_array() && turn["tools"].is_array());
     }
 
-    /// Mints an agent instance for `AGENT_TASK_XML` and returns its minted
-    /// identity JSON (`agentInstanceKey`, `elementInstanceKey`, …).
+    /// Registers an agent instance through the worker job and returns its
+    /// identity JSON together with the activated job's attribution.
     fn mint_agent_instance(eng: &mut TestEngine) -> J {
-        eng.deploy(AGENT_TASK_XML).unwrap();
-        eng.create_instance("p", "{}", None).unwrap();
-        parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone()
+        let xml = include_str!("../../engine-core/tests/fixtures/external-agent-job-type.bpmn")
+            .replace("agentType=\"external\"", "agentType=\"aiAgentTask\"");
+        eng.deploy(&xml).unwrap();
+        eng.create_instance(
+            "external-agent-routing",
+            r#"{"route":"senior:rebase"}"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            parse(&eng.search_agent_instances("{}").unwrap())["items"],
+            serde_json::json!([])
+        );
+        let jobs = parse(
+            &eng.activate_jobs("senior:rebase", 1, 60_000.0, "W")
+                .unwrap(),
+        );
+        let job = &jobs[0];
+        eng.create_agent_instance(
+            &serde_json::json!({
+                "elementInstanceKey": job["elementInstanceKey"],
+                "jobKey": job["key"],
+                "jobLease": job["jobLease"],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut agent = parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone();
+        agent["jobKey"] = job["key"].clone();
+        agent["jobLease"] = job["jobLease"].clone();
+        agent
     }
 
     /// The instance's current `tools` array via the read channel.
@@ -5103,8 +5115,8 @@ mod read_channel_tests {
             "elementId": minted["elementId"],
             "processInstanceKey": minted["processInstanceKey"],
             "status": "THINKING",
-            "jobKey": "7788990011",
-            "jobLease": "123456",
+            "jobKey": minted["jobKey"],
+            "jobLease": minted["jobLease"],
             "history": [
                 {
                     "loopIteration": 1,
@@ -5132,7 +5144,7 @@ mod read_channel_tests {
         assert_eq!(assistant.len(), 2, "both pushed turns are present");
         for turn in assistant {
             assert_eq!(
-                turn["jobKey"], "7788990011",
+                turn["jobKey"], minted["jobKey"],
                 "each turn carries the request jobKey: {turn}"
             );
         }
@@ -5178,9 +5190,7 @@ mod read_channel_tests {
     #[test]
     fn agent_instance_search_honours_the_nested_rest_filter_shape() {
         let mut eng = TestEngine::new();
-        eng.deploy(AGENT_TASK_XML).unwrap();
-        eng.create_instance("p", "{}", None).unwrap();
-        let minted = parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone();
+        let minted = mint_agent_instance(&mut eng);
         let key = minted["agentInstanceKey"].as_str().unwrap().to_string();
 
         let count = |body: &str| {
@@ -5207,15 +5217,15 @@ mod read_channel_tests {
     #[test]
     fn agent_history_search_honours_the_nested_rest_filter_shape() {
         let mut eng = TestEngine::new();
-        eng.deploy(AGENT_TASK_XML).unwrap();
-        eng.create_instance("p", "{}", None).unwrap();
-        let minted = parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone();
+        let minted = mint_agent_instance(&mut eng);
         let key = minted["agentInstanceKey"].as_str().unwrap().to_string();
         let req = serde_json::json!({
             "agentInstanceKey": minted["agentInstanceKey"],
             "elementInstanceKey": minted["elementInstanceKey"],
             "elementId": minted["elementId"],
             "processInstanceKey": minted["processInstanceKey"],
+            "jobKey": minted["jobKey"],
+            "jobLease": minted["jobLease"],
             "status": "THINKING",
             "history": [{
                 "loopIteration": 1,

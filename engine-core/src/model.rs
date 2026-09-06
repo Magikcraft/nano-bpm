@@ -471,6 +471,13 @@ pub enum ElementKind {
     ServiceTask {
         job_type: String,
         priority: Option<String>,
+        /// Optional agent classification. The marker does not change the job
+        /// lifecycle or discard any service-task configuration.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        agent_type: Option<crate::agent::AgentType>,
         /// Static custom headers declared on the task via `zeebe:taskHeaders`
         /// (`<zeebe:header key="…" value="…"/>`). Immutable model metadata
         /// surfaced verbatim on the activated job (Zeebe `ActivatedJob.customHeaders`).
@@ -800,34 +807,17 @@ pub enum ElementKind {
     /// compensating a whole sub-process, `cancelRemainingInstances`, strictly
     /// ordered nested multi-activity compensation — are follow-ups.)
     CompensationThrowEvent,
-    /// An AI agent element (Camunda `zeebe:agentDefinition`, stable/8.10). Built
-    /// from a `bpmn:serviceTask` bearing `<zeebe:agentDefinition
-    /// agentType="aiAgentTask"/>` (or `agentType="external"`). Behaviour splits
-    /// by `agent_type`:
-    ///
-    /// * `aiAgentTask` (engine-native, no external worker): on activation the
-    ///   engine creates a first-class [`crate::AgentInstance`] (status
-    ///   `INITIALIZING`) keyed by its own dedicated key and linked to the active
-    ///   element instance — the engine becomes the system-of-record for the agent
-    ///   state. LLM calls / prompt assembly / tool dispatch stay in the worker
-    ///   layer; the token parks on the element while the agent runs, exactly like
-    ///   a job-bearing service task, but **no job** is created.
-    /// * `external` (job-backed, Camunda parity #1099): there is no agent element
-    ///   type in Camunda — an `external` agent is an ordinary service-task job. So
-    ///   on activation it creates a **normal job** (activatable through the
-    ///   standard job loop) and parks the token; it does **not** auto-mint an
-    ///   AgentInstance. The worker self-registers the AgentInstance lazily via a
-    ///   lease-gated `CreateAgentInstance`, gated on that job's ACTIVATED lease.
-    ///
-    /// The `agentType="aiAgentSubProcess"` variant (on a `bpmn:adHocSubProcess`)
-    /// reuses the existing ad-hoc container machinery and is not modelled as this
-    /// kind.
+    /// Legacy persisted model shape, retained so old deployment events and
+    /// snapshots remain readable. New models use `ServiceTask.agent_type`.
+    /// [`ProcessDefinition::normalize_legacy_agent_tasks`] lowers this shape to
+    /// the canonical job-worker model before execution. Existing AgentInstance
+    /// records retain their configuration; new registrations supply it at CREATE.
     AgentTask {
         /// The `agentType` marker this element was built from.
         agent_type: crate::agent::AgentType,
         /// Optional `zeebe:taskDefinition` type (literal or FEEL expression).
-        /// External agents use it for job routing, defaulting to the element id
-        /// when absent. Engine-native agents do not create jobs.
+        /// Normalization retains this route, defaulting to the element id when
+        /// absent from a historical deployment.
         #[cfg_attr(feature = "serde", serde(default))]
         job_type: Option<String>,
         /// The static agent definition (model/provider/systemPrompt).
@@ -1286,6 +1276,27 @@ pub struct ProcessDefinition {
 }
 
 impl ProcessDefinition {
+    /// Upgrades the historical agent-only model shape without changing event
+    /// frames or minting runtime state. Called for legacy deployments and snapshots.
+    pub fn normalize_legacy_agent_tasks(&mut self) {
+        for element in self.elements.values_mut() {
+            if let ElementKind::AgentTask {
+                agent_type,
+                job_type,
+                ..
+            } = &element.kind
+            {
+                element.kind = ElementKind::ServiceTask {
+                    job_type: job_type.clone().unwrap_or_else(|| element.id.clone()),
+                    priority: None,
+                    agent_type: Some(*agent_type),
+                    custom_headers: BTreeMap::new(),
+                    linked_resources: Vec::new(),
+                };
+            }
+        }
+    }
+
     /// Looks up an element by id.
     pub fn element(&self, id: &str) -> Option<&Element> {
         self.elements.get(id)
@@ -1734,15 +1745,7 @@ impl ProcessBuilder {
 
     /// Adds a service task that creates jobs of the given `job_type`.
     pub fn service_task(self, id: impl Into<String>, job_type: impl Into<String>) -> Self {
-        self.add(
-            id,
-            ElementKind::ServiceTask {
-                job_type: job_type.into(),
-                priority: None,
-                custom_headers: BTreeMap::new(),
-                linked_resources: Vec::new(),
-            },
-        )
+        self.service_task_with_links(id, job_type, None, BTreeMap::new(), Vec::new())
     }
 
     /// Adds a service task whose jobs carry the given (raw) `zeebe:priorityDefinition`
@@ -1783,51 +1786,54 @@ impl ProcessBuilder {
         custom_headers: BTreeMap<String, String>,
         linked_resources: Vec<LinkedResource>,
     ) -> Self {
+        self.service_task_with_links_and_agent(
+            id,
+            job_type,
+            priority,
+            custom_headers,
+            linked_resources,
+            None,
+        )
+    }
+
+    /// Adds an ordinary job-worker task, optionally classified as an agent.
+    /// Agent markers share all job properties and the normal worker lifecycle.
+    pub fn service_task_with_links_and_agent(
+        self,
+        id: impl Into<String>,
+        job_type: impl Into<String>,
+        priority: Option<String>,
+        custom_headers: BTreeMap<String, String>,
+        linked_resources: Vec<LinkedResource>,
+        agent_type: Option<crate::agent::AgentType>,
+    ) -> Self {
         self.add(
             id,
             ElementKind::ServiceTask {
                 job_type: job_type.into(),
                 priority,
+                agent_type,
                 custom_headers,
                 linked_resources,
             },
         )
     }
 
-    /// Adds an AI agent task (Camunda `zeebe:agentDefinition`, stable/8.10):
-    /// a `bpmn:serviceTask` bearing the agent marker. On activation the engine
-    /// creates a first-class [`crate::AgentInstance`] for engine-native agents,
-    /// or a job typed by the element id for external agents. `definition`/`limits` are the
-    /// static agent configuration (model/provider/systemPrompt + optional
-    /// limits); pass defaults for an unconfigured agent.
+    /// Adds a service task bearing an agent marker. Workers create the
+    /// AgentInstance and supply its definition/limits via `CreateAgentInstance`.
     pub fn agent_task(
         self,
         id: impl Into<String>,
+        job_type: impl Into<String>,
         agent_type: crate::agent::AgentType,
-        definition: crate::agent::AgentDefinition,
-        limits: Option<crate::agent::AgentInstanceLimits>,
     ) -> Self {
-        self.agent_task_with_job_type(id, agent_type, definition, limits, None)
-    }
-
-    /// Adds an agent task with an optional model-authored job type. External
-    /// agents resolve this type at activation; `None` preserves element-id routing.
-    pub fn agent_task_with_job_type(
-        self,
-        id: impl Into<String>,
-        agent_type: crate::agent::AgentType,
-        definition: crate::agent::AgentDefinition,
-        limits: Option<crate::agent::AgentInstanceLimits>,
-        job_type: Option<String>,
-    ) -> Self {
-        self.add(
+        self.service_task_with_links_and_agent(
             id,
-            ElementKind::AgentTask {
-                agent_type,
-                job_type,
-                definition,
-                limits,
-            },
+            job_type,
+            None,
+            BTreeMap::new(),
+            Vec::new(),
+            Some(agent_type),
         )
     }
 

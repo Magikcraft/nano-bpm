@@ -2,8 +2,8 @@
 // (Camunda stable/8.10 parity, Stage 3) through the @nanobpm/engine-wasm
 // read-model TestEngine — the JS console/Bojtos tier.
 //
-// Deploy an aiAgentTask serviceTask -> create an instance (activation mints an
-// AgentInstance in INITIALIZING) -> reconcile via createAgentInstance -> push a
+// Deploy an aiAgentTask serviceTask -> activate its ordinary job -> explicitly
+// create an AgentInstance in INITIALIZING using the job lease -> push a
 // turn via updateAgentInstance (status advances) -> history-search returns that
 // COMMITTED turn -> completeAgentInstance drives COMPLETED.
 import { readFileSync } from "node:fs";
@@ -21,21 +21,11 @@ function assert(cond, msg) {
   }
 }
 
-const AGENT_PROC = `
-  <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
-    <bpmn:process id="agent-proc" isExecutable="true">
-      <bpmn:startEvent id="start" />
-      <bpmn:serviceTask id="agent">
-        <bpmn:extensionElements>
-          <zeebe:agentDefinition agentType="aiAgentTask" />
-        </bpmn:extensionElements>
-      </bpmn:serviceTask>
-      <bpmn:endEvent id="end" />
-      <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent" />
-      <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="end" />
-    </bpmn:process>
-  </bpmn:definitions>`;
+const EXTERNAL_PROC = readFileSync(
+  new URL("../../../engine-core/tests/fixtures/external-agent-job-type.bpmn", import.meta.url),
+  "utf8",
+);
+const AGENT_PROC = EXTERNAL_PROC.replace('agentType="external"', 'agentType="aiAgentTask"');
 
 // Load the read-model entrypoint (the AgentInstance read methods are compiled
 // only behind the `read-model` feature / `/readmodel` subpath).
@@ -50,30 +40,20 @@ const engine = new TestEngine();
 
 // 1. Deploy the aiAgentTask serviceTask and start an instance.
 engine.deploy(AGENT_PROC);
-engine.createInstance("agent-proc", "{}");
+engine.createInstance("external-agent-routing", '{"route":"senior:rebase"}');
 
-// 2. Activation mints an AgentInstance in INITIALIZING (no job created).
+// 2. Activation creates only the ordinary worker job.
 let instances = JSON.parse(engine.searchAgentInstances("{}")).items;
-assert(instances.length === 1, "activation mints exactly one AgentInstance");
-const minted = instances[0];
-assert(
-  minted.status === "INITIALIZING",
-  `minted instance is INITIALIZING (got ${JSON.stringify(minted.status)})`,
-);
-const agentInstanceKey = minted.agentInstanceKey;
-const elementInstanceKey = minted.elementInstanceKey;
-const elementId = minted.elementId;
-const processInstanceKey = minted.processInstanceKey;
-assert(
-  typeof agentInstanceKey === "string" && agentInstanceKey !== "0",
-  "instance carries its own dedicated agentInstanceKey",
-);
-assert(
-  agentInstanceKey !== elementInstanceKey,
-  "the agentInstanceKey is distinct from the elementInstanceKey",
-);
+assert(instances.length === 0, "activation creates no AgentInstance");
+const jobs = JSON.parse(engine.activateJobs("senior:rebase", 1, 60_000, "W"));
+assert(jobs.length === 1, "aiAgentTask activates through the ordinary job loop");
+const job = jobs[0];
+const elementInstanceKey = job.elementInstanceKey;
+const elementId = job.elementId;
+const processInstanceKey = job.instanceKey;
+const attribution = { jobKey: job.key, jobLease: job.jobLease };
 
-// 3. CREATE reconciles the auto-minted record (same key), applying a CREATE-time
+// 3. Explicit worker CREATE registers the record, applying a CREATE-time
 //    definition + limits + a configuration turn — still INITIALIZING. The turn
 //    uses the canonical REST history-item shape (a non-blank `historyItemId`, an
 //    RFC-3339 `producedAt`, and a `content` array) so the probe guards against
@@ -81,6 +61,7 @@ assert(
 engine.createAgentInstance(
   JSON.stringify({
     elementInstanceKey,
+    ...attribution,
     definition: { model: "gpt-4o", provider: "openai" },
     limits: { maxTokens: 1000, maxModelCalls: 10, maxToolCalls: 5 },
     history: [
@@ -99,16 +80,18 @@ engine.createAgentInstance(
 instances = JSON.parse(engine.searchAgentInstances("{}")).items;
 assert(
   instances.length === 1,
-  "CREATE reconciles (no duplicate) — still exactly one instance",
+  "explicit CREATE registers exactly one instance",
 );
 const created = instances[0];
+const agentInstanceKey = created.agentInstanceKey;
 assert(
-  created.agentInstanceKey === agentInstanceKey,
-  "CREATE reconciles to the same agentInstanceKey",
+  typeof agentInstanceKey === "string" && agentInstanceKey !== "0" &&
+    agentInstanceKey !== elementInstanceKey,
+  "CREATE allocates a dedicated agentInstanceKey distinct from the element key",
 );
 assert(
   created.status === "INITIALIZING",
-  `reconciled instance is still INITIALIZING (got ${JSON.stringify(created.status)})`,
+  `created instance is INITIALIZING (got ${JSON.stringify(created.status)})`,
 );
 assert(
   created.definition.model === "gpt-4o",
@@ -133,6 +116,7 @@ engine.updateAgentInstance(
     elementInstanceKey,
     elementId,
     processInstanceKey,
+    ...attribution,
     status: "THINKING",
     metrics: { inputTokens: 100, outputTokens: 20, modelCalls: 1 },
     history: [
@@ -257,6 +241,7 @@ const dedupUpdate = JSON.stringify({
   elementInstanceKey,
   elementId,
   processInstanceKey,
+  ...attribution,
   history: [
     {
       loopIteration: 2,
@@ -304,33 +289,20 @@ assert(
   completed.completionDate !== null && completed.completionDate !== undefined,
   "a completed instance carries a completionDate",
 );
+const finished = JSON.parse(engine.completeJob(job.key, "{}"));
+assert(finished.instances[0].state === "Completed",
+  "AgentInstance COMPLETE leaves the job to be completed separately");
 
-// 7. external (job-backed) agent parity (#1099): unlike aiAgentTask, an
-//    `external` agent auto-mints NO AgentInstance — it activates as a normal
+// 7. external (job-backed) agent parity (#1099): like aiAgentTask, an
+//    `external` agent creates NO AgentInstance — it activates as a normal
 //    job. A worker activates that job (standard job loop), learns its opaque
 //    lease token (distinct from the job's deadline, #1106), and self-registers
 //    the AgentInstance via a lease-gated createAgentInstance. A CREATE that
 //    references the job with a stale/mismatched (jobKey, jobLease) pair is
 //    rejected. This is the surface nano-workforce consumes.
-const EXTERNAL_PROC = `
-  <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
-    <bpmn:process id="ext-proc" isExecutable="true">
-      <bpmn:startEvent id="start" />
-      <bpmn:serviceTask id="ext-agent">
-        <bpmn:extensionElements>
-          <zeebe:agentDefinition agentType="external" />
-        </bpmn:extensionElements>
-      </bpmn:serviceTask>
-      <bpmn:endEvent id="end" />
-      <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ext-agent" />
-      <bpmn:sequenceFlow id="f2" sourceRef="ext-agent" targetRef="end" />
-    </bpmn:process>
-  </bpmn:definitions>`;
-
 const ext = new TestEngine();
 ext.deploy(EXTERNAL_PROC);
-ext.createInstance("ext-proc", "{}");
+ext.createInstance("external-agent-routing", '{"route":"senior:rebase"}');
 
 // Activation mints NO AgentInstance for an external agent.
 assert(
@@ -346,10 +318,10 @@ assert(
 // coincidence and keeps the assertion meaningful (#1106).
 ext.tickNow(1_000_000_000_000);
 
-// The agent element created a normal, activatable job (type = element id).
-const extJobs = JSON.parse(ext.activateJobs("ext-agent", 1, 1000, "W"));
+// The agent element created a normal job with its configured routing type.
+const extJobs = JSON.parse(ext.activateJobs("senior:rebase", 1, 1000, "W"));
 assert(
-  extJobs.length === 1 && extJobs[0].elementId === "ext-agent",
+  extJobs.length === 1 && extJobs[0].elementId === "agent",
   "an external agent activates as a normal job through the standard job loop",
 );
 const extJob = extJobs[0];

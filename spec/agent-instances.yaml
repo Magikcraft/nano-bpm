@@ -575,28 +575,21 @@ components:
         jobKey:
           description: |
             The key of the agent job whose activation authorizes this create. Optional:
-            supply it for an `external` (job-backed) agent element to lease-gate the
-            create, and the server then rejects the create unless it references that
+            supply it for an agent-marked job-worker element to lease-gate the
+            create. The server rejects the create unless it references that
             element's ACTIVATED job with a matching lease token and elementInstanceKey.
             A jobless create (omit, or `0`) is always allowed on this REST create surface,
-            which carries no history batch; when supplied it is always validated. Omit (or `0`) for the engine-native
-            `aiAgentTask` / `aiAgentSubProcess` variants, whose AgentInstance is auto-minted
-            at activation.
+            which carries no history batch; when supplied it is always validated.
+            All agent classifications use ordinary jobs and explicit worker registration;
+            none automatically creates an AgentInstance at activation.
           allOf:
             - $ref: 'keys.yaml#/components/schemas/JobKey'
         jobLease:
           description: |
-            Lease token received from the job activation response, disambiguating this
-            activation from any other of the same job. A per-activation staleness handle
-            (a monotonic value distinct from the job's lease deadline, not a
-            cryptographically unguessable secret), serialized as a decimal string (an
-            unsigned 64-bit integer), so the server rejects any non-numeric value with 400.
+            Lease token received from the job activation response.
             Required alongside `jobKey` whenever a `jobKey` is supplied.
-          type: string
-          pattern: ^[0-9]+$
-          minLength: 1
-          maxLength: 20
-          example: "42"
+          allOf:
+            - $ref: 'keys.yaml#/components/schemas/JobLease'
 
     AgentInstanceCreationResult:
       description: Response returned after successfully creating an agent instance.
@@ -674,17 +667,10 @@ components:
             - $ref: 'keys.yaml#/components/schemas/JobKey'
         jobLease:
           description: |
-            Lease token received from the job activation response, disambiguating this
-            activation from any other of the same job. A per-activation staleness handle
-            (a monotonic value distinct from the job's lease deadline, not a
-            cryptographically unguessable secret), serialized as a decimal string (an
-            unsigned 64-bit integer), so the server rejects any non-numeric value with 400.
+            Lease token received from the job activation response.
             Required alongside `jobKey` whenever a `jobKey` is supplied, and validated then.
-          type: string
-          pattern: ^[0-9]+$
-          minLength: 1
-          maxLength: 20
-          example: "42"
+          allOf:
+            - $ref: 'keys.yaml#/components/schemas/JobLease'
         metrics:
           description: Metric increments to apply to the aggregate counters.
           allOf:

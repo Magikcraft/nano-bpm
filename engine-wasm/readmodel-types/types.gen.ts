@@ -127,26 +127,22 @@ export type AgentInstanceCreationRequest = {
     limits?: AgentInstanceLimits;
     /**
      * The key of the agent job whose activation authorizes this create. Optional:
-     * supply it for an `external` (job-backed) agent element to lease-gate the
-     * create, and the server then rejects the create unless it references that
+     * supply it for an agent-marked job-worker element to lease-gate the
+     * create. The server rejects the create unless it references that
      * element's ACTIVATED job with a matching lease token and elementInstanceKey.
      * A jobless create (omit, or `0`) is always allowed on this REST create surface,
-     * which carries no history batch; when supplied it is always validated. Omit (or `0`) for the engine-native
-     * `aiAgentTask` / `aiAgentSubProcess` variants, whose AgentInstance is auto-minted
-     * at activation.
+     * which carries no history batch; when supplied it is always validated.
+     * All agent classifications use ordinary jobs and explicit worker registration;
+     * none automatically creates an AgentInstance at activation.
      *
      */
     jobKey?: JobKey;
     /**
-     * Lease token received from the job activation response, disambiguating this
-     * activation from any other of the same job. A per-activation staleness handle
-     * (a monotonic value distinct from the job's lease deadline, not a
-     * cryptographically unguessable secret), serialized as a decimal string (an
-     * unsigned 64-bit integer), so the server rejects any non-numeric value with 400.
+     * Lease token received from the job activation response.
      * Required alongside `jobKey` whenever a `jobKey` is supplied.
      *
      */
-    jobLease?: string;
+    jobLease?: JobLease;
 };
 
 /**
@@ -741,15 +737,11 @@ export type AgentInstanceUpdateRequest = {
      */
     jobKey?: JobKey;
     /**
-     * Lease token received from the job activation response, disambiguating this
-     * activation from any other of the same job. A per-activation staleness handle
-     * (a monotonic value distinct from the job's lease deadline, not a
-     * cryptographically unguessable secret), serialized as a decimal string (an
-     * unsigned 64-bit integer), so the server rejects any non-numeric value with 400.
+     * Lease token received from the job activation response.
      * Required alongside `jobKey` whenever a `jobKey` is supplied, and validated then.
      *
      */
-    jobLease?: string;
+    jobLease?: JobLease;
     /**
      * Metric increments to apply to the aggregate counters.
      */
@@ -5378,6 +5370,13 @@ export type ActivatedJobResult = {
      */
     jobKey: JobKey;
     /**
+     * The opaque token for this activation of an agent-marked BPMN job.
+     * Omitted for unmarked tasks and listener jobs. Echo it with jobKey
+     * when registering or updating an agent instance.
+     *
+     */
+    jobLease?: JobLease;
+    /**
      * The job's process instance key.
      */
     processInstanceKey: ProcessInstanceKey;
@@ -6562,6 +6561,15 @@ export type JobKey = LongKey;
  * JobKey property with full advanced search capabilities.
  */
 export type JobKeyFilterProperty = JobKey | AdvancedJobKeyFilter;
+
+/**
+ * Opaque per-activation staleness token, distinct from the job deadline.
+ * This monotonic value is not a cryptographic secret. Serialized as a
+ * decimal unsigned 64-bit integer; echo it with jobKey when registering
+ * or updating an agent instance.
+ *
+ */
+export type JobLease = string;
 
 /**
  * Zeebe Engine resource key (Java long serialized as string)

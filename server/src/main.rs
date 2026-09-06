@@ -11305,10 +11305,9 @@ impl ServerImpl {
             });
         // A present-but-unparsable jobKey/jobLease must be rejected rather than
         // silently coerced to 0: 0 changes ownership/attribution, so a malformed
-        // value is a 400, not a default. An `external` (job-backed) agent's create
-        // is lease-gated on these against the element's ACTIVATED job; the native
-        // aiAgentTask / aiAgentSubProcess variants leave them absent (0) and are
-        // auto-minted, so the engine skips the lease check for them.
+        // value is a 400, not a default. For every agent type, supplied attribution
+        // must match the element's ACTIVATED job and lease. History-free CREATE
+        // may omit attribution; workers explicitly register their AgentInstance.
         let job_key: Key = match body.job_key.as_ref() {
             None => 0,
             Some(k) => match k.0.parse() {
@@ -20205,7 +20204,7 @@ fn activated_job_result(
         .collect();
     let tags: Vec<models::Tag> = job.tags.iter().cloned().map(models::Tag).collect();
 
-    models::ActivatedJobResult::new(
+    let mut result = models::ActivatedJobResult::new(
         job.job_type,
         process_id,
         version,
@@ -20226,7 +20225,9 @@ fn activated_job_result(
         tags,
         nanobpm_gateway_rest::types::Nullable::Null,
         job.priority,
-    )
+    );
+    result.job_lease = job.lease_token.map(|lease| lease.to_string());
+    result
 }
 
 /// Converts engine variables into the generated `Object` (JSON) map used by the
@@ -35257,25 +35258,26 @@ mod call_activity_hierarchy_read_model_tests {
     /// returns the turns and defaults to COMMITTED).
     #[tokio::test]
     async fn agent_instances_rest_roundtrips_the_810_schema() {
-        let xml = r#"
-          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
-            <bpmn:process id="agent-proc" isExecutable="true">
-              <bpmn:startEvent id="start" />
-              <bpmn:serviceTask id="agent">
-                <bpmn:extensionElements>
-                  <zeebe:agentDefinition agentType="aiAgentTask" />
-                </bpmn:extensionElements>
-              </bpmn:serviceTask>
-              <bpmn:endEvent id="end" />
-              <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="agent" />
-              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="end" />
-            </bpmn:process>
-          </bpmn:definitions>"#;
-        let srv = build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1));
-        deploy(&srv, parse_bpmn(xml).expect("parse agent-proc")).await;
+        for agent_type in ["aiAgentTask", "external"] {
+            agent_instances_rest_roundtrip(agent_type).await;
+        }
+    }
 
-        // Start an instance; S1 auto-mints an AgentInstance on agent-task activation.
+    async fn agent_instances_rest_roundtrip(agent_type: &str) {
+        let xml = include_str!("../../engine-core/tests/fixtures/external-agent-job-type.bpmn")
+            .replace(
+                "agentType=\"external\"",
+                &format!("agentType=\"{agent_type}\""),
+            )
+            .replace("external-agent-routing", "agent-proc")
+            .replace(
+                "source=\"= route\"",
+                "source=\"= &quot;senior:rebase&quot;\"",
+            );
+        let srv = build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1));
+        deploy(&srv, parse_bpmn(&xml).expect("parse agent-proc")).await;
+
+        // Start an instance and activate the ordinary job; registration is explicit.
         let instr = models::ProcessInstanceCreationInstruction::from(
             models::ProcessInstanceCreationInstructionById::new("agent-proc".to_string()),
         );
@@ -35284,21 +35286,33 @@ mod call_activity_hierarchy_read_model_tests {
             .await
             .expect("create process instance");
 
-        let minted = agent_search_until(&srv, 1).await;
-        let inst = &minted[0];
-        assert_eq!(
-            inst.status,
-            models::AgentInstanceStatusEnum::Initializing,
-            "a freshly-minted agent instance is INITIALIZING"
+        assert!(agent_search_until(&srv, 0).await.is_empty());
+        let mut activation = models::JobActivationRequest::new("senior:rebase".into(), 60_000, 1);
+        activation.request_timeout = Some(-1);
+        let apis::job::ActivateJobsResponse::Status200_TheListOfActivatedJobs(activated) = srv
+            .activate_jobs_impl(&activation)
+            .await
+            .expect("activate agent job")
+        else {
+            panic!("expected an activated agent job");
+        };
+        assert_eq!(activated.jobs.len(), 1);
+        let job = &activated.jobs[0];
+        let element_instance_key = job.element_instance_key.0.clone();
+        let activation_json = serde_json::to_value(job).unwrap();
+        let job_lease = activation_json["jobLease"]
+            .as_str()
+            .expect("REST activation must expose the agent job's lease token")
+            .to_string();
+        assert_eq!(job.job_lease.as_deref(), Some(job_lease.as_str()));
+        assert_ne!(job_lease, "0");
+        assert_ne!(
+            job_lease,
+            job.deadline.to_string(),
+            "the lease is not the deadline"
         );
-        let agent_key = inst.agent_instance_key.0.clone();
-        let element_instance_key = inst
-            .element_instance_keys
-            .first()
-            .cloned()
-            .expect("minted instance carries its element instance key");
 
-        // POST create is idempotent — reconciles to the same key, INITIALIZING.
+        // POST create registers INITIALIZING and is idempotent on repetition.
         use apis::agent_instance::CreateAgentInstanceResponse as CResp;
         let create_body = models::AgentInstanceCreationRequest {
             element_instance_key: models::ElementInstanceKey(element_instance_key.clone()),
@@ -35308,9 +35322,31 @@ mod call_activity_hierarchy_read_model_tests {
                 "be helpful".to_string(),
             ),
             limits: None,
-            job_key: None,
-            job_lease: None,
+            job_key: Some(job.job_key.clone()),
+            job_lease: Some(job_lease.clone()),
         };
+        let mut unknown_job_create = create_body.clone();
+        unknown_job_create.job_key = Some(models::JobKey("7788990011".into()));
+        assert!(
+            matches!(
+                srv.create_agent_instance_impl(&unknown_job_create)
+                    .await
+                    .unwrap(),
+                CResp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(_)
+            ),
+            "CREATE must reject supplied unknown job attribution for {agent_type}"
+        );
+        let mut stale_lease_create = create_body.clone();
+        stale_lease_create.job_lease = Some((job_lease.parse::<u64>().unwrap() + 1).to_string());
+        assert!(
+            matches!(
+                srv.create_agent_instance_impl(&stale_lease_create)
+                    .await
+                    .unwrap(),
+                CResp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(_)
+            ),
+            "CREATE must reject a stale lease for {agent_type}"
+        );
         let CResp::Status200_TheAgentInstanceWasCreated(created) = srv
             .create_agent_instance_impl(&create_body)
             .await
@@ -35318,10 +35354,14 @@ mod call_activity_hierarchy_read_model_tests {
         else {
             panic!("expected a 200 create result");
         };
-        assert_eq!(
-            created.agent_instance_key.0, agent_key,
-            "create reconciles to the auto-minted instance's key"
-        );
+        let agent_key = created.agent_instance_key.0;
+        let CResp::Status200_TheAgentInstanceWasCreated(reconciled) =
+            srv.create_agent_instance_impl(&create_body).await.unwrap()
+        else {
+            panic!("expected idempotent create result");
+        };
+        assert_eq!(reconciled.agent_instance_key.0, agent_key);
+        agent_search_until(&srv, 1).await;
 
         // GET returns it in INITIALIZING.
         use apis::agent_instance::GetAgentInstanceResponse as GResp;
@@ -35343,6 +35383,8 @@ mod call_activity_hierarchy_read_model_tests {
             element_instance_key.clone(),
         ));
         upd.status = Some(models::AgentInstanceUpdateStatusEnum::Thinking);
+        upd.job_key = Some(job.job_key.clone());
+        upd.job_lease = Some(job_lease.clone());
         upd.history = Some(types::Nullable::Present(vec![
             models::AgentInstanceHistoryItem::new(
                 "h1".to_string(),
@@ -35362,6 +35404,29 @@ mod call_activity_hierarchy_read_model_tests {
         let up = models::UpdateAgentInstancePathParams {
             agent_instance_key: agent_key.clone(),
         };
+        let mut unattributed_history = upd.clone();
+        unattributed_history.job_key = None;
+        unattributed_history.job_lease = None;
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &unattributed_history)
+                    .await
+                    .unwrap(),
+                UResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "history must carry activated job attribution for {agent_type}"
+        );
+        let mut unknown_job_update = upd.clone();
+        unknown_job_update.job_key = Some(models::JobKey("7788990011".into()));
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &unknown_job_update)
+                    .await
+                    .unwrap(),
+                UResp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(_)
+            ),
+            "UPDATE must reject supplied unknown job attribution for {agent_type}"
+        );
         let UResp::Status200_TheAgentInstanceWasUpdatedSuccessfully(updated) = srv
             .update_agent_instance_impl(&up, &upd)
             .await
@@ -35384,6 +35449,8 @@ mod call_activity_hierarchy_read_model_tests {
         let mut retry = models::AgentInstanceUpdateRequest::new(models::ElementInstanceKey(
             element_instance_key.clone(),
         ));
+        retry.job_key = Some(job.job_key.clone());
+        retry.job_lease = Some(job_lease.clone());
         retry.history = Some(types::Nullable::Present(vec![
             models::AgentInstanceHistoryItem::new(
                 "h1".to_string(),
@@ -35518,6 +35585,7 @@ mod call_activity_hierarchy_read_model_tests {
             items[1].agent_instance_key.0, agent_key,
             "each history item carries its owning agentInstanceKey"
         );
+        assert_eq!(items[1].job_key, job.job_key);
 
         // --- Validation & filter behaviour (review-convergence coverage) ---
 

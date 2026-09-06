@@ -91,6 +91,18 @@ components:
       allOf:
         - $ref: '#/components/schemas/LongKey'
 
+    JobLease:
+      description: |
+        Opaque per-activation staleness token, distinct from the job deadline.
+        This monotonic value is not a cryptographic secret. Serialized as a
+        decimal unsigned 64-bit integer; echo it with jobKey when registering
+        or updating an agent instance.
+      type: string
+      pattern: ^[0-9]+$
+      minLength: 1
+      maxLength: 20
+      example: "42"
+
     DecisionDefinitionKey:
       description: System-generated key for a decision definition.
       format: DecisionDefinitionKey

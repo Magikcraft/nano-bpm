@@ -8084,6 +8084,7 @@ mod element_instance_tests {
                     worker: "w1".to_string(),
                     deadline: 60_000,
                     activated_at: Some(1),
+                    lease_token: None,
                     fetch_variables: Vec::new(),
                 },
                 &Event::JobFailed {
@@ -8109,6 +8110,7 @@ mod element_instance_tests {
                     worker: "w2".to_string(),
                     deadline: 60_000,
                     activated_at: Some(1),
+                    lease_token: None,
                     fetch_variables: Vec::new(),
                 },
                 &Event::JobErrorThrown {
@@ -8134,6 +8136,7 @@ mod element_instance_tests {
                     worker: "w3".to_string(),
                     deadline: 60_000,
                     activated_at: Some(1),
+                    lease_token: None,
                     fetch_variables: Vec::new(),
                 },
                 &Event::JobFailed {
@@ -8254,6 +8257,7 @@ mod element_instance_tests {
                     deadline: 60_000,
                     activated_at: Some(1),
                     fetch_variables: vec!["a".to_string(), "c".to_string()],
+                    lease_token: None,
                 },
                 // Declaration-free: no fetchVariables ⇒ read-set stays empty.
                 &Event::JobCreated {
@@ -8273,6 +8277,7 @@ mod element_instance_tests {
                     deadline: 60_000,
                     activated_at: Some(1),
                     fetch_variables: Vec::new(),
+                    lease_token: None,
                 },
             ])
             .unwrap();
@@ -8296,6 +8301,7 @@ mod element_instance_tests {
                 deadline: 120_000,
                 activated_at: Some(2),
                 fetch_variables: Vec::new(),
+                lease_token: None,
             }])
             .unwrap();
         let jobs: HashMap<Key, super::JobRow> =
