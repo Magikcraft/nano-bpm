@@ -252,12 +252,26 @@ export default function Extensions() {
       await installExtension({ body: { pkg }, throwOnError: true });
       await load();
       await loadMarket();
-      // A freshly installed/updated pack version may make projects scaffolded
-      // from it eligible for a template update — refresh the reverse index.
-      const after = await loadProjects();
       if (opts?.afterUpdate && before !== null) {
-        const eligible = projectsNewlyUpdatable(before, after);
-        if (eligible.length > 0) setPostUpdateProjects(eligible);
+        // Take a *fresh* authoritative post-update snapshot rather than trusting
+        // `loadProjects()`, which swallows a failed refresh and returns the stale
+        // (pre-update) `projects` — computing the delta off that could silently
+        // skip or mis-scope the post-update dialog even though the update
+        // succeeded (#1143). If the snapshot can't be taken reliably we skip the
+        // dialog (the update itself still stands) instead of trusting stale data.
+        try {
+          const after = (await listProjects({ throwOnError: true })).data
+            .projects;
+          setProjects(after);
+          const eligible = projectsNewlyUpdatable(before, after);
+          if (eligible.length > 0) setPostUpdateProjects(eligible);
+        } catch {
+          /* refresh failed: skip the post-update dialog, leave the index as-is */
+        }
+      } else {
+        // A freshly installed/updated pack version may make projects scaffolded
+        // from it eligible for a template update — refresh the reverse index.
+        await loadProjects();
       }
     } catch (e) {
       setErr(String(e));
