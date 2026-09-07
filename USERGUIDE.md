@@ -236,7 +236,8 @@ c8ctl nano supervisor stop            # stop the daemon and all its workers
 >   Terminal grant, but then pin a `tmux`/SSH session so it does not die on
 >   logout.
 >
-> See the c8ctl-nano README (“Surviving SSH logout”) for the full explanation.
+> See the [c8ctl Nano plugin README](https://github.com/jwulf/c8ctl-plugin-nano#surviving-ssh-logout-supervisor-install--uninstall)
+> (“Surviving SSH logout”) for the full explanation.
 
 ## Run the binary directly
 
