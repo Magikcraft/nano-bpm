@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   runProject,
   stopProject,
@@ -72,6 +72,11 @@ export function PostUpdateProjectsDialog({
     {},
   );
   const [outcomes, setOutcomes] = useState<ProjectUpdateOutcome[]>([]);
+  // Synchronous in-flight guard: `phase` re-renders asynchronously, so a fast
+  // double-click could call `run()` twice before it flips to "running". A ref is
+  // updated synchronously, so the second call bails before starting a parallel
+  // batch over the same projects.
+  const runningRef = useRef(false);
 
   const running = phase === "running";
   const outcomeByName = useMemo(() => {
@@ -101,28 +106,34 @@ export function PostUpdateProjectsDialog({
 
   const run = useCallback(async () => {
     // Guard against duplicate submissions: a second click while a run is in
-    // flight would start a parallel batch over the same projects.
-    if (phase === "running") return;
+    // flight would start a parallel batch over the same projects. The ref is set
+    // synchronously so the guard holds before React re-renders `phase`.
+    if (runningRef.current) return;
     const targets = projects.filter((p) => selected.has(p.name));
     if (targets.length === 0) return;
+    runningRef.current = true;
     setPhase("running");
     setOutcomes([]);
     setProgress(
       Object.fromEntries(targets.map((p) => [p.name, "pending" as const])),
     );
     const results: ProjectUpdateOutcome[] = [];
-    for (const p of targets) {
-      const outcome = await runProjectUpdate(
-        { name: p.name, running: p.running },
-        ops,
-        (ph) => setProgress((prev) => ({ ...prev, [p.name]: ph })),
-      );
-      results.push(outcome);
-      setOutcomes([...results]);
+    try {
+      for (const p of targets) {
+        const outcome = await runProjectUpdate(
+          { name: p.name, running: p.running },
+          ops,
+          (ph) => setProgress((prev) => ({ ...prev, [p.name]: ph })),
+        );
+        results.push(outcome);
+        setOutcomes([...results]);
+      }
+      await onApplied?.();
+      setPhase("done");
+    } finally {
+      runningRef.current = false;
     }
-    await onApplied?.();
-    setPhase("done");
-  }, [phase, projects, selected, ops, onApplied]);
+  }, [projects, selected, ops, onApplied]);
 
   const summary = useMemo(
     () => (phase === "done" ? summarizeProjectUpdates(outcomes) : null),

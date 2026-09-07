@@ -230,7 +230,13 @@ export default function Extensions() {
   const install = async (pkg: string, opts?: { afterUpdate?: boolean }) => {
     setBusy(pkg);
     setErr(null);
-    const before = projects;
+    // For an update, snapshot the pre-update project list *freshly* rather than
+    // trusting the `projects` state, which can still be stale/empty if the
+    // initial `loadProjects()` hasn't resolved yet. A stale (empty) `before`
+    // would make unrelated packs' projects look "newly eligible" (their
+    // `latestVersion` appears to change from null), breaking the scoping to just
+    // the updated extension (#1143).
+    const before = opts?.afterUpdate ? await loadProjects() : projects;
     try {
       await installExtension({ body: { pkg }, throwOnError: true });
       await load();
