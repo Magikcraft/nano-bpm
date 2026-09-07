@@ -180,3 +180,20 @@ test("summarizeProjectUpdates buckets updated / conflicts / failed", () => {
     failed: ["c", "d", "e"],
   });
 });
+
+test("a conflicted project that fails to restart appears in both conflicts and failed", () => {
+  const outcomes: ProjectUpdateOutcome[] = [
+    {
+      name: "e",
+      wasRunning: true,
+      status: "restart-failed",
+      restarted: false,
+      conflicts: ["x.ts"],
+    },
+  ];
+  assert.deepEqual(summarizeProjectUpdates(outcomes), {
+    updated: [],
+    conflicts: ["e"],
+    failed: ["e"],
+  });
+});

@@ -235,8 +235,19 @@ export default function Extensions() {
     // initial `loadProjects()` hasn't resolved yet. A stale (empty) `before`
     // would make unrelated packs' projects look "newly eligible" (their
     // `latestVersion` appears to change from null), breaking the scoping to just
-    // the updated extension (#1143).
-    const before = opts?.afterUpdate ? await loadProjects() : projects;
+    // the updated extension (#1143). If the snapshot can't be taken reliably we
+    // leave `before` null and skip the post-update dialog below — the update
+    // itself still proceeds — rather than risk mis-scoping off a stale list
+    // (`loadProjects()` swallows failures and returns the stale `projects`).
+    let before: ProjectSummary[] | null = null;
+    if (opts?.afterUpdate) {
+      try {
+        before = (await listProjects({ throwOnError: true })).data.projects;
+        setProjects(before);
+      } catch {
+        before = null;
+      }
+    }
     try {
       await installExtension({ body: { pkg }, throwOnError: true });
       await load();
@@ -244,7 +255,7 @@ export default function Extensions() {
       // A freshly installed/updated pack version may make projects scaffolded
       // from it eligible for a template update — refresh the reverse index.
       const after = await loadProjects();
-      if (opts?.afterUpdate) {
+      if (opts?.afterUpdate && before !== null) {
         const eligible = projectsNewlyUpdatable(before, after);
         if (eligible.length > 0) setPostUpdateProjects(eligible);
       }

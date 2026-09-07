@@ -170,9 +170,15 @@ export function summarizeProjectUpdates(outcomes: ProjectUpdateOutcome[]): {
   const conflicts: string[] = [];
   const failed: string[] = [];
   for (const o of outcomes) {
+    // A project is "conflicted" whenever the overlay left unresolved files,
+    // independent of the terminal status: an update that produced conflicts and
+    // then failed to restart (`"restart-failed"`) still carries those conflicts,
+    // so it must appear in *both* the conflicts and failed buckets rather than
+    // hiding the conflict info behind the failure.
+    if (o.status === "conflicts" || (o.conflicts?.length ?? 0) > 0)
+      conflicts.push(o.name);
     if (o.status === "updated") updated.push(o.name);
-    else if (o.status === "conflicts") conflicts.push(o.name);
-    else failed.push(o.name);
+    else if (o.status !== "conflicts") failed.push(o.name);
   }
   return { updated, conflicts, failed };
 }
