@@ -213,6 +213,31 @@ c8ctl nano supervisor stop            # stop the daemon and all its workers
 >   `workforce start`; the supervisor and all its workers inherit it:
 >   `export GITHUB_TOKEN="$(gh auth token)"` (or any PAT with `repo` scope).
 
+> **macOS + a remote engine over SSH (Local Network Privacy).** If you run the
+> fleet on a Mac over SSH against an engine on your **LAN** (e.g.
+> `merlin.local:8080`, `192.168.x.x`), workers may show `running` but sit idle —
+> `listening on 0 job type(s)`, agentic `disconnected`, logs spinning on
+> `activateJobs failed: fetch failed` / `reconcile skipped — fetch failed`. On
+> **macOS 15 Sequoia / 26 Tahoe** the supervisor's session-independent
+> **LaunchAgent** (installed so the fleet survives SSH logout) is a separate
+> **Local Network Privacy** identity that is **not** granted LAN access — so it
+> cannot reach a LAN engine, even though internet hosts and an interactive SSH
+> shell work. The signature is `EHOSTUNREACH` to the engine's LAN IP from the
+> service. Fix it with one of:
+>
+> - **Grant Node.js Local Network access** on the Mac's GUI: **System Settings →
+>   Privacy & Security → Local Network**, enable the **Node.js** runtime entry
+>   (it may appear as *“Node.js Foundation”* / *“App Background Activity”*), then
+>   `c8ctl nano supervisor stop && c8ctl nano supervisor start`.
+> - **Route over Tailscale** — traffic over the `utun` interface is not treated
+>   as “local network”, so point the engine at the tailnet address (e.g.
+>   `NANO_REST_URL=http://<host>.<tailnet>.ts.net:8080`).
+> - **Run in the SSH session** (`c8ctl nano supervisor uninstall`) — inherits the
+>   Terminal grant, but then pin a `tmux`/SSH session so it does not die on
+>   logout.
+>
+> See the c8ctl-nano README (“Surviving SSH logout”) for the full explanation.
+
 ## Run the binary directly
 
 You can also run the binary yourself (the same one the plugin installs),
