@@ -96,6 +96,10 @@ export function requiredStatusChecks(protocol, current) {
 
 export function assertBranchProtection(protocol, current) {
   const expected = requiredStatusChecks(protocol, current);
+  assert.ok(
+    Array.isArray(current.checks),
+    "Branch protection response must contain a checks array",
+  );
   const identities = (checks) =>
     sorted(checks.map(({ context, app_id }) => `${app_id}:${context}`));
   assert.deepEqual(

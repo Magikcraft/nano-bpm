@@ -88,3 +88,12 @@ test("live drift guard rejects missing console gates, renamed checks and wrong p
     );
   }
 });
+
+test("live drift guard diagnoses a missing or malformed checks array", () => {
+  for (const checks of [undefined, null, {}]) {
+    assert.throws(
+      () => assertBranchProtection(protocol, { strict: false, checks }),
+      /Branch protection response must contain a checks array/,
+    );
+  }
+});
