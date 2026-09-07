@@ -97,18 +97,29 @@ test("a pending copy cannot be raced by repeated clicks", async () => {
   assert.equal(item.status.textContent, "Copied!");
 });
 
+function assertInstallControls(html) {
+  const controls = [...html.matchAll(/<div class="install-copy" data-install-copy>\s*<div class="install install-command"[^>]*>([\s\S]*?)<\/div>\s*<p[^>]*role="status"[^>]*><\/p>\s*<\/div>/g)];
+  assert.equal(controls.length, 2);
+  for (const [, content] of controls) {
+    assert.doesNotMatch(content, /<\/?div\b/, "the match must not cross a container boundary");
+    assert.match(content, /<code>curl -fsSL https:\/\/nanobpm\.io\/install\.sh \| sh<\/code>/);
+    assert.match(content, /<button type="button"[^>]*aria-label="Copy install command"[^>]*hidden>/);
+    assert.match(content, /<svg[^>]*aria-hidden="true"/);
+  }
+}
+
 test("the published homepage wires both install controls to the shipped handler", () => {
   execFileSync(process.execPath, [fileURLToPath(new URL("./build.mjs", import.meta.url))], {
     stdio: "pipe",
   });
   const html = readFileSync(new URL("./_site/index.html", import.meta.url), "utf8");
-  const controls = [...html.matchAll(/<div class="install-copy" data-install-copy>([\s\S]*?)<\/div>\s*<p[^>]*role="status"[^>]*><\/p>/g)];
-  assert.equal(controls.length, 2);
-  for (const [, content] of controls) {
-    assert.match(content, /<code>curl -fsSL https:\/\/nanobpm\.io\/install\.sh \| sh<\/code>/);
-    assert.match(content, /<button type="button"[^>]*aria-label="Copy install command"[^>]*hidden>/);
-    assert.match(content, /<svg[^>]*aria-hidden="true"/);
-  }
+  assertInstallControls(html);
+  const misplacedStatus = html.replaceAll(
+    /(<p class="install-copy-status" role="status"><\/p>)(\s*<\/div>)/g,
+    "$2$1",
+  );
+  assert.notEqual(misplacedStatus, html);
+  assert.throws(() => assertInstallControls(misplacedStatus), assert.AssertionError);
   assert.match(html, /import \{ bindInstallCopy \} from "\/install-copy\.mjs"/);
   assert.match(html, /bindInstallCopy\(document, navigator\.clipboard\)/);
   assert.equal(
