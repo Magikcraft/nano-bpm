@@ -129,9 +129,14 @@ export function PostUpdateProjectsDialog({
         setOutcomes([...results]);
       }
       await onApplied?.();
-      setPhase("done");
     } finally {
+      // Always leave the in-flight state once the batch has run, even if the
+      // caller's `onApplied` refresh hook rejects — otherwise the dialog would
+      // stay stuck in "running" with Cancel/outside-click disabled and no way
+      // out. The per-project outcomes are already recorded, so "done" still
+      // shows the (already-applied) results.
       runningRef.current = false;
+      setPhase("done");
     }
   }, [projects, selected, ops, onApplied]);
 
