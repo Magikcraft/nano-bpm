@@ -230,16 +230,41 @@ merges it:
     { "name": "engine-core (clippy + test)", "acceptedConclusions": ["success", "skipped"] },
     { "name": "engine-wasm-ffi (dist + verify)", "acceptedConclusions": ["success", "skipped"] },
     { "name": "server (clippy + test)", "acceptedConclusions": ["success", "skipped"] },
-    { "name": "@nanobpm/nano-bernd (build + test)", "acceptedConclusions": ["success", "skipped"] },
+    { "name": "nano-bernd (build + test)", "acceptedConclusions": ["success", "skipped"] },
     { "name": "io.github.jwulf:nano-bernd (JVM, Chicory)", "acceptedConclusions": ["success", "skipped"] },
     { "name": "processos (clippy + test)", "acceptedConclusions": ["success", "skipped"] },
     { "name": "console (typecheck + test)", "acceptedConclusions": ["success", "skipped"] },
     { "name": "console (journey e2e)", "acceptedConclusions": ["success", "skipped"] }
   ],
-  "checksSemantics": "Every entry in requiredChecks gates the merge and must reach one of its acceptedConclusions. All nine checks are change-gated in ci.yml: the six code checks share the `code` filter (`*code_gate`), 'processos (clippy + test)' has its own `processos` filter, and both console jobs ('console (typecheck + test)' and 'console (journey e2e)') are gated by the `console` filter (inputs `console/**`, `spec-console/**`, `spec-app/**`, plus `.github/workflows/ci.yml`; the typecheck job additionally runs on the `docs` filter for its bundled-docs guard), so each is SKIPPED for PRs (and merge_group batches) that don't touch its inputs (e.g. a Rust-only PR skips both console jobs; a console-only PR skips every code check) and RUNS when they do. A skipped check never reports success, so each accepts 'skipped' too (required-when-run, skip-tolerant). Without this, a merge orchestrator that treats a skipped required check as unsatisfied blocks console-only PRs that GitHub itself reports as CLEAN. 'console (typecheck + test)' is required because it is the only gate on the console `tsc -p tsconfig.test.json` type surface and the `git diff --exit-code -- src/gen` client-drift guard; leaving it non-required let a foundation slice that added a REQUIRED field to a console generated type (without updating the e2e fixture defaults in console/e2e/fixtures.ts) land on main red, forcing each following slice to repair the prior slice's break (epic #1119).",
+  "checksSemantics": "Every entry in requiredChecks gates the merge and must reach one of its acceptedConclusions. All nine checks are change-gated in ci.yml: the six code checks share the `code` filter (`*code_gate`), 'processos (clippy + test)' has its own `processos` filter, and both console jobs ('console (typecheck + test)' and 'console (journey e2e)') are gated by the `console` filter (inputs `console/**`, `spec-console/**`, `spec-app/**`, `.github/workflows/ci.yml`, `AGENTS.md`, and `.mergify.yml`; the typecheck job additionally runs on the `docs` filter for its bundled-docs guard), so each is SKIPPED for PRs (and merge_group batches) that don't touch its inputs (e.g. a Rust-only PR skips both console jobs; a console-only PR skips every code check) and RUNS when they do. A skipped check never reports success, so each accepts 'skipped' too (required-when-run, skip-tolerant). Without this, a merge orchestrator that treats a skipped required check as unsatisfied blocks console-only PRs that GitHub itself reports as CLEAN. 'console (typecheck + test)' is required because it is the only gate on the console `tsc -p tsconfig.test.json` type surface and the `git diff --exit-code -- src/gen` client-drift guard; leaving it non-required let a foundation slice that added a REQUIRED field to a console generated type (without updating the e2e fixture defaults in console/e2e/fixtures.ts) land on main red, forcing each following slice to repair the prior slice's break (epic #1119).",
   "doc": "AGENTS.md#merging-prs"
 }
 ```
+
+Required check names must not start with `@`: Mergify interprets
+`@scope/name` as a GitHub App-qualified check, not an npm package name.
+`console/scripts/merge-gates.test.mjs` guards required job names and Mergify's
+success-or-skipped conditions against the canonical protocol above.
+
+When required checks change, synchronize **live GitHub branch protection** too.
+From the repository root, with console dependencies installed and an admin-capable
+`gh` login, derive the update from this protocol rather than hand-copying names:
+
+```bash
+gh api repos/Magikcraft/nano-bpm/branches/main/protection/required_status_checks > /tmp/nano-checks-before.json
+node console/scripts/merge-gates.mjs --protection-update /tmp/nano-checks-before.json > /tmp/nano-checks-update.json
+gh api --method PATCH repos/Magikcraft/nano-bpm/branches/main/protection/required_status_checks --input /tmp/nano-checks-update.json
+gh api repos/Magikcraft/nano-bpm/branches/main/protection/required_status_checks > /tmp/nano-checks-after.json
+node console/scripts/merge-gates.mjs --check-protection /tmp/nano-checks-after.json
+```
+
+The update preserves `strict` and pins every required check to GitHub Actions.
+For a rename, wait for the replacement job to pass on the migration PR's fresh
+head before atomically switching the required context; never remove a gate
+without its replacement. Other open PRs must incorporate the renamed workflow
+and produce fresh head CI before merging. Reading/updating branch protection
+requires admin permission, so this live check is an explicit admin operation,
+not a check run with the read-only CI token.
 
 - Merge is a manual act. CI runs **once when the PR is opened**; follow-up pushes
   (review-fix commits) deliberately do **not** re-run CI, to keep review cycles
@@ -325,4 +350,3 @@ checked-in derived artifact the server splices into `stack.html` at the
 run `node website/build.mjs` to regenerate — never hand-edit either rendered
 table. The `schemas` CI job runs the build and `git diff --exit-code`s the
 artifact, so a forgotten regeneration fails the build instead of shipping drift.
-
