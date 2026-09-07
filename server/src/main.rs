@@ -30372,8 +30372,35 @@ mod clustered_startup_tests {
         (node0, node1, node2, serve_handles)
     }
 
-    /// Re-election helper: polls survivors {n1, n2} until partition `p` has a leader
-    /// that is not the killed node, returning the survivor that won.
+    fn self_observed_failover_leader(views: &[(u64, Option<u64>); 2]) -> Option<usize> {
+        views
+            .iter()
+            .position(|(node_id, leader)| *leader == Some(*node_id))
+    }
+
+    #[test]
+    fn failover_readiness_uses_each_survivors_own_view() {
+        let observations = [None, Some(0), Some(1), Some(2), Some(99)];
+        for first in observations {
+            for second in observations {
+                let views = [(1, first), (2, second)];
+                match self_observed_failover_leader(&views) {
+                    Some(index) => assert_eq!(
+                        views[index].1,
+                        Some(views[index].0),
+                        "a peer report cannot make another survivor ready: {views:?}"
+                    ),
+                    None => assert!(
+                        views.iter().all(|(id, leader)| *leader != Some(*id)),
+                        "a self-observed leader must be selected: {views:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Polls survivors until one sees itself leading partition `p`. A peer's
+    /// report does not establish that the returned node's local routes are ready.
     async fn wait_new_leader<'a>(n1: &'a ServerImpl, n2: &'a ServerImpl, p: u64) -> &'a ServerImpl {
         use crate::raft::RaftPartition;
         let leader_of = |node: &ServerImpl, p: u64| -> Option<u64> {
@@ -30381,17 +30408,12 @@ mod clustered_startup_tests {
                 .get(p)
                 .and_then(|part: Arc<RaftPartition>| part.raft.metrics().borrow().current_leader)
         };
+        let nodes = [n1, n2];
         for _ in 0..500 {
-            for node in [n1, n2] {
-                if let Some(l) = leader_of(node, p)
-                    && l != 0
-                {
-                    return if l == n1.engine.topology().node_id as u64 {
-                        n1
-                    } else {
-                        n2
-                    };
-                }
+            let views =
+                nodes.map(|node| (node.engine.topology().node_id as u64, leader_of(node, p)));
+            if let Some(index) = self_observed_failover_leader(&views) {
+                return nodes[index];
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
