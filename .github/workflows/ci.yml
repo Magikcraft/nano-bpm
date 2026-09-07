@@ -491,13 +491,12 @@ jobs:
           # website/build.mjs imports the .ts moddle descriptor directly, so it
           # needs a Node with TypeScript type-stripping on by default (>= 23.6).
           node-version: '24'
-      - name: Build publish site (drift guard + identity asserts)
+      - name: Build publish site and test install copy controls
         # Zero-dep build: fails if any tracked file still references the legacy
         # schema domain, or if a published $id/uri no longer resolves to
         # nanobpm.io. This is the same build pages.yml deploys on merge, so a
-        # green PR here guarantees the site publishes cleanly.
-        run: node website/build.mjs
-      - name: Test homepage install copy controls
+        # green PR here guarantees the site publishes cleanly. The integration
+        # test runs that build once before checking the published controls.
         run: node --test website/install-copy.test.mjs
       - name: Fail if the console landscape artifact is stale
         # website/build.mjs also renders the shared landscape table into
