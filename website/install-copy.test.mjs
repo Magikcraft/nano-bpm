@@ -98,9 +98,10 @@ test("a pending copy cannot be raced by repeated clicks", async () => {
 });
 
 function assertInstallControls(html) {
-  const controls = [...html.matchAll(/<div class="install-copy" data-install-copy>\s*<div class="install install-command"[^>]*>([\s\S]*?)<\/div>\s*<p[^>]*role="status"[^>]*><\/p>\s*<\/div>/g)];
+  const controls = [...html.matchAll(/<div class="install-copy" data-install-copy>\s*<div class="install install-command" role="group" aria-label="([^"]+)"[^>]*>([\s\S]*?)<\/div>\s*<p[^>]*role="status"[^>]*><\/p>\s*<\/div>/g)];
   assert.equal(controls.length, 2);
-  for (const [, content] of controls) {
+  assert.equal(new Set(controls.map(([, label]) => label)).size, 2);
+  for (const [, , content] of controls) {
     assert.doesNotMatch(content, /<\/?div\b/, "the match must not cross a container boundary");
     assert.match(content, /<code>curl -fsSL https:\/\/nanobpm\.io\/install\.sh \| sh<\/code>/);
     assert.match(content, /<button type="button"[^>]*aria-label="Copy install command"[^>]*hidden>/);

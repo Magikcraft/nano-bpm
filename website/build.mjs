@@ -314,7 +314,7 @@ function readSnippetRegion(relPath, region) {
 
 function installCommand(label) {
   return `<div class="install-copy" data-install-copy>
-    <div class="install install-command" aria-label="${esc(label)}">
+    <div class="install install-command" role="group" aria-label="${esc(label)}">
       <code>curl -fsSL https://nanobpm.io/install.sh | sh</code>
       <button type="button" class="install-copy-button" aria-label="Copy install command" title="Copy install command" hidden>
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true" focusable="false">
