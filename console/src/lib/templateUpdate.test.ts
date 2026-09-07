@@ -8,6 +8,7 @@ import {
   planChangeCount,
   planIsClean,
   planNothingToDo,
+  projectsNewlyUpdatable,
   projectsUsingPack,
   summarizeBatch,
   targetTitle,
@@ -155,4 +156,88 @@ test("summarizeBatch buckets updated / conflicted / errored, skipping no-ops", (
     conflicted: ["c"],
     errored: ["d"],
   });
+});
+
+test("projectsNewlyUpdatable scopes to the updated pack via latestVersion delta", () => {
+  // Before: X-project already eligible at target v2; Y-project eligible at v1;
+  // Z-project up to date (no target).
+  const before = [
+    project({
+      name: "x",
+      scaffoldedFrom: { pack: "X", version: "1.0.0" },
+      updateAvailable: true,
+      latestVersion: "2.0.0",
+    }),
+    project({
+      name: "y",
+      scaffoldedFrom: { pack: "Y", version: "1.0.0" },
+      updateAvailable: true,
+      latestVersion: "1.5.0",
+    }),
+    project({ name: "z", scaffoldedFrom: { pack: "X", version: "3.0.0" } }),
+  ];
+  // Updating extension X to v3 advances X-projects' target (x: 2→3, z: none→3)
+  // but leaves Y untouched.
+  const after = [
+    project({
+      name: "x",
+      scaffoldedFrom: { pack: "X", version: "1.0.0" },
+      updateAvailable: true,
+      latestVersion: "3.0.0",
+    }),
+    project({
+      name: "y",
+      scaffoldedFrom: { pack: "Y", version: "1.0.0" },
+      updateAvailable: true,
+      latestVersion: "1.5.0",
+    }),
+    project({
+      name: "z",
+      scaffoldedFrom: { pack: "X", version: "3.0.0" },
+      updateAvailable: true,
+      latestVersion: "3.0.0",
+    }),
+  ];
+  assert.deepEqual(
+    projectsNewlyUpdatable(before, after).map((p) => p.name),
+    ["x", "z"],
+  );
+});
+
+test("projectsNewlyUpdatable excludes path imports and non-updatable projects", () => {
+  const before = [
+    project({ name: "p", updateAvailable: false }),
+    project({ name: "q", updateAvailable: false }),
+  ];
+  const after = [
+    // External path import — never overwritten in place, so excluded even though
+    // its target moved.
+    project({
+      name: "p",
+      source: "path",
+      updateAvailable: true,
+      latestVersion: "2.0.0",
+    }),
+    // Target moved but the project is not flagged updatable — excluded.
+    project({ name: "q", updateAvailable: false, latestVersion: "2.0.0" }),
+  ];
+  assert.deepEqual(projectsNewlyUpdatable(before, after), []);
+});
+
+test("projectsNewlyUpdatable is empty when no target changed (unrelated update)", () => {
+  const before = [
+    project({
+      name: "a",
+      updateAvailable: true,
+      latestVersion: "2.0.0",
+    }),
+  ];
+  const after = [
+    project({
+      name: "a",
+      updateAvailable: true,
+      latestVersion: "2.0.0",
+    }),
+  ];
+  assert.deepEqual(projectsNewlyUpdatable(before, after), []);
 });

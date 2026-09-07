@@ -22,10 +22,12 @@ import {
 import MarkdownPreview from "../components/MarkdownPreview";
 import { useTemplateUpdate } from "../components/TemplateUpdate";
 import {
+  projectsNewlyUpdatable,
   summarizeBatch,
   toUpdateTarget,
   updatableProjectsUsingPack,
 } from "../lib/templateUpdate";
+import { PostUpdateProjectsDialog } from "../components/PostUpdateProjectsDialog";
 import { registerFileTypesFromOverview } from "../lib/editorLang";
 import { setIntellisenseFromOverview } from "../lib/langIntellisense";
 import { useTheme } from "../theme/ThemeProvider";
@@ -138,13 +140,22 @@ export default function Extensions() {
   // signal). Refreshed whenever a pack is installed/updated/removed — those
   // bump the installed pack version that decides `updateAvailable`.
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  const loadProjects = async () => {
+  const loadProjects = async (): Promise<ProjectSummary[]> => {
     try {
-      setProjects((await listProjects({ throwOnError: true })).data.projects);
+      const list = (await listProjects({ throwOnError: true })).data.projects;
+      setProjects(list);
+      return list;
     } catch {
       /* non-fatal: the reverse index just stays empty */
+      return projects;
     }
   };
+  // After a successful extension *update*, the projects scaffolded from that
+  // extension that can now be updated — surfaced in the post-update dialog
+  // (#1143) so the user can run stop → update → restart for the ones they pick.
+  const [postUpdateProjects, setPostUpdateProjects] = useState<
+    ProjectSummary[] | null
+  >(null);
   // The shared review-and-apply flow, so a per-project "Update" here behaves
   // exactly like the projects list and the IDE. `applyBatch` powers "Update
   // all" (sequential, stop-and-report on conflict); the summary is shown inline.
@@ -155,7 +166,11 @@ export default function Extensions() {
     busy: updateBusy,
     error: updateError,
     modals: updateModals,
-  } = useTemplateUpdate({ onApplied: () => loadProjects() });
+  } = useTemplateUpdate({
+    onApplied: () => {
+      void loadProjects();
+    },
+  });
   const [batchSummary, setBatchSummary] = useState<{
     pack: string;
     updated: string[];
@@ -208,16 +223,56 @@ export default function Extensions() {
     };
   }, []);
 
-  const install = async (pkg: string) => {
+  // `install` also drives an extension *update* (installing a newer version of
+  // an already-installed pack). When invoked as an update, it captures the
+  // pre-update projects so it can offer the post-update selection dialog for the
+  // projects the update just made eligible (#1143).
+  const install = async (pkg: string, opts?: { afterUpdate?: boolean }) => {
     setBusy(pkg);
     setErr(null);
+    // For an update, snapshot the pre-update project list *freshly* rather than
+    // trusting the `projects` state, which can still be stale/empty if the
+    // initial `loadProjects()` hasn't resolved yet. A stale (empty) `before`
+    // would make unrelated packs' projects look "newly eligible" (their
+    // `latestVersion` appears to change from null), breaking the scoping to just
+    // the updated extension (#1143). If the snapshot can't be taken reliably we
+    // leave `before` null and skip the post-update dialog below — the update
+    // itself still proceeds — rather than risk mis-scoping off a stale list
+    // (`loadProjects()` swallows failures and returns the stale `projects`).
+    let before: ProjectSummary[] | null = null;
+    if (opts?.afterUpdate) {
+      try {
+        before = (await listProjects({ throwOnError: true })).data.projects;
+        setProjects(before);
+      } catch {
+        before = null;
+      }
+    }
     try {
       await installExtension({ body: { pkg }, throwOnError: true });
       await load();
       await loadMarket();
-      // A freshly installed/updated pack version may make projects scaffolded
-      // from it eligible for a template update — refresh the reverse index.
-      await loadProjects();
+      if (opts?.afterUpdate && before !== null) {
+        // Take a *fresh* authoritative post-update snapshot rather than trusting
+        // `loadProjects()`, which swallows a failed refresh and returns the stale
+        // (pre-update) `projects` — computing the delta off that could silently
+        // skip or mis-scope the post-update dialog even though the update
+        // succeeded (#1143). If the snapshot can't be taken reliably we skip the
+        // dialog (the update itself still stands) instead of trusting stale data.
+        try {
+          const after = (await listProjects({ throwOnError: true })).data
+            .projects;
+          setProjects(after);
+          const eligible = projectsNewlyUpdatable(before, after);
+          if (eligible.length > 0) setPostUpdateProjects(eligible);
+        } catch {
+          /* refresh failed: skip the post-update dialog, leave the index as-is */
+        }
+      } else {
+        // A freshly installed/updated pack version may make projects scaffolded
+        // from it eligible for a template update — refresh the reverse index.
+        await loadProjects();
+      }
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -419,7 +474,7 @@ export default function Extensions() {
             variant="secondary"
             size="sm"
             className="border-warn/40 text-warn"
-            onClick={() => void install(m.name)}
+            onClick={() => void install(m.name, { afterUpdate: true })}
             disabled={busy === m.name}
           >
             {busy === m.name ? (
@@ -648,6 +703,16 @@ export default function Extensions() {
         </div>
       )}
       {updateModals}
+
+      {postUpdateProjects && (
+        <PostUpdateProjectsDialog
+          projects={postUpdateProjects}
+          onClose={() => setPostUpdateProjects(null)}
+          onApplied={() => {
+            void loadProjects();
+          }}
+        />
+      )}
 
       {readmePkg && (
         <div
