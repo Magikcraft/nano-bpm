@@ -497,6 +497,8 @@ jobs:
         # nanobpm.io. This is the same build pages.yml deploys on merge, so a
         # green PR here guarantees the site publishes cleanly.
         run: node website/build.mjs
+      - name: Test homepage install copy controls
+        run: node --test website/install-copy.test.mjs
       - name: Fail if the console landscape artifact is stale
         # website/build.mjs also renders the shared landscape table into
         # server/crates/nano-server-console/src/landscape.gen.html (single source of truth for both

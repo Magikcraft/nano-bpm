@@ -143,6 +143,7 @@ const published = [];
 // when its dist has been built, is served at `/demo/` (its Vite `base`). The
 // published schema/namespace URLs are unaffected (they own their own paths).
 write(join(outDir, "index.html"), homeHtml());
+copyFileSync(join(here, "install-copy.mjs"), join(outDir, "install-copy.mjs"));
 write(join(outDir, "architecture", "index.html"), architectureHtml());
 write(join(outDir, "blog", "index.html"), blogIndexHtml());
 for (const post of blogPosts()) {
@@ -311,6 +312,21 @@ function readSnippetRegion(relPath, region) {
   return out.join("\n");
 }
 
+function installCommand(label) {
+  return `<div class="install-copy" data-install-copy>
+    <div class="install install-command" aria-label="${esc(label)}">
+      <code>curl -fsSL https://nanobpm.io/install.sh | sh</code>
+      <button type="button" class="install-copy-button" aria-label="Copy install command" title="Copy install command" hidden>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true" focusable="false">
+          <rect x="8" y="8" width="12" height="12" rx="2"/>
+          <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>
+        </svg>
+      </button>
+    </div>
+    <p class="install-copy-status" role="status"></p>
+  </div>`;
+}
+
 function homeHtml() {
   // The Code-first tab renders the `hero` region of website/snippets/hero-pr-review.ts
   // VERBATIM — a real, compilable `defineFlow` example type-checked against the
@@ -332,9 +348,7 @@ function homeHtml() {
     <a class="btn primary" href="#try">See it live ↓</a>
     <a class="btn ghost" href="/demo/">Open the browser demo →</a>
   </div>
-  <div class="install multi" aria-label="Install a Nano Workforce">
-    <code>curl -fsSL https://nanobpm.io/install.sh | sh</code>
-  </div>
+  ${installCommand("Install a Nano Workforce")}
   <p class="install-note">One command: installs the CLI, hires your coding agents,
   and brings up a Nano engine, a workforce, and the app.</p>
   <details class="install-manual">
@@ -465,9 +479,7 @@ ${compareHtml()}
     <h2>RAAD.<br><span class="grad">Rapid Agent Application Development.</span></h2>
     <p class="raad-sub">An Advanced Research Prototype for agent graph orchestration on the developer
     workstation. Start in one line.</p>
-    <div class="install multi center" aria-label="Get started">
-      <code>curl -fsSL https://nanobpm.io/install.sh | sh</code>
-    </div>
+    ${installCommand("Get started")}
     <p class="install-note center">Prefer to do it by hand?
     <a href="/docs/get-started-with-c8ctl">Manual setup →</a></p>
     <div class="cta">
@@ -516,6 +528,10 @@ ${compareHtml()}
     });
   });
 })();
+</script>
+<script type="module">
+import { bindInstallCopy } from "/install-copy.mjs";
+bindInstallCopy(document, navigator.clipboard);
 </script>`;
 
   return homePage("nanobpm.io — Agent Graph Orchestration for the Developer Workstation", body);
@@ -1553,6 +1569,22 @@ function homePage(title, body) {
   .install.multi { display: flex; flex-direction: column; gap: .5rem; align-items: flex-start; max-width: max-content; margin-inline: auto; }
   .install.multi.center { align-items: center; }
   .install.multi code { text-align: left; }
+  .install-copy { width: fit-content; max-width: 100%; margin: 1.4rem auto 0; }
+  .install.install-command {
+    display: flex; align-items: stretch; margin: 0; text-align: left;
+    background: rgba(255,255,255,.04); border: 1px solid var(--line); border-radius: 8px;
+  }
+  .install-command code { background: none; border: 0; min-width: 0; overflow-wrap: anywhere; align-self: center; }
+  .install-copy-button {
+    display: grid; place-items: center; flex: 0 0 44px; min-height: 44px; padding: 0;
+    color: var(--muted); background: transparent; border: 0; border-left: 1px solid var(--line);
+    border-radius: 0 7px 7px 0; cursor: pointer;
+  }
+  .install-copy-button[hidden] { display: none; }
+  .install-copy-button:hover { color: var(--ink); background: rgba(255,255,255,.08); }
+  .install-copy-button:focus-visible { outline: 2px solid var(--sky); outline-offset: 3px; }
+  .install-copy-button[aria-busy="true"] { cursor: progress; }
+  .install-copy-status { min-height: 1.2em; margin: .3rem 0 0; font-size: .85rem; line-height: 1.2; color: var(--sky); }
   .install-note { margin: .6rem auto 0; color: var(--muted); font-size: .9rem; max-width: 52ch; }
   .install-note.center { text-align: center; }
   .install-manual { margin: .9rem auto 0; max-width: max-content; }
