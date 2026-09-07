@@ -75,6 +75,34 @@ export function updatableProjectsUsingPack(
   );
 }
 
+/// The projects that became (or became more) update-eligible as a result of a
+/// single extension update — i.e. the projects scaffolded from the just-updated
+/// pack, which is exactly the set the post-extension-update dialog offers.
+///
+/// It scopes to the updated extension without needing the npm-name↔manifest-id
+/// mapping (which only exists server-side): a project's `latestVersion` is its
+/// scaffolding pack's currently-installed version (the update target), so a
+/// project whose `latestVersion` *changed* across the extension update is one
+/// whose pack was the one just updated. Unrelated packs' projects keep the same
+/// `latestVersion` and are excluded; already-current projects that only now
+/// gained a target (`undefined` → the new version) are included. As with
+/// [`updatableProjectsUsingPack`], external path imports (ADR 0041) are excluded
+/// — their files are never overwritten in place — and only genuinely-updatable
+/// (`updateAvailable`) projects qualify.
+export function projectsNewlyUpdatable(
+  before: ProjectSummary[],
+  after: ProjectSummary[],
+): ProjectSummary[] {
+  const priorTarget = new Map(
+    before.map((p) => [p.name, p.latestVersion ?? null]),
+  );
+  return after.filter((p) => {
+    if (!p.updateAvailable || p.source === "path") return false;
+    const prev = priorTarget.get(p.name) ?? null;
+    return (p.latestVersion ?? null) !== prev;
+  });
+}
+
 /// One project's outcome in an "Update all" batch: the plan the apply returned
 /// (or the error that aborted it).
 export type BatchItemResult = {
