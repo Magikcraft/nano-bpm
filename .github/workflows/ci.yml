@@ -36,7 +36,7 @@ on:
   # This repo merges via Mergify (Team plan can't use GitHub's native merge queue
   # — zero `merge_group` runs in history). Mergify validates a batch on a throwaway
   # `mergify/merge-queue/*` draft PR, but the final GitHub merge of THIS PR still
-  # requires the 7 branch-protection checks to be green on this PR's head via a
+  # requires the canonical branch-protection checks on this PR's head via a
   # pull_request run (see the finalizer note above) — otherwise GitHub reports
   # "N of N required status checks are expected" and Mergify dequeues after
   # retrying. `merge_group` fires only under GitHub's *native* merge queue (unused
@@ -94,6 +94,9 @@ jobs:
             console:
               - 'console/**'
               - 'spec-console/**'
+              # The merge-gate tests compare these with CI job names.
+              - 'AGENTS.md'
+              - '.mergify.yml'
               # The console SPA imports spec-app's committed `dist/` (the Urban
               # App manifest types), so a spec-app change can alter the console
               # typecheck surface — re-run the console job to validate against it.
@@ -346,7 +349,8 @@ jobs:
         run: make engine-wasm-check-read-model
 
   nano-bernd-npm:
-    name: '@nanobpm/nano-bernd (build + test)'
+    # Leading @ is reserved for Mergify's @github-app/check syntax.
+    name: 'nano-bernd (build + test)'
     runs-on: ubuntu-24.04
     needs: [engine-wasm-ffi-dist, changes]
     if: *code_gate
