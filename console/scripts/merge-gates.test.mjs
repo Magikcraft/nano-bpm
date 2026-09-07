@@ -30,6 +30,7 @@ test("guard rejects required-job renames, duplicates and missing jobs", () => {
     const id = Object.keys(copy.workflow.jobs).find(
       (id) => copy.workflow.jobs[id].name === name,
     );
+    assert.ok(id, `Fixture must contain the required CI job ${name}`);
     if (change === "rename") copy.workflow.jobs[id].name += " renamed";
     if (change === "duplicate")
       copy.workflow.jobs.duplicate = copy.workflow.jobs[id];
@@ -44,6 +45,7 @@ test("guard rejects missing Mergify gates or lost skip tolerance", () => {
     const gate = copy.mergify.merge_protections.find(
       ({ name }) => name === "required CI checks",
     );
+    assert.ok(gate, "Fixture must contain the required CI checks gate");
     if (change === "missing") gate.success_conditions.pop();
     if (change === "skip") gate.success_conditions[0].or.pop();
     assert.throws(
