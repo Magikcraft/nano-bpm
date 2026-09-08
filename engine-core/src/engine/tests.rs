@@ -874,6 +874,152 @@ fn terminating_an_instance_drops_its_variables_from_hot_state() {
 }
 
 #[test]
+fn suspend_resume_lifecycle_gates_jobs_and_timers() {
+    use crate::state::ProcessInstanceState;
+    // start -> charge (service task, job `payment`) -> wait (timer PT5S) -> end
+    let def = ProcessBuilder::new("delayed")
+        .start_event("start")
+        .service_task("charge", "payment")
+        .timer_intermediate_catch_event("wait", 5_000)
+        .end_event("end")
+        .connect("start", "charge")
+        .connect("charge", "wait")
+        .connect("wait", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let events = engine
+        .apply_command_at(Command::create_instance("delayed"), 1_000)
+        .unwrap();
+    let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(engine.instance(key).unwrap().state, ProcessInstanceState::Active);
+
+    // Suspend: the instance stops making progress. Its created `payment` job is
+    // no longer activatable while suspended (Camunda parity).
+    let suspend = engine
+        .apply_command_at(Command::suspend_instance(key), 2_000)
+        .expect("suspend");
+    assert!(suspend.contains(&Event::ProcessInstanceSuspended {
+        instance_key: key,
+        at: 2_000,
+    }));
+    assert_eq!(
+        engine.instance(key).unwrap().state,
+        ProcessInstanceState::Suspended
+    );
+    assert_eq!(engine.instance(key).unwrap().suspended_at, Some(2_000));
+    assert!(
+        engine.activate_jobs("payment", "w", 1, 60_000, 2_500).is_empty(),
+        "a suspended instance's jobs are not activatable"
+    );
+
+    // Resume: back to Active with its exact prior running state; the job is live
+    // again and `suspended_at` clears.
+    let resume = engine
+        .apply_command_at(Command::resume_instance(key), 3_000)
+        .expect("resume");
+    assert!(resume.contains(&Event::ProcessInstanceResumed { instance_key: key }));
+    assert_eq!(engine.instance(key).unwrap().state, ProcessInstanceState::Active);
+    assert_eq!(engine.instance(key).unwrap().suspended_at, None);
+
+    let job = engine
+        .activate_jobs("payment", "w", 1, 60_000, 3_000)
+        .into_iter()
+        .next()
+        .expect("job activatable again after resume");
+    engine
+        .apply_command_at(Command::complete_job(job.key), 3_000)
+        .unwrap();
+
+    // Token now parked on the timer armed for due_at = 3000 + 5000 = 8000.
+    assert!(!engine.is_completed(key));
+    assert_eq!(engine.timers()[0].due_at, 8_000);
+
+    // Suspend again: a due timer must NOT fire while the instance is suspended.
+    engine
+        .apply_command_at(Command::suspend_instance(key), 8_500)
+        .expect("re-suspend");
+    let fired = engine.trigger_timers(9_000);
+    assert!(
+        fired.is_empty(),
+        "a suspended instance's timers do not fire"
+    );
+    assert!(!engine.is_completed(key));
+
+    // Resume and tick again: the timer now fires and the instance completes.
+    engine
+        .apply_command_at(Command::resume_instance(key), 9_500)
+        .expect("resume 2");
+    let fired = engine.trigger_timers(10_000);
+    assert!(fired
+        .iter()
+        .any(|e| matches!(e, Event::TimerTriggered { .. })));
+    assert!(engine.is_completed(key));
+}
+
+#[test]
+fn suspend_resume_reject_illegal_transitions() {
+    use crate::state::ProcessInstanceState;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+
+    // Unknown instance: both suspend and resume are a clean not-found.
+    assert!(matches!(
+        engine.apply_command(Command::suspend_instance(999)),
+        Err(EngineError::InstanceNotFound { instance_key: 999 })
+    ));
+    assert!(matches!(
+        engine.apply_command(Command::resume_instance(999)),
+        Err(EngineError::InstanceNotFound { instance_key: 999 })
+    ));
+
+    let events = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Resuming an Active instance is an idempotent no-op (no error, no event).
+    let noop = engine.apply_command(Command::resume_instance(key)).unwrap();
+    assert!(noop.is_empty());
+    assert_eq!(engine.instance(key).unwrap().state, ProcessInstanceState::Active);
+
+    // Suspend, then suspending again is an idempotent no-op.
+    engine.apply_command(Command::suspend_instance(key)).unwrap();
+    let noop = engine.apply_command(Command::suspend_instance(key)).unwrap();
+    assert!(noop.is_empty());
+
+    engine.apply_command(Command::resume_instance(key)).unwrap();
+
+    // Cancel to a terminal state, then neither transition is valid.
+    engine.apply_command(Command::cancel_instance(key)).unwrap();
+    assert_eq!(
+        engine.instance(key).unwrap().state,
+        ProcessInstanceState::Terminated
+    );
+    assert!(matches!(
+        engine.apply_command(Command::suspend_instance(key)),
+        Err(EngineError::InstanceTransitionInvalid {
+            instance_key,
+            to: "SUSPENDED",
+            ..
+        }) if instance_key == key
+    ));
+    assert!(matches!(
+        engine.apply_command(Command::resume_instance(key)),
+        Err(EngineError::InstanceTransitionInvalid {
+            instance_key,
+            to: "ACTIVE",
+            ..
+        }) if instance_key == key
+    ));
+}
+
+#[test]
 fn live_job_count_excludes_completed_jobs_pending_eviction() {
     // Regression: `runnable_backlog` (the admission/governor congestion signal)
     // must count only *live* jobs — Created + Activated — never the terminal

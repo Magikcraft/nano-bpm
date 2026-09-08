@@ -95,6 +95,29 @@ pub enum ProcessInstanceState {
     /// chain drains. Not a resting state a listener-free instance ever reaches,
     /// so the ordinary synchronous cancel path is unchanged.
     Terminating,
+    /// Suspended by an operator ([`crate::Command::SuspendInstance`]). A
+    /// suspended instance makes no progress: its jobs are not activatable and
+    /// its timers/other triggers do not fire, but it retains all its runtime
+    /// state. Resuming ([`crate::Command::ResumeInstance`]) returns it to
+    /// `Active` with its exact prior running state. Only reachable from `Active`
+    /// (the sole valid live-transition source); terminal states reject
+    /// suspension. Tracked alongside [`ProcessInstance::suspended_at`], which
+    /// records the most-recent suspension instant.
+    Suspended,
+}
+
+impl ProcessInstanceState {
+    /// A stable, Camunda-style uppercase label for this state, used in error
+    /// messages describing an illegal lifecycle transition.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProcessInstanceState::Active => "ACTIVE",
+            ProcessInstanceState::Completed => "COMPLETED",
+            ProcessInstanceState::Terminated => "TERMINATED",
+            ProcessInstanceState::Terminating => "TERMINATING",
+            ProcessInstanceState::Suspended => "SUSPENDED",
+        }
+    }
 }
 
 /// Lifecycle state of a job.
@@ -384,6 +407,15 @@ pub struct ProcessInstance {
     #[cfg_attr(feature = "serde", serde(default))]
     pub process_definition_key: Key,
     pub state: ProcessInstanceState,
+    /// When this instance is currently `SUSPENDED`, the millisecond-since-epoch
+    /// instant it most recently entered suspension (the `suspendedDate` surfaced
+    /// on the REST result). `None` whenever the instance is not currently
+    /// suspended — set on `ProcessInstanceSuspended`, cleared on
+    /// `ProcessInstanceResumed` (and on any terminal transition). Moves in
+    /// lockstep with `state == Suspended`. `serde(default)` so snapshots written
+    /// before suspend/resume support deserialize as `None`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub suspended_at: Option<u64>,
     /// The logical instant the instance was started (the `created_at` carried on
     /// the creating command), in milliseconds since the Unix epoch. This is the
     /// instance's start date. `0` for instances created before the engine
@@ -1751,6 +1783,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     process_id: process_id.clone(),
                     process_definition_key: pinned_key,
                     state: ProcessInstanceState::Active,
+                    suspended_at: None,
                     created_at: *created_at,
                     tags: tags.clone(),
                     business_id: business_id.clone(),
@@ -2451,6 +2484,7 @@ pub fn apply(state: &mut State, event: &Event) {
             let terminal_pid = non_terminal_process_id(state, instance_key);
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Completed;
+                instance.suspended_at = None;
                 // Clear any residual runtime bookkeeping. On a normal completion
                 // these are already empty (the instance completes only with an
                 // empty `active` map); a top-level terminate end event completes
@@ -2492,6 +2526,20 @@ pub fn apply(state: &mut State, event: &Event) {
         Event::ProcessInstanceTerminating { instance_key } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Terminating;
+            }
+        }
+
+        Event::ProcessInstanceSuspended { instance_key, at } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.state = ProcessInstanceState::Suspended;
+                instance.suspended_at = Some(*at);
+            }
+        }
+
+        Event::ProcessInstanceResumed { instance_key } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.state = ProcessInstanceState::Active;
+                instance.suspended_at = None;
             }
         }
 
@@ -2629,6 +2677,7 @@ pub fn apply(state: &mut State, event: &Event) {
             }
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Terminated;
+                instance.suspended_at = None;
                 instance.active.clear();
                 instance.scopes.clear();
                 instance.incidents.clear();

@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -48,7 +48,7 @@ const SCHEMA_VERSION: i64 = 7;
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -6204772450958810819;
+const SCHEMA_FINGERPRINT: i64 = -5764138655528766412;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -114,7 +114,8 @@ CREATE TABLE process_instances (
     tags                   TEXT NOT NULL,
     business_id            TEXT,
     parent_process_instance_key INTEGER,
-    parent_element_instance_key INTEGER
+    parent_element_instance_key INTEGER,
+    suspended_date_ms INTEGER
 );
 CREATE TABLE jobs (
     key                    INTEGER PRIMARY KEY,
@@ -763,6 +764,12 @@ const fn instance_state_code(s: ProcessInstanceState) -> i64 {
         // becomes `Terminated`. Projected as its own code so the read model can
         // show "cancelling".
         ProcessInstanceState::Terminating => 3,
+        // A suspended instance is still in-flight: it keeps the `Active` base
+        // code (0) so `WHERE state = 0` active-count / orphan queries still
+        // count it, and its suspension is tracked out-of-band by the nullable
+        // `suspended_date_ms` column — the single source of truth from which the
+        // derived `Suspended` state and the `suspendedDate` value are both read.
+        ProcessInstanceState::Suspended => 0,
     }
 }
 
@@ -1069,6 +1076,13 @@ pub struct ProcessInstanceRow {
     /// `parentProcessInstanceKey` field/filter return real data.
     pub parent_process_instance_key: Option<Key>,
     pub parent_element_instance_key: Option<Key>,
+    /// Epoch-milliseconds instant at which this instance most recently entered
+    /// `Suspended` (via [`nanobpmn_engine_core::Command::SuspendInstance`]), or
+    /// `None` when it is not currently suspended. This nullable column is the
+    /// **single source of truth** for suspension: [`map_instance`] derives the
+    /// `Suspended` state from its presence, and the gateway's `suspendedDate`
+    /// result field is read straight from it.
+    pub suspended_date_ms: Option<u64>,
 }
 
 /// Resolves the `rootProcessInstanceKey` for `key` (C8 parity, issue #977) by
@@ -2422,7 +2436,7 @@ impl ReadStore {
         let mut stmt = conn
             .prepare(
                 "SELECT key, process_id, process_definition_id, process_definition_key, \
-                 version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, parent_element_instance_key FROM process_instances",
+                 version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, parent_element_instance_key, suspended_date_ms FROM process_instances",
             )
             .expect("prepare process_instances");
         let rows = stmt
@@ -2462,7 +2476,7 @@ impl ReadStore {
         let sql = format!(
             "SELECT key, process_id, process_definition_id, process_definition_key, \
                  version, state, start_date_ms, has_incident, tags, business_id, \
-                 parent_process_instance_key, parent_element_instance_key \
+                 parent_process_instance_key, parent_element_instance_key, suspended_date_ms \
                  FROM process_instances{} ORDER BY key DESC LIMIT ?1 OFFSET ?2",
             filter.where_clause()
         );
@@ -2477,7 +2491,7 @@ impl ReadStore {
         let conn = self.conn.lock().expect("read store poisoned");
         conn.query_row(
             "SELECT key, process_id, process_definition_id, process_definition_key, \
-             version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, parent_element_instance_key FROM process_instances WHERE key = ?1",
+             version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, parent_element_instance_key, suspended_date_ms FROM process_instances WHERE key = ?1",
             params![key as i64],
             map_instance,
         )
@@ -2985,7 +2999,7 @@ fn map_instance(r: &rusqlite::Row) -> rusqlite::Result<ProcessInstanceRow> {
     } else {
         tags_str.split(',').map(|s| s.to_string()).collect()
     };
-    Ok(ProcessInstanceRow {
+    let mut row = ProcessInstanceRow {
         key: r.get::<_, i64>(0)? as Key,
         process_id: r.get(1)?,
         process_definition_id: r.get(2)?,
@@ -2998,7 +3012,15 @@ fn map_instance(r: &rusqlite::Row) -> rusqlite::Result<ProcessInstanceRow> {
         business_id: r.get(9)?,
         parent_process_instance_key: r.get::<_, Option<i64>>(10)?.map(|k| k as Key),
         parent_element_instance_key: r.get::<_, Option<i64>>(11)?.map(|k| k as Key),
-    })
+        suspended_date_ms: r.get::<_, Option<i64>>(12)?.map(|k| k as u64),
+    };
+    // Single source of truth: an in-flight instance carrying a suspension
+    // timestamp is `Suspended`. A terminal base state (Completed/Terminated/
+    // Terminating) always wins — a suspension record never resurrects it.
+    if row.suspended_date_ms.is_some() && row.state == ProcessInstanceState::Active {
+        row.state = ProcessInstanceState::Suspended;
+    }
+    Ok(row)
 }
 
 fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
@@ -3675,8 +3697,8 @@ fn project_engine_state(
         tx.cexecute(
             "INSERT INTO process_instances (key, process_id, process_definition_id, \
              process_definition_key, version, state, start_date_ms, has_incident, tags, business_id, \
-             parent_process_instance_key, parent_element_instance_key) \
-             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10) \
+             parent_process_instance_key, parent_element_instance_key, suspended_date_ms) \
+             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT(key) DO NOTHING",
             params![
                 inst.key as i64,
@@ -3689,6 +3711,7 @@ fn project_engine_state(
                 inst.business_id.as_ref(),
                 inst.parent_process_instance_key.map(|k| k as i64),
                 inst.parent_element_instance_key.map(|k| k as i64),
+                inst.suspended_at.map(|t| t as i64),
             ],
         )?;
         // Process-level variables (scope == instance key), then each nested scope.
@@ -4066,6 +4089,30 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // A terminated instance holds no open message subscriptions.
             tx.cexecute(
                 "DELETE FROM message_subscriptions WHERE instance_key = ?1",
+                params![*instance_key as i64],
+            )?;
+        }
+
+        Event::ProcessInstanceSuspended { instance_key, at } => {
+            // Record the most-recent suspension instant. `AND state = 0` guards
+            // against suspending a row that has already reached a terminal base
+            // state; a suspended instance keeps its `Active` base code (0) and
+            // stays in the in-flight gauge, so `delta` is unchanged. The
+            // nullable `suspended_date_ms` column is the single source of truth
+            // from which the derived `Suspended` state and `suspendedDate` value
+            // are both read (see `map_instance`).
+            tx.cexecute(
+                "UPDATE process_instances SET suspended_date_ms = ?2 WHERE key = ?1 AND state = 0",
+                params![*instance_key as i64, *at as i64],
+            )?;
+        }
+
+        Event::ProcessInstanceResumed { instance_key } => {
+            // Clear the suspension record so the instance derives back to
+            // `Active` and its `suspendedDate` reverts to null. The base state
+            // code was never moved off 0, so the gauge is unchanged.
+            tx.cexecute(
+                "UPDATE process_instances SET suspended_date_ms = NULL WHERE key = ?1",
                 params![*instance_key as i64],
             )?;
         }
@@ -6618,6 +6665,51 @@ mod definition_xml_tests {
         let done = Event::ProcessInstanceCompleted { instance_key: 10 };
         assert_eq!(store.export(&[&done]).unwrap().inflight_delta, 0);
         assert_eq!(store.active_instance_count(), 1);
+    }
+
+    #[test]
+    fn suspend_and_resume_drive_suspended_state_and_suspended_date() {
+        use nanobpmn_engine_core::ProcessInstanceState;
+        let store = ReadStore::open(None).unwrap();
+
+        // A live instance starts Active with no suspension timestamp.
+        assert_eq!(store.export(&[&created_event(7)]).unwrap().inflight_delta, 1);
+        let row = store.process_instance(7).unwrap();
+        assert_eq!(row.state, ProcessInstanceState::Active);
+        assert_eq!(row.suspended_date_ms, None);
+
+        // Suspending records the instant and derives the Suspended state, but
+        // leaves it counted as in-flight (gauge unchanged).
+        let out = store
+            .export(&[&Event::ProcessInstanceSuspended {
+                instance_key: 7,
+                at: 1_700_000_000_000,
+            }])
+            .unwrap();
+        assert_eq!(out.inflight_delta, 0);
+        let row = store.process_instance(7).unwrap();
+        assert_eq!(row.state, ProcessInstanceState::Suspended);
+        assert_eq!(row.suspended_date_ms, Some(1_700_000_000_000));
+        assert_eq!(store.active_instance_count(), 1);
+
+        // Resuming clears the timestamp and reverts to Active.
+        let out = store
+            .export(&[&Event::ProcessInstanceResumed { instance_key: 7 }])
+            .unwrap();
+        assert_eq!(out.inflight_delta, 0);
+        let row = store.process_instance(7).unwrap();
+        assert_eq!(row.state, ProcessInstanceState::Active);
+        assert_eq!(row.suspended_date_ms, None);
+
+        // A completion after resume still terminates cleanly (gauge -1).
+        let out = store
+            .export(&[&Event::ProcessInstanceCompleted { instance_key: 7 }])
+            .unwrap();
+        assert_eq!(out.inflight_delta, -1);
+        assert_eq!(
+            store.process_instance(7).map(|r| r.state),
+            Some(ProcessInstanceState::Completed)
+        );
     }
 
     #[test]

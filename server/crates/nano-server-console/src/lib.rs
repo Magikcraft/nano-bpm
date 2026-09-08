@@ -2375,6 +2375,7 @@ mod instance_dto_parent_linkage_tests {
             business_id: None,
             parent_process_instance_key: parent_pi,
             parent_element_instance_key: parent_ei,
+            suspended_date_ms: None,
         }
     }
 
@@ -2785,6 +2786,7 @@ mod called_instances_tests {
             business_id: None,
             parent_process_instance_key: Some(parent_pi),
             parent_element_instance_key: parent_ei,
+            suspended_date_ms: None,
         }
     }
 

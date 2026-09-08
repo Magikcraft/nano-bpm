@@ -766,6 +766,8 @@ async fn handle_client_frame(
         ClientFrame::InstallDeployment { .. } => "install_deployment",
         ClientFrame::PublishMessage { .. } => "publish_message",
         ClientFrame::CancelInstance { .. } => "cancel_instance",
+        ClientFrame::SuspendInstance { .. } => "suspend_instance",
+        ClientFrame::ResumeInstance { .. } => "resume_instance",
         ClientFrame::MigrateInstance { .. } => "migrate_instance",
         ClientFrame::RouteSubscription { .. } => "route_subscription",
         ClientFrame::UpdateJobRetries { .. } => "update_job_retries",
@@ -1346,6 +1348,18 @@ async fn handle_client_frame(
         ClientFrame::CancelInstance { corr, instance_key } => {
             forward_by_key_reply(conn, corr, &instance_key, |key| async move {
                 server.cancel_instance_local(key).await
+            })
+            .await;
+        }
+        ClientFrame::SuspendInstance { corr, instance_key } => {
+            forward_by_key_reply(conn, corr, &instance_key, |key| async move {
+                server.suspend_instance_local(key).await
+            })
+            .await;
+        }
+        ClientFrame::ResumeInstance { corr, instance_key } => {
+            forward_by_key_reply(conn, corr, &instance_key, |key| async move {
+                server.resume_instance_local(key).await
             })
             .await;
         }

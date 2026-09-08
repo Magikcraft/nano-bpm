@@ -380,6 +380,19 @@ pub enum Command {
     /// `Terminated` (it does *not* complete). Only an active instance can be
     /// cancelled; an unknown or already-finished instance is rejected.
     CancelInstance { instance_key: Key },
+    /// Suspend a running process instance (Camunda parity). The instance stops
+    /// making progress — its jobs become non-activatable and its timers/other
+    /// triggers do not fire — while retaining all runtime state, and its state
+    /// becomes `Suspended`. Only an instance currently `Active` can be suspended
+    /// (the sole valid live-transition source); an unknown, terminal, or already
+    /// suspended instance is rejected. Emits [`crate::Event::ProcessInstanceSuspended`].
+    SuspendInstance { instance_key: Key },
+    /// Resume a suspended process instance (Camunda parity). Its state returns to
+    /// `Active` with its exact prior running state and its `suspendedDate`
+    /// clears, so jobs and timers become live again. Only an instance currently
+    /// `Suspended` can be resumed; an unknown, terminal, or already active
+    /// instance is rejected. Emits [`crate::Event::ProcessInstanceResumed`].
+    ResumeInstance { instance_key: Key },
     /// Migrate a running process instance to a target process definition
     /// (Zeebe process-instance migration). Each active element instance whose
     /// element id appears as a `source_element_id` in `mapping_instructions` is
@@ -686,6 +699,8 @@ impl Command {
             Command::CorrelateMessageSubscription { .. } => "correlate_message_subscription",
             Command::CloseMessageSubscription { .. } => "close_message_subscription",
             Command::CancelInstance { .. } => "cancel_instance",
+            Command::SuspendInstance { .. } => "suspend_instance",
+            Command::ResumeInstance { .. } => "resume_instance",
             Command::MigrateInstance { .. } => "migrate_instance",
             Command::ModifyInstance { .. } => "modify_instance",
             Command::DispatchStartInstance { .. } => "dispatch_start_instance",
@@ -1187,6 +1202,16 @@ impl Command {
     /// Convenience constructor for a `CancelInstance`.
     pub fn cancel_instance(instance_key: Key) -> Self {
         Command::CancelInstance { instance_key }
+    }
+
+    /// Convenience constructor for a `SuspendInstance`.
+    pub fn suspend_instance(instance_key: Key) -> Self {
+        Command::SuspendInstance { instance_key }
+    }
+
+    /// Convenience constructor for a `ResumeInstance`.
+    pub fn resume_instance(instance_key: Key) -> Self {
+        Command::ResumeInstance { instance_key }
     }
 
     /// Convenience constructor for a `MigrateInstance`.
