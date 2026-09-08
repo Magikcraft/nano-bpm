@@ -2361,7 +2361,14 @@ impl From<&nano_server_storage::readstore::ProcessInstanceRow> for InstanceDto {
                 // to epoch rather than collapsing to `null`, which would let the
                 // wire `suspendedDate` drift from the `Suspended` state derived
                 // from the same column. Mirrors the gateway v2 projection.
-                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+                //
+                // `suspended_date_ms` is a `u64`, so use a checked `i64::try_from`
+                // instead of an `as` cast: a value `> i64::MAX` would otherwise
+                // wrap to a negative `i64` and yield an arbitrary *pre-epoch*
+                // datetime rather than the intended epoch fallback.
+                i64::try_from(ms)
+                    .ok()
+                    .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
                     .unwrap_or_else(|| {
                         chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
                             .expect("epoch is valid")
@@ -2445,6 +2452,20 @@ mod instance_dto_parent_linkage_tests {
             Some("2023-11-14T22:13:20+00:00")
         );
         assert_eq!(dto.state, "Suspended");
+
+        // Out-of-range `u64` millis (> i64::MAX) must fall back to the epoch,
+        // NOT wrap through an `as` cast into an arbitrary pre-epoch datetime:
+        // the column is present, so the wire value stays present (never null)
+        // and never drifts negative.
+        let mut r = row(None, None);
+        r.state = ProcessInstanceState::Suspended;
+        r.suspended_date_ms = Some(u64::MAX);
+        let dto = InstanceDto::from(&r);
+        assert_eq!(
+            dto.suspended_date.as_deref(),
+            Some("1970-01-01T00:00:00+00:00"),
+            "an out-of-range millis value falls back to epoch, not a wrapped pre-epoch time"
+        );
     }
 }
 
