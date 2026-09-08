@@ -2319,7 +2319,7 @@ struct InstanceDto {
     process_id: String,
     process_definition_key: String,
     version: i32,
-    /// `Active` | `Completed` | `Terminated`.
+    /// `Active` | `Suspended` | `Completed` | `Terminated`.
     state: String,
     start_date_ms: u64,
     has_incident: bool,

@@ -182,7 +182,7 @@ paths:
       description: >
         Operator action from the Process Explorer. Pauses the instance: it stops
         making progress (no jobs are activated, no timers fire) while retaining
-        all runtime state, and its state becomes SUSPENDED. Reuses the same
+        all runtime state, and its state becomes Suspended. Reuses the same
         engine command and leader-forward core as the v2 REST endpoint POST
         /v2/process-instances/{key}/suspension. Only a running (Active) instance
         can be suspended; a terminal instance is a 400 and an unknown instance is
@@ -202,10 +202,10 @@ paths:
       summary: Resume a suspended process instance
       description: >
         Operator action from the Process Explorer. Reverses a suspension: the
-        instance resumes from exactly where it was paused (state back to ACTIVE),
+        instance resumes from exactly where it was paused (state back to Active),
         re-activating its jobs and re-arming its timers/subscriptions. Reuses the
         same engine command and leader-forward core as the v2 REST endpoint POST
-        /v2/process-instances/{key}/resumption. Only a SUSPENDED instance can be
+        /v2/process-instances/{key}/resumption. Only a Suspended instance can be
         resumed; a terminal instance is a 400 and an unknown instance is a 404.
       parameters:
         - { name: key, in: path, required: true, schema: { type: string } }
@@ -1563,7 +1563,7 @@ components:
           type: array
           items: { $ref: '#/components/schemas/NodeHealth' }
 
-    # ---- Instances (snake_case wire fields) ------------------------------
+    # ---- Instances (snake_case wire fields, plus camelCase suspendedDate) ----
     Instance:
       type: object
       required: [key, process_id, process_definition_key, version, state, start_date_ms, has_incident, business_id, tags, parent_process_instance_key, parent_element_instance_key, suspendedDate]
@@ -1582,7 +1582,7 @@ components:
           nullable: true
           description: >
             ISO-8601 datetime of the most recent suspension while the instance is
-            SUSPENDED, else `null`. ALWAYS present (mirrors the gateway v2
+            Suspended, else `null`. ALWAYS present (mirrors the gateway v2
             `ProcessInstanceResult.suspendedDate`): a non-null value implies
             `state == Suspended`, and resuming clears it back to `null`.
         tags:

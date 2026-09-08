@@ -55,7 +55,7 @@ export type Instance = {
     has_incident: boolean;
     business_id: string | null;
     /**
-     * ISO-8601 datetime of the most recent suspension while the instance is SUSPENDED, else `null`. ALWAYS present (mirrors the gateway v2 `ProcessInstanceResult.suspendedDate`): a non-null value implies `state == Suspended`, and resuming clears it back to `null`.
+     * ISO-8601 datetime of the most recent suspension while the instance is Suspended, else `null`. ALWAYS present (mirrors the gateway v2 `ProcessInstanceResult.suspendedDate`): a non-null value implies `state == Suspended`, and resuming clears it back to `null`.
      *
      */
     suspendedDate: string | null;

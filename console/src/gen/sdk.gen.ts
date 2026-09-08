@@ -67,7 +67,7 @@ export const cancelInstance = <ThrowOnError extends boolean = false>(options: Op
 /**
  * Suspend a running process instance
  *
- * Operator action from the Process Explorer. Pauses the instance: it stops making progress (no jobs are activated, no timers fire) while retaining all runtime state, and its state becomes SUSPENDED. Reuses the same engine command and leader-forward core as the v2 REST endpoint POST /v2/process-instances/{key}/suspension. Only a running (Active) instance can be suspended; a terminal instance is a 400 and an unknown instance is a 404. Resume with the resumption endpoint.
+ * Operator action from the Process Explorer. Pauses the instance: it stops making progress (no jobs are activated, no timers fire) while retaining all runtime state, and its state becomes Suspended. Reuses the same engine command and leader-forward core as the v2 REST endpoint POST /v2/process-instances/{key}/suspension. Only a running (Active) instance can be suspended; a terminal instance is a 400 and an unknown instance is a 404. Resume with the resumption endpoint.
  *
  */
 export const suspendInstance = <ThrowOnError extends boolean = false>(options: Options<SuspendInstanceData, ThrowOnError>): RequestResult<SuspendInstanceResponses, SuspendInstanceErrors, ThrowOnError> => (options.client ?? client).post<SuspendInstanceResponses, SuspendInstanceErrors, ThrowOnError>({ url: '/instances/{key}/suspension', ...options });
@@ -75,7 +75,7 @@ export const suspendInstance = <ThrowOnError extends boolean = false>(options: O
 /**
  * Resume a suspended process instance
  *
- * Operator action from the Process Explorer. Reverses a suspension: the instance resumes from exactly where it was paused (state back to ACTIVE), re-activating its jobs and re-arming its timers/subscriptions. Reuses the same engine command and leader-forward core as the v2 REST endpoint POST /v2/process-instances/{key}/resumption. Only a SUSPENDED instance can be resumed; a terminal instance is a 400 and an unknown instance is a 404.
+ * Operator action from the Process Explorer. Reverses a suspension: the instance resumes from exactly where it was paused (state back to Active), re-activating its jobs and re-arming its timers/subscriptions. Reuses the same engine command and leader-forward core as the v2 REST endpoint POST /v2/process-instances/{key}/resumption. Only a Suspended instance can be resumed; a terminal instance is a 400 and an unknown instance is a 404.
  *
  */
 export const resumeInstance = <ThrowOnError extends boolean = false>(options: Options<ResumeInstanceData, ThrowOnError>): RequestResult<ResumeInstanceResponses, ResumeInstanceErrors, ThrowOnError> => (options.client ?? client).post<ResumeInstanceResponses, ResumeInstanceErrors, ThrowOnError>({ url: '/instances/{key}/resumption', ...options });
