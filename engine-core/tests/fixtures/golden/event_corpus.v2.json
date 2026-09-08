@@ -338,5 +338,22 @@
       "priority": 50,
       "retries": 3
     }
+  },
+  {
+    "ProcessInstanceSuspended": {
+      "at": 1700000000005,
+      "instance_key": 8
+    }
+  },
+  {
+    "ProcessInstanceResumed": {
+      "instance_key": 8
+    }
+  },
+  {
+    "ProcessInstanceSuspended": {
+      "at": 1700000000007,
+      "instance_key": 8
+    }
   }
 ]

@@ -231,6 +231,24 @@ pub enum ClientFrame {
         instance_key: String,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key process-instance
+    /// suspension to the peer that owns the instance's partition. Answered by a
+    /// `CommandResult` (204 on success, 400 illegal transition from a terminal
+    /// state, 404 unknown instance, 5xx otherwise).
+    #[serde(rename_all = "camelCase")]
+    SuspendInstance {
+        corr: u64,
+        instance_key: String,
+    },
+    /// **Intra-cluster only.** A gateway forwards a by-key process-instance
+    /// resumption to the peer that owns the instance's partition. Answered by a
+    /// `CommandResult` (204 on success, 400 illegal transition from a terminal
+    /// state, 404 unknown instance, 5xx otherwise).
+    #[serde(rename_all = "camelCase")]
+    ResumeInstance {
+        corr: u64,
+        instance_key: String,
+    },
+    /// **Intra-cluster only.** A gateway forwards a by-key process-instance
     /// migration to the peer that owns the instance's partition. Answered by a
     /// `CommandResult` (204 on success, 400 invalid mapping, 404 unknown
     /// instance/target, 409 rejected migration, 5xx otherwise).

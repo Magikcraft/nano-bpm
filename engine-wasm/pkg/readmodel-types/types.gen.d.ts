@@ -8525,6 +8525,11 @@ export type ProcessInstanceResult = {
      * The business id associated with this process instance.
      */
     businessId: BusinessId | null;
+    /**
+     * The date-time at which this process instance most recently entered the SUSPENDED state, or null when the instance is not currently suspended. Always present.
+     *
+     */
+    suspendedDate: string | null;
 };
 
 /**
@@ -8606,7 +8611,7 @@ export type ProcessInstanceSequenceFlowsQueryResult = {
 /**
  * Process instance states
  */
-export type ProcessInstanceStateEnum = 'ACTIVE' | 'COMPLETED' | 'TERMINATED';
+export type ProcessInstanceStateEnum = 'ACTIVE' | 'COMPLETED' | 'TERMINATED' | 'SUSPENDED';
 
 /**
  * ProcessInstanceStateEnum property with full advanced search capabilities.
@@ -8699,9 +8704,13 @@ export type _1ProcessInstances1ProcessInstanceKey1Migration = unknown;
 
 export type _1ProcessInstances1ProcessInstanceKey1Modification = unknown;
 
+export type _1ProcessInstances1ProcessInstanceKey1Resumption = unknown;
+
 export type _1ProcessInstances1ProcessInstanceKey1SequenceFlows = unknown;
 
 export type _1ProcessInstances1ProcessInstanceKey1Statistics1ElementInstances = unknown;
+
+export type _1ProcessInstances1ProcessInstanceKey1Suspension = unknown;
 
 export type RoleClientResult = {
     /**
@@ -15635,6 +15644,49 @@ export type ModifyProcessInstanceResponses = {
 
 export type ModifyProcessInstanceResponse = ModifyProcessInstanceResponses[keyof ModifyProcessInstanceResponses];
 
+export type ResumeProcessInstanceData = {
+    body?: never;
+    path: {
+        /**
+         * The key of the process instance to resume.
+         */
+        processInstanceKey: ProcessInstanceKey;
+    };
+    query?: never;
+    url: '/process-instances/{processInstanceKey}/resumption';
+};
+
+export type ResumeProcessInstanceErrors = {
+    /**
+     * The provided data is not valid.
+     */
+    400: ProblemDetail;
+    /**
+     * The process instance is not found.
+     */
+    404: ProblemDetail;
+    /**
+     * An internal error occurred while processing the request.
+     */
+    500: ProblemDetail;
+    /**
+     * The service is currently unavailable. This may happen only on some requests where the system creates backpressure to prevent the server's compute resources from being exhausted, avoiding more severe failures. In this case, the title of the error object contains `RESOURCE_EXHAUSTED`. Clients are recommended to eventually retry those requests after a backoff period. You can learn more about the backpressure mechanism here: https://docs.camunda.io/docs/components/zeebe/technical-concepts/internal-processing/#handling-backpressure .
+     *
+     */
+    503: ProblemDetail;
+};
+
+export type ResumeProcessInstanceError = ResumeProcessInstanceErrors[keyof ResumeProcessInstanceErrors];
+
+export type ResumeProcessInstanceResponses = {
+    /**
+     * The process instance is resumed.
+     */
+    204: void;
+};
+
+export type ResumeProcessInstanceResponse = ResumeProcessInstanceResponses[keyof ResumeProcessInstanceResponses];
+
 export type GetProcessInstanceSequenceFlowsData = {
     body?: never;
     path: {
@@ -15718,6 +15770,49 @@ export type GetProcessInstanceStatisticsResponses = {
 };
 
 export type GetProcessInstanceStatisticsResponse = GetProcessInstanceStatisticsResponses[keyof GetProcessInstanceStatisticsResponses];
+
+export type SuspendProcessInstanceData = {
+    body?: never;
+    path: {
+        /**
+         * The key of the process instance to suspend.
+         */
+        processInstanceKey: ProcessInstanceKey;
+    };
+    query?: never;
+    url: '/process-instances/{processInstanceKey}/suspension';
+};
+
+export type SuspendProcessInstanceErrors = {
+    /**
+     * The provided data is not valid.
+     */
+    400: ProblemDetail;
+    /**
+     * The process instance is not found.
+     */
+    404: ProblemDetail;
+    /**
+     * An internal error occurred while processing the request.
+     */
+    500: ProblemDetail;
+    /**
+     * The service is currently unavailable. This may happen only on some requests where the system creates backpressure to prevent the server's compute resources from being exhausted, avoiding more severe failures. In this case, the title of the error object contains `RESOURCE_EXHAUSTED`. Clients are recommended to eventually retry those requests after a backoff period. You can learn more about the backpressure mechanism here: https://docs.camunda.io/docs/components/zeebe/technical-concepts/internal-processing/#handling-backpressure .
+     *
+     */
+    503: ProblemDetail;
+};
+
+export type SuspendProcessInstanceError = SuspendProcessInstanceErrors[keyof SuspendProcessInstanceErrors];
+
+export type SuspendProcessInstanceResponses = {
+    /**
+     * The process instance is suspended.
+     */
+    204: void;
+};
+
+export type SuspendProcessInstanceResponse = SuspendProcessInstanceResponses[keyof SuspendProcessInstanceResponses];
 
 export type SearchResourcesData = {
     body?: ResourceSearchQuery;

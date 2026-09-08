@@ -231,10 +231,37 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     // the live working set. One job, not in the `Activated` set.
     let mut vars_b = HashMap::new();
     vars_b.insert("amount".to_string(), Value::Int(999));
+    let created_b = engine
+        .apply_command_at(Command::create_instance_with("order", vars_b), T0 + 4)
+        .expect("create instance B");
+    let instance_b = created_b
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+            _ => None,
+        })
+        .expect("instance B was created");
+    journal.extend(created_b);
+
+    // Instance B is suspended, resumed, then suspended again (Camunda-parity
+    // suspend/resume). This exercises both the additive `ProcessInstanceSuspended`
+    // and `ProcessInstanceResumed` event frames and leaves a currently-suspended
+    // instance in the snapshot (its `suspended_at` carries the last instant), so
+    // the golden corpus pins the replay shape of both.
     journal.extend(
         engine
-            .apply_command_at(Command::create_instance_with("order", vars_b), T0 + 4)
-            .expect("create instance B"),
+            .apply_command_at(Command::suspend_instance(instance_b), T0 + 5)
+            .expect("suspend instance B"),
+    );
+    journal.extend(
+        engine
+            .apply_command_at(Command::resume_instance(instance_b), T0 + 6)
+            .expect("resume instance B"),
+    );
+    journal.extend(
+        engine
+            .apply_command_at(Command::suspend_instance(instance_b), T0 + 7)
+            .expect("re-suspend instance B"),
     );
 
     let snapshot = engine.snapshot();

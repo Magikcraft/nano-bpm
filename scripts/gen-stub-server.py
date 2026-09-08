@@ -35,6 +35,8 @@ METHOD_RE = re.compile(
 OVERRIDES: dict[tuple[str, str], str] = {
     ("process_instance", "create_process_instance"): "self.create_process_instance_impl(body).await",
     ("process_instance", "cancel_process_instance"): "self.cancel_process_instance_impl(path_params).await",
+    ("process_instance", "suspend_process_instance"): "self.suspend_process_instance_impl(path_params).await",
+    ("process_instance", "resume_process_instance"): "self.resume_process_instance_impl(path_params).await",
     ("process_instance", "migrate_process_instance"): "self.migrate_process_instance_impl(path_params, body).await",
     ("job", "complete_job"): "self.complete_job_impl(path_params, body).await",
     ("resource", "create_deployment"): "self.create_deployment_impl(body).await",

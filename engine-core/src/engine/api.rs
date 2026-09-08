@@ -147,7 +147,11 @@ impl Engine {
             .map(|&(_, key)| key)
             .filter(|key| {
                 self.state.jobs.get(key).is_some_and(|job| {
-                    super::job_activatable(job, now) && (with_lease || job.lease_token.is_none())
+                    super::job_activatable(job, now)
+                        && (with_lease || job.lease_token.is_none())
+                        // A suspended instance makes no progress: its jobs are
+                        // not activatable until it is resumed (Camunda parity).
+                        && !self.instance_is_suspended(job.instance_key)
                 })
             })
             .take(max_jobs)

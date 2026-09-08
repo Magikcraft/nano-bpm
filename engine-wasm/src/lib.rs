@@ -1486,6 +1486,7 @@ fn resource_result(row: &ResourceRow) -> serde_json::Value {
 fn process_instance_result(row: &ProcessInstanceRow, roots: &RootResolver) -> serde_json::Value {
     let state = match row.state {
         ProcessInstanceState::Active => "ACTIVE",
+        ProcessInstanceState::Suspended => "SUSPENDED",
         ProcessInstanceState::Completed => "COMPLETED",
         ProcessInstanceState::Terminated | ProcessInstanceState::Terminating => "TERMINATED",
     };
@@ -1497,6 +1498,13 @@ fn process_instance_result(row: &ProcessInstanceRow, roots: &RootResolver) -> se
         Some(k) => serde_json::Value::String(k.to_string()),
         None => serde_json::Value::Null,
     };
+    // `suspendedDate` is always present (a required, nullable field): an ISO
+    // datetime while the instance is suspended, `null` otherwise. Derived from
+    // the same `suspended_date_ms` record the `state` projection reads.
+    let suspended_date = match row.suspended_date_ms {
+        Some(ms) => serde_json::Value::String(iso8601_from_ms(ms)),
+        None => serde_json::Value::Null,
+    };
     serde_json::json!({
         "processDefinitionId": row.process_definition_id,
         "processDefinitionName": serde_json::Value::Null,
@@ -1505,6 +1513,7 @@ fn process_instance_result(row: &ProcessInstanceRow, roots: &RootResolver) -> se
         "startDate": iso8601_from_ms(row.start_date_ms),
         "endDate": serde_json::Value::Null,
         "state": state,
+        "suspendedDate": suspended_date,
         "hasIncident": row.has_incident,
         "tenantId": "<default>",
         "processInstanceKey": row.key.to_string(),
@@ -2396,7 +2405,10 @@ impl TestEngine {
                     key: inst.key.to_string(),
                     process_id: inst.process_id.clone(),
                     state: instance_state(&inst.state),
-                    completed: inst.state != ProcessInstanceState::Active,
+                    completed: !matches!(
+                        inst.state,
+                        ProcessInstanceState::Active | ProcessInstanceState::Suspended
+                    ),
                     active_elements: active,
                     variables: vars_to_json(&inst.variables),
                 }
@@ -2786,6 +2798,7 @@ fn cmp_key(a: &str, b: &str) -> std::cmp::Ordering {
 fn instance_state(s: &ProcessInstanceState) -> String {
     match s {
         ProcessInstanceState::Active => "Active",
+        ProcessInstanceState::Suspended => "Suspended",
         ProcessInstanceState::Terminating => "Terminating",
         ProcessInstanceState::Completed => "Completed",
         ProcessInstanceState::Terminated => "Terminated",

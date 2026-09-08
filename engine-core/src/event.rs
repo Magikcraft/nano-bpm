@@ -651,6 +651,22 @@ pub enum Event {
     /// [`Event::ProcessInstanceTerminated`] once the last canceling chain drains.
     ProcessInstanceTerminating { instance_key: Key },
 
+    /// A process instance was suspended by an operator
+    /// ([`crate::Command::SuspendInstance`]). It stops making progress (its jobs
+    /// become non-activatable and its timers/other triggers do not fire) while
+    /// retaining all runtime state, and its `state` becomes `Suspended`. Only
+    /// emitted for an instance currently `Active`. `at` is the suspension instant
+    /// (ms since epoch) — the `suspendedDate` surfaced downstream. Additive,
+    /// replay-safe new variant (AGENTS.md §"Adding or Changing an Event").
+    ProcessInstanceSuspended { instance_key: Key, at: u64 },
+
+    /// A suspended process instance was resumed by an operator
+    /// ([`crate::Command::ResumeInstance`]). Its `state` returns to `Active` with
+    /// its exact prior running state, and its `suspended_at`/`suspendedDate`
+    /// clears. Only emitted for an instance currently `Suspended`. Additive,
+    /// replay-safe new variant.
+    ProcessInstanceResumed { instance_key: Key },
+
     /// A process instance was migrated to a target process definition (Zeebe
     /// process-instance migration). Carries the full remapping the applier needs
     /// to rewrite state deterministically on replay: `target_process_id` is the
@@ -1267,6 +1283,8 @@ impl Event {
             | Event::DecisionInstanceDeleted { instance_key, .. }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             Event::ProcessInstanceTerminating { instance_key } => Some(*instance_key),
+            Event::ProcessInstanceSuspended { instance_key, .. } => Some(*instance_key),
+            Event::ProcessInstanceResumed { instance_key } => Some(*instance_key),
             Event::ProcessInstanceMigrated { instance_key, .. } => Some(*instance_key),
             Event::AgentInstanceCreated { instance_key, .. } => Some(*instance_key),
             Event::AgentInstanceUpdated { instance_key, .. }

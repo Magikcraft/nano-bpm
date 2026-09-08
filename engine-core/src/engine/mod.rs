@@ -2432,7 +2432,13 @@ impl Engine {
                     .state
                     .timers
                     .values()
-                    .filter(|t| t.state == state::TimerState::Created && t.due_at <= now)
+                    .filter(|t| {
+                        t.state == state::TimerState::Created
+                            && t.due_at <= now
+                            // A suspended instance makes no progress: its timers
+                            // do not fire until it is resumed (Camunda parity).
+                            && !self.instance_is_suspended(t.instance_key)
+                    })
                     .map(|t| t.key)
                     .collect();
                 due.sort_unstable();
@@ -3123,6 +3129,16 @@ impl Engine {
                     let kind = subscription.kind.clone();
 
                     if state::partition_of(instance_key) == self.partition_id {
+                        // A suspended instance makes no progress: it does not
+                        // correlate messages (Camunda parity with its gated jobs
+                        // and timers). Because the message model is unbuffered
+                        // (see the note above), the correlation is *dropped* — the
+                        // subscription stays `Open` for a future message but this
+                        // one does not re-correlate on resume. Drop-on-suspend is
+                        // the documented suspension semantics for messages.
+                        if self.instance_is_suspended(instance_key) {
+                            continue;
+                        }
                         // The instance lives on this partition: correlate and
                         // advance its token inline. This is the only path a
                         // single-partition host ever takes, so its log is
@@ -3291,13 +3307,19 @@ impl Engine {
                 // which is what makes the routed delivery at-least-once safe. A
                 // non-interrupting boundary keeps its `Opening` record open, so
                 // every routed message spawns another token.
+                //
+                // A suspended instance makes no progress (Camunda parity with its
+                // gated jobs and timers): the routed correlation is *dropped*. The
+                // message model is unbuffered, so a dropped correlation does not
+                // re-correlate on resume — drop-on-suspend is the documented
+                // suspension semantics for messages.
                 let advance = matches!(
                     self.state
                         .message_subscriptions
                         .get(&subscription_key)
                         .map(|s| s.state),
                     Some(state::MessageSubscriptionState::Opening)
-                );
+                ) && !self.instance_is_suspended(instance_key);
                 if advance {
                     self.advance_correlated_token(
                         &mut log,
@@ -3550,6 +3572,61 @@ impl Engine {
                             self.emit(&mut log, event);
                         }
                     }
+                }
+            }
+
+            Command::SuspendInstance { instance_key } => {
+                // Camunda parity: only an `Active` instance can be suspended.
+                // Suspending an already-suspended instance is an idempotent
+                // no-op; an unknown key is a clean 404; any terminal state is an
+                // illegal transition.
+                match self.state.instances.get(&instance_key) {
+                    Some(instance) => match instance.state {
+                        ProcessInstanceState::Active => {
+                            self.emit(
+                                &mut log,
+                                Event::ProcessInstanceSuspended {
+                                    instance_key,
+                                    at: now,
+                                },
+                            );
+                        }
+                        ProcessInstanceState::Suspended => {
+                            // Already suspended — no-op.
+                        }
+                        other => {
+                            return Err(EngineError::InstanceTransitionInvalid {
+                                instance_key,
+                                from: other.as_str(),
+                                to: "SUSPENDED",
+                            })
+                        }
+                    },
+                    None => return Err(EngineError::InstanceNotFound { instance_key }),
+                }
+            }
+
+            Command::ResumeInstance { instance_key } => {
+                // Camunda parity: only a `Suspended` instance can be resumed.
+                // Resuming an already-active instance is an idempotent no-op; an
+                // unknown key is a clean 404; any terminal state is illegal.
+                match self.state.instances.get(&instance_key) {
+                    Some(instance) => match instance.state {
+                        ProcessInstanceState::Suspended => {
+                            self.emit(&mut log, Event::ProcessInstanceResumed { instance_key });
+                        }
+                        ProcessInstanceState::Active => {
+                            // Already active — no-op.
+                        }
+                        other => {
+                            return Err(EngineError::InstanceTransitionInvalid {
+                                instance_key,
+                                from: other.as_str(),
+                                to: "ACTIVE",
+                            })
+                        }
+                    },
+                    None => return Err(EngineError::InstanceNotFound { instance_key }),
                 }
             }
 
@@ -10354,6 +10431,16 @@ impl Engine {
             .map(|e| e.kind.clone())
     }
 
+    /// Whether the process instance owning `instance_key` is currently
+    /// suspended. A suspended instance makes no progress: its jobs are not
+    /// activatable and its timers/other triggers do not fire (Camunda parity).
+    fn instance_is_suspended(&self, instance_key: Key) -> bool {
+        self.state
+            .instances
+            .get(&instance_key)
+            .is_some_and(|i| i.state == ProcessInstanceState::Suspended)
+    }
+
     fn apply_activation_plan(&mut self, log: &mut Vec<Event>, plan: ActivationPlan) {
         let ActivationPlan {
             job_keys,
@@ -10378,6 +10465,11 @@ impl Engine {
                 continue;
             }
             let instance_key = job.instance_key;
+            // A suspended instance makes no progress: none of its jobs activate
+            // until it is resumed (Camunda parity).
+            if self.instance_is_suspended(instance_key) {
+                continue;
+            }
             // Consuming replicated keys makes issuance deterministic. Replay
             // restores this reservation through Event::max_key.
             let lease_token = options
@@ -10606,6 +10698,15 @@ pub enum EngineError {
     /// `CancelInstance` referenced a process instance that does not exist or is
     /// no longer active (already completed or terminated).
     InstanceNotFound { instance_key: Key },
+    /// A `SuspendInstance` / `ResumeInstance` referenced a process instance that
+    /// exists but is in a state from which the requested transition is illegal
+    /// (e.g. suspending/resuming an already terminal instance). Only the live
+    /// `Active ⇄ Suspended` transitions are valid.
+    InstanceTransitionInvalid {
+        instance_key: Key,
+        from: &'static str,
+        to: &'static str,
+    },
     /// A `ModifyInstance` activate instruction referenced an element id that is
     /// not part of the instance's process definition.
     ElementNotFound {
@@ -10856,6 +10957,16 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::InstanceNotFound { instance_key } => {
                 write!(f, "no active process instance with key {instance_key}")
+            }
+            EngineError::InstanceTransitionInvalid {
+                instance_key,
+                from,
+                to,
+            } => {
+                write!(
+                    f,
+                    "process instance {instance_key} cannot transition from {from} to {to}"
+                )
             }
             EngineError::ElementNotFound {
                 instance_key,

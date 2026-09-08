@@ -1,6 +1,6 @@
 {
   "next_local": 11,
-  "now": 1700000000004,
+  "now": 1700000000007,
   "num_partitions": 1,
   "partition_id": 0,
   "start_dispatch_rr": 0,
@@ -51,6 +51,7 @@
         "scope_variables": {},
         "scopes": {},
         "state": "Completed",
+        "suspended_at": null,
         "tags": [],
         "variables": {},
         "variables_spilled": false
@@ -78,7 +79,8 @@
         "scope_parents": {},
         "scope_variables": {},
         "scopes": {},
-        "state": "Active",
+        "state": "Suspended",
+        "suspended_at": 1700000000007,
         "tags": [],
         "variables": {
           "amount": {

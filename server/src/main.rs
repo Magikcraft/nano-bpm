@@ -5648,7 +5648,9 @@ impl ServerImpl {
                         ProcessInstanceState::Terminated | ProcessInstanceState::Terminating => {
                             return false;
                         }
-                        ProcessInstanceState::Active => {}
+                        // A suspended instance is still in-flight — it may resume
+                        // and complete later — so keep waiting, exactly as Active.
+                        ProcessInstanceState::Active | ProcessInstanceState::Suspended => {}
                     }
                 }
                 notified.await;
@@ -5727,6 +5729,98 @@ impl ServerImpl {
                 ))
             }
             CancelInstanceOutcome::Internal(detail) => {
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    detail,
+                ))
+            }
+        })
+    }
+
+    async fn suspend_process_instance_impl(
+        &self,
+        path_params: &models::SuspendProcessInstancePathParams,
+    ) -> Result<apis::process_instance::SuspendProcessInstanceResponse, ()> {
+        use apis::process_instance::SuspendProcessInstanceResponse as Resp;
+
+        let instance_key: u64 = match path_params.process_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid data",
+                    400,
+                    format!(
+                        "Process instance key '{}' is not a valid key.",
+                        path_params.process_instance_key
+                    ),
+                )));
+            }
+        };
+
+        Ok(match self.suspend_instance_core(instance_key).await {
+            TransitionInstanceOutcome::Ok => Resp::Status204_TheProcessInstanceIsSuspended,
+            TransitionInstanceOutcome::BadRequest(detail) => {
+                Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid transition",
+                    400,
+                    detail,
+                ))
+            }
+            TransitionInstanceOutcome::NotFound(detail) => {
+                Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                    "Process instance not found",
+                    404,
+                    detail,
+                ))
+            }
+            TransitionInstanceOutcome::Internal(detail) => {
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    detail,
+                ))
+            }
+        })
+    }
+
+    async fn resume_process_instance_impl(
+        &self,
+        path_params: &models::ResumeProcessInstancePathParams,
+    ) -> Result<apis::process_instance::ResumeProcessInstanceResponse, ()> {
+        use apis::process_instance::ResumeProcessInstanceResponse as Resp;
+
+        let instance_key: u64 = match path_params.process_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid data",
+                    400,
+                    format!(
+                        "Process instance key '{}' is not a valid key.",
+                        path_params.process_instance_key
+                    ),
+                )));
+            }
+        };
+
+        Ok(match self.resume_instance_core(instance_key).await {
+            TransitionInstanceOutcome::Ok => Resp::Status204_TheProcessInstanceIsResumed,
+            TransitionInstanceOutcome::BadRequest(detail) => {
+                Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid transition",
+                    400,
+                    detail,
+                ))
+            }
+            TransitionInstanceOutcome::NotFound(detail) => {
+                Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                    "Process instance not found",
+                    404,
+                    detail,
+                ))
+            }
+            TransitionInstanceOutcome::Internal(detail) => {
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
@@ -6934,6 +7028,114 @@ impl ServerImpl {
                 "No active process instance with key {instance_key}."
             )),
             Err(e) => Out::Internal(e.to_string()),
+        }
+    }
+
+    /// Surface-independent core of "suspend a process instance": leader-forward
+    /// when this node is not the instance's leader, else apply
+    /// [`Command::suspend_instance`] and wait for commit. Mirrors
+    /// [`Self::cancel_instance_core`].
+    pub(crate) async fn suspend_instance_core(
+        &self,
+        instance_key: u64,
+    ) -> TransitionInstanceOutcome {
+        use TransitionInstanceOutcome as Out;
+
+        if let Some(node) = self.route_by_leader(instance_key) {
+            return match self.peer_link(node).await {
+                Ok(link) => match link.suspend_instance(instance_key.to_string()).await {
+                    Ok(r) if is_ok_status(r.status) => Out::Ok,
+                    Ok(r) if r.status == 400 => Out::BadRequest(peer_detail(&r)),
+                    Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) => Out::Internal(peer_detail(&r)),
+                    Err(e) => Out::Internal(e.to_string()),
+                },
+                Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
+            };
+        }
+
+        self.suspend_instance_local(instance_key).await.into()
+    }
+
+    /// Surface-independent core of "resume a process instance". Mirrors
+    /// [`Self::suspend_instance_core`] with [`Command::resume_instance`].
+    pub(crate) async fn resume_instance_core(
+        &self,
+        instance_key: u64,
+    ) -> TransitionInstanceOutcome {
+        use TransitionInstanceOutcome as Out;
+
+        if let Some(node) = self.route_by_leader(instance_key) {
+            return match self.peer_link(node).await {
+                Ok(link) => match link.resume_instance(instance_key.to_string()).await {
+                    Ok(r) if is_ok_status(r.status) => Out::Ok,
+                    Ok(r) if r.status == 400 => Out::BadRequest(peer_detail(&r)),
+                    Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) => Out::Internal(peer_detail(&r)),
+                    Err(e) => Out::Internal(e.to_string()),
+                },
+                Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
+            };
+        }
+
+        self.resume_instance_local(instance_key).await.into()
+    }
+
+    /// Applies a suspend transition on this node's owning partition. Returns
+    /// `Ok(())` on success (or an idempotent no-op), else `(status, detail)`:
+    /// 404 for an unknown instance, 400 for an illegal transition from a
+    /// terminal state, 500 otherwise. Shared by the v2 REST core and the
+    /// intra-cluster `SuspendInstance` frame handler so the two cannot drift.
+    pub(crate) async fn suspend_instance_local(
+        &self,
+        instance_key: u64,
+    ) -> Result<(), (u16, String)> {
+        self.apply_transition_local(instance_key, Command::suspend_instance(instance_key))
+            .await
+    }
+
+    /// Applies a resume transition on this node's owning partition. Mirrors
+    /// [`Self::suspend_instance_local`] with [`Command::resume_instance`].
+    pub(crate) async fn resume_instance_local(
+        &self,
+        instance_key: u64,
+    ) -> Result<(), (u16, String)> {
+        self.apply_transition_local(instance_key, Command::resume_instance(instance_key))
+            .await
+    }
+
+    /// Applies a suspend/resume transition on this node's owning partition,
+    /// mapping the engine result to `(status, detail)`: an unknown instance is
+    /// 404, an illegal transition from a terminal state is 400, any other engine
+    /// error is 500. A successful (or idempotent no-op) apply waits for commit.
+    pub(crate) async fn apply_transition_local(
+        &self,
+        instance_key: u64,
+        command: Command,
+    ) -> Result<(), (u16, String)> {
+        match self
+            .engine
+            .by_key(instance_key)
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
+            .await
+        {
+            Ok((events, commit)) => {
+                commit.wait().await;
+                self.spawn_routing_if_needed(&events);
+                Ok(())
+            }
+            Err(EngineError::InstanceNotFound { instance_key }) => {
+                Err((404, format!("No process instance with key {instance_key}.")))
+            }
+            Err(EngineError::InstanceTransitionInvalid {
+                instance_key,
+                from,
+                to,
+            }) => Err((
+                400,
+                format!("Process instance {instance_key} cannot transition from {from} to {to}."),
+            )),
+            Err(e) => Err((500, e.to_string())),
         }
     }
 
@@ -19253,6 +19455,16 @@ fn process_instance_result(
         roots.root_of_row(instance).to_string(),
     ));
 
+    // Single source of truth: the read-model's `suspended_date_ms` column (also
+    // what derives the `Suspended` state). Always present — a datetime while
+    // suspended, null otherwise.
+    let suspended_date = match instance.suspended_date_ms {
+        Some(ms) => types::Nullable::Present(
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64).unwrap_or_else(epoch),
+        ),
+        None => types::Nullable::Null,
+    };
+
     models::ProcessInstanceResult::new(
         process_definition_id,
         types::Nullable::Null,
@@ -19274,6 +19486,7 @@ fn process_instance_result(
             .clone()
             .map(types::Nullable::Present)
             .unwrap_or(types::Nullable::Null),
+        suspended_date,
     )
 }
 
@@ -19388,6 +19601,7 @@ fn process_instance_state_enum(state: ProcessInstanceState) -> models::ProcessIn
         ProcessInstanceState::Terminated | ProcessInstanceState::Terminating => {
             models::ProcessInstanceStateEnum::Terminated
         }
+        ProcessInstanceState::Suspended => models::ProcessInstanceStateEnum::Suspended,
     }
 }
 
@@ -21014,6 +21228,39 @@ pub(crate) enum MigrateInstanceOutcome {
     Internal(String),
 }
 
+/// Surface-independent outcome of [`ServerImpl::suspend_instance_core`] /
+/// [`ServerImpl::resume_instance_core`], mapped to the v2 REST response types so
+/// the `Command::suspend_instance` / `Command::resume_instance` and clustering
+/// (leader-forward) semantics have a single source of truth. `ACTIVE ⇄
+/// SUSPENDED` are the only valid live transitions; a request from a terminal
+/// state is [`Self::BadRequest`], and an unknown instance is [`Self::NotFound`].
+pub(crate) enum TransitionInstanceOutcome {
+    /// The instance reached the requested state (or was already in it — an
+    /// idempotent no-op is reported as success).
+    Ok,
+    /// The transition is illegal from the instance's current (terminal) state
+    /// (400).
+    BadRequest(String),
+    /// No process instance with the given key exists (404).
+    NotFound(String),
+    /// An unexpected engine/peer error occurred (500).
+    Internal(String),
+}
+
+impl From<Result<(), (u16, String)>> for TransitionInstanceOutcome {
+    /// Maps the shared `(status, detail)` shape of the `_local` transition
+    /// methods (and the peer frame handler) into the REST-facing outcome so the
+    /// status→outcome mapping lives in one place.
+    fn from(result: Result<(), (u16, String)>) -> Self {
+        match result {
+            Ok(()) => TransitionInstanceOutcome::Ok,
+            Err((400, detail)) => TransitionInstanceOutcome::BadRequest(detail),
+            Err((404, detail)) => TransitionInstanceOutcome::NotFound(detail),
+            Err((_, detail)) => TransitionInstanceOutcome::Internal(detail),
+        }
+    }
+}
+
 /// Maps a migration [`EngineError`] to the HTTP status the v2 REST surface
 /// returns. Invalid mappings are 400; unknown instance/target are 404;
 /// engine-rejected migrations (unmapped element, type change, unsupported
@@ -21244,6 +21491,7 @@ async fn instances_debug_body(server: &ServerImpl) -> Response {
                         ProcessInstanceState::Completed => "Completed",
                         ProcessInstanceState::Terminated => "Terminated",
                         ProcessInstanceState::Terminating => "Terminating",
+                        ProcessInstanceState::Suspended => "Suspended",
                     };
                     *inst_states.entry(label).or_default() += 1;
                     if !matches!(inst.state, ProcessInstanceState::Active) {
@@ -35899,6 +36147,182 @@ mod search_process_instances_variable_filter_tests {
         assert_eq!(
             keys(&matched),
             vec!["1".to_string(), "2".to_string(), "3".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod search_process_instances_suspend_resume_tests {
+    //! Camunda-parity coverage for `suspendedDate` (issue #1147): every
+    //! `/process-instances/search` result item ALWAYS carries a `suspendedDate`
+    //! key — a datetime while suspended, `null` otherwise (the SDK response-shape
+    //! validator fails if the key is absent) — and `state: SUSPENDED` filtering
+    //! selects exactly the currently-suspended instances.
+    use nanobpmn_engine_core::Event;
+
+    use super::*;
+
+    fn created(instance_key: u64) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 1_700_000_000_000,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        }
+    }
+
+    async fn search_all(server: &ServerImpl) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: None,
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    async fn search_state(
+        server: &ServerImpl,
+        state: models::ProcessInstanceStateEnum,
+    ) -> models::ProcessInstanceSearchQueryResult {
+        let body = Some(models::ProcessInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(models::ProcessInstanceFilter {
+                state: Some(
+                    models::ProcessInstanceStateFilterProperty::ProcessInstanceStateEnum(state),
+                ),
+                ..models::ProcessInstanceFilter::new()
+            }),
+        });
+        match server.search_process_instances_impl(&body).await {
+            Ok(apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r)) => r,
+            other => panic!("expected a 200 search result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn suspended_date_is_always_present_and_state_filter_selects_suspended() {
+        let server = ServerImpl::default();
+        let shard = &server.store.shards()[0].1;
+        shard
+            .export(&[&created(1), &created(2), &created(3)])
+            .unwrap();
+        // Suspend instance 2 at a known instant.
+        shard
+            .export(&[&Event::ProcessInstanceSuspended {
+                instance_key: 2,
+                at: 1_700_000_500_000,
+            }])
+            .unwrap();
+
+        let all = search_all(&server).await;
+        assert_eq!(all.page.total_items, 3);
+
+        // The `suspendedDate` key is ALWAYS present on the serialized item (a
+        // required, nullable field): a string for the suspended instance, JSON
+        // `null` for the rest. This is the exact shape the SDK validator asserts.
+        for item in &all.items {
+            let json = serde_json::to_value(item).unwrap();
+            assert!(
+                json.as_object().unwrap().contains_key("suspendedDate"),
+                "every result item must carry the suspendedDate key"
+            );
+            let key = item.process_instance_key.0.clone();
+            let sd = &json["suspendedDate"];
+            if key == "2" {
+                assert!(
+                    sd.is_string(),
+                    "the suspended instance carries an ISO datetime, got {sd:?}"
+                );
+                assert_eq!(
+                    item.state,
+                    models::ProcessInstanceStateEnum::Suspended,
+                    "instance 2 projects as SUSPENDED"
+                );
+            } else {
+                assert!(
+                    sd.is_null(),
+                    "a non-suspended instance has null suspendedDate"
+                );
+                assert_eq!(item.state, models::ProcessInstanceStateEnum::Active);
+            }
+        }
+
+        // `state: SUSPENDED` selects exactly the suspended instance.
+        let suspended = search_state(&server, models::ProcessInstanceStateEnum::Suspended).await;
+        assert_eq!(suspended.page.total_items, 1);
+        assert_eq!(suspended.items[0].process_instance_key.0, "2");
+
+        // `state: ACTIVE` excludes it and returns the other two.
+        let active = search_state(&server, models::ProcessInstanceStateEnum::Active).await;
+        assert_eq!(active.page.total_items, 2);
+        let mut active_keys: Vec<String> = active
+            .items
+            .iter()
+            .map(|i| i.process_instance_key.0.clone())
+            .collect();
+        active_keys.sort();
+        assert_eq!(active_keys, vec!["1".to_string(), "3".to_string()]);
+
+        // Resume instance 2: suspendedDate reverts to null and it re-enters the
+        // ACTIVE set (single source of truth — same stored suspension record).
+        shard
+            .export(&[&Event::ProcessInstanceResumed { instance_key: 2 }])
+            .unwrap();
+        let after = search_all(&server).await;
+        for item in &after.items {
+            let json = serde_json::to_value(item).unwrap();
+            assert!(
+                json["suspendedDate"].is_null(),
+                "after resume no instance is suspended"
+            );
+            assert_eq!(item.state, models::ProcessInstanceStateEnum::Active);
+        }
+        assert_eq!(
+            search_state(&server, models::ProcessInstanceStateEnum::Suspended)
+                .await
+                .page
+                .total_items,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn syntactically_invalid_key_is_rejected_as_400_not_404() {
+        // A `processInstanceKey` that is not a valid number is INVALID INPUT, and
+        // both endpoints declare a 400 InvalidData response in the OpenAPI — so it
+        // maps to 400, not the misleading "Process instance not found" 404.
+        let server = ServerImpl::default();
+
+        let suspend = models::SuspendProcessInstancePathParams {
+            process_instance_key: "not-a-key".to_string(),
+        };
+        assert!(
+            matches!(
+                server.suspend_process_instance_impl(&suspend).await.unwrap(),
+                apis::process_instance::SuspendProcessInstanceResponse::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "an unparseable key is a 400 on suspension"
+        );
+
+        let resume = models::ResumeProcessInstancePathParams {
+            process_instance_key: "not-a-key".to_string(),
+        };
+        assert!(
+            matches!(
+                server.resume_process_instance_impl(&resume).await.unwrap(),
+                apis::process_instance::ResumeProcessInstanceResponse::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "an unparseable key is a 400 on resumption"
         );
     }
 }

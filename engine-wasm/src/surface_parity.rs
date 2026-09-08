@@ -179,6 +179,19 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
             reason: "external ad-hoc activity activation is a server/REST seam; the studio wasm engine \
                  drives ad-hoc tools through the agent-job path, not this direct command",
         },
+        // Process-instance suspend/resume is a server/REST seam (the gateway's
+        // /process-instances/{key}/suspension + /resumption operations). The
+        // in-browser studio engine has no suspend/resume driver — a future
+        // console/Bojtos slice would add the `#[wasm_bindgen]` methods alongside
+        // its own regenerated `pkg/` — so both stay NotSurfaced here.
+        Command::SuspendInstance { .. } => Surface::NotSurfaced {
+            reason: "process-instance suspend is a server/REST seam (POST /process-instances/{key}/suspension); \
+                 the in-browser test engine exposes no suspend driver",
+        },
+        Command::ResumeInstance { .. } => Surface::NotSurfaced {
+            reason: "process-instance resume is a server/REST seam (POST /process-instances/{key}/resumption); \
+                 the in-browser test engine exposes no resume driver",
+        },
         // AgentInstance write commands (engine-native AgentInstance parity). The
         // CREATE/UPDATE/COMPLETE lifecycle processors landed in S3; their
         // `#[wasm_bindgen]` TestEngine drivers land here in S6 alongside the
