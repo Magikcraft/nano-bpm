@@ -749,8 +749,9 @@ impl PeerLink {
 
     /// Forwards a `resumeProcessInstance` to the peer that owns the instance.
     pub async fn resume_instance(&self, instance_key: String) -> Result<PeerResult, PeerError> {
-        self.request_within(fast_forward_timeout(), |corr| {
-            ClientFrame::ResumeInstance { corr, instance_key }
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::ResumeInstance {
+            corr,
+            instance_key,
         })
         .await
     }

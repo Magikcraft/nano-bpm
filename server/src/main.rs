@@ -5761,7 +5761,11 @@ impl ServerImpl {
         Ok(match self.suspend_instance_core(instance_key).await {
             TransitionInstanceOutcome::Ok => Resp::Status204_TheProcessInstanceIsSuspended,
             TransitionInstanceOutcome::BadRequest(detail) => {
-                Resp::Status400_TheProvidedDataIsNotValid(problem("Invalid transition", 400, detail))
+                Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid transition",
+                    400,
+                    detail,
+                ))
             }
             TransitionInstanceOutcome::NotFound(detail) => {
                 Resp::Status404_TheProcessInstanceIsNotFound(problem(
@@ -5803,7 +5807,11 @@ impl ServerImpl {
         Ok(match self.resume_instance_core(instance_key).await {
             TransitionInstanceOutcome::Ok => Resp::Status204_TheProcessInstanceIsResumed,
             TransitionInstanceOutcome::BadRequest(detail) => {
-                Resp::Status400_TheProvidedDataIsNotValid(problem("Invalid transition", 400, detail))
+                Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid transition",
+                    400,
+                    detail,
+                ))
             }
             TransitionInstanceOutcome::NotFound(detail) => {
                 Resp::Status404_TheProcessInstanceIsNotFound(problem(
@@ -7116,10 +7124,9 @@ impl ServerImpl {
                 self.spawn_routing_if_needed(&events);
                 Ok(())
             }
-            Err(EngineError::InstanceNotFound { instance_key }) => Err((
-                404,
-                format!("No process instance with key {instance_key}."),
-            )),
+            Err(EngineError::InstanceNotFound { instance_key }) => {
+                Err((404, format!("No process instance with key {instance_key}.")))
+            }
             Err(EngineError::InstanceTransitionInvalid {
                 instance_key,
                 from,
@@ -19453,8 +19460,7 @@ fn process_instance_result(
     // suspended, null otherwise.
     let suspended_date = match instance.suspended_date_ms {
         Some(ms) => types::Nullable::Present(
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
-                .unwrap_or_else(epoch),
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64).unwrap_or_else(epoch),
         ),
         None => types::Nullable::Null,
     };
@@ -36243,7 +36249,10 @@ mod search_process_instances_suspend_resume_tests {
                     "instance 2 projects as SUSPENDED"
                 );
             } else {
-                assert!(sd.is_null(), "a non-suspended instance has null suspendedDate");
+                assert!(
+                    sd.is_null(),
+                    "a non-suspended instance has null suspendedDate"
+                );
                 assert_eq!(item.state, models::ProcessInstanceStateEnum::Active);
             }
         }

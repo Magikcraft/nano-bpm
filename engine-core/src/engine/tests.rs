@@ -895,7 +895,10 @@ fn suspend_resume_lifecycle_gates_jobs_and_timers() {
         .apply_command_at(Command::create_instance("delayed"), 1_000)
         .unwrap();
     let key = events.iter().find_map(|e| e.instance_key()).unwrap();
-    assert_eq!(engine.instance(key).unwrap().state, ProcessInstanceState::Active);
+    assert_eq!(
+        engine.instance(key).unwrap().state,
+        ProcessInstanceState::Active
+    );
 
     // Suspend: the instance stops making progress. Its created `payment` job is
     // no longer activatable while suspended (Camunda parity).
@@ -912,7 +915,9 @@ fn suspend_resume_lifecycle_gates_jobs_and_timers() {
     );
     assert_eq!(engine.instance(key).unwrap().suspended_at, Some(2_000));
     assert!(
-        engine.activate_jobs("payment", "w", 1, 60_000, 2_500).is_empty(),
+        engine
+            .activate_jobs("payment", "w", 1, 60_000, 2_500)
+            .is_empty(),
         "a suspended instance's jobs are not activatable"
     );
 
@@ -922,7 +927,10 @@ fn suspend_resume_lifecycle_gates_jobs_and_timers() {
         .apply_command_at(Command::resume_instance(key), 3_000)
         .expect("resume");
     assert!(resume.contains(&Event::ProcessInstanceResumed { instance_key: key }));
-    assert_eq!(engine.instance(key).unwrap().state, ProcessInstanceState::Active);
+    assert_eq!(
+        engine.instance(key).unwrap().state,
+        ProcessInstanceState::Active
+    );
     assert_eq!(engine.instance(key).unwrap().suspended_at, None);
 
     let job = engine
@@ -986,11 +994,18 @@ fn suspend_resume_reject_illegal_transitions() {
     // Resuming an Active instance is an idempotent no-op (no error, no event).
     let noop = engine.apply_command(Command::resume_instance(key)).unwrap();
     assert!(noop.is_empty());
-    assert_eq!(engine.instance(key).unwrap().state, ProcessInstanceState::Active);
+    assert_eq!(
+        engine.instance(key).unwrap().state,
+        ProcessInstanceState::Active
+    );
 
     // Suspend, then suspending again is an idempotent no-op.
-    engine.apply_command(Command::suspend_instance(key)).unwrap();
-    let noop = engine.apply_command(Command::suspend_instance(key)).unwrap();
+    engine
+        .apply_command(Command::suspend_instance(key))
+        .unwrap();
+    let noop = engine
+        .apply_command(Command::suspend_instance(key))
+        .unwrap();
     assert!(noop.is_empty());
 
     engine.apply_command(Command::resume_instance(key)).unwrap();

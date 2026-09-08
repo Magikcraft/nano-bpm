@@ -6673,7 +6673,10 @@ mod definition_xml_tests {
         let store = ReadStore::open(None).unwrap();
 
         // A live instance starts Active with no suspension timestamp.
-        assert_eq!(store.export(&[&created_event(7)]).unwrap().inflight_delta, 1);
+        assert_eq!(
+            store.export(&[&created_event(7)]).unwrap().inflight_delta,
+            1
+        );
         let row = store.process_instance(7).unwrap();
         assert_eq!(row.state, ProcessInstanceState::Active);
         assert_eq!(row.suspended_date_ms, None);
