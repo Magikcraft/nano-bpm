@@ -2355,9 +2355,18 @@ impl From<&nano_server_storage::readstore::ProcessInstanceRow> for InstanceDto {
             has_incident: r.has_incident,
             business_id: r.business_id.clone(),
             tags: r.tags.clone(),
-            suspended_date: r.suspended_date_ms.and_then(|ms| {
+            suspended_date: r.suspended_date_ms.map(|ms| {
+                // A present column ALWAYS projects to a present datetime string:
+                // map (not and_then) so an out-of-range millis value falls back
+                // to epoch rather than collapsing to `null`, which would let the
+                // wire `suspendedDate` drift from the `Suspended` state derived
+                // from the same column. Mirrors the gateway v2 projection.
                 chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
-                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                            .expect("epoch is valid")
+                    })
+                    .to_rfc3339()
             }),
             parent_process_instance_key: r.parent_process_instance_key.map(|k| k.to_string()),
             parent_element_instance_key: r.parent_element_instance_key.map(|k| k.to_string()),

@@ -65,12 +65,7 @@ export type ExplorerFilters = {
 
 /** The `state` query param the console API accepts (undefined = All). */
 function isStateFilter(value: string | null): value is InstanceStateFilter {
-  return (
-    value === "Active" ||
-    value === "Suspended" ||
-    value === "Completed" ||
-    value === "Terminated"
-  );
+  return INSTANCE_STATE_FILTERS.includes(value as InstanceStateFilter);
 }
 
 /**

@@ -465,7 +465,7 @@ impl apis::instances::Instances for ServerImpl {
         let instance_key: u64 = match path_params.key.parse() {
             Ok(k) => k,
             Err(_) => {
-                return Ok(Resp::Status404_NotFound(format!(
+                return Ok(Resp::Status400_InvalidRequest(format!(
                     "Instance key '{}' is not a valid key.",
                     path_params.key
                 )));
@@ -496,7 +496,7 @@ impl apis::instances::Instances for ServerImpl {
         let instance_key: u64 = match path_params.key.parse() {
             Ok(k) => k,
             Err(_) => {
-                return Ok(Resp::Status404_NotFound(format!(
+                return Ok(Resp::Status400_InvalidRequest(format!(
                     "Instance key '{}' is not a valid key.",
                     path_params.key
                 )));
