@@ -3129,6 +3129,16 @@ impl Engine {
                     let kind = subscription.kind.clone();
 
                     if state::partition_of(instance_key) == self.partition_id {
+                        // A suspended instance makes no progress: it does not
+                        // correlate messages (Camunda parity with its gated jobs
+                        // and timers). Because the message model is unbuffered
+                        // (see the note above), the correlation is *dropped* — the
+                        // subscription stays `Open` for a future message but this
+                        // one does not re-correlate on resume. Drop-on-suspend is
+                        // the documented suspension semantics for messages.
+                        if self.instance_is_suspended(instance_key) {
+                            continue;
+                        }
                         // The instance lives on this partition: correlate and
                         // advance its token inline. This is the only path a
                         // single-partition host ever takes, so its log is
@@ -3297,13 +3307,19 @@ impl Engine {
                 // which is what makes the routed delivery at-least-once safe. A
                 // non-interrupting boundary keeps its `Opening` record open, so
                 // every routed message spawns another token.
+                //
+                // A suspended instance makes no progress (Camunda parity with its
+                // gated jobs and timers): the routed correlation is *dropped*. The
+                // message model is unbuffered, so a dropped correlation does not
+                // re-correlate on resume — drop-on-suspend is the documented
+                // suspension semantics for messages.
                 let advance = matches!(
                     self.state
                         .message_subscriptions
                         .get(&subscription_key)
                         .map(|s| s.state),
                     Some(state::MessageSubscriptionState::Opening)
-                );
+                ) && !self.instance_is_suspended(instance_key);
                 if advance {
                     self.advance_correlated_token(
                         &mut log,

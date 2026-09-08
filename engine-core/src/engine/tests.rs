@@ -969,6 +969,79 @@ fn suspend_resume_lifecycle_gates_jobs_and_timers() {
 }
 
 #[test]
+fn suspend_drops_message_correlation_and_does_not_rebuffer() {
+    use crate::state::ProcessInstanceState;
+    // A suspended instance makes no progress, and the message model is
+    // unbuffered — so a message correlated to a suspended instance is DROPPED
+    // (not buffered) and does not re-correlate on resume. This is the
+    // documented drop-on-suspend suspension semantics for messages, mirroring
+    // the gate jobs and timers already have.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_message_catch()))
+        .unwrap();
+
+    let events = engine
+        .apply_command(Command::create_instance_with(
+            "await-payment",
+            vars(&[("orderId", Value::Str("A".into()))]),
+        ))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Parked on the message catch with one open subscription.
+    assert!(!engine.is_completed(instance_key));
+    assert_eq!(
+        engine.message_subscriptions()[0].state,
+        state::MessageSubscriptionState::Open
+    );
+
+    // Suspend, then publish the matching message: it correlates NOTHING while
+    // suspended and the subscription stays open (the message is dropped).
+    engine
+        .apply_command_at(Command::suspend_instance(instance_key), 1_000)
+        .expect("suspend");
+    assert_eq!(
+        engine.instance(instance_key).unwrap().state,
+        ProcessInstanceState::Suspended
+    );
+    let fired = engine.correlate_message("payment-received", "A", HashMap::new(), 1_500);
+    assert!(
+        !fired
+            .iter()
+            .any(|e| matches!(e, Event::MessageCorrelated { .. })),
+        "a suspended instance does not correlate messages"
+    );
+    assert!(!engine.is_completed(instance_key));
+    assert_eq!(
+        engine.message_subscriptions()[0].state,
+        state::MessageSubscriptionState::Open,
+        "the subscription stays open; the dropped message is not buffered"
+    );
+
+    // Resume: the previously dropped message does NOT re-correlate — the token
+    // is still parked on the catch.
+    engine
+        .apply_command_at(Command::resume_instance(instance_key), 2_000)
+        .expect("resume");
+    assert!(
+        !engine.is_completed(instance_key),
+        "the message dropped during suspension does not re-correlate on resume"
+    );
+    assert_eq!(
+        engine.message_subscriptions()[0].state,
+        state::MessageSubscriptionState::Open
+    );
+
+    // A fresh matching message after resume correlates normally and completes.
+    let fired = engine.correlate_message("payment-received", "A", HashMap::new(), 2_500);
+    assert!(fired
+        .iter()
+        .any(|e| matches!(e, Event::MessageCorrelated { .. })));
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
 fn suspend_resume_reject_illegal_transitions() {
     use crate::state::ProcessInstanceState;
     let mut engine = Engine::new();

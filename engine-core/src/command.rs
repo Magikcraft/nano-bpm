@@ -383,7 +383,10 @@ pub enum Command {
     /// Suspend a running process instance (Camunda parity). The instance stops
     /// making progress — its jobs become non-activatable and its timers/other
     /// triggers do not fire — while retaining all runtime state, and its state
-    /// becomes `Suspended`. Only an instance currently `Active` can be suspended
+    /// becomes `Suspended`. Because the message model is unbuffered, a message
+    /// correlated to a suspended instance is *dropped* (not buffered) and does
+    /// not re-correlate on resume — drop-on-suspend is the message suspension
+    /// semantics. Only an instance currently `Active` can be suspended
     /// (the sole valid live-transition source); suspending an already
     /// `Suspended` instance is an idempotent no-op, while an unknown or terminal
     /// instance is rejected. Emits [`crate::Event::ProcessInstanceSuspended`].
