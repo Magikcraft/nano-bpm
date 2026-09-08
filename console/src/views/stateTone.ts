@@ -7,11 +7,15 @@
 export function stateTone(
   state: string,
   hasIncident: boolean,
-): "danger" | "info" | "ok" | "neutral" {
+): "danger" | "info" | "ok" | "neutral" | "warn" {
   if (hasIncident) return "danger";
   switch (state) {
     case "Active":
       return "info";
+    case "Suspended":
+      // Paused, not terminal — a distinct amber "held" tone so a suspended
+      // instance reads apart from a running (info) or terminated (neutral) one.
+      return "warn";
     case "Completed":
       return "ok";
     case "Terminated":

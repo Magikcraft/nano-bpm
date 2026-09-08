@@ -5,6 +5,7 @@ import {
   explorerStackView,
   filtersQueryKey,
   INSTANCE_DEEP_LINK_PARAM,
+  INSTANCE_STATE_FILTERS,
   parseExplorerFilters,
   readInstanceParam,
   shouldResetPageOnFilterChange,
@@ -26,6 +27,24 @@ test("parseExplorerFilters reads a valid state and the incident flag", () => {
 test("parseExplorerFilters ignores an unknown state value (falls back to All)", () => {
   const filters = parseExplorerFilters(new URLSearchParams("state=Bogus"));
   assert.equal(filters.state, undefined);
+});
+
+test("INSTANCE_STATE_FILTERS offers Suspended between Active and the terminal states", () => {
+  // Drives both the desktop segmented group and the mobile chip row, so this is
+  // the single source that makes "Suspended" a selectable filter option.
+  assert.deepEqual(INSTANCE_STATE_FILTERS, [
+    "Active",
+    "Suspended",
+    "Completed",
+    "Terminated",
+  ]);
+});
+
+test("parseExplorerFilters reads the Suspended state and round-trips it to the query", () => {
+  const filters = parseExplorerFilters(new URLSearchParams("state=Suspended"));
+  assert.deepEqual(filters, { state: "Suspended", hasIncident: false });
+  assert.deepEqual(toInstanceQuery(filters), { state: "Suspended" });
+  assert.deepEqual(filtersQueryKey(filters), ["Suspended", false]);
 });
 
 test("parseExplorerFilters treats any incident value other than '1' as unchecked", () => {

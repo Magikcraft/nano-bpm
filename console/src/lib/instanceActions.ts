@@ -11,6 +11,20 @@ export function isCancellable(state: string): boolean {
   return state === "Active";
 }
 
+// Suspend pauses a running instance (Active -> Suspended); only a running
+// instance can be suspended (a terminal/transient one has nothing to pause).
+// Mirrors the engine's ACTIVE<->SUSPENDED live-transition rule so the button is
+// never offered when the engine would reject it with a 400/404.
+export function isSuspendable(state: string): boolean {
+  return state === "Active";
+}
+
+// Resume reverses a suspension (Suspended -> Active); only a Suspended instance
+// can be resumed.
+export function isResumable(state: string): boolean {
+  return state === "Suspended";
+}
+
 // Confirmation copy for the (destructive, irreversible) cancel action. Kept
 // here so the exact wording is asserted by a test rather than buried in JSX.
 // The instance key is included because a processId is NOT unique across

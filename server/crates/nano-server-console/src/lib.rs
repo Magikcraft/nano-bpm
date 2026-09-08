@@ -2325,6 +2325,13 @@ struct InstanceDto {
     has_incident: bool,
     business_id: Option<String>,
     tags: Vec<String>,
+    /// ISO-8601 datetime of the most recent suspension while the instance is
+    /// `Suspended`, else `None` (serialized `null`). ALWAYS present — mirrors the
+    /// gateway v2 `ProcessInstanceResult.suspendedDate`. Derived from the read
+    /// model's `suspended_date_ms` column, the same single source of truth that
+    /// derives the `Suspended` state, so the two cannot drift.
+    #[serde(rename = "suspendedDate")]
+    suspended_date: Option<String>,
     /// C8 parent linkage for a call-activity **child** process instance: the key
     /// of the calling (parent) process instance. `None` for a top-level
     /// instance. Mirrors C8's `parentProcessInstanceKey`.
@@ -2348,6 +2355,10 @@ impl From<&nano_server_storage::readstore::ProcessInstanceRow> for InstanceDto {
             has_incident: r.has_incident,
             business_id: r.business_id.clone(),
             tags: r.tags.clone(),
+            suspended_date: r.suspended_date_ms.and_then(|ms| {
+                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+                    .map(|dt| dt.to_rfc3339())
+            }),
             parent_process_instance_key: r.parent_process_instance_key.map(|k| k.to_string()),
             parent_element_instance_key: r.parent_element_instance_key.map(|k| k.to_string()),
         }
@@ -2400,6 +2411,31 @@ mod instance_dto_parent_linkage_tests {
         let json = serde_json::to_value(&dto).unwrap();
         assert!(json["parent_process_instance_key"].is_null());
         assert!(json["parent_element_instance_key"].is_null());
+    }
+
+    #[test]
+    fn suspended_date_projects_to_an_always_present_nullable_iso_string() {
+        // Not suspended: the key is present and null (mirrors the gateway v2
+        // `ProcessInstanceResult.suspendedDate`, which is always present).
+        let json = serde_json::to_value(InstanceDto::from(&row(None, None))).unwrap();
+        assert!(
+            json.as_object().unwrap().contains_key("suspendedDate"),
+            "suspendedDate must always be present on the wire"
+        );
+        assert!(json["suspendedDate"].is_null());
+
+        // Suspended: the read-model `suspended_date_ms` column renders as an
+        // ISO-8601 datetime string, the same single source of truth that derives
+        // the `Suspended` state so the two cannot drift.
+        let mut r = row(None, None);
+        r.state = ProcessInstanceState::Suspended;
+        r.suspended_date_ms = Some(1_700_000_000_000);
+        let dto = InstanceDto::from(&r);
+        assert_eq!(
+            dto.suspended_date.as_deref(),
+            Some("2023-11-14T22:13:20+00:00")
+        );
+        assert_eq!(dto.state, "Suspended");
     }
 }
 
@@ -2543,15 +2579,17 @@ pub struct ActiveElementDto {
 
 /// Parses a console `state` filter string into an engine
 /// [`ProcessInstanceState`]. Accepts exactly the spec's enum values
-/// (`Active` / `Completed` / `Terminated`) — the same names the console
-/// projects for a row (see [`InstanceDto`]) — so "filter by what you see" holds.
-/// An unrecognized value yields `None`, i.e. no state constraint (unfiltered).
+/// (`Active` / `Suspended` / `Completed` / `Terminated`) — the same names the
+/// console projects for a row (see [`InstanceDto`]) — so "filter by what you
+/// see" holds. An unrecognized value yields `None`, i.e. no state constraint
+/// (unfiltered).
 pub fn parse_instance_state_filter(
     state: &str,
 ) -> Option<nanobpmn_engine_core::ProcessInstanceState> {
     use nanobpmn_engine_core::ProcessInstanceState;
     match state {
         "Active" => Some(ProcessInstanceState::Active),
+        "Suspended" => Some(ProcessInstanceState::Suspended),
         "Completed" => Some(ProcessInstanceState::Completed),
         "Terminated" => Some(ProcessInstanceState::Terminated),
         _ => None,

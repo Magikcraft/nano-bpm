@@ -365,6 +365,7 @@ export function makeInstance(overrides: Partial<Instance> = {}): Instance {
     has_incident: false,
     business_id: null,
     tags: [],
+    suspendedDate: null,
     parent_process_instance_key: null,
     parent_element_instance_key: null,
     ...overrides,

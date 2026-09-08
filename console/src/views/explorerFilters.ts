@@ -7,7 +7,7 @@
 // filtered view is deep-linkable / reload-stable.
 //
 // URL contract (mirrors the existing `?instance=` deep-link pattern):
-//   - `state=Active|Completed|Terminated`  (absent = All)
+//   - `state=Active|Suspended|Completed|Terminated`  (absent = All)
 //   - `incident=1`                          (absent = no incident constraint)
 
 /**
@@ -45,10 +45,12 @@ export function explorerStackView(selected: string | null): "list" | "detail" {
 }
 
 /** The lifecycle states the console can filter on (the console-api enum). */
-export type InstanceStateFilter = "Active" | "Completed" | "Terminated";
+export type InstanceStateFilter =
+  "Active" | "Suspended" | "Completed" | "Terminated";
 
 export const INSTANCE_STATE_FILTERS: readonly InstanceStateFilter[] = [
   "Active",
+  "Suspended",
   "Completed",
   "Terminated",
 ];
@@ -63,7 +65,12 @@ export type ExplorerFilters = {
 
 /** The `state` query param the console API accepts (undefined = All). */
 function isStateFilter(value: string | null): value is InstanceStateFilter {
-  return value === "Active" || value === "Completed" || value === "Terminated";
+  return (
+    value === "Active" ||
+    value === "Suspended" ||
+    value === "Completed" ||
+    value === "Terminated"
+  );
 }
 
 /**
