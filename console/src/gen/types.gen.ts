@@ -54,6 +54,11 @@ export type Instance = {
     start_date_ms: number;
     has_incident: boolean;
     business_id: string | null;
+    /**
+     * ISO-8601 datetime of the most recent suspension while the instance is Suspended, else `null`. ALWAYS present (mirrors the gateway v2 `ProcessInstanceResult.suspendedDate`): a non-null value implies `state == Suspended`, and resuming clears it back to `null`.
+     *
+     */
+    suspendedDate: string | null;
     tags: Array<string>;
     /**
      * C8 parent linkage for a call-activity **child** process instance: the key of the calling (parent) process instance. `null` for a top-level instance. Mirrors C8's `parentProcessInstanceKey`.
@@ -1620,7 +1625,7 @@ export type ListInstancesData = {
         /**
          * Restrict the list to instances in this lifecycle state. Omit for no state constraint (all states).
          */
-        state?: 'Active' | 'Completed' | 'Terminated';
+        state?: 'Active' | 'Suspended' | 'Completed' | 'Terminated';
         /**
          * Restrict the list by incident status. When `true`, only instances currently carrying an open incident; when `false`, only instances without one. Both values are real constraints. Omit the parameter entirely for no incident constraint (instances with and without incidents).
          */
@@ -1731,6 +1736,76 @@ export type CancelInstanceResponses = {
 };
 
 export type CancelInstanceResponse = CancelInstanceResponses[keyof CancelInstanceResponses];
+
+export type SuspendInstanceData = {
+    body?: never;
+    path: {
+        key: string;
+    };
+    query?: never;
+    url: '/instances/{key}/suspension';
+};
+
+export type SuspendInstanceErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+    /**
+     * Internal error
+     */
+    500: string;
+};
+
+export type SuspendInstanceError = SuspendInstanceErrors[keyof SuspendInstanceErrors];
+
+export type SuspendInstanceResponses = {
+    /**
+     * The instance was suspended
+     */
+    204: void;
+};
+
+export type SuspendInstanceResponse = SuspendInstanceResponses[keyof SuspendInstanceResponses];
+
+export type ResumeInstanceData = {
+    body?: never;
+    path: {
+        key: string;
+    };
+    query?: never;
+    url: '/instances/{key}/resumption';
+};
+
+export type ResumeInstanceErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+    /**
+     * Internal error
+     */
+    500: string;
+};
+
+export type ResumeInstanceError = ResumeInstanceErrors[keyof ResumeInstanceErrors];
+
+export type ResumeInstanceResponses = {
+    /**
+     * The instance was resumed
+     */
+    204: void;
+};
+
+export type ResumeInstanceResponse = ResumeInstanceResponses[keyof ResumeInstanceResponses];
 
 export type SetInstanceVariablesData = {
     body: SetInstanceVariablesRequest;

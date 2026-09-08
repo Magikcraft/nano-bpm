@@ -14,12 +14,19 @@ import {
   getInstance,
   getTrace,
   resolveIncident,
+  resumeInstance,
   setInstanceVariables,
+  suspendInstance,
   type InstanceTrace,
   type Variable,
 } from "../gen";
 import { fetchProcessXml } from "../lib/api";
-import { isCancellable, cancelConfirmMessage } from "../lib/instanceActions";
+import {
+  isCancellable,
+  isResumable,
+  isSuspendable,
+  cancelConfirmMessage,
+} from "../lib/instanceActions";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import { usePaneResize } from "../lib/usePaneResize";
 import { ResizeHandle } from "../components/ResizeHandle";
@@ -259,6 +266,27 @@ export default function InstanceDetail({
       .finally(() => setBusy(false));
   };
 
+  // Suspend/resume are reversible (unlike cancel), so no confirm prompt: the
+  // operator can undo either instantly. Refresh so the state badge and the
+  // Suspend/Resume affordance flip to match the new engine state.
+  const onSuspendInstance = () => {
+    setBusy(true);
+    setActionError(null);
+    suspendInstance({ path: { key: instanceKey }, throwOnError: true })
+      .then(refresh)
+      .catch((e) => setActionError(String(e)))
+      .finally(() => setBusy(false));
+  };
+
+  const onResumeInstance = () => {
+    setBusy(true);
+    setActionError(null);
+    resumeInstance({ path: { key: instanceKey }, throwOnError: true })
+      .then(refresh)
+      .catch((e) => setActionError(String(e)))
+      .finally(() => setBusy(false));
+  };
+
   if (isLoading) return <p className="p-8 text-fg-muted">Loading…</p>;
   if (error)
     return <p className="p-8 text-danger">Failed to load: {String(error)}</p>;
@@ -333,17 +361,38 @@ export default function InstanceDetail({
         </h1>
         <Badge tone="neutral">{instance.state}</Badge>
         {instance.has_incident && <Badge tone="danger">Incident</Badge>}
-        {isCancellable(instance.state) && (
-          <Button
-            size="sm"
-            variant="danger"
-            disabled={busy}
-            className="ml-auto shrink-0"
-            onClick={() => onCancelInstance(instance.process_id)}
-          >
-            Cancel instance
-          </Button>
-        )}
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          {isSuspendable(instance.state) && (
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={busy}
+              onClick={onSuspendInstance}
+            >
+              Suspend
+            </Button>
+          )}
+          {isResumable(instance.state) && (
+            <Button
+              size="sm"
+              variant="primary"
+              disabled={busy}
+              onClick={onResumeInstance}
+            >
+              Resume
+            </Button>
+          )}
+          {isCancellable(instance.state) && (
+            <Button
+              size="sm"
+              variant="danger"
+              disabled={busy}
+              onClick={() => onCancelInstance(instance.process_id)}
+            >
+              Cancel instance
+            </Button>
+          )}
+        </div>
       </div>
       <div className="mt-1 font-mono text-xs break-all text-fg-faint">
         instance {instance.key} · definition {instance.process_definition_key} ·

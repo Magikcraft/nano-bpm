@@ -2319,12 +2319,19 @@ struct InstanceDto {
     process_id: String,
     process_definition_key: String,
     version: i32,
-    /// `Active` | `Completed` | `Terminated`.
+    /// `Active` | `Suspended` | `Completed` | `Terminated`.
     state: String,
     start_date_ms: u64,
     has_incident: bool,
     business_id: Option<String>,
     tags: Vec<String>,
+    /// ISO-8601 datetime of the most recent suspension while the instance is
+    /// `Suspended`, else `None` (serialized `null`). ALWAYS present — mirrors the
+    /// gateway v2 `ProcessInstanceResult.suspendedDate`. Derived from the read
+    /// model's `suspended_date_ms` column, the same single source of truth that
+    /// derives the `Suspended` state, so the two cannot drift.
+    #[serde(rename = "suspendedDate")]
+    suspended_date: Option<String>,
     /// C8 parent linkage for a call-activity **child** process instance: the key
     /// of the calling (parent) process instance. `None` for a top-level
     /// instance. Mirrors C8's `parentProcessInstanceKey`.
@@ -2348,6 +2355,26 @@ impl From<&nano_server_storage::readstore::ProcessInstanceRow> for InstanceDto {
             has_incident: r.has_incident,
             business_id: r.business_id.clone(),
             tags: r.tags.clone(),
+            suspended_date: r.suspended_date_ms.map(|ms| {
+                // A present column ALWAYS projects to a present datetime string:
+                // map (not and_then) so an out-of-range millis value falls back
+                // to epoch rather than collapsing to `null`, which would let the
+                // wire `suspendedDate` drift from the `Suspended` state derived
+                // from the same column. Mirrors the gateway v2 projection.
+                //
+                // `suspended_date_ms` is a `u64`, so use a checked `i64::try_from`
+                // instead of an `as` cast: a value `> i64::MAX` would otherwise
+                // wrap to a negative `i64` and yield an arbitrary *pre-epoch*
+                // datetime rather than the intended epoch fallback.
+                i64::try_from(ms)
+                    .ok()
+                    .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                    .unwrap_or_else(|| {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                            .expect("epoch is valid")
+                    })
+                    .to_rfc3339()
+            }),
             parent_process_instance_key: r.parent_process_instance_key.map(|k| k.to_string()),
             parent_element_instance_key: r.parent_element_instance_key.map(|k| k.to_string()),
         }
@@ -2400,6 +2427,45 @@ mod instance_dto_parent_linkage_tests {
         let json = serde_json::to_value(&dto).unwrap();
         assert!(json["parent_process_instance_key"].is_null());
         assert!(json["parent_element_instance_key"].is_null());
+    }
+
+    #[test]
+    fn suspended_date_projects_to_an_always_present_nullable_iso_string() {
+        // Not suspended: the key is present and null (mirrors the gateway v2
+        // `ProcessInstanceResult.suspendedDate`, which is always present).
+        let json = serde_json::to_value(InstanceDto::from(&row(None, None))).unwrap();
+        assert!(
+            json.as_object().unwrap().contains_key("suspendedDate"),
+            "suspendedDate must always be present on the wire"
+        );
+        assert!(json["suspendedDate"].is_null());
+
+        // Suspended: the read-model `suspended_date_ms` column renders as an
+        // ISO-8601 datetime string, the same single source of truth that derives
+        // the `Suspended` state so the two cannot drift.
+        let mut r = row(None, None);
+        r.state = ProcessInstanceState::Suspended;
+        r.suspended_date_ms = Some(1_700_000_000_000);
+        let dto = InstanceDto::from(&r);
+        assert_eq!(
+            dto.suspended_date.as_deref(),
+            Some("2023-11-14T22:13:20+00:00")
+        );
+        assert_eq!(dto.state, "Suspended");
+
+        // Out-of-range `u64` millis (> i64::MAX) must fall back to the epoch,
+        // NOT wrap through an `as` cast into an arbitrary pre-epoch datetime:
+        // the column is present, so the wire value stays present (never null)
+        // and never drifts negative.
+        let mut r = row(None, None);
+        r.state = ProcessInstanceState::Suspended;
+        r.suspended_date_ms = Some(u64::MAX);
+        let dto = InstanceDto::from(&r);
+        assert_eq!(
+            dto.suspended_date.as_deref(),
+            Some("1970-01-01T00:00:00+00:00"),
+            "an out-of-range millis value falls back to epoch, not a wrapped pre-epoch time"
+        );
     }
 }
 
@@ -2543,15 +2609,17 @@ pub struct ActiveElementDto {
 
 /// Parses a console `state` filter string into an engine
 /// [`ProcessInstanceState`]. Accepts exactly the spec's enum values
-/// (`Active` / `Completed` / `Terminated`) — the same names the console
-/// projects for a row (see [`InstanceDto`]) — so "filter by what you see" holds.
-/// An unrecognized value yields `None`, i.e. no state constraint (unfiltered).
+/// (`Active` / `Suspended` / `Completed` / `Terminated`) — the same names the
+/// console projects for a row (see [`InstanceDto`]) — so "filter by what you
+/// see" holds. An unrecognized value yields `None`, i.e. no state constraint
+/// (unfiltered).
 pub fn parse_instance_state_filter(
     state: &str,
 ) -> Option<nanobpmn_engine_core::ProcessInstanceState> {
     use nanobpmn_engine_core::ProcessInstanceState;
     match state {
         "Active" => Some(ProcessInstanceState::Active),
+        "Suspended" => Some(ProcessInstanceState::Suspended),
         "Completed" => Some(ProcessInstanceState::Completed),
         "Terminated" => Some(ProcessInstanceState::Terminated),
         _ => None,

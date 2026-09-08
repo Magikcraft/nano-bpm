@@ -451,6 +451,68 @@ impl apis::instances::Instances for ServerImpl {
         })
     }
 
+    async fn suspend_instance(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::SuspendInstancePathParams,
+    ) -> Result<apis::instances::SuspendInstanceResponse, ()> {
+        use apis::instances::SuspendInstanceResponse as Resp;
+
+        use crate::TransitionInstanceOutcome as Out;
+
+        let instance_key: u64 = match path_params.key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status400_InvalidRequest(format!(
+                    "Instance key '{}' is not a valid key.",
+                    path_params.key
+                )));
+            }
+        };
+
+        // Console operator action: reuses the same engine-command + leader-forward
+        // core as `POST /v2/process-instances/{key}/suspension`.
+        Ok(match self.suspend_instance_core(instance_key).await {
+            Out::Ok => Resp::Status204_TheInstanceWasSuspended,
+            Out::BadRequest(d) => Resp::Status400_InvalidRequest(d),
+            Out::NotFound(d) => Resp::Status404_NotFound(d),
+            Out::Internal(d) => Resp::Status500_InternalError(d),
+        })
+    }
+
+    async fn resume_instance(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::ResumeInstancePathParams,
+    ) -> Result<apis::instances::ResumeInstanceResponse, ()> {
+        use apis::instances::ResumeInstanceResponse as Resp;
+
+        use crate::TransitionInstanceOutcome as Out;
+
+        let instance_key: u64 = match path_params.key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status400_InvalidRequest(format!(
+                    "Instance key '{}' is not a valid key.",
+                    path_params.key
+                )));
+            }
+        };
+
+        // Console operator action: reuses the same engine-command + leader-forward
+        // core as `POST /v2/process-instances/{key}/resumption`.
+        Ok(match self.resume_instance_core(instance_key).await {
+            Out::Ok => Resp::Status204_TheInstanceWasResumed,
+            Out::BadRequest(d) => Resp::Status400_InvalidRequest(d),
+            Out::NotFound(d) => Resp::Status404_NotFound(d),
+            Out::Internal(d) => Resp::Status500_InternalError(d),
+        })
+    }
+
     async fn set_instance_variables(
         &self,
         _method: &Method,
