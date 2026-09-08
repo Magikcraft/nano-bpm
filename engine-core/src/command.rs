@@ -384,14 +384,16 @@ pub enum Command {
     /// making progress — its jobs become non-activatable and its timers/other
     /// triggers do not fire — while retaining all runtime state, and its state
     /// becomes `Suspended`. Only an instance currently `Active` can be suspended
-    /// (the sole valid live-transition source); an unknown, terminal, or already
-    /// suspended instance is rejected. Emits [`crate::Event::ProcessInstanceSuspended`].
+    /// (the sole valid live-transition source); suspending an already
+    /// `Suspended` instance is an idempotent no-op, while an unknown or terminal
+    /// instance is rejected. Emits [`crate::Event::ProcessInstanceSuspended`].
     SuspendInstance { instance_key: Key },
     /// Resume a suspended process instance (Camunda parity). Its state returns to
     /// `Active` with its exact prior running state and its `suspendedDate`
     /// clears, so jobs and timers become live again. Only an instance currently
-    /// `Suspended` can be resumed; an unknown, terminal, or already active
-    /// instance is rejected. Emits [`crate::Event::ProcessInstanceResumed`].
+    /// `Suspended` can be resumed; resuming an already `Active` instance is an
+    /// idempotent no-op, while an unknown or terminal instance is rejected.
+    /// Emits [`crate::Event::ProcessInstanceResumed`].
     ResumeInstance { instance_key: Key },
     /// Migrate a running process instance to a target process definition
     /// (Zeebe process-instance migration). Each active element instance whose

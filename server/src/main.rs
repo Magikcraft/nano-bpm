@@ -5747,9 +5747,9 @@ impl ServerImpl {
         let instance_key: u64 = match path_params.process_instance_key.parse() {
             Ok(k) => k,
             Err(_) => {
-                return Ok(Resp::Status404_TheProcessInstanceIsNotFound(problem(
-                    "Process instance not found",
-                    404,
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid data",
+                    400,
                     format!(
                         "Process instance key '{}' is not a valid key.",
                         path_params.process_instance_key
@@ -5793,9 +5793,9 @@ impl ServerImpl {
         let instance_key: u64 = match path_params.process_instance_key.parse() {
             Ok(k) => k,
             Err(_) => {
-                return Ok(Resp::Status404_TheProcessInstanceIsNotFound(problem(
-                    "Process instance not found",
-                    404,
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid data",
+                    400,
                     format!(
                         "Process instance key '{}' is not a valid key.",
                         path_params.process_instance_key
@@ -36293,6 +36293,36 @@ mod search_process_instances_suspend_resume_tests {
                 .page
                 .total_items,
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn syntactically_invalid_key_is_rejected_as_400_not_404() {
+        // A `processInstanceKey` that is not a valid number is INVALID INPUT, and
+        // both endpoints declare a 400 InvalidData response in the OpenAPI — so it
+        // maps to 400, not the misleading "Process instance not found" 404.
+        let server = ServerImpl::default();
+
+        let suspend = models::SuspendProcessInstancePathParams {
+            process_instance_key: "not-a-key".to_string(),
+        };
+        assert!(
+            matches!(
+                server.suspend_process_instance_impl(&suspend).await.unwrap(),
+                apis::process_instance::SuspendProcessInstanceResponse::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "an unparseable key is a 400 on suspension"
+        );
+
+        let resume = models::ResumeProcessInstancePathParams {
+            process_instance_key: "not-a-key".to_string(),
+        };
+        assert!(
+            matches!(
+                server.resume_process_instance_impl(&resume).await.unwrap(),
+                apis::process_instance::ResumeProcessInstanceResponse::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "an unparseable key is a 400 on resumption"
         );
     }
 }

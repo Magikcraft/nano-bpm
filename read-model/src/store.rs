@@ -838,6 +838,21 @@ impl InstanceFilter {
         let mut clauses: Vec<String> = Vec::new();
         if let Some(state) = self.state {
             clauses.push(format!("state = {}", instance_state_code(state)));
+            // `Active` and `Suspended` share base code 0 (see
+            // [`instance_state_code`]), so `state = 0` alone cannot tell them
+            // apart. Disambiguate by the nullable `suspended_date_ms` column —
+            // the single source of truth `map_instance` derives `Suspended` from
+            // — so a console filter for one never returns the other. Every other
+            // state has a distinct code and needs no extra clause.
+            match state {
+                ProcessInstanceState::Active => {
+                    clauses.push("suspended_date_ms IS NULL".to_string());
+                }
+                ProcessInstanceState::Suspended => {
+                    clauses.push("suspended_date_ms IS NOT NULL".to_string());
+                }
+                _ => {}
+            }
         }
         if let Some(has_incident) = self.has_incident {
             clauses.push(format!("has_incident = {}", i64::from(has_incident)));
@@ -7581,6 +7596,77 @@ mod definition_xml_tests {
             vec![5, 4, 3, 2, 1]
         );
         assert_eq!(store.process_instance_count(&InstanceFilter::default()), 5);
+    }
+
+    #[test]
+    fn state_filter_disambiguates_active_from_suspended_via_suspended_date() {
+        use nanobpmn_engine_core::ProcessInstanceState;
+
+        use super::InstanceFilter;
+        let store = ReadStore::open(None).unwrap();
+        // Three Active instances, keys 1..=3.
+        for k in 1..=3u64 {
+            store.export(&[&created_event(k)]).unwrap();
+        }
+        // Suspend key 2 → base state code stays 0 (Active), but the nullable
+        // `suspended_date_ms` column disambiguates it as Suspended.
+        store
+            .export(&[&Event::ProcessInstanceSuspended {
+                instance_key: 2,
+                at: 1_700_000_000_000,
+            }])
+            .unwrap();
+
+        let active = InstanceFilter {
+            state: Some(ProcessInstanceState::Active),
+            has_incident: None,
+        };
+        let suspended = InstanceFilter {
+            state: Some(ProcessInstanceState::Suspended),
+            has_incident: None,
+        };
+
+        // SQL page + count filter for Active must exclude the suspended row…
+        assert_eq!(
+            store
+                .process_instances_page(50, 0, &active)
+                .iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+        assert_eq!(store.process_instance_count(&active), 2);
+        // …and the Suspended filter must return only the suspended row (not the
+        // active ones that share base code 0).
+        assert_eq!(
+            store
+                .process_instances_page(50, 0, &suspended)
+                .iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(store.process_instance_count(&suspended), 1);
+
+        // Page + count agree with the in-memory `matches` predicate used by the
+        // multi-shard merge, so a sharded node filters identically (pager-desync
+        // guard for the shared derivation).
+        for (filter, expect) in [(&active, [3u64, 1].as_slice()), (&suspended, &[2])] {
+            let all = store.process_instances_page(50, 0, &InstanceFilter::default());
+            let merged: Vec<u64> = all
+                .into_iter()
+                .filter(|r| filter.matches(r))
+                .map(|r| r.key)
+                .collect();
+            assert_eq!(merged, expect);
+        }
+
+        // Resuming key 2 clears the suspension: it returns to the Active set.
+        store
+            .export(&[&Event::ProcessInstanceResumed { instance_key: 2 }])
+            .unwrap();
+        assert_eq!(store.process_instance_count(&active), 3);
+        assert_eq!(store.process_instance_count(&suspended), 0);
     }
 
     #[test]
