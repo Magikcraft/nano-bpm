@@ -694,7 +694,6 @@ mod tests {
             version: 0,
             parent_process_instance_key: None,
             parent_element_instance_key: None,
-            suspended_at: None,
         }
     }
 
@@ -830,7 +829,6 @@ mod tests {
             version: 0,
             parent_process_instance_key: Some(parent_pi),
             parent_element_instance_key: Some(parent_ei),
-            suspended_at: None,
         }
     }
 

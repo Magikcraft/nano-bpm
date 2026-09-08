@@ -650,6 +650,7 @@ mod tests {
                 business_id: None,
                 parent_process_instance_key: None,
                 parent_element_instance_key: None,
+                suspended_at: None,
                 active: HashMap::new(),
                 scopes: HashMap::new(),
                 variables: Arc::new(vars("payload")),
