@@ -9653,6 +9653,12 @@ fn static_input_mapping_source_is_passed_through_as_literal_not_feel() {
                         source: "openaiCompatible".to_string(),
                         target: "provider".to_string(),
                     },
+                    // A static literal is passed through VERBATIM — significant
+                    // leading/trailing whitespace must be preserved, not trimmed.
+                    crate::model::Mapping {
+                        source: "  spaced value  ".to_string(),
+                        target: "padded".to_string(),
+                    },
                     // A leading `=` still selects FEEL evaluation.
                     crate::model::Mapping {
                         source: "=1 + 1".to_string(),
@@ -9693,6 +9699,11 @@ fn static_input_mapping_source_is_passed_through_as_literal_not_feel() {
     assert_eq!(
         job.variables.get("provider"),
         Some(&Value::Str("openaiCompatible".to_string()))
+    );
+    assert_eq!(
+        job.variables.get("padded"),
+        Some(&Value::Str("  spaced value  ".to_string())),
+        "a static literal source must be passed through verbatim, whitespace intact"
     );
     assert_eq!(job.variables.get("sum"), Some(&Value::Int(2)));
 }

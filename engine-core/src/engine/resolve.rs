@@ -193,11 +193,14 @@ impl Engine {
         source: &str,
         vars: &HashMap<String, Value>,
     ) -> Result<Value, crate::feel::FeelError> {
-        let trimmed = source.trim();
-        if trimmed.starts_with('=') {
-            crate::feel::eval(trimmed, vars)
+        if source.trim_start().starts_with('=') {
+            crate::feel::eval(source.trim(), vars)
         } else {
-            Ok(Value::Str(trimmed.to_string()))
+            // A static literal is passed through verbatim — matching the other
+            // `resolve_*` helpers (`resolve_event_name` / `resolve_job_type`),
+            // which return the raw text for the non-`=` branch. Trimming here
+            // would silently drop significant leading/trailing whitespace.
+            Ok(Value::Str(source.to_string()))
         }
     }
 
