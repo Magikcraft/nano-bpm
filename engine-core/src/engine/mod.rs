@@ -6973,6 +6973,33 @@ impl Engine {
             .cloned()
     }
 
+    /// Teardown events for a tool's dedicated inner-instance wrapper (gap #9).
+    /// Emits `ElementCompleting` + `ElementCompleted` for the wrapper ONLY when its
+    /// element id still resolves. An inner instance that has already left `active`
+    /// (but lingers via `scopes`) would otherwise complete with an empty
+    /// `element_id`, which corrupts downstream element aggregates — the same
+    /// failure mode guarded in `cancel_adhoc_active_child` and ModifyInstance
+    /// termination (regression `nested_adhoc_cancel_child_skips_already_completed_inner_instance`).
+    /// Returns an empty vec when the id is unresolvable — there is nothing to tear
+    /// down. Single source of truth for both the leaf and mid-chain tool paths.
+    fn adhoc_inner_instance_teardown(&self, instance_key: Key, inner_key: Key) -> Vec<Event> {
+        match self.element_id_of_instance(instance_key, inner_key) {
+            Some(inner_element_id) => vec![
+                Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key: inner_key,
+                    element_id: inner_element_id.clone(),
+                },
+                Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key: inner_key,
+                    element_id: inner_element_id,
+                },
+            ],
+            None => Vec::new(),
+        }
+    }
+
     /// The follow-up sibling elements a just-completed ad-hoc tool chains into
     /// (issue #1154): the target of each of its outgoing `inner_flows` whose
     /// guard condition is absent or evaluates true in the tool's completed
@@ -7527,13 +7554,25 @@ impl Engine {
         output_updates: &HashMap<String, Value>,
         others: usize,
     ) -> AdHocPostTool {
-        let completion_now = self
-            .adhoc_def_of(instance_key, container_element_id)
-            .and_then(|def| def.completion_condition)
+        // Borrow the container's catalog entry once by reference (no clone of the
+        // def or its `tools` / `inner_flows`) and reuse it for BOTH the
+        // completion-condition evaluation and the `cancelRemainingInstances` read
+        // — this runs on every tool completion, so it stays off the hot path's
+        // allocator (mirrors `adhoc_inner_flow_targets`). A missing container has
+        // no completion condition to honour, so the chain simply continues.
+        let Some(def) = self
+            .process_of_instance(instance_key)
+            .and_then(|p| p.adhoc.iter().find(|d| d.container_id == container_element_id))
+        else {
+            return AdHocPostTool::Continue;
+        };
+        let completion_now = def
+            .completion_condition
+            .as_ref()
             .map(|cond| {
                 let mut ctx = (*self.variables_for_element(instance_key, container_key)).clone();
                 ctx.extend(output_updates.iter().map(|(k, v)| (k.clone(), v.clone())));
-                matches!(crate::feel::eval_bool(&cond, &ctx), Ok(true))
+                matches!(crate::feel::eval_bool(cond, &ctx), Ok(true))
             })
             .unwrap_or(false);
         let already_fulfilled = self
@@ -7546,10 +7585,7 @@ impl Engine {
         if !(completion_now || already_fulfilled) {
             return AdHocPostTool::Continue;
         }
-        let cancel_remaining = self
-            .adhoc_def_of(instance_key, container_element_id)
-            .map(|d| d.cancel_remaining_instances)
-            .unwrap_or(true);
+        let cancel_remaining = def.cancel_remaining_instances;
         if cancel_remaining {
             // `cancelRemainingInstances=true` (the BPMN default): complete now,
             // cancelling any tools still running this turn — exactly like a
@@ -7684,9 +7720,6 @@ impl Engine {
         // dangling once the tool drains. This teardown is emitted here — after the
         // type guard — not at the top, so a deferred (incident-parked) tool keeps
         // its inner wrapper alive for the retry-on-resolve re-drive.
-        let inner_element_id = self
-            .element_id_of_instance(instance_key, inner_key)
-            .unwrap_or_default();
         let mut events = vec![
             Event::ElementCompleting {
                 instance_key,
@@ -7698,23 +7731,14 @@ impl Engine {
                 element_instance_key: child_eik,
                 element_id: tool_element_id.clone(),
             },
-            Event::ElementCompleting {
-                instance_key,
-                element_instance_key: inner_key,
-                element_id: inner_element_id.clone(),
-            },
-            Event::ElementCompleted {
-                instance_key,
-                element_instance_key: inner_key,
-                element_id: inner_element_id,
-            },
-            Event::AdHocToolCompleted {
-                instance_key,
-                container_key,
-                child_key: child_eik,
-                output,
-            },
         ];
+        events.extend(self.adhoc_inner_instance_teardown(instance_key, inner_key));
+        events.push(Event::AdHocToolCompleted {
+            instance_key,
+            container_key,
+            child_key: child_eik,
+            output,
+        });
         // Tool output mappings (ADR 0023 seam 4): project the tool's result into
         // the container scope, sourced from the container catalog (the pruned tool
         // has no element entry, so `io_outputs` cannot see it). Evaluated in the
@@ -7862,9 +7886,6 @@ impl Engine {
             Some(a) => (a.element_id.clone(), a.active.len()),
             None => return (Vec::new(), Vec::new()),
         };
-        let inner_element_id = self
-            .element_id_of_instance(instance_key, inner_key)
-            .unwrap_or_default();
         let mut events = vec![
             Event::ElementCompleting {
                 instance_key,
@@ -7876,16 +7897,11 @@ impl Engine {
                 element_instance_key: child_eik,
                 element_id: tool_element_id.clone(),
             },
-            Event::ElementCompleting {
-                instance_key,
-                element_instance_key: inner_key,
-                element_id: inner_element_id.clone(),
-            },
-            Event::ElementCompleted {
-                instance_key,
-                element_instance_key: inner_key,
-                element_id: inner_element_id,
-            },
+        ];
+        // Tear down the tool's dedicated inner-instance wrapper (only when its id
+        // resolves — see `adhoc_inner_instance_teardown`).
+        events.extend(self.adhoc_inner_instance_teardown(instance_key, inner_key));
+        events.push(
             // An intermediate node of a chained path is not a path completion, so
             // `output` is `None`: nothing is appended to `outputCollection` (the
             // leaf appends the path's result). This event drops the tool from the
@@ -7896,7 +7912,7 @@ impl Engine {
                 child_key: child_eik,
                 output: None,
             },
-        ];
+        );
         // Tool output mappings (ADR 0023 seam 4) still project the tool's result
         // into the container scope so the follow-up can read it — evaluated in the
         // child's local scope while it is still resident (its `ElementCompleted`

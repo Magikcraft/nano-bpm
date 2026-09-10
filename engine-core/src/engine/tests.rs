@@ -14281,6 +14281,104 @@ fn adhoc_inner_sequence_flow_chains_to_the_follow_up_tool() {
     );
 }
 
+/// Regression for the empty-`element_id` teardown failure mode in the mid-chain
+/// hand-off (`continue_adhoc_inner_flow`). A completing tool tears down its
+/// dedicated inner-instance wrapper; if that wrapper has already left `active`
+/// (but still resolves via `scopes`), the old `unwrap_or_default()` emitted
+/// `ElementCompleting`/`ElementCompleted` with an empty `element_id`, which
+/// corrupts downstream element aggregates — the same class guarded on the cancel
+/// path by `nested_adhoc_cancel_child_skips_already_completed_inner_instance`.
+/// The fix routes both tool paths through `adhoc_inner_instance_teardown`, which
+/// skips the teardown when the id is unresolvable.
+#[test]
+fn adhoc_mid_chain_handoff_skips_already_completed_inner_instance() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_chained_tools_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+
+    // Turn 1: activate only `toolA` (the head of the chain).
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let tool_a = engine
+        .activate_jobs("toolA-type", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolA")
+        .expect("toolA job emitted");
+    let tool_a_eik = tool_a.element_instance_key;
+
+    // The dedicated inner wrapper `toolA` hangs off.
+    let inner = engine.scope_of(inst, tool_a_eik);
+    assert_ne!(inner, 0, "toolA hangs off a dedicated inner instance");
+
+    // Simulate that inner wrapper having ALREADY been torn down: drop it from
+    // `active` (so its element id no longer resolves) while its `scopes` mapping
+    // still resolves it — the exact state the old `unwrap_or_default()` mishandled.
+    engine
+        .state
+        .instances
+        .get_mut(&inst)
+        .unwrap()
+        .active
+        .remove(&inner);
+    assert!(
+        engine.element_id_of_instance(inst, inner).is_none(),
+        "inner wrapper is no longer active"
+    );
+    assert_eq!(
+        engine.scope_of(inst, tool_a_eik),
+        inner,
+        "but its scopes mapping still resolves it"
+    );
+
+    // Completing `toolA` drives the mid-chain hand-off; its events must not carry
+    // an empty element_id nor fabricate a completion for the gone inner instance.
+    let events = engine
+        .apply_command(Command::complete_job_with(
+            tool_a.key,
+            HashMap::from([("result".to_string(), Value::Str("A".into()))]),
+        ))
+        .unwrap();
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleting { element_id, .. } | Event::ElementCompleted { element_id, .. }
+                if element_id.is_empty()
+        )),
+        "no element-completion event carries an empty element_id; events: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_instance_key, .. } if *element_instance_key == inner
+        )),
+        "the already-completed inner instance is not torn down again; events: {events:?}"
+    );
+    // The chain still hands off — toolB activates despite the gone inner wrapper.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "toolA" && to == "toolB"
+        )),
+        "toolA's outgoing inner flow to toolB is still taken; events: {events:?}"
+    );
+}
+
 fn adhoc_agent_chained_tools_completion_condition_process() -> ProcessDefinition {
     // Like `adhoc_agent_chained_tools_process` (the `toolA -> toolB` structured
     // sequence, issue #1154) but the container also declares a
