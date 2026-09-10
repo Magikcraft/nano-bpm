@@ -293,7 +293,6 @@ impl TestEngine {
             .state()
             .decisions
             .get(decision_id)
-            .cloned()
             .ok_or_else(|| {
                 js_err(&format!(
                     "evaluate error: no deployed decision with id '{decision_id}'"
