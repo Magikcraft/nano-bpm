@@ -7158,6 +7158,83 @@ fn should_create_one_instance_per_matching_message_start() {
     assert_eq!(engine.state().instances.len(), 2);
 }
 
+/// message-start "start"(probe-alert) -> service task "host"(agent), with an
+/// interrupting message boundary "bnd"(probe-alert, correlating on customerId)
+/// on the host. The SAME message name is subscribed both at the process level
+/// (start event) and by the boundary on a running instance.
+fn process_message_start_and_boundary() -> ProcessDefinition {
+    ProcessBuilder::new("agent")
+        .message_start_event("start", "probe-alert")
+        .service_task("host", "agent")
+        .message_boundary_event("bnd", "host", "probe-alert", "customerId")
+        .end_event("running")
+        .end_event("interrupted")
+        .connect("start", "host")
+        .connect("host", "running")
+        .connect("bnd", "interrupted")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn message_prefers_open_subscription_over_starting_a_new_instance() {
+    // Issue #1156: a message name subscribed by BOTH a message start event and
+    // an open boundary subscription on a running instance must correlate to
+    // exactly one destination. Once a subscription is open, it wins — the same
+    // publish must NOT also start a duplicate instance.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_message_start_and_boundary()))
+        .unwrap();
+
+    // First publish: no subscription is open yet, so the message start event
+    // creates a fresh instance. It parks on the service task and opens the
+    // boundary subscription (correlating on the seeded customerId).
+    engine.correlate_message(
+        "probe-alert",
+        "C1",
+        vars(&[("customerId", Value::Str("C1".into()))]),
+        0,
+    );
+    assert_eq!(engine.state().instances.len(), 1);
+    let open: Vec<_> = engine
+        .message_subscriptions()
+        .into_iter()
+        .filter(|s| s.state == state::MessageSubscriptionState::Open)
+        .collect();
+    assert_eq!(open.len(), 1);
+    let instance_key = open[0].instance_key;
+
+    // Second publish: the open boundary subscription on the running instance
+    // claims the message. It fires the boundary (interrupting the instance) and
+    // does NOT start a second instance from the message start event.
+    let fired = engine.correlate_message(
+        "probe-alert",
+        "C1",
+        vars(&[("customerId", Value::Str("C1".into()))]),
+        0,
+    );
+    assert_eq!(
+        engine.state().instances.len(),
+        1,
+        "the open subscription wins; no duplicate instance is created"
+    );
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "bnd" && to == "interrupted"
+        )),
+        "the boundary event fires on the running instance"
+    );
+    assert!(
+        !fired
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceCreated { .. })),
+        "no new instance is created by the same publish"
+    );
+    assert!(engine.is_completed(instance_key));
+}
+
 #[test]
 fn message_start_distributes_created_instances_across_partitions() {
     // On a multi-partition deploy owner, message-start correlations must NOT

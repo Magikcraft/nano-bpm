@@ -3114,6 +3114,14 @@ impl Engine {
                     .collect();
                 matched.sort_unstable();
 
+                // Zeebe correlates a published message to exactly one destination
+                // and prefers an already-open subscription on a running instance
+                // over creating a fresh instance from a message start event. If
+                // any matching subscription is still open when this message
+                // arrives, it wins and the message-start-event instance creation
+                // below is suppressed (issue #1156).
+                let mut correlated_to_subscription = false;
+
                 for subscription_key in matched {
                     // A boundary correlation earlier in this batch may have
                     // interrupted an activity that cancelled this subscription;
@@ -3123,6 +3131,10 @@ impl Engine {
                         Some(s) if s.state == state::MessageSubscriptionState::Open => s,
                         _ => continue,
                     };
+                    // An open subscription for this message name and correlation
+                    // key exists on a running instance: it claims the message, so
+                    // no new instance is started from a message start event.
+                    correlated_to_subscription = true;
                     let instance_key = subscription.instance_key;
                     let element_instance_key = subscription.element_instance_key;
                     let element_id = subscription.element_id.clone();
@@ -3175,16 +3187,23 @@ impl Engine {
                 }
 
                 // Message start events: a matching message also creates a new
-                // instance of every process subscribed at the process level.
-                // Deterministic by process-definition key. The message's
-                // variables seed the new instance.
-                let mut started: Vec<(String, ElementId)> = self
-                    .state
-                    .message_start_subscriptions
-                    .values()
-                    .filter(|s| s.message_name == message_name)
-                    .map(|s| (s.process_id.clone(), s.start_element_id.clone()))
-                    .collect();
+                // instance of every process subscribed at the process level —
+                // but only when the message was not already claimed by an open
+                // subscription on a running instance. A published message
+                // correlates to exactly one destination, and an already-open
+                // subscription wins over starting a fresh instance (Zeebe
+                // parity, issue #1156). Deterministic by process-definition key.
+                // The message's variables seed the new instance.
+                let mut started: Vec<(String, ElementId)> = if correlated_to_subscription {
+                    Vec::new()
+                } else {
+                    self.state
+                        .message_start_subscriptions
+                        .values()
+                        .filter(|s| s.message_name == message_name)
+                        .map(|s| (s.process_id.clone(), s.start_element_id.clone()))
+                        .collect()
+                };
                 started.sort_unstable();
                 for (process_id, start_element_id) in started {
                     self.start_or_dispatch_instance(
