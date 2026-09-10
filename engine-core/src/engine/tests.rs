@@ -14093,6 +14093,194 @@ fn adhoc_agent_activates_a_user_task_tool_and_parks_until_completed() {
     );
 }
 
+fn adhoc_agent_chained_tools_process() -> ProcessDefinition {
+    // A JOB_WORKER ad-hoc container whose two service-task tools are joined by a
+    // plain `bpmn:sequenceFlow` BETWEEN THE CONTAINER'S OWN CHILDREN (issue
+    // #1154): `toolA -> toolB`. Camunda documents this "structured sequence" —
+    // activating `toolA` alone must, on its completion, take the flow and run
+    // `toolB`; the container re-emits its agent job only once the whole chain
+    // drains. `toolA`/`toolB` carry distinct job types so each is drained
+    // independently by the test.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="toolA-type" />
+              </bpmn:extensionElements>
+              <bpmn:outgoing>chain</bpmn:outgoing>
+            </bpmn:serviceTask>
+            <bpmn:sequenceFlow id="chain" sourceRef="toolA" targetRef="toolB" />
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="toolB-type" />
+              </bpmn:extensionElements>
+              <bpmn:incoming>chain</bpmn:incoming>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+/// Regression for Magikcraft/nano-bpm#1154: a `bpmn:sequenceFlow` between two
+/// DIRECT children of an ad-hoc container must execute as a chain. Before the
+/// fix the activated element ran but its outgoing flow was silently dropped —
+/// the downstream element never activated and the container completed as if the
+/// activated element were a leaf (the `parsed-not-executed` class #1009, for a
+/// sequence flow inside an ad-hoc scope). This drives the reproduction: activate
+/// `toolA` alone, and assert `toolA -> toolB` is taken, `toolB` runs, the agent
+/// job re-emits only once the chain drains, and the leaf's output is the single
+/// entry appended to the container's `outputCollection`.
+#[test]
+fn adhoc_inner_sequence_flow_chains_to_the_follow_up_tool() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_chained_tools_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    // Turn 1: the agent activates ONLY `toolA` (the head of the chain).
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // `toolB` is NOT active yet — it only runs once `toolA` completes and its
+    // outgoing flow is taken.
+    assert!(
+        engine
+            .activate_jobs("toolB-type", "W", 10, 1_000, 0)
+            .is_empty(),
+        "toolB must not run before toolA completes and its flow is taken"
+    );
+
+    // Complete `toolA`. This is where the defect surfaced: the flow was dropped.
+    let tool_a = engine
+        .activate_jobs("toolA-type", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolA")
+        .expect("toolA job emitted");
+    let chain_events = engine
+        .apply_command(Command::complete_job_with(
+            tool_a.key,
+            HashMap::from([("result".to_string(), Value::Str("A".into()))]),
+        ))
+        .unwrap();
+    assert!(
+        chain_events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "toolA" && to == "toolB"
+        )),
+        "toolA's outgoing inner flow to toolB must be taken (issue #1154), \
+         got {chain_events:?}"
+    );
+
+    // The agent job must NOT re-emit while the chain is still running: the
+    // container is a single active path (now at toolB), not drained.
+    assert!(
+        engine
+            .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+            .is_empty(),
+        "the agent job must not re-emit mid-chain — the path is still running"
+    );
+
+    // `toolB` chained into existence and produces a job.
+    let tool_b = engine
+        .activate_jobs("toolB-type", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolB")
+        .expect("toolB chained from toolA's completed flow (issue #1154)");
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "exactly one tool active during the chain (toolB, after toolA handed off)"
+    );
+
+    // Complete `toolB` (the leaf). Only NOW does the path drain and the agent
+    // job re-emit for the next turn.
+    engine
+        .apply_command(Command::complete_job_with(
+            tool_b.key,
+            HashMap::from([("result".to_string(), Value::Str("B".into()))]),
+        ))
+        .unwrap();
+    let adhoc = engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .unwrap();
+    assert_eq!(adhoc.active.len(), 0, "the chain drained after the leaf toolB");
+    assert_eq!(
+        adhoc.iterations, 1,
+        "the agent job re-emits exactly once — only after the whole chain drained"
+    );
+    // `outputElement` is a per-execution-path result: the chain toolA -> toolB is
+    // ONE path, so the collection has exactly ONE entry — the leaf's result.
+    assert!(
+        matches!(
+            container_output_collection(&engine, inst, container, "results"),
+            Some(Value::List(ref v)) if v.as_slice() == [Value::Str("B".into())]
+        ),
+        "the chain contributes ONE outputCollection entry — the leaf toolB's \
+         result — not one per node, got {:?}",
+        container_output_collection(&engine, inst, container, "results")
+    );
+
+    // Turn 2: the agent signals completion → the container completes and writes
+    // its aggregated collection outward.
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job re-emitted for turn 2");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent2.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "the container completes once the agent is done"
+    );
+}
+
 fn adhoc_agent_with_embedded_subprocess_tool() -> ProcessDefinition {
     // A JOB_WORKER ad-hoc container whose tool `review` is a plain embedded
     // `bpmn:subProcess` with a MULTI-ELEMENT token-flow body

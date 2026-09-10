@@ -1032,6 +1032,30 @@ pub enum AdHocToolKind {
     Other,
 }
 
+/// A `bpmn:sequenceFlow` between two DIRECT children of an ad-hoc container
+/// (issue #1154). Camunda documents that inner elements of an ad-hoc
+/// sub-process "can be connected by a sequence flow to build a structured
+/// sequence": when the source element completes, the flow is taken and the
+/// target element runs, and only once that chain drains does the container
+/// re-emit its agent job. These flows reference elements that are pruned from
+/// the executable graph, so — like the tool catalog — they are captured here at
+/// parse time and driven out-of-band by the ad-hoc runtime seam rather than by
+/// ordinary token flow. Flows *inside* an embedded-`subProcess` tool's body are
+/// NOT captured here (they run by ordinary token flow); only flows whose source
+/// and target are both direct children of the container are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AdHocInnerFlow {
+    /// The source element id (a direct child of the container).
+    pub from: ElementId,
+    /// The target element id (a direct child of the container).
+    pub to: ElementId,
+    /// The flow's optional `conditionExpression` guard, evaluated in the source
+    /// tool's completed scope. `None` is an unconditional flow.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub condition: Option<Condition>,
+}
+
 /// A single activatable inner element ("tool") of an ad-hoc sub-process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1094,6 +1118,13 @@ pub struct AdHocSubProcessDef {
     /// The inner activatable elements, in document order.
     #[cfg_attr(feature = "serde", serde(default))]
     pub tools: Vec<AdHocTool>,
+    /// The `bpmn:sequenceFlow`s between the container's DIRECT children (issue
+    /// #1154), in document order. Captured before the inner elements are pruned
+    /// so the runtime can drive a "structured sequence" (Camunda) — take a
+    /// completed tool's outgoing flow and run its follow-up — instead of
+    /// silently dropping it. Empty when the container's tools are unconnected.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub inner_flows: Vec<AdHocInnerFlow>,
 }
 
 /// The result a JOB_WORKER ad-hoc sub-process agent returns when it completes
