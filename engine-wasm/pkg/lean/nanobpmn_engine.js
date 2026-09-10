@@ -603,9 +603,15 @@ export class TestEngine {
         }
     }
     /**
-     * Parse and deploy a BPMN resource. Returns a JSON object
-     * `{ "processIds": [...], "snapshot": {...} }` on success, or throws a
-     * JS error carrying the parse/deploy failure message.
+     * Parse and deploy a BPMN **or** DMN resource — the one entry point accepts
+     * both (issue #1158). A BPMN process resource deploys as before and returns
+     * `{ "processIds": [...], "snapshot": {...} }`. A DMN decision resource (no
+     * `<process>` element) is routed to decision deployment and returns the same
+     * shape as [`Self::deploy_decision`]
+     * (`{ "decisionRequirementsId": ..., "decisions": [...], "snapshot": {...} }`),
+     * so a `zeebe:calledDecision` on a business rule task can finally resolve.
+     * On failure it throws a JS error carrying the parse/deploy message for the
+     * format the document most resembles.
      * @param {string} xml
      * @returns {string}
      */
@@ -617,6 +623,42 @@ export class TestEngine {
             const ptr0 = passStringToWasm0(xml, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len0 = WASM_VECTOR_LEN;
             wasm.testengine_deploy(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Parse and deploy a DMN decision-requirements resource explicitly. Registers
+     * every `<decision>` it contains (by id) so a business rule task's
+     * `zeebe:calledDecision` resolves and `evaluateDecision` can run it. Returns a
+     * JSON object
+     * `{ "decisionRequirementsId": ..., "decisionRequirementsKey": ..., "version": N, "decisions": [{ "decisionId", "decisionName", "decisionKey", "version" }], "snapshot": {...} }`
+     * on success, or throws a JS error carrying the parse/deploy failure message.
+     * @param {string} xml
+     * @returns {string}
+     */
+    deployDecision(xml) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(xml, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.testengine_deployDecision(retptr, this.__wbg_ptr, ptr0, len0);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
             var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -702,6 +744,48 @@ export class TestEngine {
             const ptr1 = passStringToWasm0(content, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len1 = WASM_VECTOR_LEN;
             wasm.testengine_deployResource(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
+     * Evaluate a deployed decision by id against the given variables — the
+     * standalone counterpart to a business rule task's in-line evaluation. The
+     * decision must already be deployed (via `deploy`/`deployDecision`). Read-only:
+     * it evaluates and returns the result without mutating engine state or
+     * recording a decision instance. `variables_json` is a JSON object string
+     * (`"{}"` / `""` for none). Returns
+     * `{ "decisionId": ..., "decisionKey": ..., "output": <value> }` on success,
+     * or throws a JS error carrying an "unknown decision" or evaluation-failure
+     * message.
+     * @param {string} decision_id
+     * @param {string} variables_json
+     * @returns {string}
+     */
+    evaluateDecision(decision_id, variables_json) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(decision_id, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(variables_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.testengine_evaluateDecision(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
             var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);

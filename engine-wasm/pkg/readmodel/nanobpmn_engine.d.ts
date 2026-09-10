@@ -142,11 +142,26 @@ export class TestEngine {
      */
     debugStep(): string;
     /**
-     * Parse and deploy a BPMN resource. Returns a JSON object
-     * `{ "processIds": [...], "snapshot": {...} }` on success, or throws a
-     * JS error carrying the parse/deploy failure message.
+     * Parse and deploy a BPMN **or** DMN resource — the one entry point accepts
+     * both (issue #1158). A BPMN process resource deploys as before and returns
+     * `{ "processIds": [...], "snapshot": {...} }`. A DMN decision resource (no
+     * `<process>` element) is routed to decision deployment and returns the same
+     * shape as [`Self::deploy_decision`]
+     * (`{ "decisionRequirementsId": ..., "decisions": [...], "snapshot": {...} }`),
+     * so a `zeebe:calledDecision` on a business rule task can finally resolve.
+     * On failure it throws a JS error carrying the parse/deploy message for the
+     * format the document most resembles.
      */
     deploy(xml: string): string;
+    /**
+     * Parse and deploy a DMN decision-requirements resource explicitly. Registers
+     * every `<decision>` it contains (by id) so a business rule task's
+     * `zeebe:calledDecision` resolves and `evaluateDecision` can run it. Returns a
+     * JSON object
+     * `{ "decisionRequirementsId": ..., "decisionRequirementsKey": ..., "version": N, "decisions": [{ "decisionId", "decisionName", "decisionKey", "version" }], "snapshot": {...} }`
+     * on success, or throws a JS error carrying the parse/deploy failure message.
+     */
+    deployDecision(xml: string): string;
     /**
      * Deploy a single `form-js` `.form` resource (the verbatim form-js JSON
      * document). Mirrors the native deploy decomposition, which registers a
@@ -175,6 +190,18 @@ export class TestEngine {
      * on success, or throws a JS error carrying the deploy failure message.
      */
     deployResource(resource_name: string, content: string): string;
+    /**
+     * Evaluate a deployed decision by id against the given variables — the
+     * standalone counterpart to a business rule task's in-line evaluation. The
+     * decision must already be deployed (via `deploy`/`deployDecision`). Read-only:
+     * it evaluates and returns the result without mutating engine state or
+     * recording a decision instance. `variables_json` is a JSON object string
+     * (`"{}"` / `""` for none). Returns
+     * `{ "decisionId": ..., "decisionKey": ..., "output": <value> }` on success,
+     * or throws a JS error carrying an "unknown decision" or evaluation-failure
+     * message.
+     */
+    evaluateDecision(decision_id: string, variables_json: string): string;
     /**
      * The full ordered event log emitted so far, as a JSON array of
      * `{ seq, now, type, ...payload }`. Useful for a step-through / trace view.
@@ -376,8 +403,10 @@ export interface InitOutput {
     readonly testengine_debugResume: (a: number, b: number) => void;
     readonly testengine_debugStep: (a: number, b: number) => void;
     readonly testengine_deploy: (a: number, b: number, c: number, d: number) => void;
+    readonly testengine_deployDecision: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_deployForm: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_deployResource: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly testengine_evaluateDecision: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_events: (a: number, b: number) => void;
     readonly testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly testengine_getFormByKey: (a: number, b: number, c: number, d: number) => void;

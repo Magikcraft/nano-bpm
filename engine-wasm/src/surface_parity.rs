@@ -148,8 +148,8 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::DeployProcess(..) => Surface::NotSurfaced {
             reason: "single-process deploy; the wrapper deploys via the DeployResources superset",
         },
-        Command::DeployDecisionRequirements(..) => Surface::NotSurfaced {
-            reason: "DMN deployment; the in-browser test engine exercises BPMN execution only",
+        Command::DeployDecisionRequirements(..) => Surface::Surfaced {
+            js_method: "deploy/deployDecision",
         },
         Command::DeleteDecisionInstance { .. } => Surface::NotSurfaced {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",
