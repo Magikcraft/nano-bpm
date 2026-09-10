@@ -56,6 +56,8 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
+        ElementKind::LinkIntermediateThrowEvent { .. } => "linkIntermediateThrowEvent",
+        ElementKind::LinkIntermediateCatchEvent { .. } => "linkIntermediateCatchEvent",
         ElementKind::Task => "task",
         ElementKind::ScriptTask { .. } => "scriptTask",
         ElementKind::CallActivity { .. } => "callActivity",
@@ -2043,6 +2045,26 @@ fn emit_element(
             out.push_str(&format!(
                 "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}/>\n"
             ));
+        }
+        ElementKind::LinkIntermediateThrowEvent { link_name } => {
+            out.push_str(&format!(
+                "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}>\n"
+            ));
+            out.push_str(&format!(
+                "      <bpmn:linkEventDefinition name=\"{}\"/>\n",
+                xml_escape(link_name)
+            ));
+            out.push_str("    </bpmn:intermediateThrowEvent>\n");
+        }
+        ElementKind::LinkIntermediateCatchEvent { link_name } => {
+            out.push_str(&format!(
+                "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
+            ));
+            out.push_str(&format!(
+                "      <bpmn:linkEventDefinition name=\"{}\"/>\n",
+                xml_escape(link_name)
+            ));
+            out.push_str("    </bpmn:intermediateCatchEvent>\n");
         }
         ElementKind::Task => {
             // An abstract task is a pass-through, but — like the typed tasks — it
@@ -4578,6 +4600,51 @@ mod tests {
         // And the emitted model re-parses to the same structure.
         let reparsed = parse_bpmn(&xml).expect("emitted agent model re-parses");
         assert_same_structure(&orig, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_link_events() {
+        // A link throw/catch pair must survive serialize -> re-parse: the throw
+        // emits an `<intermediateThrowEvent>` and the catch an
+        // `<intermediateCatchEvent>`, each carrying a `<linkEventDefinition
+        // name=…>`, and re-parse to the same link kinds (#1157).
+        use nanobpmn_engine_core::ProcessBuilder;
+
+        let orig = ProcessBuilder::new("links")
+            .start_event("s")
+            .link_intermediate_throw_event("throw", "hop")
+            .link_intermediate_catch_event("catch", "hop")
+            .service_task("after", "probe-after-link")
+            .end_event("done")
+            .connect("s", "throw")
+            .connect("catch", "after")
+            .connect("after", "done")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&orig);
+        assert!(
+            xml.contains("<bpmn:intermediateThrowEvent id=\"throw\"")
+                && xml.contains("<bpmn:linkEventDefinition name=\"hop\"/>"),
+            "the link throw must emit a linkEventDefinition, got:\n{xml}"
+        );
+        assert!(
+            xml.contains("<bpmn:intermediateCatchEvent id=\"catch\""),
+            "the link catch must emit an intermediateCatchEvent, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized link model re-parses");
+        assert_same_structure(&orig, &reparsed[0]);
+        assert_eq!(
+            reparsed[0].elements["throw"].kind,
+            ElementKind::LinkIntermediateThrowEvent {
+                link_name: "hop".to_string()
+            }
+        );
+        assert_eq!(
+            reparsed[0].elements["catch"].kind,
+            ElementKind::LinkIntermediateCatchEvent {
+                link_name: "hop".to_string()
+            }
+        );
     }
 
     #[test]

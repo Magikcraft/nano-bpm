@@ -92,9 +92,20 @@ pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
     }
 
     // Link pairing: every intermediate *throw* link must have a matching
-    // intermediate *catch* link of the same name in the process
+    // intermediate *catch* link of the same name in the process, and no two
+    // catch links may share a name — an ambiguous target is rejected at deploy
     // (Zeebe `ModelUtil.verifyLinkIntermediateEvents`).
-    let catch_names: HashSet<&str> = capture.link_catches.iter().map(String::as_str).collect();
+    let mut catch_names: HashSet<&str> = HashSet::new();
+    for catch_name in &capture.link_catches {
+        if !catch_names.insert(catch_name.as_str()) {
+            return Err(ParseError::InvalidProcess {
+                process_id: capture.process_id.clone(),
+                reason: format!(
+                    "multiple intermediate catch link events with the same link name '{catch_name}' are not allowed"
+                ),
+            });
+        }
+    }
     for (throw_name, from_node) in &capture.link_throws {
         if !catch_names.contains(throw_name.as_str()) {
             return Err(ParseError::UnresolvedReference {
@@ -227,6 +238,40 @@ mod tests {
                <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="thr"/>"#,
         );
         assert_unresolved(&xml, "linkThrow", "L1", "thr");
+    }
+
+    #[test]
+    fn should_reject_duplicate_catch_link_names() {
+        // Two intermediate catch links sharing a name make a throw's target
+        // ambiguous; Zeebe's `verifyLinkIntermediateEvents` rejects it at deploy.
+        let xml = model(
+            "",
+            r#"<bpmn:startEvent id="s"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+               <bpmn:intermediateThrowEvent id="thr">
+                 <bpmn:incoming>a</bpmn:incoming>
+                 <bpmn:linkEventDefinition name="L1"/>
+               </bpmn:intermediateThrowEvent>
+               <bpmn:intermediateCatchEvent id="c1">
+                 <bpmn:outgoing>b</bpmn:outgoing>
+                 <bpmn:linkEventDefinition name="L1"/>
+               </bpmn:intermediateCatchEvent>
+               <bpmn:intermediateCatchEvent id="c2">
+                 <bpmn:outgoing>c</bpmn:outgoing>
+                 <bpmn:linkEventDefinition name="L1"/>
+               </bpmn:intermediateCatchEvent>
+               <bpmn:endEvent id="e1"><bpmn:incoming>b</bpmn:incoming></bpmn:endEvent>
+               <bpmn:endEvent id="e2"><bpmn:incoming>c</bpmn:incoming></bpmn:endEvent>
+               <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="thr"/>
+               <bpmn:sequenceFlow id="b" sourceRef="c1" targetRef="e1"/>
+               <bpmn:sequenceFlow id="c" sourceRef="c2" targetRef="e2"/>"#,
+        );
+        match parse_bpmn(&xml) {
+            Err(ParseError::InvalidProcess { reason, .. }) => assert!(
+                reason.contains("same link name 'L1'"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("expected InvalidProcess for duplicate catch link, got {other:?}"),
+        }
     }
 
     #[test]

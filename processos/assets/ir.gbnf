@@ -12,7 +12,7 @@
 root      ::= ws "process" sp string sp "{" nl indent "start" sp id nl elements flows "}" ws
 elements  ::= element*
 flows     ::= flow*
-element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
+element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-linkIntermediateThrowEvent | elem-linkIntermediateCatchEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
 
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
@@ -133,6 +133,18 @@ attr-subProcess-startEvent  ::= "startEvent" sp attr-id   # Id of the sub-proces
 elem-intermediateThrowEvent  ::= indent "intermediateThrowEvent" sp id (sp string)? (sp attrs-intermediateThrowEvent)? nl
 attrs-intermediateThrowEvent   ::= "{" nl (indent2 attr-line-intermediateThrowEvent nl)+ indent "}"
 attr-line-intermediateThrowEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+
+# linkIntermediateThrowEvent — Link throw. Has no outgoing flow; hands its token to the matching link catch (same `link`) in the same scope.
+elem-linkIntermediateThrowEvent  ::= indent "linkIntermediateThrowEvent" sp id (sp string)? (sp attrs-linkIntermediateThrowEvent)? nl
+attrs-linkIntermediateThrowEvent   ::= "{" nl (indent2 attr-line-linkIntermediateThrowEvent nl)+ indent "}"
+attr-line-linkIntermediateThrowEvent  ::= attr-linkIntermediateThrowEvent-link | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-linkIntermediateThrowEvent-link  ::= "link" sp attr-str   # The `linkEventDefinition name` this throw hands its token to.
+
+# linkIntermediateCatchEvent — Link catch. Has no incoming flow; activated directly by the matching link throw (same `link`), then a pass-through along its outgoing flow.
+elem-linkIntermediateCatchEvent  ::= indent "linkIntermediateCatchEvent" sp id (sp string)? (sp attrs-linkIntermediateCatchEvent)? nl
+attrs-linkIntermediateCatchEvent   ::= "{" nl (indent2 attr-line-linkIntermediateCatchEvent nl)+ indent "}"
+attr-line-linkIntermediateCatchEvent  ::= attr-linkIntermediateCatchEvent-link | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-linkIntermediateCatchEvent-link  ::= "link" sp attr-str   # The `linkEventDefinition name` a matching throw hands its token to.
 
 # task — Abstract task (also manualTask). No execution semantics — pure pass-through.
 elem-task  ::= indent "task" sp id (sp string)? (sp attrs-task)? nl

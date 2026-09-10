@@ -356,6 +356,28 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
         attrs: &[],
     },
     KindSpec {
+        keyword: "linkIntermediateThrowEvent",
+        doc: "Link throw. Has no outgoing flow; hands its token to the matching link catch \
+              (same `link`) in the same scope.",
+        attrs: &[AttrSpec {
+            key: "link",
+            required: true,
+            ty: AttrType::Str,
+            doc: "The `linkEventDefinition name` this throw hands its token to.",
+        }],
+    },
+    KindSpec {
+        keyword: "linkIntermediateCatchEvent",
+        doc: "Link catch. Has no incoming flow; activated directly by the matching link throw \
+              (same `link`), then a pass-through along its outgoing flow.",
+        attrs: &[AttrSpec {
+            key: "link",
+            required: true,
+            ty: AttrType::Str,
+            doc: "The `linkEventDefinition name` a matching throw hands its token to.",
+        }],
+    },
+    KindSpec {
         keyword: "task",
         doc: "Abstract task (also manualTask). No execution semantics — pure pass-through.",
         attrs: &[],
@@ -866,6 +888,8 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         TimerStartEvent { .. } => "timerStartEvent",
         SubProcess { .. } => "subProcess",
         IntermediateThrowEvent => "intermediateThrowEvent",
+        LinkIntermediateThrowEvent { .. } => "linkIntermediateThrowEvent",
+        LinkIntermediateCatchEvent { .. } => "linkIntermediateCatchEvent",
         Task => "task",
         ScriptTask { .. } => "scriptTask",
         CallActivity { .. } => "callActivity",
@@ -982,6 +1006,18 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
         (
             "intermediateThrowEvent",
             ElementKind::IntermediateThrowEvent,
+        ),
+        (
+            "linkIntermediateThrowEvent",
+            ElementKind::LinkIntermediateThrowEvent {
+                link_name: "hop".into(),
+            },
+        ),
+        (
+            "linkIntermediateCatchEvent",
+            ElementKind::LinkIntermediateCatchEvent {
+                link_name: "hop".into(),
+            },
         ),
         ("task", ElementKind::Task),
         (

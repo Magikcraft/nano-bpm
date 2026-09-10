@@ -602,12 +602,13 @@ fn element_kind_family(kind: &ElementKind) -> ElementFamily {
         ElementKind::TimerIntermediateCatchEvent { .. }
         | ElementKind::MessageIntermediateCatchEvent { .. }
         | ElementKind::SignalIntermediateCatchEvent { .. }
+        | ElementKind::LinkIntermediateCatchEvent { .. }
         | ElementKind::ConditionalIntermediateCatchEvent { .. } => {
             ElementFamily::IntermediateCatchEvent
         }
-        ElementKind::IntermediateThrowEvent | ElementKind::CompensationThrowEvent => {
-            ElementFamily::IntermediateThrowEvent
-        }
+        ElementKind::IntermediateThrowEvent
+        | ElementKind::LinkIntermediateThrowEvent { .. }
+        | ElementKind::CompensationThrowEvent => ElementFamily::IntermediateThrowEvent,
         ElementKind::MessageStartEvent { .. } => ElementFamily::MessageStartEvent,
         ElementKind::TimerStartEvent { .. } => ElementFamily::TimerStartEvent,
         ElementKind::SubProcess { .. } => ElementFamily::SubProcess,
