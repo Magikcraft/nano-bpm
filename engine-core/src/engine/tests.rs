@@ -7178,10 +7178,10 @@ fn process_message_start_and_boundary() -> ProcessDefinition {
 
 #[test]
 fn message_prefers_open_subscription_over_starting_a_new_instance() {
-    // Issue #1156: a message name subscribed by BOTH a message start event and
-    // an open boundary subscription on a running instance must correlate to
-    // exactly one destination. Once a subscription is open, it wins — the same
-    // publish must NOT also start a duplicate instance.
+    // Issue #1156: when a message name is subscribed by BOTH a message start
+    // event and an open boundary subscription on a running instance, the open
+    // subscription takes precedence — the same publish must NOT also start a
+    // duplicate instance.
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(process_message_start_and_boundary()))
