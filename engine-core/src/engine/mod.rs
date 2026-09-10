@@ -7024,10 +7024,12 @@ impl Engine {
         else {
             return Vec::new();
         };
-        // Conditions are evaluated in the source tool's completed scope, exactly
-        // like a sequence-flow guard elsewhere. A condition that fails to
-        // evaluate (or is non-boolean) is treated as not taken, mirroring the
-        // conservative "don't route on a broken guard" stance.
+        // Conditions are evaluated against the source tool's completed scope
+        // (`variables_for_element`), deliberately *not* the instance-level
+        // variables an exclusive-gateway guard routes on: a structured-sequence
+        // flow is guarded by what the emitting tool produced. A condition that
+        // fails to evaluate (or is non-boolean) is treated as not taken,
+        // mirroring the conservative "don't route on a broken guard" stance.
         let vars = self.variables_for_element(instance_key, child_eik);
         def.inner_flows
             .iter()
