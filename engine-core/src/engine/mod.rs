@@ -244,6 +244,25 @@ struct AgentHistoryBase {
     tenant_id: String,
 }
 
+/// The decision an ad-hoc container makes after a tool's output mappings are
+/// applied, driven by its `<completionCondition>` (ADR 0023 seam 4). Returned by
+/// [`Engine::adhoc_completion_after_tool`] so the leaf path
+/// (`complete_adhoc_tool`) and the mid-chain hand-off (`continue_adhoc_inner_flow`)
+/// share one canonical completion decision.
+enum AdHocPostTool {
+    /// The completion condition triggered — finish the container now. `cancel`
+    /// mirrors `cancelRemainingInstances`: `true` cancels any still-active tools,
+    /// `false` completes only because none remain.
+    Complete { cancel: bool },
+    /// `cancelRemainingInstances=false` with other children still active — latch
+    /// the fulfilment (emitting `fulfilled_event` the first time) and park so the
+    /// container completes as its children drain, without a new agent turn or any
+    /// further activation.
+    Defer { fulfilled_event: Option<Box<Event>> },
+    /// The completion condition did not trigger — continue normally.
+    Continue,
+}
+
 /// A unit of internal work in the processing loop — one transition of the BPMN
 /// element lifecycle.
 enum Step {
@@ -6972,6 +6991,76 @@ impl Engine {
             .cloned()
     }
 
+    /// Teardown events for a tool's dedicated inner-instance wrapper (gap #9).
+    /// Emits `ElementCompleting` + `ElementCompleted` for the wrapper ONLY when its
+    /// element id still resolves. An inner instance that has already left `active`
+    /// (but lingers via `scopes`) would otherwise complete with an empty
+    /// `element_id`, which corrupts downstream element aggregates — the same
+    /// failure mode guarded in `cancel_adhoc_active_child` and ModifyInstance
+    /// termination (regression `nested_adhoc_cancel_child_skips_already_completed_inner_instance`).
+    /// Returns an empty vec when the id is unresolvable — there is nothing to tear
+    /// down. Single source of truth for both the leaf and mid-chain tool paths.
+    fn adhoc_inner_instance_teardown(&self, instance_key: Key, inner_key: Key) -> Vec<Event> {
+        match self.element_id_of_instance(instance_key, inner_key) {
+            Some(inner_element_id) => vec![
+                Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key: inner_key,
+                    element_id: inner_element_id.clone(),
+                },
+                Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key: inner_key,
+                    element_id: inner_element_id,
+                },
+            ],
+            None => Vec::new(),
+        }
+    }
+
+    /// The follow-up sibling elements a just-completed ad-hoc tool chains into
+    /// (issue #1154): the target of each of its outgoing `inner_flows` whose
+    /// guard condition is absent or evaluates true in the tool's completed
+    /// scope. Camunda drives these "structured sequence" flows out-of-band — the
+    /// inner elements are pruned from the executable graph — so the container's
+    /// catalog is the source of truth, not the flat flow graph. Returns the
+    /// targets in document order; an empty result means the tool is a leaf of its
+    /// execution path (the container's agent job re-emits once the path drains).
+    fn adhoc_inner_flow_targets(
+        &self,
+        instance_key: Key,
+        container_element_id: &str,
+        tool_element_id: &str,
+        child_eik: Key,
+    ) -> Vec<String> {
+        // Borrow the container's catalog by reference (no clone of the def or its
+        // tool catalog) and stream-filter its `inner_flows` — this runs on every
+        // tool completion, so it stays off the hot path's allocator.
+        let Some(def) = self.process_of_instance(instance_key).and_then(|p| {
+            p.adhoc
+                .iter()
+                .find(|d| d.container_id == container_element_id)
+        }) else {
+            return Vec::new();
+        };
+        // Conditions are evaluated against the source tool's completed scope
+        // (`variables_for_element`), deliberately *not* the instance-level
+        // variables an exclusive-gateway guard routes on: a structured-sequence
+        // flow is guarded by what the emitting tool produced. A condition that
+        // fails to evaluate (or is non-boolean) is treated as not taken,
+        // mirroring the conservative "don't route on a broken guard" stance.
+        let vars = self.variables_for_element(instance_key, child_eik);
+        def.inner_flows
+            .iter()
+            .filter(|fl| fl.from == tool_element_id)
+            .filter(|fl| match &fl.condition {
+                None => true,
+                Some(cond) => matches!(cond.eval(&vars), Ok(true)),
+            })
+            .map(|fl| fl.to.clone())
+            .collect()
+    }
+
     /// The advertised tool catalog an ad-hoc container writes to its local
     /// `adHocSubProcessElements` variable on activation (Camunda
     /// `AdHocSubProcessProcessor.onActivate`): one `{ elementId, elementName }`
@@ -7087,13 +7176,18 @@ impl Engine {
         container_element_id: &str,
         tool_element_id: &str,
     ) -> crate::model::IoMapping {
-        self.adhoc_def_of(instance_key, container_element_id)
-            .and_then(|def| {
-                def.tools
+        // Borrow the container def rather than `adhoc_def_of`, which `.cloned()`s
+        // the whole `AdHocSubProcessDef` (all `tools` + `inner_flows`). This runs
+        // on every tool activation AND completion (including mid-chain), so clone
+        // only the matched tool's `io`, never the entire catalog.
+        self.process_of_instance(instance_key)
+            .and_then(|p| {
+                p.adhoc
                     .iter()
-                    .find(|t| t.element_id == tool_element_id)
-                    .map(|t| t.io.clone())
+                    .find(|d| d.container_id == container_element_id)
             })
+            .and_then(|def| def.tools.iter().find(|t| t.element_id == tool_element_id))
+            .map(|t| t.io.clone())
             .unwrap_or_default()
     }
 
@@ -7465,6 +7559,84 @@ impl Engine {
     /// accumulated results, drops it from the active set, and — once the last
     /// active tool of the turn completes — re-emits the container's agent job for
     /// the next activate-element turn (ADR 0023 seam 2).
+    /// Evaluate an ad-hoc container's `<completionCondition>` (ADR 0023 seam 4)
+    /// after one tool's output mappings have been projected into the container
+    /// scope, and decide what the container does next. Shared by the leaf path
+    /// (`complete_adhoc_tool`) and the mid-chain hand-off
+    /// (`continue_adhoc_inner_flow`) so the completion semantics cannot drift
+    /// between them.
+    ///
+    /// `output_updates` is the tool's just-applied output projection (overlaid on
+    /// the container scope for the FEEL evaluation); `others` is the number of
+    /// OTHER children still active (i.e. the active count excluding the tool that
+    /// just completed). Zeebe latches a satisfied condition (`ElementInstance
+    /// #isCompletionConditionFulfilled`), so a container that already deferred
+    /// keeps completing on drain even if a later tool no longer satisfies it.
+    fn adhoc_completion_after_tool(
+        &self,
+        instance_key: Key,
+        container_key: Key,
+        container_element_id: &str,
+        output_updates: &HashMap<String, Value>,
+        others: usize,
+    ) -> AdHocPostTool {
+        // Borrow the container's catalog entry once by reference (no clone of the
+        // def or its `tools` / `inner_flows`) and reuse it for BOTH the
+        // completion-condition evaluation and the `cancelRemainingInstances` read
+        // — this runs on every tool completion, so it stays off the hot path's
+        // allocator (mirrors `adhoc_inner_flow_targets`). A missing container has
+        // no completion condition to honour, so the chain simply continues.
+        let Some(def) = self.process_of_instance(instance_key).and_then(|p| {
+            p.adhoc
+                .iter()
+                .find(|d| d.container_id == container_element_id)
+        }) else {
+            return AdHocPostTool::Continue;
+        };
+        let completion_now = def
+            .completion_condition
+            .as_ref()
+            .map(|cond| {
+                let mut ctx = (*self.variables_for_element(instance_key, container_key)).clone();
+                ctx.extend(output_updates.iter().map(|(k, v)| (k.clone(), v.clone())));
+                matches!(crate::feel::eval_bool(cond, &ctx), Ok(true))
+            })
+            .unwrap_or(false);
+        let already_fulfilled = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+            .map(|a| a.completion_condition_fulfilled)
+            .unwrap_or(false);
+        if !(completion_now || already_fulfilled) {
+            return AdHocPostTool::Continue;
+        }
+        let cancel_remaining = def.cancel_remaining_instances;
+        if cancel_remaining {
+            // `cancelRemainingInstances=true` (the BPMN default): complete now,
+            // cancelling any tools still running this turn — exactly like a
+            // multi-instance body's early completion.
+            return AdHocPostTool::Complete { cancel: true };
+        }
+        // `cancelRemainingInstances=false`: defer container completion until no
+        // active children/flows remain (Zeebe
+        // `BpmnAdHocSubProcessBehavior#completionConditionFulfilled`). When the
+        // last outstanding tool drains, complete without cancelling; otherwise
+        // latch the fulfilment and park — no new agent turn, no further
+        // activation — so the container completes as its children drain.
+        if others == 0 {
+            return AdHocPostTool::Complete { cancel: false };
+        }
+        let fulfilled_event = (!already_fulfilled).then(|| {
+            Box::new(Event::AdHocCompletionConditionFulfilled {
+                instance_key,
+                container_key,
+            })
+        });
+        AdHocPostTool::Defer { fulfilled_event }
+    }
+
     fn complete_adhoc_tool(
         &mut self,
         instance_key: Key,
@@ -7488,6 +7660,29 @@ impl Engine {
             ),
             None => return (Vec::new(), Vec::new()),
         };
+        // Issue #1154: an ad-hoc tool connected to a follow-up sibling by a
+        // `bpmn:sequenceFlow` is NOT a leaf of its execution path — Camunda takes
+        // that flow and runs the follow-up, re-emitting the container's agent job
+        // only once the whole chain drains. So before treating this tool as a
+        // path-completing leaf (append `outputElement`, evaluate the completion
+        // condition, re-emit the agent job below), check for outgoing inner flows
+        // and, when any are taken, continue the path instead.
+        let chain_targets = self.adhoc_inner_flow_targets(
+            instance_key,
+            &container_element_id,
+            &tool_element_id,
+            child_eik,
+        );
+        if !chain_targets.is_empty() {
+            return self.continue_adhoc_inner_flow(
+                instance_key,
+                child_eik,
+                tool_element_id,
+                container_key,
+                inner_key,
+                chain_targets,
+            );
+        }
         // Collect this tool's output (evaluated in its local scope, which is still
         // resident — its `ElementCompleted` is deferred until the append is known
         // to be safe below) — an entry in the agent's accumulated
@@ -7553,9 +7748,6 @@ impl Engine {
         // dangling once the tool drains. This teardown is emitted here — after the
         // type guard — not at the top, so a deferred (incident-parked) tool keeps
         // its inner wrapper alive for the retry-on-resolve re-drive.
-        let inner_element_id = self
-            .element_id_of_instance(instance_key, inner_key)
-            .unwrap_or_default();
         let mut events = vec![
             Event::ElementCompleting {
                 instance_key,
@@ -7567,23 +7759,14 @@ impl Engine {
                 element_instance_key: child_eik,
                 element_id: tool_element_id.clone(),
             },
-            Event::ElementCompleting {
-                instance_key,
-                element_instance_key: inner_key,
-                element_id: inner_element_id.clone(),
-            },
-            Event::ElementCompleted {
-                instance_key,
-                element_instance_key: inner_key,
-                element_id: inner_element_id,
-            },
-            Event::AdHocToolCompleted {
-                instance_key,
-                container_key,
-                child_key: child_eik,
-                output,
-            },
         ];
+        events.extend(self.adhoc_inner_instance_teardown(instance_key, inner_key));
+        events.push(Event::AdHocToolCompleted {
+            instance_key,
+            container_key,
+            child_key: child_eik,
+            output,
+        });
         // Tool output mappings (ADR 0023 seam 4): project the tool's result into
         // the container scope, sourced from the container catalog (the pruned tool
         // has no element entry, so `io_outputs` cannot see it). Evaluated in the
@@ -7626,70 +7809,34 @@ impl Engine {
         }
         // Completion condition (ADR 0023 seam 4): a declared `<completionCondition>`
         // is evaluated after each tool completes, against the container scope
-        // overlaid with the output mappings just projected into it.
-        let completion_now = self
-            .adhoc_def_of(instance_key, &container_element_id)
-            .and_then(|def| def.completion_condition)
-            .map(|cond| {
-                let mut ctx = (*self.variables_for_element(instance_key, container_key)).clone();
-                ctx.extend(output_updates);
-                matches!(crate::feel::eval_bool(&cond, &ctx), Ok(true))
-            })
-            .unwrap_or(false);
-        // `active_now` still counts this child (its removal above is not yet
-        // applied), so the last tool of the turn is the one leaving one active.
+        // overlaid with the output mappings just projected into it. `active_now`
+        // still counts this child (its removal above is not yet applied), so the
+        // last tool of the turn is the one leaving one active.
         let others = active_now.saturating_sub(1);
-        // Zeebe latches a satisfied condition (`ElementInstance
-        // #isCompletionConditionFulfilled`), so a container that already deferred
-        // keeps completing on drain even if a later tool no longer satisfies it.
-        let already_fulfilled = self
-            .state
-            .instances
-            .get(&instance_key)
-            .and_then(|i| i.adhoc_instances.get(&container_key))
-            .map(|a| a.completion_condition_fulfilled)
-            .unwrap_or(false);
-        if completion_now || already_fulfilled {
-            let cancel_remaining = self
-                .adhoc_def_of(instance_key, &container_element_id)
-                .map(|d| d.cancel_remaining_instances)
-                .unwrap_or(true);
-            if cancel_remaining {
-                // `cancelRemainingInstances=true` (the BPMN default): complete now,
-                // cancelling any tools still running this turn — exactly like a
-                // multi-instance body's early completion.
+        match self.adhoc_completion_after_tool(
+            instance_key,
+            container_key,
+            &container_element_id,
+            &output_updates,
+            others,
+        ) {
+            AdHocPostTool::Complete { cancel } => {
                 return (
                     events,
                     vec![Step::CompleteAdHoc {
                         instance_key,
                         container_key,
-                        cancel: true,
+                        cancel,
                     }],
                 );
             }
-            // `cancelRemainingInstances=false`: defer container completion until no
-            // active children/flows remain (Zeebe
-            // `BpmnAdHocSubProcessBehavior#completionConditionFulfilled`). When the
-            // last outstanding tool drains, complete without cancelling; otherwise
-            // latch the fulfilment and park — no new agent turn, no further
-            // activation — so the container completes as its children drain.
-            if others == 0 {
-                return (
-                    events,
-                    vec![Step::CompleteAdHoc {
-                        instance_key,
-                        container_key,
-                        cancel: false,
-                    }],
-                );
+            AdHocPostTool::Defer { fulfilled_event } => {
+                if let Some(event) = fulfilled_event {
+                    events.push(*event);
+                }
+                return (events, Vec::new());
             }
-            if !already_fulfilled {
-                events.push(Event::AdHocCompletionConditionFulfilled {
-                    instance_key,
-                    container_key,
-                });
-            }
-            return (events, Vec::new());
+            AdHocPostTool::Continue => {}
         }
         if others == 0 {
             // The declarative (BPMN_TASK) variant activates its collection once
@@ -7724,6 +7871,162 @@ impl Engine {
             ));
         }
         (events, Vec::new())
+    }
+
+    /// Continues an ad-hoc "structured sequence" (issue #1154): a completing tool
+    /// that has one or more taken outgoing inner flows is not a leaf of its
+    /// execution path, so instead of completing the path (append `outputElement`,
+    /// re-emit the agent job) this completes the tool + its inner instance,
+    /// projects the tool's output mappings into the container scope so the
+    /// follow-up can read them, drops the tool from the active set WITHOUT
+    /// appending to `outputCollection` (the leaf appends the path's result), and
+    /// activates each follow-up sibling as a fresh tool child of the container.
+    /// The container's `<completionCondition>` is still evaluated on this
+    /// hand-off (via [`Self::adhoc_completion_after_tool`], shared with the leaf
+    /// path): if it triggers completion the sub-process ends now and the
+    /// follow-up sibling(s) are NOT activated. Otherwise the container's agent
+    /// job is NOT re-emitted mid-chain — the just-completed tool is dropped from
+    /// the active set and its follow-up sibling(s) activated in its place, so the
+    /// chain simply keeps draining. The agent job is re-emitted only once the
+    /// whole chain drains to a leaf (a tool with no taken outgoing inner flow).
+    fn continue_adhoc_inner_flow(
+        &mut self,
+        instance_key: Key,
+        child_eik: Key,
+        tool_element_id: String,
+        container_key: Key,
+        inner_key: Key,
+        targets: Vec<String>,
+    ) -> (Vec<Event>, Vec<Step>) {
+        // Resolve the container's identity and its active count from live state.
+        // The caller already early-returns when this lookup is absent, but resolve
+        // it safely here too: an empty `element_id` fallback would make
+        // `adhoc_tool_io` / the completion condition read IO mappings under the
+        // wrong container id and continue the chain with missing projections, so a
+        // genuinely missing container returns early (no events) instead. `active`
+        // still counts this completing tool (its removal is not yet applied).
+        let (container_element_id, active_now) = match self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+        {
+            Some(a) => (a.element_id.clone(), a.active.len()),
+            None => return (Vec::new(), Vec::new()),
+        };
+        let mut events = vec![
+            Event::ElementCompleting {
+                instance_key,
+                element_instance_key: child_eik,
+                element_id: tool_element_id.clone(),
+            },
+            Event::ElementCompleted {
+                instance_key,
+                element_instance_key: child_eik,
+                element_id: tool_element_id.clone(),
+            },
+        ];
+        // Tear down the tool's dedicated inner-instance wrapper (only when its id
+        // resolves — see `adhoc_inner_instance_teardown`).
+        events.extend(self.adhoc_inner_instance_teardown(instance_key, inner_key));
+        events.push(
+            // An intermediate node of a chained path is not a path completion, so
+            // `output` is `None`: nothing is appended to `outputCollection` (the
+            // leaf appends the path's result). This event drops the tool from the
+            // container's active set.
+            Event::AdHocToolCompleted {
+                instance_key,
+                container_key,
+                child_key: child_eik,
+                output: None,
+            },
+        );
+        // Tool output mappings (ADR 0023 seam 4) still project the tool's result
+        // into the container scope so the follow-up can read it — evaluated in the
+        // child's local scope while it is still resident (its `ElementCompleted`
+        // above tears the scope down only when the caller applies these events).
+        let outputs = self
+            .adhoc_tool_io(instance_key, &container_element_id, &tool_element_id)
+            .outputs;
+        let output_updates = if outputs.is_empty() {
+            HashMap::new()
+        } else {
+            let vars = self.variables_for_element(instance_key, child_eik);
+            match self.eval_io_mappings_in(&vars, &outputs) {
+                Ok(updates) => updates,
+                Err(failure) => {
+                    // A failing tool output mapping halts the tool with an incident
+                    // rather than continuing the chain with a silently-unset output
+                    // (#939); resolution re-drives its completion, re-evaluating the
+                    // chain.
+                    let event = self.io_mapping_incident(
+                        instance_key,
+                        child_eik,
+                        tool_element_id,
+                        failure,
+                        state::IoMappingRedrive::Completion,
+                    );
+                    return (vec![event], Vec::new());
+                }
+            }
+        };
+        if !output_updates.is_empty() {
+            events.extend(self.propagated_updates(
+                instance_key,
+                container_key,
+                output_updates.clone(),
+                false,
+            ));
+        }
+        // Completion condition (ADR 0023 seam 4) is evaluated after EVERY tool
+        // completes — the mid-chain hand-off is no exception. If the container's
+        // `<completionCondition>` (or a previously latched fulfilment) triggers
+        // completion now, the sub-process is ending: short-circuit and complete it
+        // rather than activating the follow-up sibling(s), which would spawn fresh
+        // tools into a container that is already completing.
+        let others = active_now.saturating_sub(1);
+        match self.adhoc_completion_after_tool(
+            instance_key,
+            container_key,
+            &container_element_id,
+            &output_updates,
+            others,
+        ) {
+            AdHocPostTool::Complete { cancel } => {
+                return (
+                    events,
+                    vec![Step::CompleteAdHoc {
+                        instance_key,
+                        container_key,
+                        cancel,
+                    }],
+                );
+            }
+            AdHocPostTool::Defer { fulfilled_event } => {
+                if let Some(event) = fulfilled_event {
+                    events.push(*event);
+                }
+                return (events, Vec::new());
+            }
+            AdHocPostTool::Continue => {}
+        }
+        // Take each outgoing inner flow and activate its target as a fresh tool
+        // child of the container, continuing the execution path.
+        let mut followups = Vec::new();
+        for target in targets {
+            events.push(Event::SequenceFlowTaken {
+                instance_key,
+                from: tool_element_id.clone(),
+                to: target.clone(),
+            });
+            followups.push(Step::ActivateAdHocTool {
+                instance_key,
+                container_key,
+                element_id: target,
+                variables: HashMap::new(),
+            });
+        }
+        (events, followups)
     }
 
     /// Builds the `JobCreated` event that (re-)emits an ad-hoc container's agent
