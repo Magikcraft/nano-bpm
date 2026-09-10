@@ -14241,7 +14241,11 @@ fn adhoc_inner_sequence_flow_chains_to_the_follow_up_tool() {
         .adhoc_instances
         .get(&container)
         .unwrap();
-    assert_eq!(adhoc.active.len(), 0, "the chain drained after the leaf toolB");
+    assert_eq!(
+        adhoc.active.len(),
+        0,
+        "the chain drained after the leaf toolB"
+    );
     assert_eq!(
         adhoc.iterations, 1,
         "the agent job re-emits exactly once — only after the whole chain drained"
@@ -14506,7 +14510,10 @@ fn adhoc_completion_condition_fires_on_the_mid_chain_handoff() {
     assert!(
         !events.iter().any(|e| matches!(
             e,
-            Event::AdHocToolCompleted { output: Some(_), .. }
+            Event::AdHocToolCompleted {
+                output: Some(_),
+                ..
+            }
         )),
         "the mid-chain short-circuit must drop the tool with output: None — a \
          cancelled path appends nothing to the outputCollection, got {events:?}"

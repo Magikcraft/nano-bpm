@@ -7018,10 +7018,11 @@ impl Engine {
         // Borrow the container's catalog by reference (no clone of the def or its
         // tool catalog) and stream-filter its `inner_flows` — this runs on every
         // tool completion, so it stays off the hot path's allocator.
-        let Some(def) = self
-            .process_of_instance(instance_key)
-            .and_then(|p| p.adhoc.iter().find(|d| d.container_id == container_element_id))
-        else {
+        let Some(def) = self.process_of_instance(instance_key).and_then(|p| {
+            p.adhoc
+                .iter()
+                .find(|d| d.container_id == container_element_id)
+        }) else {
             return Vec::new();
         };
         // Conditions are evaluated against the source tool's completed scope
@@ -7162,7 +7163,11 @@ impl Engine {
         // on every tool activation AND completion (including mid-chain), so clone
         // only the matched tool's `io`, never the entire catalog.
         self.process_of_instance(instance_key)
-            .and_then(|p| p.adhoc.iter().find(|d| d.container_id == container_element_id))
+            .and_then(|p| {
+                p.adhoc
+                    .iter()
+                    .find(|d| d.container_id == container_element_id)
+            })
             .and_then(|def| def.tools.iter().find(|t| t.element_id == tool_element_id))
             .map(|t| t.io.clone())
             .unwrap_or_default()
@@ -7563,10 +7568,11 @@ impl Engine {
         // — this runs on every tool completion, so it stays off the hot path's
         // allocator (mirrors `adhoc_inner_flow_targets`). A missing container has
         // no completion condition to honour, so the chain simply continues.
-        let Some(def) = self
-            .process_of_instance(instance_key)
-            .and_then(|p| p.adhoc.iter().find(|d| d.container_id == container_element_id))
-        else {
+        let Some(def) = self.process_of_instance(instance_key).and_then(|p| {
+            p.adhoc
+                .iter()
+                .find(|d| d.container_id == container_element_id)
+        }) else {
             return AdHocPostTool::Continue;
         };
         let completion_now = def
@@ -7604,11 +7610,12 @@ impl Engine {
         if others == 0 {
             return AdHocPostTool::Complete { cancel: false };
         }
-        let fulfilled_event =
-            (!already_fulfilled).then(|| Box::new(Event::AdHocCompletionConditionFulfilled {
+        let fulfilled_event = (!already_fulfilled).then(|| {
+            Box::new(Event::AdHocCompletionConditionFulfilled {
                 instance_key,
                 container_key,
-            }));
+            })
+        });
         AdHocPostTool::Defer { fulfilled_event }
     }
 
