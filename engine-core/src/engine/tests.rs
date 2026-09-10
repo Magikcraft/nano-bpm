@@ -9704,6 +9704,136 @@ fn output_mapping_projects_job_result() {
 }
 
 #[test]
+fn static_input_mapping_source_is_passed_through_as_literal_not_feel() {
+    // #1160: a `zeebe:input` `source` WITHOUT a leading `=` is a STATIC literal
+    // string (Zeebe parity), not a FEEL expression. Before the fix, engine-wasm
+    // 0.9.0 evaluated every source as FEEL, so `in-process` parsed as the FEEL
+    // subtraction `in - process` (incident "- not defined for null and null")
+    // and `{{secrets.FOO}}` as a malformed context ("expected a context key").
+    // Each must now merge verbatim, no incident, and the job must be offered.
+    let def = ProcessBuilder::new("io-static")
+        .start_event("s")
+        .service_task("t", "work")
+        .with_io(
+            "t",
+            crate::model::IoMapping {
+                inputs: vec![
+                    crate::model::Mapping {
+                        source: "in-process".to_string(),
+                        target: "mode".to_string(),
+                    },
+                    crate::model::Mapping {
+                        source: "{{secrets.CAMUNDA_PROVIDED_LLM_API_ENDPOINT}}".to_string(),
+                        target: "endpoint".to_string(),
+                    },
+                    crate::model::Mapping {
+                        source: "openaiCompatible".to_string(),
+                        target: "provider".to_string(),
+                    },
+                    // A static literal is passed through VERBATIM — significant
+                    // leading/trailing whitespace must be preserved, not trimmed.
+                    crate::model::Mapping {
+                        source: "  spaced value  ".to_string(),
+                        target: "padded".to_string(),
+                    },
+                    // A leading `=` still selects FEEL evaluation.
+                    crate::model::Mapping {
+                        source: "=1 + 1".to_string(),
+                        target: "sum".to_string(),
+                    },
+                ],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("e")
+        .connect("s", "t")
+        .connect("t", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let key = create_instance_key(&mut engine, "io-static");
+
+    assert!(
+        engine.active_incidents().is_empty(),
+        "static ioMapping sources must not raise incidents: {:?}",
+        engine.active_incidents()
+    );
+    assert!(!engine.is_completed(key));
+
+    // The activated job sees each mapped value: literals verbatim, FEEL evaluated.
+    let job = &engine.activate_jobs("work", "w", 1, 60_000, 0)[0];
+    assert_eq!(
+        job.variables.get("mode"),
+        Some(&Value::Str("in-process".to_string()))
+    );
+    assert_eq!(
+        job.variables.get("endpoint"),
+        Some(&Value::Str(
+            "{{secrets.CAMUNDA_PROVIDED_LLM_API_ENDPOINT}}".to_string()
+        ))
+    );
+    assert_eq!(
+        job.variables.get("provider"),
+        Some(&Value::Str("openaiCompatible".to_string()))
+    );
+    assert_eq!(
+        job.variables.get("padded"),
+        Some(&Value::Str("  spaced value  ".to_string())),
+        "a static literal source must be passed through verbatim, whitespace intact"
+    );
+    assert_eq!(job.variables.get("sum"), Some(&Value::Int(2)));
+}
+
+#[test]
+fn static_output_mapping_source_is_passed_through_as_literal_not_feel() {
+    // #1160 (output side): a `zeebe:output` `source` without a leading `=` is a
+    // static literal string too, projected verbatim at completion rather than
+    // evaluated as FEEL.
+    let def = ProcessBuilder::new("io-static-out")
+        .start_event("s")
+        .service_task("t", "work")
+        .with_io(
+            "t",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "in-process".to_string(),
+                    target: "mode".to_string(),
+                }],
+            },
+        )
+        .end_event("e")
+        .connect("s", "t")
+        .connect("t", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = create_instance_key(&mut engine, "io-static-out");
+    let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
+    let events = engine
+        .apply_command(Command::complete_job_with(job_key, HashMap::new()))
+        .unwrap();
+    assert!(
+        engine.active_incidents().is_empty(),
+        "static output mapping must not raise an incident"
+    );
+    let mapped = events.iter().any(|e| {
+        matches!(
+            e,
+            Event::VariablesUpdated { instance_key, variables }
+                if *instance_key == inst
+                    && variables.get("mode") == Some(&Value::Str("in-process".to_string()))
+        )
+    });
+    assert!(
+        mapped,
+        "output mapping should set mode='in-process'; {events:?}"
+    );
+}
+
+#[test]
 fn input_mapping_eval_failure_raises_io_mapping_incident_and_no_job() {
     // #939: an input `zeebe:ioMapping` whose SOURCE fails to evaluate (here
     // `=x + 1` with `x` bound to a string — a FEEL type error, not a bare
