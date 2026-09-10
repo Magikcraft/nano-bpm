@@ -162,8 +162,9 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   boundary), which resumes as a pass-through out its own outgoing flow. No
   synthetic sequence flow is emitted (the handoff never appears in
   `takenSequenceFlows`). Many throws may target one catch; two catches sharing a
-  link name, a throw/catch pair split across scopes, or an empty link `name` are
-  all rejected at deploy (Zeebe `verifyLinkIntermediateEvents` parity). Before
+  link name, a throw/catch pair split across scopes, an empty link `name`, or a
+  throw with an outgoing (or a catch with an incoming) sequence flow are all
+  rejected at deploy (Zeebe `verifyLinkIntermediateEvents` parity). Before
   this an unrecognised link throw silently swallowed the token and the catch never
   fired.
 - **Timer intermediate catch events** park a token mid-flow until a deadline.
