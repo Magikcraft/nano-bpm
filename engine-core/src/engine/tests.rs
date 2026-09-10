@@ -14492,6 +14492,34 @@ fn adhoc_completion_condition_fires_on_the_mid_chain_handoff() {
             .is_empty(),
         "toolB must never run — the chain was cut short by completion"
     );
+    // The mid-chain hand-off must NOT append `toolA`'s output to the
+    // `outputCollection`: with the default `cancelRemainingInstances=true`, a
+    // fulfilled completion condition CANCELS the in-flight execution path, which
+    // therefore drains no leaf and contributes no entry. `outputElement` is a
+    // per-execution-path result appended only at a leaf (see
+    // `adhoc_inner_sequence_flow_chains_to_the_follow_up_tool`); a truncated,
+    // cancelled path is not a leaf, so evaluating the container-level
+    // `outputElement` against `toolA`'s non-final scope would be wrong. Lock that
+    // `continue_adhoc_inner_flow` hands off with `output: None` even when the
+    // condition short-circuits — guarding against a future refactor silently
+    // collecting the cancelled tool's partial result ("A").
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::AdHocToolCompleted { output: Some(_), .. }
+        )),
+        "the mid-chain short-circuit must drop the tool with output: None — a \
+         cancelled path appends nothing to the outputCollection, got {events:?}"
+    );
+    assert!(
+        !matches!(
+            engine.instance(inst).unwrap().variables.get("results"),
+            Some(Value::List(v)) if v.contains(&Value::Str("A".into()))
+        ),
+        "toolA's result must never reach the outputCollection when the completion \
+         condition short-circuits the chain, got {:?}",
+        engine.instance(inst).unwrap().variables.get("results")
+    );
 }
 
 fn adhoc_agent_with_embedded_subprocess_tool() -> ProcessDefinition {
