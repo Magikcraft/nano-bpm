@@ -10471,10 +10471,13 @@ impl Engine {
     /// Resolves the matching link *catch* element for a link *throw*: the
     /// [`LinkIntermediateCatchEvent`](crate::model::ElementKind::LinkIntermediateCatchEvent)
     /// with the same `link_name` in the same scope (`parent`) as the throw. Deploy
-    /// validation guarantees a matching, unique catch exists, so a well-formed
-    /// model always resolves; a same-scope catch is preferred, falling back to any
-    /// catch of that name so the token is never silently dropped. Returns the
-    /// catch element id, or `None` when the process/element is unknown.
+    /// validation guarantees a matching, unique, **same-scope** catch exists (a
+    /// cross-scope or empty-named pairing is rejected at deploy), so a well-formed
+    /// model always resolves. Only a same-scope catch is returned: activating a
+    /// different-scope catch in the throw's runtime scope would corrupt variable
+    /// scoping, so that is never done. Returns the catch element id, or `None`
+    /// when the process/element is unknown or (defensively) no same-scope catch
+    /// exists.
     fn resolve_link_catch(
         &self,
         instance_key: Key,
@@ -10483,18 +10486,14 @@ impl Engine {
     ) -> Option<String> {
         let def = self.process_of_instance(instance_key)?;
         let throw_parent = def.element(throw_id).and_then(|e| e.parent.clone());
-        let mut fallback: Option<&str> = None;
         for element in def.elements.values() {
             if let ElementKind::LinkIntermediateCatchEvent { link_name: name } = &element.kind {
-                if name == link_name {
-                    if element.parent == throw_parent {
-                        return Some(element.id.clone());
-                    }
-                    fallback.get_or_insert(element.id.as_str());
+                if name == link_name && element.parent == throw_parent {
+                    return Some(element.id.clone());
                 }
             }
         }
-        fallback.map(str::to_string)
+        None
     }
 
     /// Whether the process instance owning `instance_key` is currently

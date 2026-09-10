@@ -39,7 +39,7 @@
 //! [`crate::bpmn`]'s streaming parser, `validate/mod.rs`, or the `ParseError`
 //! enum.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::ValidationInput;
 use crate::bpmn::ParseError;
@@ -92,12 +92,24 @@ pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
     }
 
     // Link pairing: every intermediate *throw* link must have a matching
-    // intermediate *catch* link of the same name in the process, and no two
-    // catch links may share a name — an ambiguous target is rejected at deploy
-    // (Zeebe `ModelUtil.verifyLinkIntermediateEvents`).
-    let mut catch_names: HashSet<&str> = HashSet::new();
-    for catch_name in &capture.link_catches {
-        if !catch_names.insert(catch_name.as_str()) {
+    // intermediate *catch* link of the same name **in the same scope**, and no
+    // two catch links may share a name — an ambiguous target is rejected at
+    // deploy (Zeebe `ModelUtil.verifyLinkIntermediateEvents`). An empty link
+    // name is malformed and rejected outright (Zeebe requires a non-empty
+    // `name`), so a missing/blank name can never route silently under "".
+    let mut catch_scopes: HashMap<&str, Option<&str>> = HashMap::new();
+    for (catch_name, catch_scope) in &capture.link_catches {
+        if catch_name.trim().is_empty() {
+            return Err(ParseError::InvalidProcess {
+                process_id: capture.process_id.clone(),
+                reason: "intermediate catch link event with an empty link name is not allowed"
+                    .to_string(),
+            });
+        }
+        if catch_scopes
+            .insert(catch_name.as_str(), catch_scope.as_deref())
+            .is_some()
+        {
             return Err(ParseError::InvalidProcess {
                 process_id: capture.process_id.clone(),
                 reason: format!(
@@ -106,14 +118,36 @@ pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
             });
         }
     }
-    for (throw_name, from_node) in &capture.link_throws {
-        if !catch_names.contains(throw_name.as_str()) {
-            return Err(ParseError::UnresolvedReference {
-                kind: "linkThrow".to_string(),
-                id: throw_name.clone(),
+    for (throw_name, from_node, throw_scope) in &capture.link_throws {
+        if throw_name.trim().is_empty() {
+            return Err(ParseError::InvalidProcess {
                 process_id: capture.process_id.clone(),
-                from_node: from_node.clone(),
+                reason: "intermediate throw link event with an empty link name is not allowed"
+                    .to_string(),
             });
+        }
+        match catch_scopes.get(throw_name.as_str()) {
+            None => {
+                return Err(ParseError::UnresolvedReference {
+                    kind: "linkThrow".to_string(),
+                    id: throw_name.clone(),
+                    process_id: capture.process_id.clone(),
+                    from_node: from_node.clone(),
+                });
+            }
+            // A throw and its catch must live in the same scope: link events do
+            // not cross a (sub)process boundary. A cross-scope pair would let the
+            // runtime activate the catch in the throw's scope, corrupting
+            // variable scoping — reject it here so that can never happen.
+            Some(catch_scope) if *catch_scope != throw_scope.as_deref() => {
+                return Err(ParseError::InvalidProcess {
+                    process_id: capture.process_id.clone(),
+                    reason: format!(
+                        "intermediate throw link event '{throw_name}' and its matching catch link event are in different scopes; link events must be paired within the same scope"
+                    ),
+                });
+            }
+            Some(_) => {}
         }
     }
 
@@ -271,6 +305,91 @@ mod tests {
                 "unexpected reason: {reason}"
             ),
             other => panic!("expected InvalidProcess for duplicate catch link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_an_empty_catch_link_name() {
+        // A catch link with a missing/blank `name` (parsed as "") is malformed:
+        // it would route under an empty link name. Zeebe requires a non-empty
+        // name, so reject it at deploy rather than deploy a silently-broken model.
+        let xml = model(
+            "",
+            r#"<bpmn:startEvent id="s"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+               <bpmn:intermediateCatchEvent id="cat">
+                 <bpmn:outgoing>b</bpmn:outgoing>
+                 <bpmn:linkEventDefinition/>
+               </bpmn:intermediateCatchEvent>
+               <bpmn:endEvent id="e"><bpmn:incoming>b</bpmn:incoming></bpmn:endEvent>
+               <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="cat"/>
+               <bpmn:sequenceFlow id="b" sourceRef="cat" targetRef="e"/>"#,
+        );
+        match parse_bpmn(&xml) {
+            Err(ParseError::InvalidProcess { reason, .. }) => assert!(
+                reason.contains("catch link event with an empty link name"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("expected InvalidProcess for empty catch link name, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_an_empty_throw_link_name() {
+        // A throw link with a missing/blank `name` (parsed as "") is likewise
+        // malformed and rejected at deploy.
+        let xml = model(
+            "",
+            r#"<bpmn:startEvent id="s"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+               <bpmn:intermediateThrowEvent id="thr">
+                 <bpmn:incoming>a</bpmn:incoming>
+                 <bpmn:linkEventDefinition/>
+               </bpmn:intermediateThrowEvent>
+               <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="thr"/>"#,
+        );
+        match parse_bpmn(&xml) {
+            Err(ParseError::InvalidProcess { reason, .. }) => assert!(
+                reason.contains("throw link event with an empty link name"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("expected InvalidProcess for empty throw link name, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_a_cross_scope_link_pairing() {
+        // A throw at the process root and its only same-named catch nested inside
+        // an embedded subprocess are in *different* scopes. Link events do not
+        // cross a (sub)process boundary, so pairing them is rejected at deploy —
+        // this prevents the runtime from ever activating a different-scope catch
+        // in the throw's scope (which would corrupt variable scoping).
+        let xml = model(
+            "",
+            r#"<bpmn:startEvent id="s"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+               <bpmn:intermediateThrowEvent id="thr">
+                 <bpmn:incoming>a</bpmn:incoming>
+                 <bpmn:linkEventDefinition name="L1"/>
+               </bpmn:intermediateThrowEvent>
+               <bpmn:subProcess id="Sub">
+                 <bpmn:startEvent id="innerStart"><bpmn:outgoing>i1</bpmn:outgoing></bpmn:startEvent>
+                 <bpmn:intermediateCatchEvent id="cat">
+                   <bpmn:incoming>i1</bpmn:incoming>
+                   <bpmn:outgoing>i2</bpmn:outgoing>
+                   <bpmn:linkEventDefinition name="L1"/>
+                 </bpmn:intermediateCatchEvent>
+                 <bpmn:endEvent id="innerEnd"><bpmn:incoming>i2</bpmn:incoming></bpmn:endEvent>
+                 <bpmn:sequenceFlow id="i1" sourceRef="innerStart" targetRef="cat"/>
+                 <bpmn:sequenceFlow id="i2" sourceRef="cat" targetRef="innerEnd"/>
+               </bpmn:subProcess>
+               <bpmn:endEvent id="e"><bpmn:incoming>b</bpmn:incoming></bpmn:endEvent>
+               <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="thr"/>
+               <bpmn:sequenceFlow id="b" sourceRef="Sub" targetRef="e"/>"#,
+        );
+        match parse_bpmn(&xml) {
+            Err(ParseError::InvalidProcess { reason, .. }) => assert!(
+                reason.contains("different scopes"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("expected InvalidProcess for cross-scope link pairing, got {other:?}"),
         }
     }
 

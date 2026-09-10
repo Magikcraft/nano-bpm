@@ -942,11 +942,13 @@ fn parse_with_captures(
                                 let link_name = attr(attrs, "name").unwrap_or("").to_string();
                                 if let Some(idx) = cur_throw {
                                     let from_node = acc.nodes[idx].id.clone();
+                                    let scope = acc.nodes[idx].parent.clone();
                                     acc.nodes[idx].link_name = Some(link_name.clone());
-                                    acc.link_throws.push((link_name, from_node));
+                                    acc.link_throws.push((link_name, from_node, scope));
                                 } else if let Some(idx) = cur_intermediate {
+                                    let scope = acc.nodes[idx].parent.clone();
                                     acc.nodes[idx].link_name = Some(link_name.clone());
-                                    acc.link_catches.push(link_name);
+                                    acc.link_catches.push((link_name, scope));
                                 }
                             }
                             "messageEventDefinition" => {
@@ -2163,13 +2165,15 @@ struct ProcessAcc {
     /// error_ref)`. Boundary `errorRef`s are resolved in `build`; these are the
     /// extra sites the reference-integrity validator (#851) generalises over.
     error_refs_extra: Vec<(String, String)>,
-    /// `(link name, throwing element id)` for each `linkEventDefinition` on an
-    /// intermediate *throw* event (consumed by #851's throw↔catch pairing
-    /// check; the element id is the `from_node` on a rejected unpaired throw).
-    link_throws: Vec<(String, String)>,
+    /// `(link name, throwing element id, enclosing scope)` for each
+    /// `linkEventDefinition` on an intermediate *throw* event (consumed by #851's
+    /// throw↔catch pairing check; the element id is the `from_node` on a rejected
+    /// unpaired throw, and the scope enforces same-scope pairing at deploy).
+    link_throws: Vec<(String, String, Option<String>)>,
     /// Link names declared on `linkEventDefinition`s of intermediate *catch*
-    /// events (consumed by #851's throw↔catch pairing check).
-    link_catches: Vec<String>,
+    /// events, paired with their enclosing scope (consumed by #851's throw↔catch
+    /// pairing check).
+    link_catches: Vec<(String, Option<String>)>,
     /// Flow-element tags / event definitions the streaming parser does not
     /// model, recorded as `(tag, element_id)` instead of being silently
     /// dropped. `element_id` is the tag's own `id`, or — when the tag is
