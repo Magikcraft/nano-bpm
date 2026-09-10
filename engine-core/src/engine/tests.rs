@@ -14281,6 +14281,121 @@ fn adhoc_inner_sequence_flow_chains_to_the_follow_up_tool() {
     );
 }
 
+fn adhoc_agent_chained_tools_completion_condition_process() -> ProcessDefinition {
+    // Like `adhoc_agent_chained_tools_process` (the `toolA -> toolB` structured
+    // sequence, issue #1154) but the container also declares a
+    // `<completionCondition>=done = true`. When `toolA` completes with
+    // `done = true`, the container's completion condition fires MID-CHAIN: the
+    // sub-process must complete at once rather than take `toolA`'s outgoing flow
+    // and activate the follow-up `toolB`.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:completionCondition>=done = true</bpmn:completionCondition>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="toolA-type" />
+              </bpmn:extensionElements>
+              <bpmn:outgoing>chain</bpmn:outgoing>
+            </bpmn:serviceTask>
+            <bpmn:sequenceFlow id="chain" sourceRef="toolA" targetRef="toolB" />
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="toolB-type" />
+              </bpmn:extensionElements>
+              <bpmn:incoming>chain</bpmn:incoming>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+/// Regression for the PR #1164 review: a fulfilled `<completionCondition>` must
+/// be honoured on the MID-CHAIN hand-off, not just on a leaf tool. Before the
+/// fix `complete_adhoc_tool` early-returned into `continue_adhoc_inner_flow`
+/// whenever a tool had an outgoing inner flow, skipping ALL completion-condition
+/// handling — so a container whose condition became true after `toolA` would
+/// still take the flow and activate `toolB` instead of completing. This drives
+/// the reproduction: activate `toolA` alone, complete it with `done = true`, and
+/// assert the container completes at once, the `toolA -> toolB` flow is NOT
+/// taken, and `toolB` never runs.
+#[test]
+fn adhoc_completion_condition_fires_on_the_mid_chain_handoff() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_chained_tools_completion_condition_process(),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+
+    // Turn 1: the agent activates ONLY `toolA` (the head of the chain).
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // Complete `toolA` returning `done = true`: the completion condition fires on
+    // the hand-off, so the flow to `toolB` must NOT be taken.
+    let tool_a = engine
+        .activate_jobs("toolA-type", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolA")
+        .expect("toolA job emitted");
+    let events = engine
+        .apply_command(Command::complete_job_with(
+            tool_a.key,
+            HashMap::from([
+                ("done".to_string(), Value::Bool(true)),
+                ("result".to_string(), Value::Str("A".into())),
+            ]),
+        ))
+        .unwrap();
+
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "toolA" && to == "toolB"
+        )),
+        "a fulfilled completion condition must short-circuit the chain — \
+         toolA's outgoing flow to toolB must NOT be taken, got {events:?}"
+    );
+    assert!(
+        engine.is_completed(inst),
+        "the container completes at once when its completion condition fires \
+         on the mid-chain hand-off"
+    );
+    assert!(
+        engine
+            .activate_jobs("toolB-type", "W", 10, 1_000, 0)
+            .is_empty(),
+        "toolB must never run — the chain was cut short by completion"
+    );
+}
+
 fn adhoc_agent_with_embedded_subprocess_tool() -> ProcessDefinition {
     // A JOB_WORKER ad-hoc container whose tool `review` is a plain embedded
     // `bpmn:subProcess` with a MULTI-ELEMENT token-flow body
