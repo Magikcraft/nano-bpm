@@ -44,18 +44,25 @@ import init, { TestEngine } from "@nanobpm/engine-wasm";
 await init();                       // instantiate the wasm module
 const engine = new TestEngine();
 
-engine.deploy(bpmnXml);             // deploy a BPMN diagram
+engine.deploy(bpmnXml);             // deploy a BPMN diagram (or a DMN decision)
 const handle = engine.createInstance("my-process", "{}");
 const snap = JSON.parse(engine.snapshot());   // live primary state
 const trace = JSON.parse(engine.events());    // the event log
 engine.reset();                     // back to a clean engine
 ```
 
-The lean surface covers primary state and execution: `deploy`, `createInstance`,
+The lean surface covers primary state and execution: `deploy`, `deployDecision`,
+`evaluateDecision`, `createInstance`,
 `snapshot`, `events`, `replayEvents`, job ops (`activateJobs`, `completeJob`, `failJob`,
 `updateRetries`, `updateTimeout`, `throwError`), user-task ops (`completeUserTask`,
 `assignUserTask`, …), messaging/signals, the virtual clock (`advanceTime`,
 `tickNow`), and `reset`. It links **no** SQLite / read-model code.
+
+`deploy` accepts **either** a BPMN process **or** a DMN decision resource: a
+document with no BPMN `<process>` is routed to decision deployment (equivalent to
+calling `deployDecision`), so a `businessRuleTask` carrying a
+`zeebe:calledDecision` can resolve its decision. `evaluateDecision(decisionId,
+variablesJson)` evaluates a deployed decision standalone.
 
 ### Optional job leasing and agent history
 
