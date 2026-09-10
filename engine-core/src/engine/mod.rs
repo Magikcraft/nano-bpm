@@ -7155,13 +7155,14 @@ impl Engine {
         container_element_id: &str,
         tool_element_id: &str,
     ) -> crate::model::IoMapping {
-        self.adhoc_def_of(instance_key, container_element_id)
-            .and_then(|def| {
-                def.tools
-                    .iter()
-                    .find(|t| t.element_id == tool_element_id)
-                    .map(|t| t.io.clone())
-            })
+        // Borrow the container def rather than `adhoc_def_of`, which `.cloned()`s
+        // the whole `AdHocSubProcessDef` (all `tools` + `inner_flows`). This runs
+        // on every tool activation AND completion (including mid-chain), so clone
+        // only the matched tool's `io`, never the entire catalog.
+        self.process_of_instance(instance_key)
+            .and_then(|p| p.adhoc.iter().find(|d| d.container_id == container_element_id))
+            .and_then(|def| def.tools.iter().find(|t| t.element_id == tool_element_id))
+            .map(|t| t.io.clone())
             .unwrap_or_default()
     }
 
