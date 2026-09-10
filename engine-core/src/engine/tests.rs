@@ -9750,7 +9750,10 @@ fn static_output_mapping_source_is_passed_through_as_literal_not_feel() {
                     && variables.get("mode") == Some(&Value::Str("in-process".to_string()))
         )
     });
-    assert!(mapped, "output mapping should set mode='in-process'; {events:?}");
+    assert!(
+        mapped,
+        "output mapping should set mode='in-process'; {events:?}"
+    );
 }
 
 #[test]
