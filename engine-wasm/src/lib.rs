@@ -167,8 +167,8 @@ impl TestEngine {
     /// both (issue #1158). A BPMN process resource deploys as before and returns
     /// `{ "processIds": [...], "snapshot": {...} }`. A DMN decision resource (no
     /// `<process>` element) is routed to decision deployment and returns the same
-    /// shape as [`Self::deploy_decision`]
-    /// (`{ "decisionRequirementsId": ..., "decisions": [...], "snapshot": {...} }`),
+    /// shape as the `deployDecision` method
+    /// (`{ "decisionRequirementsId": ..., "decisionRequirementsKey": ..., "version": N, "decisions": [{ "decisionId", "decisionName", "decisionKey", "version" }], "snapshot": {...} }`),
     /// so a `zeebe:calledDecision` on a business rule task can finally resolve.
     /// On failure it throws a JS error carrying the parse/deploy message for the
     /// format the document most resembles.
@@ -242,15 +242,23 @@ impl TestEngine {
                 .decisions
                 .iter()
                 .map(|d| {
-                    let identity = state.decisions.get(&d.id);
-                    serde_json::json!({
+                    // Every <decision> in a successfully-deployed DRG must be
+                    // registered; a missing identity is a deploy bug, so fail
+                    // loudly rather than silently emitting null key/version.
+                    let identity = state.decisions.get(&d.id).ok_or_else(|| {
+                        js_err(&format!(
+                            "deploy error: decision '{}' was not registered after deploy",
+                            d.id
+                        ))
+                    })?;
+                    Ok(serde_json::json!({
                         "decisionId": d.id,
                         "decisionName": d.name,
-                        "decisionKey": identity.map(|x| x.key.to_string()),
-                        "version": identity.map(|x| x.version),
-                    })
+                        "decisionKey": identity.key.to_string(),
+                        "version": identity.version,
+                    }))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, JsValue>>()?;
             (deployed.key, deployed.version, decisions)
         };
         let snapshot = self.snapshot_value(None);

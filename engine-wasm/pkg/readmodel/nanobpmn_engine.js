@@ -607,8 +607,8 @@ export class TestEngine {
      * both (issue #1158). A BPMN process resource deploys as before and returns
      * `{ "processIds": [...], "snapshot": {...} }`. A DMN decision resource (no
      * `<process>` element) is routed to decision deployment and returns the same
-     * shape as [`Self::deploy_decision`]
-     * (`{ "decisionRequirementsId": ..., "decisions": [...], "snapshot": {...} }`),
+     * shape as the `deployDecision` method
+     * (`{ "decisionRequirementsId": ..., "decisionRequirementsKey": ..., "version": N, "decisions": [{ "decisionId", "decisionName", "decisionKey", "version" }], "snapshot": {...} }`),
      * so a `zeebe:calledDecision` on a business rule task can finally resolve.
      * On failure it throws a JS error carrying the parse/deploy message for the
      * format the document most resembles.
