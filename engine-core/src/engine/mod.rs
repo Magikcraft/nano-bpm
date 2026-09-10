@@ -6969,24 +6969,23 @@ impl Engine {
         tool_element_id: &str,
         child_eik: Key,
     ) -> Vec<String> {
-        let Some(def) = self.adhoc_def_of(instance_key, container_element_id) else {
+        // Borrow the container's catalog by reference (no clone of the def or its
+        // tool catalog) and stream-filter its `inner_flows` — this runs on every
+        // tool completion, so it stays off the hot path's allocator.
+        let Some(def) = self
+            .process_of_instance(instance_key)
+            .and_then(|p| p.adhoc.iter().find(|d| d.container_id == container_element_id))
+        else {
             return Vec::new();
         };
-        let outgoing: Vec<&crate::model::AdHocInnerFlow> = def
-            .inner_flows
-            .iter()
-            .filter(|fl| fl.from == tool_element_id)
-            .collect();
-        if outgoing.is_empty() {
-            return Vec::new();
-        }
         // Conditions are evaluated in the source tool's completed scope, exactly
         // like a sequence-flow guard elsewhere. A condition that fails to
         // evaluate (or is non-boolean) is treated as not taken, mirroring the
         // conservative "don't route on a broken guard" stance.
         let vars = self.variables_for_element(instance_key, child_eik);
-        outgoing
-            .into_iter()
+        def.inner_flows
+            .iter()
+            .filter(|fl| fl.from == tool_element_id)
             .filter(|fl| match &fl.condition {
                 None => true,
                 Some(cond) => matches!(cond.eval(&vars), Ok(true)),
@@ -7780,9 +7779,11 @@ impl Engine {
     /// container scope so the follow-up can read them, drops the tool from the
     /// active set WITHOUT appending to `outputCollection` (the leaf appends the
     /// path's result), and activates each follow-up sibling as a fresh tool child
-    /// of the container. The active count stays stable across the hand-off, so the
-    /// container's agent job is NOT re-emitted mid-chain — only once the whole
-    /// chain drains to a leaf.
+    /// of the container. The container's agent job is NOT re-emitted mid-chain:
+    /// the just-completed tool is dropped from the active set and its follow-up
+    /// sibling(s) activated in its place, so the chain simply keeps draining. The
+    /// agent job is re-emitted only once the whole chain drains to a leaf (a tool
+    /// with no taken outgoing inner flow).
     fn continue_adhoc_inner_flow(
         &mut self,
         instance_key: Key,
