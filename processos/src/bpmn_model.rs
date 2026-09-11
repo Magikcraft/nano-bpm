@@ -951,23 +951,29 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
         // Join hazards (heuristic, via ancestry).
         if matches!(kind, ElementKind::ParallelGateway) && def.incoming_count(id) > 1 {
             let anc = ancestors(id, &rev);
-            let exclusive_split_upstream = anc.iter().any(|a| {
+            let conditional_split_upstream = anc.iter().any(|a| {
                 def.elements
                     .get(a)
                     .map(|e| {
-                        matches!(e.kind, ElementKind::ExclusiveGateway) && e.outgoing.len() > 1
+                        // A condition-routed split (XOR or OR) may activate only
+                        // some of its outgoing branches, so a downstream parallel
+                        // (AND) join that waits for all of them can deadlock.
+                        matches!(
+                            e.kind,
+                            ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway
+                        ) && e.outgoing.len() > 1
                     })
                     .unwrap_or(false)
             });
-            if exclusive_split_upstream {
+            if conditional_split_upstream {
                 findings.push(finding(
                     "info",
                     "parallel-join-may-deadlock",
                     Some(id),
                     format!(
-                        "Parallel (AND) join '{id}' waits for all incoming branches, but an \
-                         exclusive split upstream may activate only some of them — risk of a \
-                         token waiting forever. Verify branch arrival in the traces."
+                        "Parallel (AND) join '{id}' waits for all incoming branches, but a \
+                         conditional (XOR/OR) split upstream may activate only some of them — \
+                         risk of a token waiting forever. Verify branch arrival in the traces."
                     ),
                 ));
             }
@@ -4166,6 +4172,56 @@ mod tests {
                     && f["element"] == gw_id
                     && f["severity"] == "warn"),
                 "expected gateway-no-default for {kw} '{gw_id}', got: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn analyze_model_flags_a_parallel_join_fed_by_a_conditional_split() {
+        // A parallel (AND) join waits for ALL its incoming branches, but a
+        // condition-routed split upstream — exclusive (XOR) OR inclusive (OR) —
+        // may activate only some of them, so the join can wait forever. The
+        // `parallel-join-may-deadlock` heuristic must fire for both split kinds
+        // (regression: it originally recognised only the exclusive split).
+        for kw in ["exclusiveGateway", "inclusiveGateway"] {
+            let bpmn = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="d">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:{kw} id="Split">
+      <bpmn:incoming>a</bpmn:incoming>
+      <bpmn:outgoing>hi</bpmn:outgoing>
+      <bpmn:outgoing>lo</bpmn:outgoing>
+    </bpmn:{kw}>
+    <bpmn:task id="Ta"><bpmn:incoming>hi</bpmn:incoming><bpmn:outgoing>ja</bpmn:outgoing></bpmn:task>
+    <bpmn:task id="Tb"><bpmn:incoming>lo</bpmn:incoming><bpmn:outgoing>jb</bpmn:outgoing></bpmn:task>
+    <bpmn:parallelGateway id="Join">
+      <bpmn:incoming>ja</bpmn:incoming>
+      <bpmn:incoming>jb</bpmn:incoming>
+      <bpmn:outgoing>done</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:endEvent id="E"><bpmn:incoming>done</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="a" sourceRef="S" targetRef="Split"/>
+    <bpmn:sequenceFlow id="hi" sourceRef="Split" targetRef="Ta">
+      <bpmn:conditionExpression>= x &gt;= 1</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="lo" sourceRef="Split" targetRef="Tb">
+      <bpmn:conditionExpression>= x &lt; 1</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="ja" sourceRef="Ta" targetRef="Join"/>
+    <bpmn:sequenceFlow id="jb" sourceRef="Tb" targetRef="Join"/>
+    <bpmn:sequenceFlow id="done" sourceRef="Join" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#
+            );
+            let v = analyze_model(&bpmn).expect("analyze");
+            let findings = v["findings"].as_array().unwrap();
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f["code"] == "parallel-join-may-deadlock" && f["element"] == "Join"),
+                "expected parallel-join-may-deadlock for {kw} split feeding 'Join', got: {v}"
             );
         }
     }
