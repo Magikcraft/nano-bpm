@@ -4728,6 +4728,96 @@ fn early_multi_instance_completion_terminates_running_call_activity_callees() {
     );
 }
 
+/// Issue #1170 regression — an EARLY multi-instance completion (satisfied
+/// `completionCondition`) that cancels a still-running embedded SUB-PROCESS child
+/// must tear down that child's whole INNER scope (its inner job, timers, nested
+/// tokens), not just the child's own sub-process token. The leaf-only
+/// `cancel_mi_child_events` reaches only resources owned directly by the child
+/// element instance, so a sub-process child's inner job would otherwise be
+/// orphaned — leaving the process `Active` forever even though the loop
+/// "completed" early. The early-cancel path must sweep descendants (mirroring the
+/// interrupting-boundary teardown) before completing the child.
+#[test]
+fn early_multi_instance_completion_tears_down_a_running_subprocess_child_scope() {
+    // start -> each(MI sub[ sub_start -> inner("work") -> sub_end ]) -> sink -> done
+    // parallel MI, completionCondition = true (fires as soon as ONE child drains),
+    // leaving the sibling sub-process child's inner job running to be cancelled.
+    let def = ProcessBuilder::new("mi-sub-early")
+        .start_event("start")
+        .sub_process("each", "sub_start")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: Some("=true".to_string()),
+                sequential: false,
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "each")
+        .service_task("inner", "work")
+        .contained_in("inner", "each")
+        .end_event("sub_end")
+        .contained_in("sub_end", "each")
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-sub-early",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let jobs = engine.activate_jobs("work", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 2, "each MI sub-process child runs an inner job");
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+
+    // Completing ONE inner job drains that child's sub-process and satisfies the
+    // completion condition, ending the body early. The sibling child's inner job
+    // must be cancelled with its scope — not orphaned.
+    let sibling = jobs[1].key;
+    engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+
+    assert_eq!(
+        engine.state().jobs[&sibling].state,
+        state::JobState::Canceled,
+        "the still-running sub-process child's inner job is cancelled on early completion (#1170)"
+    );
+    assert!(
+        !engine.pending_jobs().iter().any(|j| j.job_type == "work"),
+        "no inner job leaks past the early completion"
+    );
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the loop's runtime record is cleared"
+    );
+    // The body completed early and advanced to `sink` — the instance is legitimately
+    // parked on the sink job, NOT wedged Active by an orphaned inner job.
+    assert!(
+        engine
+            .pending_jobs()
+            .iter()
+            .any(|j| j.job_type == "sink-work"),
+        "the early completion advances the body to its outgoing flow (`sink`)"
+    );
+}
+
 /// Issue #1170 regression — when an interrupting boundary fires while the MI body
 /// is parked on its own `start` execution-listener job (the boundary is armed
 /// BEFORE the start-listener gate), the body-level listener job must be

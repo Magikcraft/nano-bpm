@@ -6804,6 +6804,26 @@ impl Engine {
             if self.is_adhoc_container(instance_key, *child) {
                 events.extend(self.cancel_adhoc_active_child(instance_key, body_key, *child));
             } else {
+                // A non-ad-hoc MI child may itself be an embedded SUB-PROCESS that
+                // opened its OWN token scope with an inner flow (inner jobs, timers,
+                // nested scopes, open user tasks, call-activity children) running
+                // under `child`. `cancel_mi_child_events` sweeps only resources
+                // owned DIRECTLY by the child element instance, so tearing a
+                // sub-process child down with the leaf path alone would leave its
+                // inner job/scope active — orphaning the inner work and keeping the
+                // parent process `Active` (the completion condition fires but the
+                // instance never ends). Mirror the interrupting-boundary teardown:
+                // sweep every descendant token first via `scope_teardown_events`
+                // (which also resolves descendant incidents, resets parallel joins,
+                // drops nested MI/ad-hoc records, terminates call-activity children
+                // and clears scoped compensation) — a leaf child has no
+                // descendants, so it returns nothing and the leaf behaviour is
+                // byte-identical — then mark the scope torn down for this drain so a
+                // still-queued inner activation cannot recreate a token inside the
+                // dead scope (the per-drain dead-scope guard), and finally complete
+                // the child element instance itself (#1170).
+                events.extend(self.scope_teardown_events(instance_key, *child));
+                self.torn_down_scopes.insert(*child);
                 events.extend(self.cancel_mi_child_events(instance_key, *child));
             }
         }
