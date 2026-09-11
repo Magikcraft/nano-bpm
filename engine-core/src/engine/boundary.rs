@@ -714,6 +714,22 @@ impl Engine {
             // `MultiInstanceCompleted` only for a *nested* MI body it finds among
             // the descendants, never for the scope root itself, so this is the
             // body's own clear.
+            //
+            // Cancel the body's OWN execution-listener job first, if one is live.
+            // The boundary is armed before the body's `start`-listener gate
+            // (`run_mi_body_activation`), and the body parks on a start/end
+            // listener job while its chain runs, so firing during a listener would
+            // otherwise leave that job live on a removed body — mirrors the ad-hoc
+            // container branch below.
+            if let Some(job_key) = self.active_job_on(element_instance_key) {
+                self.emit(
+                    log,
+                    Event::JobCanceled {
+                        job_key,
+                        instance_key,
+                    },
+                );
+            }
             self.terminate_subprocess_scope(log, instance_key, element_instance_key);
             self.emit(
                 log,

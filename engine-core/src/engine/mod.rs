@@ -6385,6 +6385,21 @@ impl Engine {
                         output_collection: def.output_collection.clone(),
                         output_element: def.output_element.clone(),
                     });
+                    // Seed the container's `outputCollection` to an empty array as
+                    // a local variable the moment it activates (Zeebe
+                    // `AdHocSubProcessProcessor.onActivate`), exactly like the
+                    // normally-activated container path (`activate`). This local
+                    // list is the single source of truth `complete_adhoc_tool`
+                    // appends each tool result to; without it, an MI ad-hoc child
+                    // with `outputCollection="r"` silently loses every tool result
+                    // and container completion falls back to an empty array.
+                    if let Some(name) = def.output_collection.clone() {
+                        events.push(Event::ScopedVariablesUpdated {
+                            instance_key,
+                            scope_key: child_key,
+                            variables: HashMap::from([(name, Value::List(Vec::new()))]),
+                        });
+                    }
                     let mut catalog_var = HashMap::new();
                     catalog_var.insert(
                         "adHocSubProcessElements".to_string(),
@@ -6505,12 +6520,25 @@ impl Engine {
     /// decides what comes next — fire the completion condition (complete the body
     /// early), spawn the next child (sequential), or complete the body once every
     /// child has finished (parallel).
+    ///
+    /// `output_overlay` carries the produced outputs of a child whose results do
+    /// NOT live in its own element-instance scope: a CALL-ACTIVITY child parks its
+    /// token on a distinct callee process instance, so its propagated child
+    /// variables (and the activity's output-mapping result) are passed here as an
+    /// already-projected overlay (the caller, `complete_call_activity`, applies the
+    /// activity's `zeebe:output` itself against the callee variables). When `Some`,
+    /// the overlay is laid over the child's scope view for the `output_element`
+    /// evaluation and the element's own `zeebe:output` mappings are NOT re-applied
+    /// here (the caller already did). When `None` (service-task / sub-process
+    /// children, whose outputs are already resident in the child scope), the
+    /// element's `zeebe:output` mappings are applied in-memory as before.
     fn complete_mi_child(
         &mut self,
         instance_key: Key,
         child_eik: Key,
         element_id: String,
         body_key: Key,
+        output_overlay: Option<HashMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut events = vec![
             Event::ElementCompleting {
@@ -6587,29 +6615,44 @@ impl Engine {
             None => None,
             Some(expr) => {
                 let visible = self.variables_for_element(instance_key, child_eik);
-                let outputs = self.io_outputs(instance_key, &element_id);
-                if outputs.is_empty() {
-                    crate::feel::eval(expr, &visible).ok()
-                } else {
-                    match self.eval_io_mappings_in(&visible, &outputs) {
-                        Ok(mapped) => {
-                            let mut vars = (*visible).clone();
-                            vars.extend(mapped);
-                            crate::feel::eval(expr, &vars).ok()
-                        }
-                        Err(failure) => {
-                            // An output mapping that fails to evaluate halts the
-                            // child with an incident instead of completing it with
-                            // a silently-unset output (#939). The child does not
-                            // complete; resolution re-drives its completion.
-                            let event = self.io_mapping_incident(
-                                instance_key,
-                                child_eik,
-                                element_id,
-                                failure,
-                                state::IoMappingRedrive::Completion,
-                            );
-                            return (vec![event], Vec::new());
+                match &output_overlay {
+                    // A call-activity child: its produced outputs (propagated
+                    // child variables + the activity's already-applied output
+                    // mappings) live in `overlay`, not the child scope. Lay them
+                    // over the scope view and evaluate `output_element` against
+                    // that — the element's `zeebe:output` was applied by the
+                    // caller, so it is not re-applied here.
+                    Some(overlay) => {
+                        let mut vars = (*visible).clone();
+                        vars.extend(overlay.clone());
+                        crate::feel::eval(expr, &vars).ok()
+                    }
+                    None => {
+                        let outputs = self.io_outputs(instance_key, &element_id);
+                        if outputs.is_empty() {
+                            crate::feel::eval(expr, &visible).ok()
+                        } else {
+                            match self.eval_io_mappings_in(&visible, &outputs) {
+                                Ok(mapped) => {
+                                    let mut vars = (*visible).clone();
+                                    vars.extend(mapped);
+                                    crate::feel::eval(expr, &vars).ok()
+                                }
+                                Err(failure) => {
+                                    // An output mapping that fails to evaluate halts
+                                    // the child with an incident instead of completing
+                                    // it with a silently-unset output (#939). The child
+                                    // does not complete; resolution re-drives it.
+                                    let event = self.io_mapping_incident(
+                                        instance_key,
+                                        child_eik,
+                                        element_id,
+                                        failure,
+                                        state::IoMappingRedrive::Completion,
+                                    );
+                                    return (vec![event], Vec::new());
+                                }
+                            }
                         }
                     }
                 }
@@ -6749,6 +6792,18 @@ impl Engine {
         for child in &active {
             events.extend(self.cancel_mi_child_events(instance_key, *child));
         }
+        // Disarm every boundary event armed on the BODY as the loop enters
+        // completion (before end listeners, mirroring the sub-process/ad-hoc
+        // completion paths). An interrupting boundary on an MI activity is armed
+        // on the body (`run_mi_body_activation`), so a natural or zero-item
+        // completion must cancel those timers/subscriptions too — otherwise a
+        // later timer/message could re-enter the boundary flow of an
+        // already-completed body (#1170). A body with no attached boundaries
+        // yields nothing here (the common case).
+        events.extend(self.cancel_boundary_timers_on(body_key));
+        events.extend(self.cancel_boundary_message_subscriptions_on(body_key));
+        events.extend(self.cancel_boundary_signal_subscriptions_on(body_key));
+        events.extend(self.cancel_boundary_conditional_subscriptions_on(body_key));
         // The output collection propagates OUT of the body to its enclosing (flow)
         // scope — for a top-level loop that is the root, collapsing to the flat
         // `VariablesUpdated`, byte-identical to the pre-scoping engine.
@@ -6888,6 +6943,17 @@ impl Engine {
         let element_id = self
             .element_id_of_instance(instance_key, child_eik)
             .unwrap_or_default();
+        // A call-activity MI child parks its token on a distinct callee PROCESS
+        // INSTANCE. The `cancel_all_*_on(child_eik)` sweeps below only reach
+        // resources owned by this child element instance, never the separate
+        // callee, so an early body completion (satisfied completion condition)
+        // would leave the callee running with nothing left to complete it.
+        // Terminate the callee here; its `ProcessInstanceTerminated` also seeds
+        // the command tail's `cascade_cancel_children` to reap any transitive
+        // grandchildren (#1170).
+        if let Some(callee) = self.call_activity_child_of(child_eik) {
+            events.extend(self.discard_instance_events(callee));
+        }
         if let Some(job_key) = self.active_job_on(child_eik) {
             events.push(Event::JobCanceled {
                 job_key,
@@ -8189,6 +8255,52 @@ impl Engine {
         };
         let scope = self.scope_of(instance_key, container_key);
 
+        // A JOB_WORKER ad-hoc container that is a MULTI-INSTANCE child (its token
+        // parks in an MI body whose loop element is this container): its
+        // completion must feed the loop's output collection / completion condition
+        // and advance the loop, NOT take the activity's outgoing flow. This path
+        // is reached directly when the container's agent turn completes, bypassing
+        // the MI-child detection in `complete`, so without this route a
+        // normally-completing MI ad-hoc loop leaves the container's key in the
+        // body's `active` set and hangs forever (#1170). The container's own
+        // `outputCollection` variable (seeded on activation, appended per tool)
+        // lives in the container/child scope, so `complete_mi_child` reads it via
+        // the child scope view for the MI `output_element`.
+        let is_mi_child = scope != 0
+            && self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.multi_instances.get(&scope))
+                .map(|mi| mi.element_id == element_id)
+                .unwrap_or(false);
+        if is_mi_child {
+            let mut events = Vec::new();
+            // A `cancel`-remaining-instances completion still tears the container's
+            // own live tools down (each hangs off a dedicated inner instance)
+            // before the child completes; a natural completion has none active.
+            if cancel {
+                for child in &active {
+                    events.extend(self.cancel_adhoc_active_child(
+                        instance_key,
+                        container_key,
+                        *child,
+                    ));
+                }
+            }
+            // Drop the container's ad-hoc runtime record; its `outputCollection`
+            // stays resident in the child scope for the MI `output_element` below.
+            events.push(Event::AdHocCompleted {
+                instance_key,
+                container_key,
+                cancelled: cancel,
+            });
+            let (mi_events, mi_followups) =
+                self.complete_mi_child(instance_key, container_key, element_id, scope, None);
+            events.extend(mi_events);
+            return (events, mi_followups);
+        }
+
         // Detect up front whether this container is itself an active tool of a
         // PARENT ad-hoc container (nested agent-of-agents, #631). Detected exactly
         // like the tool-completion routing in `complete`: walk the
@@ -8439,7 +8551,13 @@ impl Engine {
                 .map(|mi| mi.element_id == element_id)
                 .unwrap_or(false)
         {
-            return self.complete_mi_child(instance_key, element_instance_key, element_id, scope);
+            return self.complete_mi_child(
+                instance_key,
+                element_instance_key,
+                element_id,
+                scope,
+                None,
+            );
         }
 
         // A completing element instance that is an ad-hoc tool: it hangs off an
@@ -10472,6 +10590,64 @@ impl Engine {
             _ => true,
         };
         let scope = self.scope_of(instance_key, element_instance_key);
+
+        // A call-activity that is a MULTI-INSTANCE child (its token parks in an MI
+        // body whose loop element is this call activity) must NOT take the
+        // activity's outgoing flow on completion — its result feeds the loop's
+        // output collection / completion condition, and the loop advances the next
+        // child or drains the body. `complete_call_activity` is reached directly
+        // (the callee process instance drained), bypassing the MI-child detection
+        // in `complete`, so without this route a normally-completing MI
+        // call-activity loop would leave the callee's key in the body's `active`
+        // set and hang forever (#1170). Build the child's produced-output overlay
+        // exactly as the ordinary path would (propagateAllChildVariables first,
+        // then the activity's own `zeebe:output`, which overrides) and hand it to
+        // `complete_mi_child`.
+        let is_mi_child = scope != 0
+            && self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.multi_instances.get(&scope))
+                .map(|mi| mi.element_id == element_id)
+                .unwrap_or(false);
+        if is_mi_child {
+            let mut overlay: HashMap<String, Value> = HashMap::new();
+            if propagate_all_child && !child_variables.is_empty() {
+                overlay.extend(child_variables.clone());
+            }
+            let outputs = self.io_outputs(instance_key, &element_id);
+            if !outputs.is_empty() {
+                match self.eval_io_mappings_in(&child_variables, &outputs) {
+                    Ok(updates) => overlay.extend(updates),
+                    Err(failure) => {
+                        // Same halt-on-mapping-failure semantics as the ordinary
+                        // path: park the call activity on an incident whose
+                        // resolution re-drives its completion against the captured
+                        // child variables (#939/#946), rather than dropping the
+                        // child with a silently-unset output.
+                        let event = self.io_mapping_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            failure,
+                            state::IoMappingRedrive::CallActivityCompletion {
+                                child_variables: child_variables.clone(),
+                            },
+                        );
+                        return (vec![event], Vec::new());
+                    }
+                }
+            }
+            return self.complete_mi_child(
+                instance_key,
+                element_instance_key,
+                element_id,
+                scope,
+                Some(overlay),
+            );
+        }
+
         let mut events = vec![
             Event::ElementCompleting {
                 instance_key,

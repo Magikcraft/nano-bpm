@@ -4127,6 +4127,487 @@ fn interrupting_boundary_on_a_multi_instance_adhoc_tears_down_every_container() 
     );
 }
 
+/// Issue #1170 regression — the NORMAL (non-boundary) completion of a
+/// multi-instance CALL ACTIVITY must drain the loop. This PR taught
+/// `run_mi_child_behaviour` to spawn a real callee process instance per loop
+/// item; without a matching completion route a callee that finishes normally is
+/// handled by `complete_call_activity`, which takes the activity's outgoing flow
+/// and never emits `MultiInstanceChildCompleted` — so the callee's key stays in
+/// the body's `active` set and the loop hangs forever. Assert the loop drains,
+/// aggregates each callee's output through the MI `outputElement`, and completes.
+#[test]
+fn multi_instance_call_activity_completes_normally_and_aggregates_output() {
+    // callee: cs -> ct("work") -> ce. The "work" job completes with a `result`
+    // variable that propagates back (propagateAllChildVariables defaults true).
+    let callee = ProcessBuilder::new("callee")
+        .start_event("cs")
+        .service_task("ct", "work")
+        .end_event("ce")
+        .connect("cs", "ct")
+        .connect("ct", "ce")
+        .build()
+        .unwrap();
+    // start -> each(MI call "callee", outputElement `=result`) -> sink -> end.
+    let def = ProcessBuilder::new("mi-call")
+        .start_event("start")
+        .call_activity("each", "callee")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=result".to_string()),
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(callee))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-call",
+            vars(&[("items", Value::List(vec![Value::Int(10), Value::Int(20)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Two callee instances, each parked on its "work" job.
+    let jobs = engine.activate_jobs("work", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 2, "one callee per loop item");
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+
+    // Complete each callee's job with a distinct `result` echoing its item — out
+    // of collection order, to prove index-based aggregation survives the route.
+    let mut ordered = jobs.clone();
+    ordered.sort_by_key(|j| {
+        std::cmp::Reverse(j.variables.get("item").and_then(Value::as_f64).unwrap() as i64)
+    });
+    for job in &ordered {
+        let item = job.variables.get("item").cloned().unwrap();
+        assert!(!engine.is_completed(key), "loop must not drain early");
+        engine
+            .apply_command(Command::complete_job_with_result(
+                job.key,
+                HashMap::from([("result".to_string(), item)]),
+                crate::model::AdHocJobResult::default(),
+            ))
+            .unwrap();
+    }
+
+    // The loop drained: its runtime record is gone and the token advanced to the
+    // sink task (so the aggregate is still observable on the still-active
+    // instance). Results are ordered by loop index regardless of completion order.
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record is cleared — the loop did not hang (#1170)"
+    );
+    assert!(
+        engine
+            .state()
+            .jobs
+            .values()
+            .any(|j| j.job_type == "sink-work" && matches!(j.state, state::JobState::Created)),
+        "the loop advanced to the activity's outgoing flow exactly once"
+    );
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![Value::Int(10), Value::Int(20)])),
+        "each callee's propagated `result` aggregates through the MI outputElement in order"
+    );
+}
+
+/// Issue #1170 regression — the NORMAL completion of a multi-instance JOB_WORKER
+/// ad-hoc container must drain the loop, and each child must seed its own
+/// `outputCollection`. This PR taught `run_mi_child_behaviour` to register an
+/// ad-hoc runtime record per loop item; without a matching completion route the
+/// container's agent turn completes via `complete_adhoc_container`, which takes
+/// the outgoing flow and never emits `MultiInstanceChildCompleted` — hanging the
+/// loop. It also never seeded the child's `outputCollection`, so tool results
+/// would be silently dropped. Assert the seed reaches the tool job and the loop
+/// drains to completion.
+#[test]
+fn multi_instance_adhoc_child_completes_normally_and_seeds_its_output_collection() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics>
+              <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" />
+            </bpmn:multiInstanceLoopCharacteristics>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="f2" sourceRef="Host" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Each MI child is its own ad-hoc container with its own agent job.
+    let agents = engine.activate_jobs("agent-worker", "W", 10, 1_000, 0);
+    assert_eq!(
+        agents.len(),
+        2,
+        "each MI ad-hoc child minted its own agent job"
+    );
+    assert_eq!(engine.instance(inst).unwrap().multi_instances.len(), 1);
+
+    // Each container activates its tool. The tool job must inherit the child
+    // container's seeded (empty) `outputCollection` — proving the seed is present
+    // in the MI child scope, without which tool results would be dropped.
+    for agent in &agents {
+        engine
+            .apply_command(Command::complete_job_with_result(
+                agent.key,
+                HashMap::new(),
+                crate::model::AdHocJobResult {
+                    activate_elements: vec![activate_element("toolA")],
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+    }
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(tool_jobs.len(), 2, "one tool per MI ad-hoc child");
+    assert!(
+        tool_jobs
+            .iter()
+            .all(|j| j.variables.get("results") == Some(&Value::List(Vec::new()))),
+        "each MI ad-hoc child seeded its own outputCollection `results: []` (#1170)"
+    );
+
+    // Complete each tool with a `result`, then let each agent turn finish (no more
+    // tools) so its container completes.
+    for job in &tool_jobs {
+        engine
+            .apply_command(Command::complete_job_with_result(
+                job.key,
+                HashMap::from([("result".to_string(), Value::Int(7))]),
+                crate::model::AdHocJobResult::default(),
+            ))
+            .unwrap();
+    }
+    let agents2 = engine.activate_jobs("agent-worker", "W", 10, 1_000, 0);
+    for agent in &agents2 {
+        engine
+            .apply_command(Command::complete_job_with_result(
+                agent.key,
+                HashMap::new(),
+                crate::model::AdHocJobResult::default(),
+            ))
+            .unwrap();
+    }
+
+    assert!(
+        engine.is_completed(inst),
+        "every MI ad-hoc child completes and the loop drains to completion (#1170)"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || (engine.instance(inst).unwrap().multi_instances.is_empty()
+                && engine.instance(inst).unwrap().adhoc_instances.is_empty()),
+        "no stale multi-instance or ad-hoc runtime records remain"
+    );
+}
+
+/// Issue #1170 regression — a NORMAL multi-instance completion must disarm the
+/// boundary events armed on the body. This PR arms an interrupting boundary on
+/// the MI body (not per child); `complete_multi_instance_body` /
+/// `finalize_multi_instance_body` must cancel those resources when the loop
+/// drains, or a later timer could re-enter the boundary flow of an
+/// already-completed body.
+#[test]
+fn normal_multi_instance_completion_disarms_the_body_boundary() {
+    // start -> each(MI service "handle") --normal--> sink -> done
+    // each --(interrupting timer boundary "timeout")--> escalated
+    let def = ProcessBuilder::new("mi")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .timer_boundary_event("timeout", "each", 5_000)
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let _key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // A timer boundary is armed on the body for the life of the loop.
+    let timeout_armed = |engine: &Engine| {
+        engine.state().timers.values().any(|t| {
+            t.state == state::TimerState::Created
+                && matches!(
+                    &t.kind,
+                    state::TimerKind::InterruptingBoundary { boundary_element_id }
+                        if boundary_element_id == "timeout"
+                )
+        })
+    };
+    assert!(
+        timeout_armed(&engine),
+        "the body boundary timer is armed while the loop runs"
+    );
+
+    // Drain the loop normally.
+    for job in engine.activate_jobs("handle", "W", 10, 60_000, 0) {
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+
+    // The body's boundary timer is disarmed as the loop completes.
+    assert!(
+        !timeout_armed(&engine),
+        "the body boundary timer is cancelled on normal completion (#1170)"
+    );
+    // Firing timers now can never re-enter the (completed) boundary flow.
+    let fired = engine.trigger_timers(10_000);
+    assert!(
+        !fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, .. } if from == "timeout"
+        )),
+        "a late timer must not re-enter the boundary flow of a completed body"
+    );
+}
+
+/// Issue #1170 regression — an EARLY multi-instance completion (satisfied
+/// `completionCondition`) that cancels a still-running call-activity child must
+/// terminate that child's separate callee process instance, not just the child
+/// token. `cancel_mi_child_events` only reaches resources owned by the child
+/// element instance, so the distinct callee would otherwise leak (run forever).
+#[test]
+fn early_multi_instance_completion_terminates_running_call_activity_callees() {
+    let callee = ProcessBuilder::new("callee")
+        .start_event("cs")
+        .service_task("ct", "work")
+        .end_event("ce")
+        .connect("cs", "ct")
+        .connect("ct", "ce")
+        .build()
+        .unwrap();
+    // A parallel MI call activity whose completion condition fires as soon as ONE
+    // child completes — leaving the others' callees still running to be cancelled.
+    let def = ProcessBuilder::new("mi-call")
+        .start_event("start")
+        .call_activity("each", "callee")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: Some("=true".to_string()),
+                sequential: false,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(callee))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-call",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            )]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let jobs = engine.activate_jobs("work", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 3, "three callee instances, one per loop item");
+    fn live_callees(engine: &Engine, parent: Key) -> usize {
+        engine
+            .state()
+            .instances
+            .values()
+            .filter(|i| {
+                i.parent_process_instance_key == Some(parent)
+                    && matches!(i.state, ProcessInstanceState::Active)
+            })
+            .count()
+    }
+    assert_eq!(
+        live_callees(&engine, key),
+        3,
+        "all three callees are running"
+    );
+
+    // Completing one child satisfies `completionCondition` and ends the body
+    // early — the other two callees must be terminated, not orphaned.
+    let fired = engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+    assert!(
+        fired
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessInstanceTerminated { .. }))
+            .count()
+            >= 2,
+        "the two still-running callees are terminated on early completion (#1170)"
+    );
+    assert_eq!(
+        live_callees(&engine, key),
+        0,
+        "no callee process instance leaks past the early completion"
+    );
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the loop's runtime record is cleared"
+    );
+}
+
+/// Issue #1170 regression — when an interrupting boundary fires while the MI body
+/// is parked on its own `start` execution-listener job (the boundary is armed
+/// BEFORE the start-listener gate), the body-level listener job must be
+/// cancelled, not left live on a removed body.
+#[test]
+fn interrupting_boundary_cancels_the_multi_instance_body_start_listener_job() {
+    let def = ProcessBuilder::new("mi")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .timer_boundary_event("timeout", "each", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("each", "done")
+        .connect("timeout", "escalated")
+        .with_listeners(
+            "each",
+            vec![el(ListenerEventType::Start, "mi-start")],
+            Vec::new(),
+        )
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The body parks on its start-listener job; no children have spawned yet.
+    let listener = engine.activate_jobs("mi-start", "W", 10, 1_000, 0);
+    assert_eq!(
+        listener.len(),
+        1,
+        "the body is parked on a start-listener job"
+    );
+    let listener_key = listener[0].key;
+    assert!(
+        engine.activate_jobs("handle", "W", 10, 1_000, 0).is_empty(),
+        "no child jobs while the body start listener is live"
+    );
+
+    // The boundary fires while the body is parked on that listener.
+    let fired = engine.trigger_timers(5_000);
+    assert_eq!(
+        engine.state().jobs[&listener_key].state,
+        state::JobState::Canceled,
+        "the body's own start-listener job is cancelled, not left live on a removed body (#1170)"
+    );
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+            ))
+            .count(),
+        1,
+        "the boundary flow is taken exactly once"
+    );
+    assert!(
+        engine.instance(key).is_none() || engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record is cleared"
+    );
+    assert!(engine.is_completed(key), "the instance completes (#1170)");
+}
+
 /// Defect-class guard (dead-scope guard, `Step::Activate` branch): a scoped
 /// terminate tears down every descendant token but deliberately leaves the
 /// enclosing sub-process token active until the post-drain completion sweep. A
