@@ -661,6 +661,26 @@ impl Engine {
             .is_some_and(|i| i.adhoc_instances.contains_key(&element_instance_key))
     }
 
+    /// Whether `element_instance_key` is a live multi-instance **body** — i.e. it
+    /// has a `multi_instances` runtime record. An interrupting boundary attached
+    /// to a multi-instance activity is armed on the body (see
+    /// `run_mi_body_activation`), so this is the routing signal
+    /// [`interrupt_activity_via_boundary`] uses to tear down the whole loop
+    /// (every active child of any kind, plus the body's own runtime record)
+    /// rather than falling through to the single-activity branches — which would
+    /// leave the children (and their jobs/scopes) running and the body's stale
+    /// `active` set alive (#1170).
+    pub(crate) fn is_multi_instance_body(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+    ) -> bool {
+        self.state
+            .instances
+            .get(&instance_key)
+            .is_some_and(|i| i.multi_instances.contains_key(&element_instance_key))
+    }
+
     /// Interrupts the activity `element_instance_key`/`element_id` because an
     /// interrupting timer or message boundary fired on it: tears down the work it
     /// owns, completes its element instance, and disarms any sibling boundaries.
@@ -674,7 +694,63 @@ impl Engine {
         element_instance_key: Key,
         element_id: &str,
     ) {
-        if self.is_subprocess(instance_key, element_id) {
+        if self.is_multi_instance_body(instance_key, element_instance_key) {
+            // An interrupting boundary attached to a multi-instance activity is
+            // armed on its BODY (`run_mi_body_activation`), so `element_instance_key`
+            // here is the multi-instance body — not one child. Interrupting it must
+            // tear down the WHOLE loop: every still-active child of every kind (its
+            // job, sub-process scope, ad-hoc inner scope, or call-activity child)
+            // and the body's own runtime record. `terminate_subprocess_scope`
+            // sweeps each descendant child generically — that is precisely the
+            // per-descendant-kind teardown `scope_teardown_events` was built for —
+            // so the sub-process / ad-hoc / call-activity / service-task branches
+            // do not need re-implementing per child. It clears each child token via
+            // `ElementCompleted`, but `MultiInstanceState.active` is only ever
+            // cleared by `MultiInstanceChildCompleted` / `MultiInstanceCompleted`
+            // (never `ElementCompleted`, `state.rs`), so we must drop the body's
+            // runtime record explicitly — otherwise the terminated loop keeps a
+            // stale active-child set and the MI body holds the process open after
+            // the boundary flow finishes (#1170). `scope_teardown_events` emits
+            // `MultiInstanceCompleted` only for a *nested* MI body it finds among
+            // the descendants, never for the scope root itself, so this is the
+            // body's own clear.
+            //
+            // Cancel the body's OWN execution-listener job first, if one is live.
+            // The boundary is armed before the body's `start`-listener gate
+            // (`run_mi_body_activation`), and the body parks on a start/end
+            // listener job while its chain runs, so firing during a listener would
+            // otherwise leave that job live on a removed body — mirrors the ad-hoc
+            // container branch below.
+            if let Some(job_key) = self.active_job_on(element_instance_key) {
+                self.emit(
+                    log,
+                    Event::JobCanceled {
+                        job_key,
+                        instance_key,
+                    },
+                );
+            }
+            // Resolve any incident sitting on the body ROOT itself before it is
+            // torn down. `terminate_subprocess_scope` resolves incidents for every
+            // *descendant* it sweeps (`scope_teardown_events` -> `resolve_incidents_on`),
+            // but never for the scope root — so a body parked on a FAILED
+            // start/end-listener job (its `JobNoRetries` incident) would keep the
+            // completed instance carrying a stale `hasIncident` for a vanished body,
+            // and a later external resolve could re-drive the dead token. The
+            // `JobCanceled` above makes the parked job terminal first, so the
+            // `IncidentResolved` reducer's `Failed`-only guard leaves it cancelled.
+            for ev in self.resolve_incidents_on(instance_key, element_instance_key) {
+                self.emit(log, ev);
+            }
+            self.terminate_subprocess_scope(log, instance_key, element_instance_key);
+            self.emit(
+                log,
+                Event::MultiInstanceCompleted {
+                    instance_key,
+                    body_key: element_instance_key,
+                },
+            );
+        } else if self.is_subprocess(instance_key, element_id) {
             // Cancel every job/timer/subscription inside the sub-process and
             // complete its inner element instances first.
             self.terminate_subprocess_scope(log, instance_key, element_instance_key);
