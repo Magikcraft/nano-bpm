@@ -7644,12 +7644,21 @@ impl Engine {
             // applied above (`applied_inputs`); `propagateAllParentVariables`
             // selects the child's seed — the full activating view, or only the
             // input results when suppressed.
+            //
+            // Only a BOUND callee (`process_id: Some`) spawns: the ad-hoc catalog
+            // deliberately supports an UNBOUND call-activity tool (`processId`
+            // absent → `process_id: None`, round-tripped as `UnboundCall` by
+            // `processos`), which names no callee to instantiate. An unbound tool
+            // falls through to the pass-through completion arm below (its
+            // pre-#1159 behaviour) rather than being handed an empty callee that
+            // would raise a spurious `CalledElementError`. A FEEL-expression
+            // callee is `Some("=expr")`, so it still spawns and resolves at
+            // dispatch — only a genuinely absent `calledElement` is `None`.
             Some(crate::model::AdHocToolKind::CallActivity {
-                process_id,
+                process_id: Some(called),
                 propagate_all_parent_variables,
                 ..
             }) => {
-                let called = process_id.unwrap_or_default();
                 let child_seed = if propagate_all_parent_variables {
                     child_vars.clone()
                 } else {
@@ -7666,8 +7675,9 @@ impl Engine {
                 events.extend(spawn_events);
                 followups.extend(spawn_followups);
             }
-            // Other / an unlisted id: no job or task to run, so the child passes
-            // straight through to completion, feeding the loop.
+            // Other / an unlisted id (including an UNBOUND `callActivity` tool with
+            // no `calledElement`): no job, task, or callee to run, so the child
+            // passes straight through to completion, feeding the loop.
             _ => {
                 followups.push(Step::Complete {
                     instance_key,
@@ -10433,13 +10443,14 @@ impl Engine {
                     .map(|t| t.kind.clone())
             }) {
             Some(crate::model::AdHocToolKind::CallActivity {
-                process_id,
+                process_id: Some(process_id),
                 propagate_all_parent_variables,
                 ..
-            }) => (
-                process_id.unwrap_or_default(),
-                propagate_all_parent_variables,
-            ),
+            }) => (process_id, propagate_all_parent_variables),
+            // An unbound call-activity tool (`process_id: None`) never spawns (it
+            // passes straight through on activation), so no spawn incident can
+            // exist to re-drive here — return a no-op rather than re-attempting a
+            // spawn with an empty callee.
             _ => return (Vec::new(), Vec::new()),
         };
         let view = (*self.variables_for_element(instance_key, child_eik)).clone();

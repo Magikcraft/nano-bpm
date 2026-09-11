@@ -22730,6 +22730,116 @@ fn adhoc_call_activity_tool_output_mapping_single_pass_through_chained_flow() {
     );
 }
 
+/// A parent process whose ad-hoc agent has an UNBOUND `bpmn:callActivity` tool —
+/// a `callActivity` with no `calledElement`/`zeebe:calledElement processId`
+/// (issue #1159). The ad-hoc catalog deliberately supports this shape
+/// (`process_id: None`, round-tripped as `UnboundCall` by `processos`); it names
+/// no callee, so it must pass straight through to completion (its pre-#1159
+/// behaviour), NOT be handed an empty callee that raises a spurious
+/// `CalledElementError`.
+fn adhoc_agent_with_unbound_call_activity_tool() -> ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=toolResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="Unbound">
+              <bpmn:extensionElements>
+                <zeebe:ioMapping>
+                  <zeebe:output source="=42" target="toolResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+/// Issue #1159 (Copilot review round 4): the new `callActivity` spawn arm must
+/// only fire for a BOUND callee. An UNBOUND call-activity tool (no
+/// `calledElement`) must pass through to completion — the previous generic arm
+/// did — instead of spawning with an empty callee and raising a spurious
+/// `CalledElementError`. Activating it raises NO incident, completes the tool
+/// (its output mapping projects into the container), and re-emits the agent job.
+#[test]
+fn adhoc_unbound_call_activity_tool_passes_through_without_incident() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_with_unbound_call_activity_tool(),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "parent");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("Unbound")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // The unbound tool spawns NO child process and raises NO incident — it passes
+    // straight through to completion.
+    assert!(
+        engine
+            .activate_jobs("probe-child", "W", 10, 1_000, 0)
+            .is_empty(),
+        "an unbound call-activity tool spawns no child process"
+    );
+    assert!(
+        engine.instance(inst).unwrap().incidents.is_empty(),
+        "an unbound call-activity tool passes through — no spurious CalledElementError"
+    );
+
+    // It completed like a pass-through tool: its output mapping projected `42`
+    // into the container scope, visible to the next agent turn. (`outputElement`
+    // reads the child scope, where the tool output target is not set, so the
+    // collected entry is null — the projection lands in the container, not the
+    // child.)
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job re-emitted after the unbound tool drained");
+    assert_eq!(
+        agent2.variables.get("toolResult"),
+        Some(&Value::Int(42)),
+        "the unbound tool completed and projected its pass-through output into \
+         the container, got {:?}",
+        agent2.variables.get("toolResult")
+    );
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent2.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(engine.is_completed(inst), "the parent instance completed");
+}
+
 /// A parent process whose ad-hoc agent has a `bpmn:callActivity` tool with BOTH
 /// propagate flags at their Zeebe default (`true`, the attributes absent): the
 /// whole parent scope crosses INTO the child, and the child's whole final scope
