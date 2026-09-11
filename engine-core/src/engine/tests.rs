@@ -3954,11 +3954,13 @@ fn interrupting_boundary_on_a_multi_instance_call_activity_cancels_every_child_i
     assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
 
     let fired = engine.trigger_timers(5_000);
-    assert!(
+    assert_eq!(
         fired
             .iter()
-            .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })),
-        "the spawned child process instances are terminated"
+            .filter(|e| matches!(e, Event::ProcessInstanceTerminated { .. }))
+            .count(),
+        2,
+        "both spawned child process instances are terminated"
     );
     for job_key in &job_keys {
         assert_eq!(
@@ -4125,6 +4127,206 @@ fn interrupting_boundary_on_a_multi_instance_adhoc_tears_down_every_container() 
             .all(|t| t.element_id != "InnerTask" || t.state != state::UserTaskState::Created),
         "the activated tool's open user task was cancelled, not left Created"
     );
+}
+
+/// Issue #1170 regression — an EARLY multi-instance completion (a satisfied
+/// completion condition, not an interrupting boundary) must tear down a still-
+/// active AD-HOC container child container-aware, exactly like the boundary
+/// path. `complete_multi_instance_body` cancels the remaining active children
+/// via `cancel_mi_child_events`, which is LEAF-only: for a JOB_WORKER ad-hoc MI
+/// child it would cancel the agent job but orphan the child's activated tool
+/// (its open user task / tool jobs) and leave the ad-hoc runtime record behind
+/// with no `AdHocCompleted`. Assert the cancelled container emits
+/// `AdHocCompleted { cancelled: true }`, its activated tool's user task is
+/// cancelled (not left `Created`), and no ad-hoc record leaks.
+#[test]
+fn early_multi_instance_completion_tears_down_an_active_adhoc_tool_child() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-agent" />
+              <zeebe:adHoc outputCollection="r" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics>
+              <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" />
+              <bpmn:completionCondition>=true</bpmn:completionCondition>
+            </bpmn:multiInstanceLoopCharacteristics>
+            <bpmn:userTask id="InnerTask">
+              <bpmn:extensionElements>
+                <zeebe:userTask />
+              </bpmn:extensionElements>
+            </bpmn:userTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="f2" sourceRef="Host" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Each MI child is its own ad-hoc container with its own agent job.
+    let agents = engine.activate_jobs("probe-agent", "W", 10, 1_000, 0);
+    assert_eq!(
+        agents.len(),
+        2,
+        "each MI ad-hoc child minted its own agent job"
+    );
+    // Container A activates an inner user-task tool into its own scope; it is now
+    // an active tool the leaf cancel path would orphan.
+    let container_a = agents[0].element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agents[0].key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("InnerTask")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container_a)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "container A holds an active tool before the early completion"
+    );
+
+    // Container B finishes its agent turn with no tools -> it completes, which
+    // completes MI child B and satisfies the completion condition (`=true`),
+    // triggering the early cancel of the still-active container A.
+    let fired = engine
+        .apply_command(Command::complete_job_with_result(
+            agents[1].key,
+            HashMap::new(),
+            crate::model::AdHocJobResult::default(),
+        ))
+        .unwrap();
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::AdHocCompleted { container_key, cancelled: true, .. } if *container_key == container_a
+        )),
+        "the early-cancelled ad-hoc container emits AdHocCompleted{{cancelled:true}}, not a leaked record"
+    );
+    assert!(
+        engine.is_completed(inst),
+        "the loop completes early and the instance drains"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || (engine.instance(inst).unwrap().multi_instances.is_empty()
+                && engine.instance(inst).unwrap().adhoc_instances.is_empty()),
+        "no stale multi-instance or ad-hoc runtime records remain after early completion"
+    );
+    assert!(
+        engine
+            .state()
+            .user_tasks
+            .values()
+            .all(|t| t.element_id != "InnerTask" || t.state != state::UserTaskState::Created),
+        "container A's activated tool user task was cancelled, not left Created"
+    );
+}
+
+/// Issue #1170 regression — firing an interrupting boundary on a multi-instance
+/// body must RESOLVE an incident sitting on the body root itself, not only on
+/// its swept descendants. `terminate_subprocess_scope` resolves descendant
+/// incidents (`scope_teardown_events` -> `resolve_incidents_on`) but never the
+/// scope root, so a body parked on a FAILED start-listener job (a `JobNoRetries`
+/// incident) would keep the completed instance carrying a stale incident for a
+/// vanished body. Assert the incident is resolved when the boundary fires.
+#[test]
+fn interrupting_boundary_on_a_multi_instance_body_resolves_a_stale_body_incident() {
+    let def = ProcessBuilder::new("mi")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .timer_boundary_event("timeout", "each", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("each", "done")
+        .connect("timeout", "escalated")
+        .with_listeners(
+            "each",
+            vec![el(ListenerEventType::Start, "mi-start")],
+            Vec::new(),
+        )
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The body parks on its start-listener job; fail it with no retries so the
+    // body element instance carries a JobNoRetries incident.
+    let listener = engine.activate_jobs("mi-start", "W", 10, 1_000, 0);
+    assert_eq!(
+        listener.len(),
+        1,
+        "the body is parked on a start-listener job"
+    );
+    engine
+        .apply_command(Command::fail_job(listener[0].key, 0, "boom"))
+        .unwrap();
+    assert_eq!(
+        engine.active_incidents().len(),
+        1,
+        "the failed body start-listener job raised an incident on the body"
+    );
+
+    // The boundary fires while the body carries that stale incident.
+    let fired = engine.trigger_timers(5_000);
+    assert!(
+        fired
+            .iter()
+            .any(|e| matches!(e, Event::IncidentResolved { .. })),
+        "firing the boundary resolves the incident on the body root"
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no stale incident remains on the vanished body"
+    );
+    assert!(engine.is_completed(key), "the instance completes (#1170)");
 }
 
 /// Issue #1170 regression — the NORMAL (non-boundary) completion of a

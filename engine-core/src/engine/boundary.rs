@@ -730,6 +730,18 @@ impl Engine {
                     },
                 );
             }
+            // Resolve any incident sitting on the body ROOT itself before it is
+            // torn down. `terminate_subprocess_scope` resolves incidents for every
+            // *descendant* it sweeps (`scope_teardown_events` -> `resolve_incidents_on`),
+            // but never for the scope root — so a body parked on a FAILED
+            // start/end-listener job (its `JobNoRetries` incident) would keep the
+            // completed instance carrying a stale `hasIncident` for a vanished body,
+            // and a later external resolve could re-drive the dead token. The
+            // `JobCanceled` above makes the parked job terminal first, so the
+            // `IncidentResolved` reducer's `Failed`-only guard leaves it cancelled.
+            for ev in self.resolve_incidents_on(instance_key, element_instance_key) {
+                self.emit(log, ev);
+            }
             self.terminate_subprocess_scope(log, instance_key, element_instance_key);
             self.emit(
                 log,

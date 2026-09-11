@@ -6789,8 +6789,23 @@ impl Engine {
 
         let mut events = Vec::new();
         // Cancel any children still running (reached here via completion condition).
+        // An ad-hoc container child (a JOB_WORKER ad-hoc MI child, #1170) owns its
+        // OWN active tool scope (`adhoc_instances[child].active`), its agent job,
+        // and an `adhoc_instances` runtime record — none of which the leaf-only
+        // `cancel_mi_child_events` knows about. Tearing such a child down with the
+        // leaf path alone would orphan its activated tools (open user tasks, tool
+        // jobs, nested containers) and leave its ad-hoc record behind (no
+        // `AdHocCompleted`), exactly as the interrupting-boundary teardown was
+        // fixed to avoid (#1170). Route it through the container-aware
+        // `cancel_adhoc_active_child` (recurses tools, emits `AdHocCompleted`)
+        // instead, using the body as the enclosing container key; a non-ad-hoc
+        // child (service task, sub-process, call activity) keeps the leaf path.
         for child in &active {
-            events.extend(self.cancel_mi_child_events(instance_key, *child));
+            if self.is_adhoc_container(instance_key, *child) {
+                events.extend(self.cancel_adhoc_active_child(instance_key, body_key, *child));
+            } else {
+                events.extend(self.cancel_mi_child_events(instance_key, *child));
+            }
         }
         // Disarm every boundary event armed on the BODY as the loop enters
         // completion (before end listeners, mirroring the sub-process/ad-hoc
