@@ -23224,7 +23224,11 @@ fn adhoc_call_activity_tool_output_failure_preserves_child_result_for_redrive() 
         .unwrap();
 
     let active = engine.active_incidents();
-    assert_eq!(active.len(), 1, "the failing output mapping parks one incident");
+    assert_eq!(
+        active.len(),
+        1,
+        "the failing output mapping parks one incident"
+    );
     assert_eq!(
         active[0].kind,
         state::IncidentKind::IoMapping,
