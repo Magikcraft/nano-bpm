@@ -52,7 +52,7 @@ documentation, foreign `zeebe:*`/`nano:*` extension children — is still ignore
 | `scriptTask` | **executed** | `bpmn.rs:289`; inline FEEL, no job, at `engine/mod.rs:4650` |
 | `userTask` | **executed** | `bpmn.rs:310`; user-task record + listeners at `engine/mod.rs:3273` |
 | `receiveTask` | **parsed-not-executed** | Parsed as an inert throw/pass-through, `bpmn.rs:540`. Use a message intermediate **catch** event to wait for a message instead. |
-| `manualTask` | **unsupported** | No parser arm in `bpmn.rs`. |
+| `manualTask` | **executed** | Parsed as an abstract `task` pass-through (`ElementKind::Task`), `bpmn.rs:1294`; activates and immediately completes, taking its outgoing flow, `engine/mod.rs`. |
 | `sendTask` | **executed** | `bpmn.rs` (`sendTask` arm); a job-based service task — the throwing cousin of `receiveTask` — job created at the shared `JobCreated` emission in the service-task activation path, `engine/mod.rs` (#1168). |
 
 ### Gateways
