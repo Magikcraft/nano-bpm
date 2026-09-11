@@ -3324,7 +3324,10 @@ fn should_raise_incident_when_inclusive_split_matches_no_flow() {
 
     assert!(events.iter().any(|e| matches!(
         e,
-        Event::IncidentRaised { kind: state::IncidentKind::NoMatchingSequenceFlow, .. }
+        Event::IncidentRaised {
+            kind: state::IncidentKind::NoMatchingSequenceFlow,
+            ..
+        }
     )));
     assert!(!engine.is_completed(instance_key));
 }

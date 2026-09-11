@@ -4461,8 +4461,9 @@ mod tests {
   </bpmn:process>
 </bpmn:definitions>"#;
 
-        let err = parse_bpmn(xml)
-            .expect_err("a boundary carrying escalation must be rejected even with a supported def");
+        let err = parse_bpmn(xml).expect_err(
+            "a boundary carrying escalation must be rejected even with a supported def",
+        );
         match err {
             ParseError::UnsupportedElement { tag, element_id } => {
                 assert_eq!(tag, "escalationEventDefinition");

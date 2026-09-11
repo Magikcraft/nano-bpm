@@ -10617,7 +10617,12 @@ impl Engine {
             element_instance_key,
             element_id: element_id.clone(),
         });
-        self.reset_open_inclusive_join(instance_key, element_instance_key, &element_id, &mut events);
+        self.reset_open_inclusive_join(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            &mut events,
+        );
         let mut followups = Vec::new();
         for flow_to in selected {
             events.push(Event::SequenceFlowTaken {
@@ -10843,8 +10848,7 @@ impl Engine {
             // `resolve_link_catch`'s same-name, same-scope pairing).
             if let ElementKind::LinkIntermediateThrowEvent { link_name } = &element.kind {
                 for other in process.elements.values() {
-                    if let ElementKind::LinkIntermediateCatchEvent { link_name: name } =
-                        &other.kind
+                    if let ElementKind::LinkIntermediateCatchEvent { link_name: name } = &other.kind
                     {
                         if name == link_name && other.parent == element.parent {
                             predecessors
