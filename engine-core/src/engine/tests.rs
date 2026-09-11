@@ -22444,6 +22444,156 @@ fn adhoc_call_activity_tool_spawns_child_and_maps_its_real_output() {
     assert!(engine.is_completed(inst), "the parent instance completed");
 }
 
+/// A parent whose ad-hoc `bpmn:callActivity` tool declares two CHAINED output
+/// mappings (issue #1159): `summary -> summaryCopy`, then a second mapping whose
+/// source references `summaryCopy`. Zeebe's `eval_io_mappings_in` is a SINGLE
+/// pass — every mapping reads the original child-variable view — so the second
+/// mapping sees no `summaryCopy` (it is a sibling target, not a child variable)
+/// and its `summary` field resolves to `null`. This guards against the tool's
+/// output mapping being evaluated TWICE (once against the child variables, then
+/// again against the seeded tool scope): a second pass would see `summaryCopy`
+/// and manufacture a non-null field, and — because `outputElement` reads the
+/// first-pass value while the container projection would read the second — the
+/// collected `outputElement` and the projected `toolCallResult` would DISAGREE.
+fn adhoc_agent_with_chained_output_call_activity_tool() -> Vec<ProcessDefinition> {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="child"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="=summary" target="summaryCopy" />
+                  <zeebe:output source="={status: status, summary: summaryCopy}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+        <bpmn:process id="child">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap()
+}
+
+/// Issue #1159 (Copilot review round 2): the call-activity tool's output mapping
+/// must be evaluated EXACTLY ONCE, against the child's real produced variables —
+/// not once in the bridge and again in the shared completion leaf. A double pass
+/// double-applies chained mappings, so the container's `outputElement`-collected
+/// result and its projected `toolCallResult` disagree. Both must equal the
+/// single-pass projection `{status: "resolved", summary: null}` (the second
+/// mapping's `summaryCopy` is a sibling target, absent from the child view).
+#[test]
+fn adhoc_call_activity_tool_output_mapping_evaluated_once_for_chained_mappings() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_chained_output_call_activity_tool() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("askedAbout", Value::Str("a mortgage".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let child_jobs = engine.activate_jobs("probe-child", "W", 10, 1_000, 0);
+    assert_eq!(child_jobs.len(), 1, "the called process was instantiated");
+    engine
+        .apply_command(Command::complete_job_with(
+            child_jobs[0].key,
+            vars(&[
+                ("status", Value::Str("resolved".into())),
+                ("summary", Value::Str("Monthly payment is $1,516.".into())),
+            ]),
+        ))
+        .unwrap();
+
+    // Single-pass projection: `summaryCopy` is a sibling output target, NOT a
+    // child variable, so the second mapping's `summary: summaryCopy` resolves to
+    // null. A double evaluation would instead see the seeded `summaryCopy` and
+    // manufacture the real summary here.
+    let single_pass = Value::Map(std::collections::BTreeMap::from([
+        ("status".to_string(), Value::Str("resolved".into())),
+        ("summary".to_string(), Value::Null),
+    ]));
+
+    // The container's `outputElement` (`=toolCallResult`) collected exactly the
+    // single-pass projection...
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "toolCallResults"),
+        Some(Value::List(vec![single_pass.clone()])),
+        "outputElement collected the single-pass projection"
+    );
+
+    // ...and the `toolCallResult` projected into the container (the agent's next
+    // working memory) AGREES with it — the double-eval bug made these diverge.
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job re-emitted after the tool drained");
+    assert_eq!(
+        agent2.variables.get("toolCallResult"),
+        Some(&single_pass),
+        "the projected toolCallResult agrees with the collected outputElement \
+         (single evaluation, no double-applied chained mapping)"
+    );
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent2.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(engine.is_completed(inst), "the parent instance completed");
+}
+
 /// A parent process whose ad-hoc agent has a `bpmn:callActivity` tool with BOTH
 /// propagate flags at their Zeebe default (`true`, the attributes absent): the
 /// whole parent scope crosses INTO the child, and the child's whole final scope
