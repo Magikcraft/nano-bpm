@@ -648,6 +648,19 @@ impl Engine {
         )
     }
 
+    /// Whether `element_instance_key` is a live ad-hoc sub-process container —
+    /// i.e. it has an `adhoc_instances` runtime record. Unlike [`is_subprocess`]
+    /// (which keys off the static `ElementKind`), an ad-hoc container flattens to
+    /// a job-backed `ServiceTask` element, so its ad-hoc nature is only visible
+    /// in runtime state. Used by [`interrupt_activity_via_boundary`] to route an
+    /// interrupting boundary through inner-scope teardown (#1155).
+    pub(crate) fn is_adhoc_container(&self, instance_key: Key, element_instance_key: Key) -> bool {
+        self.state
+            .instances
+            .get(&instance_key)
+            .is_some_and(|i| i.adhoc_instances.contains_key(&element_instance_key))
+    }
+
     /// Interrupts the activity `element_instance_key`/`element_id` because an
     /// interrupting timer or message boundary fired on it: tears down the work it
     /// owns, completes its element instance, and disarms any sibling boundaries.
@@ -665,6 +678,37 @@ impl Engine {
             // Cancel every job/timer/subscription inside the sub-process and
             // complete its inner element instances first.
             self.terminate_subprocess_scope(log, instance_key, element_instance_key);
+        } else if self.is_adhoc_container(instance_key, element_instance_key) {
+            // An ad-hoc sub-process (#1155) is a job-backed activity whose
+            // activated tools live in its own inner scope (each tool hangs off a
+            // dedicated `#innerInstance` parented to the container). An
+            // interrupting boundary must tear down that scope — the tool, its
+            // `#innerInstance`, and any open user task — exactly like a plain
+            // sub-process, otherwise the container leaves the flow via the
+            // boundary while its inner tokens survive and the instance hangs
+            // `Active` forever. Cancel the container's own agent job (if one is
+            // still in play), sweep the inner scope, then drop the container's
+            // ad-hoc runtime record so a still-queued `ActivateAdHocTool` cannot
+            // mint a tool into the dead container (mirrors the dead-scope guard
+            // in `scope_teardown_events`).
+            if let Some(job_key) = self.active_job_on(element_instance_key) {
+                self.emit(
+                    log,
+                    Event::JobCanceled {
+                        job_key,
+                        instance_key,
+                    },
+                );
+            }
+            self.terminate_subprocess_scope(log, instance_key, element_instance_key);
+            self.emit(
+                log,
+                Event::AdHocCompleted {
+                    instance_key,
+                    container_key: element_instance_key,
+                    cancelled: true,
+                },
+            );
         } else if let Some(child) = self.call_activity_child_of(element_instance_key) {
             // A call activity parks its token on a distinct child process
             // instance (Zeebe parity). Interrupting the call activity via a
