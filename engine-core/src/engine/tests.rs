@@ -4818,6 +4818,102 @@ fn early_multi_instance_completion_tears_down_a_running_subprocess_child_scope()
     );
 }
 
+/// Issue #1170 regression — an EARLY multi-instance completion (satisfied
+/// `completionCondition`) that cancels a still-running MI child parked on a ROOT
+/// incident (a service task's `JobNoRetries`) must RESOLVE that incident, not
+/// merely cancel the job and complete the child. The early-cancel path sweeps a
+/// child's *descendants* (`scope_teardown_events` -> `resolve_incidents_on`) but
+/// `cancel_mi_child_events` completes the child ROOT via `ElementCompleted`,
+/// which touches no incident state — and `ProcessInstanceCompleted` deliberately
+/// RETAINS incidents. Without resolving the child-root incident, the completed
+/// instance would carry a stale active incident tied to a removed element that a
+/// later external resolve could re-drive against a dead token. Assert the
+/// incident is resolved on early completion and no active incident survives.
+#[test]
+fn early_multi_instance_completion_resolves_a_stale_child_root_incident() {
+    // start -> each(MI service "handle", parallel, completionCondition = true)
+    //          -> sink -> done. Two items: one child completes (firing the
+    // condition) while the sibling is parked on a JobNoRetries incident.
+    let def = ProcessBuilder::new("mi-incident-early")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: Some("=true".to_string()),
+                sequential: false,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-incident-early",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let jobs = engine.activate_jobs("handle", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 2, "each MI child runs a `handle` job");
+
+    // Park the sibling on a JobNoRetries incident (fail with no retries).
+    let parked = jobs[1].key;
+    engine
+        .apply_command(Command::fail_job(parked, 0, "boom"))
+        .unwrap();
+    assert_eq!(
+        engine.active_incidents().len(),
+        1,
+        "the failed sibling job raised a root incident on its MI child"
+    );
+
+    // Completing the OTHER child satisfies `completionCondition` and ends the
+    // body early — the parked sibling child is cancelled AND its stale incident
+    // must be resolved, not left tied to the removed element.
+    let fired = engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+    assert!(
+        fired
+            .iter()
+            .any(|e| matches!(e, Event::IncidentResolved { .. })),
+        "the early completion resolves the parked child's root incident (#1170)"
+    );
+    assert_eq!(
+        engine.state().jobs[&parked].state,
+        state::JobState::Canceled,
+        "the parked sibling job is cancelled, not resurrected by its resolve"
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no stale active incident survives on the removed MI child (#1170)"
+    );
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the loop's runtime record is cleared"
+    );
+    assert!(
+        engine
+            .pending_jobs()
+            .iter()
+            .any(|j| j.job_type == "sink-work"),
+        "the early completion advances the body to its outgoing flow (`sink`)"
+    );
+}
+
 /// Issue #1170 regression — when an interrupting boundary fires while the MI body
 /// is parked on its own `start` execution-listener job (the boundary is armed
 /// BEFORE the start-listener gate), the body-level listener job must be

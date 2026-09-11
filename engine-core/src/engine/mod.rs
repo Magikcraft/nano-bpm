@@ -7021,6 +7021,22 @@ impl Engine {
                 instance_key,
             });
         }
+        // Resolve any incident parked on the child ROOT itself before completing
+        // it. `scope_teardown_events` resolves incidents for every *descendant* it
+        // sweeps (via `resolve_incidents_on`) but never for the scope root, and
+        // `ElementCompleted` touches no incident state — so a child parked on a
+        // root incident (a service task's `JobNoRetries`, an input/output ioMapping
+        // failure) would keep the completed instance carrying a stale `hasIncident`
+        // for a vanished element, and a later external resolve could re-drive the
+        // dead token (#1170). `ProcessInstanceCompleted` deliberately retains
+        // incidents, so an early MI completion that clears the child's MI record
+        // must close the child's own incident here. The `JobCanceled` above makes
+        // any parked job terminal first, so the `IncidentResolved` reducer's
+        // `Failed`-only job-resurrection guard leaves the cancelled job terminal.
+        // A leaf child with no incident yields nothing here, so the behaviour is
+        // byte-identical in the common case — mirrors the interrupting-boundary
+        // teardown's body-root incident resolution.
+        events.extend(self.resolve_incidents_on(instance_key, child_eik));
         events.push(Event::ElementCompleting {
             instance_key,
             element_instance_key: child_eik,
@@ -7084,6 +7100,18 @@ impl Engine {
             }
             events.extend(self.cancel_all_timers_on(child));
             events.extend(self.cancel_all_subscriptions_on(child));
+            // Resolve any incident parked on the nested container ROOT itself
+            // (a failed agent job's `JobNoRetries`, an ioMapping failure) before
+            // completing it — same root-incident gap as `cancel_mi_child_events`:
+            // `ElementCompleted` touches no incident state and
+            // `ProcessInstanceCompleted` retains incidents, so an early MI
+            // completion would otherwise leave a stale active incident on the
+            // removed container that a later resolve could re-drive against a dead
+            // token (#1170). The `JobCanceled` above makes the parked agent job
+            // terminal first, so the reducer's `Failed`-only resurrection guard
+            // keeps it cancelled. Yields nothing when the container has no
+            // incident, so the behaviour is byte-identical in the common case.
+            events.extend(self.resolve_incidents_on(instance_key, child));
             events.push(Event::ElementCompleting {
                 instance_key,
                 element_instance_key: child,
