@@ -469,7 +469,9 @@ mod tests {
                 reason.contains("throw link event 'thr' must not have an outgoing sequence flow"),
                 "unexpected reason: {reason}"
             ),
-            other => panic!("expected InvalidProcess for a link throw with an outgoing flow, got {other:?}"),
+            other => panic!(
+                "expected InvalidProcess for a link throw with an outgoing flow, got {other:?}"
+            ),
         }
     }
 
@@ -498,7 +500,9 @@ mod tests {
                 reason.contains("catch link event 'cat' must not have an incoming sequence flow"),
                 "unexpected reason: {reason}"
             ),
-            other => panic!("expected InvalidProcess for a link catch with an incoming flow, got {other:?}"),
+            other => panic!(
+                "expected InvalidProcess for a link catch with an incoming flow, got {other:?}"
+            ),
         }
     }
 

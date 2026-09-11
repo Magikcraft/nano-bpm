@@ -2658,6 +2658,7 @@ impl ProcessAcc {
                     output_element: n.adhoc_output_element.clone(),
                     cancel_remaining_instances: n.adhoc_cancel_remaining_instances,
                     tools: Vec::new(),
+                    inner_flows: Vec::new(),
                 });
             }
             // Assign each pruned tool — and each retained embedded-subProcess
@@ -2708,6 +2709,42 @@ impl ProcessAcc {
                         kind,
                         io: n.io.clone(),
                     });
+                }
+            }
+
+            // Capture the `bpmn:sequenceFlow`s between the container's DIRECT
+            // children (issue #1154) BEFORE the pruning below drops them. Camunda
+            // lets an ad-hoc container's inner elements be "connected by a
+            // sequence flow to build a structured sequence": on the source's
+            // completion the flow is taken and the target runs. These flows
+            // reference pruned (or retained-subprocess-tool) elements, so — like
+            // the tool catalog — they are captured here and driven by the ad-hoc
+            // runtime seam rather than by token flow. Only flows whose source AND
+            // target are both DIRECT children of the SAME ad-hoc container are
+            // captured; a flow inside an embedded-`subProcess` tool's body (parent
+            // is the subProcess, not the container) is left to run by ordinary
+            // token flow.
+            for f in &self.flows {
+                let (Some(src), Some(tgt)) = (f.source.as_deref(), f.target.as_deref()) else {
+                    continue;
+                };
+                let src_parent = parent_of.get(src).copied();
+                let tgt_parent = parent_of.get(tgt).copied();
+                if let (Some(sp), Some(tp)) = (src_parent, tgt_parent) {
+                    if sp == tp && adhoc_ids.contains(sp) {
+                        if let Some(pos) = index.get(sp).copied() {
+                            adhoc_catalog[pos]
+                                .inner_flows
+                                .push(crate::model::AdHocInnerFlow {
+                                    from: src.to_string(),
+                                    to: tgt.to_string(),
+                                    condition: f
+                                        .condition
+                                        .clone()
+                                        .map(crate::model::Condition::new),
+                                });
+                        }
+                    }
                 }
             }
 
@@ -4362,6 +4399,13 @@ mod tests {
             crate::model::AdHocToolKind::UserTask(crate::model::UserTaskProps::default())
         );
         assert_eq!(cat.tools[2].kind, crate::model::AdHocToolKind::Other);
+        // and: the `bpmn:sequenceFlow` between the container's own children is
+        // captured as an inner flow (issue #1154) — NOT silently dropped — so the
+        // runtime can drive the "structured sequence" tool_review -> tool_gw.
+        assert_eq!(cat.inner_flows.len(), 1);
+        assert_eq!(cat.inner_flows[0].from, "tool_review");
+        assert_eq!(cat.inner_flows[0].to, "tool_gw");
+        assert_eq!(cat.inner_flows[0].condition, None);
     }
 
     // ---- Deploy-time ad-hoc validation (gap #6, Zeebe AdHocSubProcessValidator) ----

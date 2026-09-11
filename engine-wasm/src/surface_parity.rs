@@ -65,7 +65,10 @@ pub(crate) enum Surface {
 /// hard compile error (`E0004: non-exhaustive patterns`) — that is the guard.
 pub(crate) fn classify(cmd: &Command) -> Surface {
     match cmd {
-        // ---- Surfaced: each has a #[wasm_bindgen] method on TestEngine ----
+        // ---- Predominantly surfaced (arms in Command-enum declaration order):
+        // most have a #[wasm_bindgen] method on TestEngine. Arms are grouped by
+        // enum order — not strictly partitioned by verdict — so each arm's own
+        // Surfaced/NotSurfaced below is the single authoritative source. ----
         Command::DeployResources(..) => Surface::Surfaced {
             js_method: "deploy",
         },
@@ -144,12 +147,16 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
             js_method: "advanceTime/tickNow",
         },
 
-        // ---- Not surfaced: conscious exclusions from the modeler test engine ----
+        // ---- Predominantly not surfaced (arms continue in Command-enum
+        // declaration order): mostly conscious exclusions from the modeler test
+        // engine, with a few surfaced commands (e.g. DeployDecisionRequirements,
+        // UpdateJobTimeout) interleaved to preserve enum order. As above, each
+        // arm's own Surfaced/NotSurfaced verdict is authoritative. ----
         Command::DeployProcess(..) => Surface::NotSurfaced {
             reason: "single-process deploy; the wrapper deploys via the DeployResources superset",
         },
-        Command::DeployDecisionRequirements(..) => Surface::NotSurfaced {
-            reason: "DMN deployment; the in-browser test engine exercises BPMN execution only",
+        Command::DeployDecisionRequirements(..) => Surface::Surfaced {
+            js_method: "deploy/deployDecision",
         },
         Command::DeleteDecisionInstance { .. } => Surface::NotSurfaced {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",

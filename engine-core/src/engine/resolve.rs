@@ -160,7 +160,7 @@ impl Engine {
     ) -> Result<HashMap<String, Value>, IoMappingFailure> {
         let mut result: HashMap<String, Value> = HashMap::new();
         for m in mappings {
-            match crate::feel::eval(m.source.trim(), vars) {
+            match Self::eval_io_mapping_source(&m.source, vars) {
                 Ok(value) => Self::assign_io_target(&mut result, vars, &m.target, value),
                 Err(err) => {
                     return Err(IoMappingFailure {
@@ -175,6 +175,33 @@ impl Engine {
             }
         }
         Ok(result)
+    }
+
+    /// Evaluates a single `zeebe:input`/`zeebe:output` mapping `source`,
+    /// applying Zeebe's static-vs-FEEL rule: a `source` is a FEEL expression
+    /// **only** when its (trimmed) text begins with the `=` marker; any other
+    /// value is a **static literal string** passed through unevaluated (#1160).
+    ///
+    /// This matches Zeebe, which treats an ioMapping `source` the same as every
+    /// other extension attribute (`zeebe:taskDefinition type`, `retries`, event
+    /// names): `in-process` is the literal string `"in-process"`, not the FEEL
+    /// subtraction `in - process`, and `{{secrets.FOO}}` is a literal the
+    /// connector runtime resolves, not a malformed context expression. Only a
+    /// leading `=` (e.g. `=1 + 1`) selects FEEL evaluation, where the marker is
+    /// stripped by [`crate::feel::eval`].
+    fn eval_io_mapping_source(
+        source: &str,
+        vars: &HashMap<String, Value>,
+    ) -> Result<Value, crate::feel::FeelError> {
+        if source.trim_start().starts_with('=') {
+            crate::feel::eval(source.trim(), vars)
+        } else {
+            // A static literal is passed through verbatim — matching the other
+            // `resolve_*` helpers (`resolve_event_name` / `resolve_job_type`),
+            // which return the raw text for the non-`=` branch. Trimming here
+            // would silently drop significant leading/trailing whitespace.
+            Ok(Value::Str(source.to_string()))
+        }
     }
 
     /// Like [`Self::eval_io_mappings_in`], but *tolerates* a mapping whose source
@@ -195,7 +222,7 @@ impl Engine {
     ) -> Result<HashMap<String, Value>, IoMappingFailure> {
         let mut result: HashMap<String, Value> = HashMap::new();
         for m in mappings {
-            match crate::feel::eval(m.source.trim(), vars) {
+            match Self::eval_io_mapping_source(&m.source, vars) {
                 Ok(value) => Self::assign_io_target(&mut result, vars, &m.target, value),
                 Err(err) => {
                     let refs = crate::feel::referenced_variables(m.source.trim());

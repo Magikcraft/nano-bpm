@@ -163,19 +163,152 @@ impl TestEngine {
         }
     }
 
-    /// Parse and deploy a BPMN resource. Returns a JSON object
-    /// `{ "processIds": [...], "snapshot": {...} }` on success, or throws a
-    /// JS error carrying the parse/deploy failure message.
+    /// Parse and deploy a BPMN **or** DMN resource — the one entry point accepts
+    /// both (issue #1158). A BPMN process resource deploys as before and returns
+    /// `{ "processIds": [...], "snapshot": {...} }`. A DMN decision resource (no
+    /// `<process>` element) is routed to decision deployment and returns the same
+    /// shape as the `deployDecision` method
+    /// (`{ "decisionRequirementsId": ..., "decisionRequirementsKey": ..., "version": N, "decisions": [{ "decisionId", "decisionName", "decisionKey", "version" }], "snapshot": {...} }`),
+    /// so a `zeebe:calledDecision` on a business rule task can finally resolve.
+    /// On failure it throws a JS error carrying the parse/deploy message for the
+    /// format the document most resembles.
     pub fn deploy(&mut self, xml: &str) -> Result<String, JsValue> {
         self.guard_paused()?;
-        let defs = parse_bpmn(xml).map_err(|e| js_err(&format!("parse error: {e}")))?;
-        let ids: Vec<String> = defs.iter().map(|d| d.id.clone()).collect();
-        self.apply(Command::DeployResources(defs))
+        // Try BPMN first (the common case). A DMN document carries no BPMN
+        // `<process>`, so it fails the BPMN parse and falls back to the DMN
+        // parser — no fragile up-front content sniffing on the happy path.
+        match parse_bpmn(xml) {
+            Ok(defs) => {
+                let ids: Vec<String> = defs.iter().map(|d| d.id.clone()).collect();
+                self.apply(Command::DeployResources(defs))
+                    .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+                let snapshot = self.snapshot_value(None);
+                to_json(&serde_json::json!({
+                    "processIds": ids,
+                    "snapshot": snapshot,
+                }))
+            }
+            Err(bpmn_err) => match nanobpmn_engine_core::dmn::parse_dmn(xml) {
+                Ok(drg) => to_json(&self.deploy_decision_drg(drg)?),
+                // Neither parser accepted it: report the error for the format the
+                // document most resembles (a DMN-namespaced doc gets the DMN
+                // error), so the message is actionable rather than misleading.
+                Err(dmn_err) => {
+                    if resource_looks_like_dmn(xml) {
+                        Err(js_err(&format!("parse error: {dmn_err}")))
+                    } else {
+                        Err(js_err(&format!("parse error: {bpmn_err}")))
+                    }
+                }
+            },
+        }
+    }
+
+    /// Parse and deploy a DMN decision-requirements resource explicitly. Registers
+    /// every `<decision>` it contains (by id) so a business rule task's
+    /// `zeebe:calledDecision` resolves and `evaluateDecision` can run it. Returns a
+    /// JSON object
+    /// `{ "decisionRequirementsId": ..., "decisionRequirementsKey": ..., "version": N, "decisions": [{ "decisionId", "decisionName", "decisionKey", "version" }], "snapshot": {...} }`
+    /// on success, or throws a JS error carrying the parse/deploy failure message.
+    #[wasm_bindgen(js_name = deployDecision)]
+    pub fn deploy_decision(&mut self, xml: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(xml)
+            .map_err(|e| js_err(&format!("parse error: {e}")))?;
+        to_json(&self.deploy_decision_drg(drg)?)
+    }
+
+    /// Register a parsed DRG as a decision deployment and build the response
+    /// object. Shared by [`Self::deploy`] (DMN auto-route) and
+    /// [`Self::deploy_decision`]. Resolves the assigned identities from post-apply
+    /// state rather than the emitted events, so an idempotent redeploy of the
+    /// identical latest DRG (which emits no `DecisionDeployed` event) still returns
+    /// the existing identity (native parity — the server builds responses from
+    /// resolved state, not events).
+    fn deploy_decision_drg(
+        &mut self,
+        drg: nanobpmn_engine_core::dmn::DecisionRequirementsGraph,
+    ) -> Result<serde_json::Value, JsValue> {
+        let drg_id = drg.id.clone();
+        self.apply(Command::DeployDecisionRequirements(vec![drg]))
             .map_err(|e| js_err(&format!("deploy error: {e}")))?;
+        let (drg_key, version, decisions) = {
+            let state = self.engine.state();
+            let deployed = state.decision_requirements.get(&drg_id).ok_or_else(|| {
+                js_err("deploy error: decision requirements not found after deploy")
+            })?;
+            let decisions: Vec<serde_json::Value> = deployed
+                .drg
+                .decisions
+                .iter()
+                .map(|d| {
+                    // Every <decision> in a successfully-deployed DRG must be
+                    // registered; a missing identity is a deploy bug, so fail
+                    // loudly rather than silently emitting null key/version.
+                    let identity = state.decisions.get(&d.id).ok_or_else(|| {
+                        js_err(&format!(
+                            "deploy error: decision '{}' was not registered after deploy",
+                            d.id
+                        ))
+                    })?;
+                    Ok(serde_json::json!({
+                        "decisionId": d.id,
+                        "decisionName": d.name,
+                        "decisionKey": identity.key.to_string(),
+                        "version": identity.version,
+                    }))
+                })
+                .collect::<Result<Vec<_>, JsValue>>()?;
+            (deployed.key, deployed.version, decisions)
+        };
         let snapshot = self.snapshot_value(None);
-        to_json(&serde_json::json!({
-            "processIds": ids,
+        Ok(serde_json::json!({
+            "decisionRequirementsId": drg_id,
+            "decisionRequirementsKey": drg_key.to_string(),
+            "version": version,
+            "decisions": decisions,
             "snapshot": snapshot,
+        }))
+    }
+
+    /// Evaluate a deployed decision by id against the given variables — the
+    /// standalone counterpart to a business rule task's in-line evaluation. The
+    /// decision must already be deployed (via `deploy`/`deployDecision`). Read-only:
+    /// it evaluates and returns the result without mutating engine state or
+    /// recording a decision instance. `variables_json` is a JSON object string
+    /// (`"{}"` / `""` for none). Returns
+    /// `{ "decisionId": ..., "decisionKey": ..., "output": <value> }` on success,
+    /// or throws a JS error carrying an "unknown decision" or evaluation-failure
+    /// message.
+    #[wasm_bindgen(js_name = evaluateDecision)]
+    pub fn evaluate_decision(
+        &mut self,
+        decision_id: &str,
+        variables_json: &str,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let variables = parse_vars(variables_json)?;
+        let deployed = self
+            .engine
+            .state()
+            .decisions
+            .get(decision_id)
+            .ok_or_else(|| {
+                js_err(&format!(
+                    "evaluate error: no deployed decision with id '{decision_id}'"
+                ))
+            })?;
+        let result = nanobpmn_engine_core::dmn::evaluate(&deployed.drg, decision_id, &variables);
+        if let Some(failure) = &result.failure {
+            return Err(js_err(&format!(
+                "evaluate error: failed to evaluate decision '{}': {}",
+                failure.failed_decision_id, failure.message
+            )));
+        }
+        to_json(&serde_json::json!({
+            "decisionId": decision_id,
+            "decisionKey": deployed.key.to_string(),
+            "output": value_to_json(&result.decision_output),
         }))
     }
 
@@ -2842,6 +2975,16 @@ fn parse_key(s: &str) -> Result<u64, JsValue> {
         .map_err(|_| js_err(&format!("invalid key: {s}")))
 }
 
+/// Whether an XML resource that failed *both* the BPMN and DMN parsers most
+/// resembles DMN, used only to attribute the error message in [`TestEngine::deploy`]
+/// (the happy path routes by successful parse, never by this heuristic). A DMN
+/// document declares the DMN MODEL namespace; a BPMN document declares the BPMN
+/// one — so the namespace substring cleanly distinguishes the two even when the
+/// body is too malformed for either parser to accept.
+fn resource_looks_like_dmn(xml: &str) -> bool {
+    xml.contains("/spec/DMN/")
+}
+
 fn update_timeout_value(timeout_ms: f64) -> Result<i64, String> {
     if !timeout_ms.is_finite()
         || timeout_ms < i64::MIN as f64
@@ -4668,6 +4811,126 @@ mod tests {
                 "an invalid RFC-3339 string is rejected: {bad}"
             );
         }
+    }
+
+    // --- DMN deploy / evaluate surface (issue #1158) -------------------------
+
+    const GREETING_DMN: &str = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="drg" name="drg">
+      <decision id="greeting" name="Greeting">
+        <decisionTable hitPolicy="UNIQUE">
+          <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+          <output id="o1" name="result" typeRef="string" />
+          <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+            <outputEntry id="oe1"><text>"hello"</text></outputEntry></rule>
+          <rule id="r2"><inputEntry id="ie2"><text>"de"</text></inputEntry>
+            <outputEntry id="oe2"><text>"hallo"</text></outputEntry></rule>
+        </decisionTable>
+      </decision>
+    </definitions>"##;
+
+    const BUSINESS_RULE_TASK_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="rules" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:businessRuleTask id="decide">
+      <bpmn:extensionElements>
+        <zeebe:calledDecision decisionId="greeting" resultVariable="score" />
+      </bpmn:extensionElements>
+    </bpmn:businessRuleTask>
+    <bpmn:endEvent id="done" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="decide" />
+    <bpmn:sequenceFlow id="f2" sourceRef="decide" targetRef="done" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    #[test]
+    fn deploy_decision_registers_the_drg_and_its_decisions() {
+        let mut eng = TestEngine::new();
+        let out = parse(&eng.deploy_decision(GREETING_DMN).unwrap());
+        assert_eq!(out["decisionRequirementsId"], "drg");
+        assert_eq!(out["version"], 1);
+        let decisions = out["decisions"].as_array().unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0]["decisionId"], "greeting");
+        assert_eq!(decisions[0]["decisionName"], "Greeting");
+        assert_eq!(decisions[0]["version"], 1);
+        assert!(decisions[0]["decisionKey"].as_str().is_some());
+        // The decision is now resolvable in engine state.
+        assert!(eng.engine.state().decisions.contains_key("greeting"));
+    }
+
+    #[test]
+    fn deploy_auto_detects_dmn_and_routes_to_decision_deployment() {
+        // The one deploy() entry point accepts DMN — the exact repro from #1158,
+        // where `deploy(<dmn>)` used to fail with "no <process> element found".
+        let mut eng = TestEngine::new();
+        let out = parse(&eng.deploy(GREETING_DMN).unwrap());
+        assert_eq!(out["decisionRequirementsId"], "drg");
+        assert!(out.get("processIds").is_none());
+        assert!(eng.engine.state().decisions.contains_key("greeting"));
+    }
+
+    #[test]
+    fn deploy_still_returns_process_ids_for_bpmn() {
+        let mut eng = TestEngine::new();
+        let out = parse(&eng.deploy(SERVICE_TASK_XML).unwrap());
+        assert_eq!(out["processIds"], serde_json::json!(["p"]));
+        assert!(out.get("decisionRequirementsId").is_none());
+    }
+
+    #[test]
+    fn business_rule_task_resolves_called_decision_end_to_end() {
+        // Deploy the DMN and a process whose businessRuleTask calls it, run an
+        // instance, and confirm the decision output is bound and a decision
+        // instance is recorded in the snapshot — the whole point of #1158.
+        let mut eng = TestEngine::new();
+        eng.deploy_decision(GREETING_DMN).unwrap();
+        eng.deploy(BUSINESS_RULE_TASK_XML).unwrap();
+        let snap = parse(
+            &eng.create_instance("rules", r#"{"lang":"de"}"#, None)
+                .unwrap(),
+        );
+
+        // The instance ran straight through to completion (no incident).
+        assert!(
+            snap["incidents"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(true),
+            "unexpected incident: {snap}"
+        );
+        // A decision instance was recorded with the evaluated output.
+        let decisions = snap["decisionInstances"].as_array().unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0]["decisionId"], "greeting");
+        assert_eq!(decisions[0]["output"], "hallo");
+    }
+
+    #[test]
+    fn evaluate_decision_runs_a_deployed_decision() {
+        let mut eng = TestEngine::new();
+        eng.deploy_decision(GREETING_DMN).unwrap();
+        let out = parse(
+            &eng.evaluate_decision("greeting", r#"{"lang":"en"}"#)
+                .unwrap(),
+        );
+        assert_eq!(out["decisionId"], "greeting");
+        assert_eq!(out["output"], "hello");
+        assert!(out["decisionKey"].as_str().is_some());
+    }
+
+    #[test]
+    fn resource_dmn_detection_distinguishes_dmn_from_bpmn() {
+        // Error attribution in deploy() relies on this: a DMN-namespaced document
+        // is DMN, a BPMN-namespaced one is not. (Only reached when both parsers
+        // reject; the happy path routes by successful parse.)
+        assert!(resource_looks_like_dmn(GREETING_DMN));
+        assert!(resource_looks_like_dmn(
+            r#"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="e" />"#
+        ));
+        assert!(!resource_looks_like_dmn(SERVICE_TASK_XML));
+        assert!(!resource_looks_like_dmn(BUSINESS_RULE_TASK_XML));
     }
 }
 
