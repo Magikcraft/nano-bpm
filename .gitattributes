@@ -1,0 +1,30 @@
+# Checked-in DERIVED artifacts — regenerated from source, never hand-edited.
+#
+#   engine-wasm/pkg/**        wasm-pack output rebuilt from engine-core by
+#                             `make console-wasm` (both `lean` and `readmodel`
+#                             subpath variants).
+#   processos/assets/ir.gbnf  emitted by `cd processos && cargo run -- emit-gbnf`.
+#
+# Two consequences for each:
+#
+#  1. linguist-generated — collapse them in GitHub PR diffs (the compiled `.wasm`
+#     are binary; the surrounding JS/TS/grammar are machine-emitted), so a review
+#     sees the source change, not the regenerated blob.
+#
+#  2. merge=keep-ours — never attempt a three-way merge of the artifact. Two
+#     branches that both rebuilt it otherwise collide on every integration (the
+#     recurring conflict class behind Magikcraft/nano-bpm#1166, where the SOURCE
+#     merged cleanly and only the committed `*_bg.wasm` blobs conflicted). The
+#     authoritative bytes are not merged — they are REGENERATED against the merged
+#     source, and CI's `engine-wasm (release drift guard)` + processos build
+#     `git diff --exit-code` the regenerated artifact, so a stale commit fails the
+#     build rather than shipping. Keeping "ours" on merge is therefore safe: it is
+#     immediately re-derived and drift-guarded.
+#
+# The `keep-ours` driver is registered by `make setup` (`git config
+# merge.keep-ours.driver true`). Git silently ignores an unregistered driver and
+# falls back to today's manual binary-conflict resolve, so this degrades
+# gracefully in a clone that has not run setup.
+engine-wasm/pkg/**            linguist-generated=true merge=keep-ours
+engine-wasm/pkg/**/*_bg.wasm  -diff
+processos/assets/ir.gbnf      linguist-generated=true merge=keep-ours

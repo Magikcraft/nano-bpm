@@ -55,11 +55,19 @@ FMT_CRATES := $(ENGINE_DIR) $(PROJECT_ROOT)/server $(PROCESSOS_DIR) $(WASM_DIR) 
 .DEFAULT_GOAL := build
 
 .PHONY: setup
-setup: check-deps ## Verify the toolchain, provision the Python build env (uv sync), then generate the REST stubs — run this first
+setup: check-deps git-merge-drivers ## Verify the toolchain, provision the Python build env (uv sync), then generate the REST stubs — run this first
 	$(UV) sync
 	$(MAKE) generate
 	@echo
 	@echo "Setup complete. Build everything with: make all"
+
+.PHONY: git-merge-drivers
+git-merge-drivers: ## Register the `keep-ours` merge driver used by .gitattributes for checked-in derived artifacts (engine-wasm/pkg, processos/assets/ir.gbnf). Idempotent; no-op outside a git work tree.
+	@if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+	  git config merge.keep-ours.driver true; \
+	  git config merge.keep-ours.name "keep the current side (derived artifact; regenerate + drift-guard is the source of truth)"; \
+	  echo "  registered git merge driver 'keep-ours' (see .gitattributes)"; \
+	fi
 
 .PHONY: check-deps
 check-deps: ## Check that the required toolchain is installed (rust, uv, java) and report optional tools
