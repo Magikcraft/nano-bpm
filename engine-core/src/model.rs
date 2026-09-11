@@ -142,9 +142,14 @@ impl Condition {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SequenceFlow {
     pub to: ElementId,
-    /// `None` means an unconditional flow. On a condition-routed gateway
-    /// (exclusive or inclusive) an unconditional flow acts as the default (place
-    /// it last).
+    /// `None` means an unconditional flow (its absent guard always holds). The
+    /// two condition-routed gateways treat that differently: an **exclusive**
+    /// gateway takes only the *first* matching flow in document order, so an
+    /// unconditional flow placed last acts as a de-facto default; an
+    /// **inclusive** gateway takes *every* matching flow, so an unconditional
+    /// non-default flow is **always** selected (never a fallback). For an
+    /// inclusive fallback use the explicit [`is_default`](Self::is_default) flow,
+    /// which is chosen only when no other flow matches (see `select_inclusive_flows`).
     pub condition: Option<Condition>,
     /// True when this is the condition-routed gateway's explicit **default** flow
     /// (the gateway's `default="..."` attribute). A default flow is selected only

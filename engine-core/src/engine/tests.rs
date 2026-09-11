@@ -3743,6 +3743,79 @@ fn inclusive_join_waits_while_a_boundary_that_reaches_it_is_still_armed() {
 }
 
 #[test]
+fn inclusive_join_waits_while_a_link_throw_that_reaches_it_is_pending() {
+    // #1168 regression (link-event reachability). An inclusive join `j` is
+    // reachable from branch `a` (normal flow `a -> j`) AND from branch `b` via a
+    // link hop: `b -> thr` (link *throw*) hands its token directly to the
+    // matching same-scope link *catch* `cat` (no sequence flow), and `cat -> j`.
+    // Because the throw→catch transition is invisible to the sequence-flow graph,
+    // a token parked on `b` (upstream of the throw) is NOT a sequence-flow
+    // predecessor of `j` — only the link edge makes `b` reach `j`. When `a`
+    // arrives at the open join while `b` is still parked on its job, the
+    // quiescence sweep must NOT fire `j`: the pending link hop could yet route a
+    // token in, and firing early would then create a second, late arrival at `j`.
+    let def = ProcessBuilder::new("inc-link")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .link_intermediate_throw_event("thr", "L")
+        .link_intermediate_catch_event("cat", "L")
+        .inclusive_gateway("j")
+        .end_event("e")
+        .connect("s", "isplit")
+        .connect("isplit", "a")
+        .connect("isplit", "b")
+        .connect("a", "j")
+        .connect("b", "thr")
+        .connect("cat", "j")
+        .connect("j", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("inc-link"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(engine.pending_jobs().len(), 2);
+
+    // Complete branch `a`; its token reaches the open inclusive join `j`. Branch
+    // `b` is still parked on its job, and `b` reaches `j` through the pending link
+    // hop, so `j` must not fire yet.
+    let after_a = complete_one(&mut engine, "ja");
+    assert!(
+        !after_a
+            .iter()
+            .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "e")),
+        "the inclusive join must not fire while `b` can still reach it via the link throw"
+    );
+    assert!(
+        !engine.is_completed(instance_key),
+        "the instance must still be running with `b` parked and the join held open"
+    );
+
+    // Complete branch `b`; its token flows `b -> thr -> (link) -> cat -> j`. Now no
+    // live token can reach `j` other than the two that arrived — it fires once and
+    // routes to the end exactly once (no premature fire, no duplicate).
+    let after_b = complete_one(&mut engine, "jb");
+    assert!(
+        engine.is_completed(instance_key),
+        "once `b` arrives through the link hop, the join fires and the instance completes"
+    );
+    assert_eq!(
+        after_b
+            .iter()
+            .filter(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "e"))
+            .count(),
+        1,
+        "the join routes to the end exactly once (no premature fire, no duplicate)"
+    );
+    assert!(engine.active_incidents().is_empty());
+}
+
+#[test]
 fn terminate_end_kills_sibling_branch_and_completes_the_instance() {
     // s -> split =< work (service task), trigger (service task) -> stop (terminate end) >
     //

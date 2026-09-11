@@ -10830,6 +10830,31 @@ impl Engine {
                     .or_default()
                     .push(host.as_str());
             }
+            // A link intermediate *throw* event has no outgoing sequence flow:
+            // on completion it hands its token directly to the matching
+            // same-scope link *catch* (see `resolve_link_catch`). That direct
+            // transition is invisible to the sequence-flow graph, so — exactly
+            // like the reactive-boundary edge above — a token resting on (or
+            // upstream of) a link throw would not be seen as reaching a join
+            // downstream of the catch, and the sweep would fire the join
+            // prematurely before the throw hands off; the throw then activates
+            // the catch and creates a second late arrival (#1168 defect class).
+            // Treat the throw as a predecessor of its matching catch (mirroring
+            // `resolve_link_catch`'s same-name, same-scope pairing).
+            if let ElementKind::LinkIntermediateThrowEvent { link_name } = &element.kind {
+                for other in process.elements.values() {
+                    if let ElementKind::LinkIntermediateCatchEvent { link_name: name } =
+                        &other.kind
+                    {
+                        if name == link_name && other.parent == element.parent {
+                            predecessors
+                                .entry(other.id.as_str())
+                                .or_default()
+                                .push(element.id.as_str());
+                        }
+                    }
+                }
+            }
         }
         let mut stack = vec![target];
         while let Some(node) = stack.pop() {
