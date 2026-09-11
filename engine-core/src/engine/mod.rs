@@ -7257,13 +7257,18 @@ impl Engine {
         // like a leaf activity's inputs — but sourced from the container catalog
         // because the tool element is pruned from the executable graph.
         let mut local_variables = variables;
+        // The tool's own input-mapping results, kept aside so a `callActivity`
+        // tool can seed its spawned child with exactly them when
+        // `propagateAllParentVariables=false` (issue #1159).
+        let mut applied_inputs: HashMap<String, Value> = HashMap::new();
         if let Some(cid) = container_element_id.as_deref() {
             let inputs = self.adhoc_tool_io(instance_key, cid, &element_id).inputs;
             if !inputs.is_empty() {
                 match self.eval_io_mappings_in(&child_vars, &inputs) {
                     Ok(input_updates) => {
                         child_vars.extend(input_updates.clone());
-                        local_variables.extend(input_updates);
+                        local_variables.extend(input_updates.clone());
+                        applied_inputs = input_updates;
                     }
                     Err(failure) => {
                         // A tool input mapping that fails to evaluate halts the
@@ -7534,15 +7539,45 @@ impl Engine {
                     scope: child_key,
                 });
             }
+            // A `callActivity` tool (issue #1159): spawn a distinct CHILD PROCESS
+            // INSTANCE of its `calledElement`, exactly like a call activity on an
+            // ordinary sequence flow — instead of the pass-through arm below,
+            // which silently completed the tool child without ever instantiating
+            // the callee (its output mapping then ran against variables the child
+            // never set, manufacturing an all-null result). The tool child
+            // element instance (`child_key`) is the call-activity token: it stays
+            // ACTIVATED in the container's active set while the child runs, and
+            // the child links back to it via `parentElementInstanceKey` so its
+            // completion routes through `complete_call_activity` →
+            // `complete_adhoc_call_activity_tool` (feeding the container's
+            // `outputElement`/loop). The tool's input mappings were already
+            // applied above (`applied_inputs`); `propagateAllParentVariables`
+            // selects the child's seed — the full activating view, or only the
+            // input results when suppressed.
+            Some(crate::model::AdHocToolKind::CallActivity {
+                process_id,
+                propagate_all_parent_variables,
+                ..
+            }) => {
+                let called = process_id.unwrap_or_default();
+                let child_seed = if propagate_all_parent_variables {
+                    child_vars.clone()
+                } else {
+                    applied_inputs
+                };
+                let (spawn_events, spawn_followups) = self.spawn_call_activity_instance(
+                    instance_key,
+                    child_key,
+                    &element_id,
+                    &called,
+                    &child_vars,
+                    child_seed,
+                );
+                events.extend(spawn_events);
+                followups.extend(spawn_followups);
+            }
             // Other / an unlisted id: no job or task to run, so the child passes
             // straight through to completion, feeding the loop.
-            //
-            // NOTE (issue #808 ↔ #631 coordination): a `callActivity` used *as* an
-            // ad-hoc tool still takes this pass-through arm rather than spawning a
-            // real child process instance via this issue's call-activity
-            // machinery. Per the coordination note, whichever of #631/#808 lands
-            // second owns wiring this arm to `spawn_call_activity_child`; #808
-            // (this change) leaves it as the current pass-through and flags it.
             _ => {
                 followups.push(Step::Complete {
                     instance_key,
@@ -10232,6 +10267,77 @@ impl Engine {
         propagate_all_parent: bool,
         element_vars: &HashMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
+        // Input mappings are evaluated into the call activity's local scope
+        // regardless (Zeebe: they seed the child's local variables). With
+        // `propagate_all_parent` (the Zeebe `propagateAllParentVariables`
+        // default), *all* variables visible in the call activity's scope also
+        // cross into the child, with the input-mapping results layered on top
+        // (child-local wins). With it off, only the input-mapping results cross —
+        // an isolated child seeded purely by the mappings.
+        let inputs = self.io_inputs(parent_instance, element_id);
+        let input_results = if inputs.is_empty() {
+            HashMap::new()
+        } else {
+            match self.eval_io_mappings_in(element_vars, &inputs) {
+                Ok(updates) => updates,
+                Err(failure) => {
+                    // A call-activity input mapping that fails to evaluate halts the
+                    // call activity with an `IO_MAPPING_ERROR` incident rather than
+                    // starting the child process against a silently-unset variable
+                    // (#939/#946). Resolution re-drives only the *spawn*
+                    // (`CallActivitySpawn`) for the already-activated call activity —
+                    // its boundary events were armed on the first pass and must not
+                    // be re-armed.
+                    let event = self.io_mapping_incident(
+                        parent_instance,
+                        call_eik,
+                        element_id.to_string(),
+                        failure,
+                        state::IoMappingRedrive::CallActivitySpawn,
+                    );
+                    return (vec![event], Vec::new());
+                }
+            }
+        };
+        let child_vars = if propagate_all_parent {
+            let mut merged = element_vars.clone();
+            merged.extend(input_results);
+            merged
+        } else {
+            input_results
+        };
+        self.spawn_call_activity_instance(
+            parent_instance,
+            call_eik,
+            element_id,
+            called_process_id,
+            element_vars,
+            child_vars,
+        )
+    }
+
+    /// Shared child-process spawn for a call activity, whether it is reached on
+    /// an ordinary sequence flow ([`spawn_call_activity_child`]) or as an ad-hoc
+    /// tool ([`activate_adhoc_tool`], issue #1159). Resolves the callee id (a
+    /// literal or a FEEL `=` expression, evaluated against `eval_view`), guards
+    /// runaway recursion, resolves the called definition, and — on success —
+    /// creates the child process instance seeded with the caller-prepared
+    /// `child_seed` variables, linked back to `call_eik` via
+    /// `parentElementInstanceKey`/`parentProcessInstanceKey` so its completion
+    /// releases the parent's parked call-activity token. An unresolvable callee
+    /// expression, an unknown callee, or exceeding the depth cap parks the token
+    /// on a recoverable incident instead (no child is created). The caller owns
+    /// the input mappings and the `propagateAllParentVariables` seed decision, so
+    /// this single site owns only the callee-resolution + spawn machinery.
+    fn spawn_call_activity_instance(
+        &mut self,
+        parent_instance: Key,
+        call_eik: Key,
+        element_id: &str,
+        called_process_id: &str,
+        eval_view: &HashMap<String, Value>,
+        child_seed: HashMap<String, Value>,
+    ) -> (Vec<Event>, Vec<Step>) {
         // The callee id may be a literal or a FEEL `=` expression (C8
         // `zeebe:calledElement processId`), resolved against the activating view.
         // A failing expression must surface as an expression-evaluation incident
@@ -10241,7 +10347,7 @@ impl Engine {
         let called = {
             let trimmed = called_process_id.trim();
             if trimmed.starts_with('=') {
-                match crate::feel::eval_string(trimmed, element_vars) {
+                match crate::feel::eval_string(trimmed, eval_view) {
                     Ok(id) => id,
                     Err(err) => {
                         let incident_key = self.mint_key();
@@ -10316,51 +10422,12 @@ impl Engine {
                 Vec::new(),
             );
         };
-        // Input mappings are evaluated into the call activity's local scope
-        // regardless (Zeebe: they seed the child's local variables). With
-        // `propagate_all_parent` (the Zeebe `propagateAllParentVariables`
-        // default), *all* variables visible in the call activity's scope also
-        // cross into the child, with the input-mapping results layered on top
-        // (child-local wins). With it off, only the input-mapping results cross —
-        // an isolated child seeded purely by the mappings.
-        let inputs = self.io_inputs(parent_instance, element_id);
-        let input_results = if inputs.is_empty() {
-            HashMap::new()
-        } else {
-            match self.eval_io_mappings_in(element_vars, &inputs) {
-                Ok(updates) => updates,
-                Err(failure) => {
-                    // A call-activity input mapping that fails to evaluate halts the
-                    // call activity with an `IO_MAPPING_ERROR` incident rather than
-                    // starting the child process against a silently-unset variable
-                    // (#939/#946). Resolution re-drives only the *spawn*
-                    // (`CallActivitySpawn`) for the already-activated call activity —
-                    // its boundary events were armed on the first pass and must not
-                    // be re-armed.
-                    let event = self.io_mapping_incident(
-                        parent_instance,
-                        call_eik,
-                        element_id.to_string(),
-                        failure,
-                        state::IoMappingRedrive::CallActivitySpawn,
-                    );
-                    return (vec![event], Vec::new());
-                }
-            }
-        };
-        let child_vars = if propagate_all_parent {
-            let mut merged = element_vars.clone();
-            merged.extend(input_results);
-            merged
-        } else {
-            input_results
-        };
         let child_key = self.mint_key();
         (
             vec![Event::ProcessInstanceCreated {
                 instance_key: child_key,
                 process_id: called,
-                variables: child_vars,
+                variables: child_seed,
                 created_at: self.now,
                 tags: Vec::new(),
                 business_id: None,
@@ -10399,6 +10466,24 @@ impl Engine {
             .unwrap_or(false);
         if !still_active {
             return (Vec::new(), Vec::new());
+        }
+        // A call activity used *as an ad-hoc tool* (issue #1159) is not a leaf on
+        // an ordinary sequence flow: its element instance hangs off an
+        // `AD_HOC_SUB_PROCESS_INNER_INSTANCE` whose scope is the ad-hoc container
+        // that still lists it active. Its completion must feed the container's
+        // `outputElement`/loop (via `complete_adhoc_tool`), not take an outgoing
+        // sequence flow, so route it there — carrying the child's produced
+        // variables so the tool's output mapping projects them for real.
+        if let Some((container_key, _inner_key)) =
+            self.adhoc_tool_container_of(instance_key, element_instance_key)
+        {
+            return self.complete_adhoc_call_activity_tool(
+                instance_key,
+                element_instance_key,
+                element_id,
+                container_key,
+                child_variables,
+            );
         }
         // Zeebe `propagateAllChildVariables` (default true when the attribute is
         // absent). When off, only the output mappings cross back.
@@ -10484,7 +10569,159 @@ impl Engine {
         (events, followups)
     }
 
-    /// Cancels the in-flight call-activity children of every instance ended by
+    /// Resolves the ad-hoc container (and the tool's inner-instance wrapper) that
+    /// owns `element_instance_key` when it is an ad-hoc tool child, or `None`
+    /// otherwise (issue #1159). An ad-hoc tool child hangs off an
+    /// `AD_HOC_SUB_PROCESS_INNER_INSTANCE` whose own scope is the container that
+    /// still lists the tool child in its `active` set — the exact scope-chain
+    /// check `complete` uses to route a completing tool child to
+    /// `complete_adhoc_tool`. Used by `complete_call_activity` to recognise a
+    /// call-activity tool whose spawned child has just finished.
+    fn adhoc_tool_container_of(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+    ) -> Option<(Key, Key)> {
+        let inner_key = self.scope_of(instance_key, element_instance_key);
+        if inner_key == 0 {
+            return None;
+        }
+        let container_key = self.scope_of(instance_key, inner_key);
+        if container_key == 0 {
+            return None;
+        }
+        let is_tool = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+            .map(|a| a.active.contains(&element_instance_key))
+            .unwrap_or(false);
+        is_tool.then_some((container_key, inner_key))
+    }
+
+    /// Completes a `callActivity` ad-hoc tool (issue #1159) once its spawned
+    /// child process instance finished. Unlike a service-task tool — whose result
+    /// variables are written into the tool child's own scope by the agent's job
+    /// completion — a call-activity tool's results live in a *separate* child
+    /// instance and cross back through the tool's output mapping (and, with
+    /// `propagateAllChildVariables`, the whole child scope). This bridges the
+    /// gap: it evaluates the tool's `zeebe:output` mappings against what the child
+    /// actually produced (`child_variables`) and writes both those projected
+    /// results and — when propagation is on — the raw child variables into the
+    /// tool child's LOCAL scope, then hands off to the shared
+    /// `complete_adhoc_tool` leaf path (via `Step::Complete`). That way the
+    /// container's `outputElement` sees the real projected result before it is
+    /// collected, and the tool's output mapping projects into the container scope
+    /// exactly as for any other tool — no more all-null manufactured answer. The
+    /// tool child's local scope is torn down on completion, so the raw child
+    /// variables never leak past the intended projections when propagation is
+    /// off.
+    fn complete_adhoc_call_activity_tool(
+        &mut self,
+        instance_key: Key,
+        child_eik: Key,
+        element_id: String,
+        container_key: Key,
+        child_variables: HashMap<String, Value>,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let container_element_id = match self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+        {
+            Some(a) => a.element_id.clone(),
+            None => return (Vec::new(), Vec::new()),
+        };
+        // Honour `propagateAllChildVariables` (Zeebe default `true`) as declared
+        // on the tool's catalog entry.
+        let propagate_all_child = self
+            .adhoc_def_of(instance_key, &container_element_id)
+            .and_then(|def| {
+                def.tools
+                    .iter()
+                    .find(|t| t.element_id == element_id)
+                    .map(|t| match &t.kind {
+                        crate::model::AdHocToolKind::CallActivity {
+                            propagate_all_child_variables,
+                            ..
+                        } => *propagate_all_child_variables,
+                        _ => true,
+                    })
+            })
+            .unwrap_or(true);
+        // Project the tool's output mapping against the child's produced
+        // variables (NOT the tool child's scope, which the child never wrote) —
+        // the fix for the all-null result. A failing mapping halts the tool with
+        // an incident, mirroring `complete_adhoc_tool`; resolution re-drives the
+        // completion (the child that produced these variables is already gone, so
+        // they are captured on the incident's redrive).
+        let outputs = self
+            .adhoc_tool_io(instance_key, &container_element_id, &element_id)
+            .outputs;
+        let output_updates = if outputs.is_empty() {
+            HashMap::new()
+        } else {
+            match self.eval_io_mappings_in(&child_variables, &outputs) {
+                Ok(updates) => updates,
+                Err(failure) => {
+                    let event = self.io_mapping_incident(
+                        instance_key,
+                        child_eik,
+                        element_id,
+                        failure,
+                        state::IoMappingRedrive::Completion,
+                    );
+                    return (vec![event], Vec::new());
+                }
+            }
+        };
+        // Seed the tool child's LOCAL scope with the raw child variables AND the
+        // projected output. The shared leaf path (`complete_adhoc_tool`) evaluates
+        // the container's `outputElement` and RE-projects the tool's output
+        // mapping against this scope, so it must resolve both the output target
+        // (e.g. `outputElement="=toolCallResult"`) and every field the mapping's
+        // source references (e.g. `status`/`summary`). This scope is torn down
+        // when the tool child completes, so the raw child variables never leak
+        // past the intended projections regardless of `propagateAllChildVariables`.
+        let mut seed = child_variables.clone();
+        seed.extend(output_updates);
+        let mut events = Vec::new();
+        if !seed.is_empty() {
+            events.push(Event::ScopedVariablesUpdated {
+                instance_key,
+                scope_key: child_eik,
+                variables: seed,
+            });
+        }
+        // `propagateAllChildVariables` (Zeebe default `true`): when on, merge the
+        // child's raw variables into the CONTAINER scope — the tool's parent —
+        // mirroring the sequence-flow call-activity path. The leaf re-projects the
+        // tool's output mapping into the container AFTER this, so an explicit
+        // output mapping still overrides a propagated value. When off, only the
+        // output mapping crosses back.
+        if propagate_all_child && !child_variables.is_empty() {
+            events.extend(self.propagated_updates(
+                instance_key,
+                container_key,
+                child_variables,
+                false,
+            ));
+        }
+        // Hand off to the shared ad-hoc tool completion leaf path. The seeded
+        // variables above are applied before this step runs, so
+        // `complete_adhoc_tool` sees the real result when it evaluates the
+        // container's `outputElement` and re-projects the tool's output mapping
+        // into the container scope.
+        let followups = vec![Step::Complete {
+            instance_key,
+            element_instance_key: child_eik,
+            element_id,
+        }];
+        (events, followups)
+    }
+
     /// the current command that leaves its parent's call-activity token behind
     /// (Zeebe parity: cancelling the parent cancels the child), transitively down
     /// the parent-child tree. Called after the command drains, so it sees every

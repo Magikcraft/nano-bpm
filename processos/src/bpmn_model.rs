@@ -2122,7 +2122,10 @@ fn emit_element(
                 tool.element_id == id
                     && matches!(
                         tool.kind,
-                        nanobpmn_engine_core::AdHocToolKind::CallActivity { process_id: None }
+                        nanobpmn_engine_core::AdHocToolKind::CallActivity {
+                            process_id: None,
+                            ..
+                        }
                     )
             });
             if !unbound_tool {
@@ -2789,10 +2792,14 @@ fn restore_adhoc_catalog_elements(def: &mut ProcessDefinition) {
                     linked_resources: Vec::new(),
                 },
                 AdHocToolKind::UserTask(props) => ElementKind::UserTask(props.clone()),
-                AdHocToolKind::CallActivity { process_id } => ElementKind::CallActivity {
+                AdHocToolKind::CallActivity {
+                    process_id,
+                    propagate_all_parent_variables,
+                    propagate_all_child_variables,
+                } => ElementKind::CallActivity {
                     called_process_id: process_id.clone().unwrap_or_default(),
-                    propagate_all_parent_variables: true,
-                    propagate_all_child_variables: true,
+                    propagate_all_parent_variables: *propagate_all_parent_variables,
+                    propagate_all_child_variables: *propagate_all_child_variables,
                 },
                 AdHocToolKind::SubProcess { start_event } => ElementKind::SubProcess {
                     start_event: start_event.clone(),

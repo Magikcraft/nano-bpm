@@ -22247,3 +22247,199 @@ fn link_events_route_by_matching_name() {
         "the throw hands off to the same-named catch 'B'"
     );
 }
+
+/// A parent process whose ad-hoc agent's only tool is a `bpmn:callActivity`
+/// delegating to a separate `child` process (issue #1159). The tool maps
+/// `askedAbout -> customerRequest` inbound and `{status, summary} ->
+/// toolCallResult` outbound, with both propagate flags off (the child crosses
+/// the instance boundary purely through the mappings). The container's
+/// `outputElement` collects `toolCallResult`.
+fn adhoc_agent_with_call_activity_tool() -> Vec<ProcessDefinition> {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="child"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="={status: status, summary: summary}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+        <bpmn:process id="child">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap()
+}
+
+/// Issue #1159 (red/green): activating a `callActivity` as an ad-hoc tool must
+/// INSTANTIATE its called process (propagating the mapped input), wait for it,
+/// and apply the tool's output mapping to what the child ACTUALLY produced —
+/// instead of the old bug where the call activity was activated but its child
+/// process was never started, so no child instance/job/incident was created and
+/// the output mapping manufactured an all-null `{status: null, summary: null}`.
+#[test]
+fn adhoc_call_activity_tool_spawns_child_and_maps_its_real_output() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_call_activity_tool() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("askedAbout", Value::Str("a mortgage".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    // Turn 1: the agent activates the call-activity tool. This must SPAWN the
+    // child process (its `probe-child` job appears) rather than pass straight
+    // through — and the tool child must stay ACTIVE while the child runs.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "the call-activity tool child stays active while its spawned child runs"
+    );
+
+    let child_jobs = engine.activate_jobs("probe-child", "W", 10, 1_000, 0);
+    assert_eq!(
+        child_jobs.len(),
+        1,
+        "activating a call-activity tool instantiates the called process \
+         (a `probe-child` job is minted) — the #1159 bug minted zero"
+    );
+    let child_job = &child_jobs[0];
+    assert_eq!(
+        child_job.variables.get("customerRequest"),
+        Some(&Value::Str("a mortgage".into())),
+        "the tool's input mapping (askedAbout -> customerRequest) crossed into \
+         the spawned child"
+    );
+
+    // The container must NOT have re-emitted the agent job yet — it parks on the
+    // in-flight child, exactly like it parks on an open user-task tool.
+    assert!(
+        engine
+            .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+            .is_empty(),
+        "the container waits for the child; no premature agent re-emit"
+    );
+
+    // The specialist child answers.
+    engine
+        .apply_command(Command::complete_job_with(
+            child_job.key,
+            vars(&[
+                ("status", Value::Str("resolved".into())),
+                ("summary", Value::Str("Monthly payment is $1,516.".into())),
+            ]),
+        ))
+        .unwrap();
+
+    // The tool child drained, and the child's REAL output flowed through the
+    // tool's output mapping into `toolCallResult` and the container's
+    // `outputCollection` — no all-null result.
+    let adhoc = engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .unwrap();
+    assert_eq!(
+        adhoc.active.len(),
+        0,
+        "the call-activity tool drained once its child completed"
+    );
+
+    let expected = Value::Map(std::collections::BTreeMap::from([
+        ("status".to_string(), Value::Str("resolved".into())),
+        (
+            "summary".to_string(),
+            Value::Str("Monthly payment is $1,516.".into()),
+        ),
+    ]));
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "toolCallResults"),
+        Some(Value::List(vec![expected.clone()])),
+        "the container's outputCollection carries the child's real result, not \
+         a manufactured {{status: null, summary: null}}"
+    );
+
+    // Turn 2: the agent's re-emitted job sees the tool's REAL result in its
+    // working memory (`toolCallResult`, the io-output projection into the
+    // container scope) — the "parent's toolCallResult" the issue tracks — instead
+    // of a manufactured `{status: null, summary: null}`. The agent then signals
+    // completion and the container (and parent instance) complete.
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job re-emitted after the tool drained");
+    assert_eq!(
+        agent2.variables.get("toolCallResult"),
+        Some(&expected),
+        "the tool's output mapping projected the child's real result for the agent"
+    );
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent2.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(engine.is_completed(inst), "the parent instance completed");
+}
