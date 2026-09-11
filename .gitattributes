@@ -18,8 +18,10 @@
 #     authoritative bytes are not merged — they are REGENERATED against the merged
 #     source. Each artifact then has its own CI drift guard:
 #
-#       * processos/assets/ir.gbnf — the processos build regenerates it and
-#         `git diff --exit-code`s the result, so a stale commit fails the build
+#       * processos/assets/ir.gbnf — the processos test suite regenerates the
+#         grammar in memory and asserts it equals the checked-in file (the
+#         `checked_in_grammar_matches_emitter` parity test compares `emit_gbnf()`
+#         against the `include_str!`'d bytes), so a stale commit fails the build
 #         (a true byte-level content guard).
 #
 #       * engine-wasm/pkg — CI does NOT byte-diff the regenerated pkg (wasm-pack
