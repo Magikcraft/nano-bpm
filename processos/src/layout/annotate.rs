@@ -16,8 +16,10 @@
 //! their outputs into a single [`SemanticAnnotations`]:
 //!
 //! 1. **Structural** ([`infer`], slice 1): tracing from `start_event` through
-//!    every non-gateway element's outgoing flows and each exclusive
-//!    gateway's `is_default` (or first) outgoing yields the *primary flow*.
+//!    every non-gateway element's outgoing flows and each exclusive **or
+//!    inclusive** gateway's `is_default` (or first) outgoing yields the
+//!    *primary flow* (both condition-routed gateway kinds pick a single
+//!    representative branch for the spine).
 //!    Every interrupting boundary event (error / timer / message / signal /
 //!    conditional) seeds an *exception flow* spanning everything reachable
 //!    downstream. `ExclusiveGateway`/`InclusiveGateway → decision` (both
@@ -113,7 +115,13 @@ fn trace_primary(def: &ProcessDefinition) -> Option<Vec<String>> {
         order.push(id.clone());
         let Some(el) = def.element(&id) else { continue };
         let next: Vec<String> = match &el.kind {
-            ElementKind::ExclusiveGateway => el
+            // Both condition-routed gateway kinds pick a single representative
+            // branch for the primary spine — its `is_default` (or first)
+            // outgoing. An inclusive gateway can fire several branches at
+            // runtime, but following *all* of them here would mark every branch
+            // as primary (the exact flat-line failure this module fixes), so it
+            // is traced like an exclusive gateway.
+            ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway => el
                 .outgoing
                 .iter()
                 .find(|f| f.is_default)
@@ -501,6 +509,26 @@ mod tests {
             Some(Role::Decision),
             "inclusive gateway {} should be a decision role",
             gw.id
+        );
+        // `trace_primary` must treat the inclusive gateway like an exclusive
+        // one: follow its `default` branch (Flow_b → End_b) for the primary
+        // spine, not fan out across every outgoing branch (which would mark the
+        // non-default End_a as primary too — the flat-line failure this module
+        // exists to prevent).
+        let primary = ann
+            .flows
+            .iter()
+            .find(|f| f.kind == FlowKind::Primary)
+            .expect("primary flow inferred");
+        assert!(
+            primary.nodes.iter().any(|n| n == "End_b"),
+            "primary follows the inclusive gateway's default branch, got {:?}",
+            primary.nodes
+        );
+        assert!(
+            !primary.nodes.iter().any(|n| n == "End_a"),
+            "primary must not visit the non-default inclusive branch, got {:?}",
+            primary.nodes
         );
     }
 

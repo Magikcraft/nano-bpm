@@ -19,6 +19,9 @@ const sendTask = readFileSync(new URL(
 const inclusive = readFileSync(new URL(
   "../../../engine-core/tests/fixtures/inclusive-gateway.bpmn", import.meta.url,
 ), "utf8");
+const escalation = readFileSync(new URL(
+  "../../../engine-core/tests/fixtures/escalation-throw.bpmn", import.meta.url,
+), "utf8");
 
 for (const variant of ["lean", "readmodel"]) {
   const entry = variant === "lean" ? "@nanobpm/engine-wasm" : "@nanobpm/engine-wasm/readmodel";
@@ -64,6 +67,25 @@ for (const variant of ["lean", "readmodel"]) {
   }
 
   console.log(`[${variant}] sendTask + inclusiveGateway deploy/createInstance OK`);
+
+  // escalation: the committed wasm must *reject* an escalation carrier at
+  // deploy (#1168) — escalation is not modelled for execution, so `deploy()`
+  // has to throw a clean error naming `escalationEventDefinition` rather than
+  // silently demoting the throw to a none pass-through. This mirrors the native
+  // `should_reject_an_escalation_throw_event_naming_the_construct` test; a
+  // stale/broken committed wasm could regress the parser/error conversion while
+  // the two success probes above still pass, so assert the rejection surfaces
+  // through both shipped variants.
+  {
+    const engine = new TestEngine();
+    assert.throws(
+      () => engine.deploy(escalation),
+      /escalationEventDefinition/,
+      `${variant}: deploying an escalation carrier must throw naming the construct`,
+    );
+  }
+
+  console.log(`[${variant}] escalation carrier cleanly rejected OK`);
 }
 
 console.log("element-support: all variants OK");
