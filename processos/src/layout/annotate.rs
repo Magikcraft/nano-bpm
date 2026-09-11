@@ -479,6 +479,9 @@ mod tests {
         // contract processos consumers rely on.
         const INCLUSIVE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
                   id="Definitions_or" targetNamespace="http://bpmn.io/schema/bpmn">
   <bpmn:process id="OrProcess" isExecutable="true">
     <bpmn:startEvent id="Start_1"><bpmn:outgoing>Flow_1</bpmn:outgoing></bpmn:startEvent>
@@ -495,6 +498,34 @@ mod tests {
     </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="Flow_b" sourceRef="GwOr" targetRef="End_b"/>
   </bpmn:process>
+  <bpmndi:BPMNDiagram id="Diagram_or">
+    <bpmndi:BPMNPlane id="Plane_or" bpmnElement="OrProcess">
+      <bpmndi:BPMNShape id="Start_1_di" bpmnElement="Start_1">
+        <dc:Bounds x="150" y="102" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="GwOr_di" bpmnElement="GwOr" isMarkerVisible="true">
+        <dc:Bounds x="255" y="95" width="50" height="50"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_a_di" bpmnElement="End_a">
+        <dc:Bounds x="412" y="52" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_b_di" bpmnElement="End_b">
+        <dc:Bounds x="412" y="152" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1">
+        <di:waypoint x="186" y="120"/>
+        <di:waypoint x="255" y="120"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_a_di" bpmnElement="Flow_a">
+        <di:waypoint x="305" y="112"/>
+        <di:waypoint x="412" y="70"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_b_di" bpmnElement="Flow_b">
+        <di:waypoint x="305" y="128"/>
+        <di:waypoint x="412" y="170"/>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
 </bpmn:definitions>"#;
         let defs = parse_bpmn(INCLUSIVE_XML).expect("parse");
         let def = defs.into_iter().next().expect("one process");
