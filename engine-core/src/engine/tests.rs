@@ -4013,6 +4013,1293 @@ fn subprocess_terminate_end_clears_a_multi_instance_body_in_its_scope() {
     );
 }
 
+/// Issue #1170 — regression guard, service-task multi-instance child.
+///
+/// An interrupting boundary event on a multi-instance activity is armed on the
+/// BODY and must tear down the WHOLE loop: every active child (here, each MI
+/// child's job), the body's `MultiInstanceState` runtime record, and route the
+/// boundary's outgoing flow exactly once. Before the fix,
+/// `interrupt_activity_via_boundary` had no multi-instance branch, so the body's
+/// `active` set kept the (now-cancelled) child keys and the instance hung
+/// `Active` forever after the boundary flow finished.
+#[test]
+fn interrupting_boundary_on_a_multi_instance_service_task_tears_down_the_whole_loop() {
+    // start -> each(MI svc "work") --normal--> done
+    // each --(interrupting timer boundary "timeout")--> escalated
+    let def = ProcessBuilder::new("mi-svc")
+        .start_event("start")
+        .service_task("each", "work")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .timer_boundary_event("timeout", "each", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("each", "done")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-svc",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Two parallel children, each with a "work" job; the body registered its
+    // multi-instance runtime record and armed the boundary timer on itself.
+    let job_keys: Vec<_> = engine.pending_jobs().iter().map(|j| j.key).collect();
+    assert_eq!(job_keys.len(), 2, "two MI children each minted a job");
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+    assert!(engine.timers().iter().any(|t| t.element_id == "each"));
+
+    // The timer interrupts the whole loop.
+    let fired = engine.trigger_timers(5_000);
+    for job_key in &job_keys {
+        assert_eq!(
+            engine.state().jobs[job_key].state,
+            state::JobState::Canceled,
+            "every MI child job is cancelled by the interrupting boundary"
+        );
+    }
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+            ))
+            .count(),
+        1,
+        "the boundary flow is taken exactly once"
+    );
+    assert!(
+        !fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "done"
+        )),
+        "the normal outgoing flow is never taken"
+    );
+    assert!(
+        engine.instance(key).is_none() || engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record is cleared (no stale active set)"
+    );
+    assert!(
+        engine.is_completed(key),
+        "the instance completes after the loop is torn down (#1170)"
+    );
+}
+
+/// Issue #1170 — regression guard, embedded-sub-process multi-instance child.
+///
+/// Each MI child opens its own inner token scope with a running job. The
+/// interrupting boundary on the body must terminate every child scope (and its
+/// inner jobs), clear the body record, and route the boundary flow once.
+#[test]
+fn interrupting_boundary_on_a_multi_instance_subprocess_tears_down_every_child_scope() {
+    // start -> each(MI sub[ sub_start -> inner("work") -> sub_end ]) --normal--> done
+    // each --(interrupting timer boundary "timeout")--> escalated
+    let def = ProcessBuilder::new("mi-sub")
+        .start_event("start")
+        .sub_process("each", "sub_start")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "each")
+        .service_task("inner", "work")
+        .contained_in("inner", "each")
+        .end_event("sub_end")
+        .contained_in("sub_end", "each")
+        .timer_boundary_event("timeout", "each", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("each", "done")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-sub",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let job_keys: Vec<_> = engine.pending_jobs().iter().map(|j| j.key).collect();
+    assert_eq!(
+        job_keys.len(),
+        2,
+        "each MI sub-process child runs an inner job"
+    );
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+
+    let fired = engine.trigger_timers(5_000);
+    for job_key in &job_keys {
+        assert_eq!(
+            engine.state().jobs[job_key].state,
+            state::JobState::Canceled,
+            "every inner job is cancelled with its child scope"
+        );
+    }
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+            ))
+            .count(),
+        1,
+        "the boundary flow is taken exactly once"
+    );
+    assert!(
+        !fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "done"
+        )),
+        "the normal outgoing flow is never taken"
+    );
+    assert!(
+        engine.instance(key).is_none() || engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record is cleared"
+    );
+    assert!(engine.is_completed(key), "the instance completes (#1170)");
+}
+
+/// Issue #1170 — regression guard, call-activity multi-instance child.
+///
+/// Each MI child spawns its own child process instance (Zeebe parity). The
+/// interrupting boundary on the body must cancel every spawned child instance,
+/// clear the body record, and route the boundary flow once.
+#[test]
+fn interrupting_boundary_on_a_multi_instance_call_activity_cancels_every_child_instance() {
+    // callee: cs -> ct("work") -> ce
+    let callee = ProcessBuilder::new("callee")
+        .start_event("cs")
+        .service_task("ct", "work")
+        .end_event("ce")
+        .connect("cs", "ct")
+        .connect("ct", "ce")
+        .build()
+        .unwrap();
+    // start -> each(MI call "callee") --normal--> done
+    // each --(interrupting timer boundary "timeout")--> escalated
+    let def = ProcessBuilder::new("mi-call")
+        .start_event("start")
+        .call_activity("each", "callee")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .timer_boundary_event("timeout", "each", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("each", "done")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(callee))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-call",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Each MI child spawned a "callee" child instance parked on its "work" job.
+    let job_keys: Vec<_> = engine.pending_jobs().iter().map(|j| j.key).collect();
+    assert_eq!(
+        job_keys.len(),
+        2,
+        "two child process instances, each on a job"
+    );
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+
+    let fired = engine.trigger_timers(5_000);
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessInstanceTerminated { .. }))
+            .count(),
+        2,
+        "both spawned child process instances are terminated"
+    );
+    for job_key in &job_keys {
+        assert_eq!(
+            engine.state().jobs[job_key].state,
+            state::JobState::Canceled,
+            "each child instance's job is cancelled"
+        );
+    }
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+            ))
+            .count(),
+        1,
+        "the boundary flow is taken exactly once"
+    );
+    assert!(
+        !fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "done"
+        )),
+        "the normal outgoing flow is never taken"
+    );
+    assert!(
+        engine.instance(key).is_none() || engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record is cleared"
+    );
+    assert!(
+        engine.is_completed(key),
+        "the parent instance completes (#1170)"
+    );
+}
+
+/// Issue #1170 — regression guard, ad-hoc (JOB_WORKER) multi-instance child.
+///
+/// Each MI child is a JOB_WORKER `adHocSubProcess`: it mints an agent job and
+/// registers its own ad-hoc runtime record, into which the agent can activate
+/// tools. The interrupting boundary on the body must tear down every child's
+/// ad-hoc scope (its agent job, activated tools and their inner instances),
+/// clear both the ad-hoc records and the body record, and route the boundary
+/// flow once.
+#[test]
+fn interrupting_boundary_on_a_multi_instance_adhoc_tears_down_every_container() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-agent" />
+              <zeebe:adHoc outputCollection="r" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics>
+              <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" />
+            </bpmn:multiInstanceLoopCharacteristics>
+            <bpmn:userTask id="InnerTask">
+              <bpmn:extensionElements>
+                <zeebe:userTask />
+              </bpmn:extensionElements>
+            </bpmn:userTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:boundaryEvent id="Bnd" attachedToRef="Host">
+            <bpmn:messageEventDefinition messageRef="M" />
+          </bpmn:boundaryEvent>
+          <bpmn:endEvent id="EndNormal" />
+          <bpmn:endEvent id="EndInterrupted" />
+          <bpmn:sequenceFlow id="F1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="F2" sourceRef="Host" targetRef="EndNormal" />
+          <bpmn:sequenceFlow id="F3" sourceRef="Bnd" targetRef="EndInterrupted" />
+        </bpmn:process>
+        <bpmn:message id="M" name="probe-cancel">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=customerId" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[
+                ("customerId", Value::Str("C1".into())),
+                ("items", Value::List(vec![Value::Int(1), Value::Int(2)])),
+            ]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Each MI child is its own ad-hoc container with its own agent job.
+    let agents = engine.activate_jobs("probe-agent", "W", 10, 1_000, 0);
+    assert_eq!(
+        agents.len(),
+        2,
+        "each MI ad-hoc child minted its own agent job"
+    );
+    assert_eq!(engine.instance(inst).unwrap().multi_instances.len(), 1);
+    // One container activates an inner user-task tool into its own scope.
+    let container = agents[0].element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agents[0].key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("InnerTask")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "the tool is active in its container before the boundary fires"
+    );
+    assert!(!engine.is_completed(inst));
+
+    // The cancel message fires the interrupting boundary on the whole loop.
+    let fired = engine.correlate_message("probe-cancel", "C1", HashMap::new(), 0);
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "Bnd" && to == "EndInterrupted"
+            ))
+            .count(),
+        1,
+        "the boundary flow is taken exactly once"
+    );
+    assert!(
+        engine.is_completed(inst),
+        "the instance reaches EndInterrupted and completes (#1170)"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || engine.instance(inst).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record is cleared (no stale active set)"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || engine.instance(inst).unwrap().adhoc_instances.is_empty(),
+        "every ad-hoc container record was cleared on cancel"
+    );
+    assert!(
+        engine
+            .state()
+            .user_tasks
+            .values()
+            .all(|t| t.element_id != "InnerTask" || t.state != state::UserTaskState::Created),
+        "the activated tool's open user task was cancelled, not left Created"
+    );
+}
+
+/// Issue #1170 regression — an EARLY multi-instance completion (a satisfied
+/// completion condition, not an interrupting boundary) must tear down a still-
+/// active AD-HOC container child container-aware, exactly like the boundary
+/// path. `complete_multi_instance_body` cancels the remaining active children
+/// via `cancel_mi_child_events`, which is LEAF-only: for a JOB_WORKER ad-hoc MI
+/// child it would cancel the agent job but orphan the child's activated tool
+/// (its open user task / tool jobs) and leave the ad-hoc runtime record behind
+/// with no `AdHocCompleted`. Assert the cancelled container emits
+/// `AdHocCompleted { cancelled: true }`, its activated tool's user task is
+/// cancelled (not left `Created`), and no ad-hoc record leaks.
+#[test]
+fn early_multi_instance_completion_tears_down_an_active_adhoc_tool_child() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-agent" />
+              <zeebe:adHoc outputCollection="r" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics>
+              <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" />
+              <bpmn:completionCondition>=true</bpmn:completionCondition>
+            </bpmn:multiInstanceLoopCharacteristics>
+            <bpmn:userTask id="InnerTask">
+              <bpmn:extensionElements>
+                <zeebe:userTask />
+              </bpmn:extensionElements>
+            </bpmn:userTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="f2" sourceRef="Host" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Each MI child is its own ad-hoc container with its own agent job.
+    let agents = engine.activate_jobs("probe-agent", "W", 10, 1_000, 0);
+    assert_eq!(
+        agents.len(),
+        2,
+        "each MI ad-hoc child minted its own agent job"
+    );
+    // Container A activates an inner user-task tool into its own scope; it is now
+    // an active tool the leaf cancel path would orphan.
+    let container_a = agents[0].element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agents[0].key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("InnerTask")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container_a)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "container A holds an active tool before the early completion"
+    );
+
+    // Container B finishes its agent turn with no tools -> it completes, which
+    // completes MI child B and satisfies the completion condition (`=true`),
+    // triggering the early cancel of the still-active container A.
+    let fired = engine
+        .apply_command(Command::complete_job_with_result(
+            agents[1].key,
+            HashMap::new(),
+            crate::model::AdHocJobResult::default(),
+        ))
+        .unwrap();
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::AdHocCompleted { container_key, cancelled: true, .. } if *container_key == container_a
+        )),
+        "the early-cancelled ad-hoc container emits AdHocCompleted{{cancelled:true}}, not a leaked record"
+    );
+    assert!(
+        engine.is_completed(inst),
+        "the loop completes early and the instance drains"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || (engine.instance(inst).unwrap().multi_instances.is_empty()
+                && engine.instance(inst).unwrap().adhoc_instances.is_empty()),
+        "no stale multi-instance or ad-hoc runtime records remain after early completion"
+    );
+    assert!(
+        engine
+            .state()
+            .user_tasks
+            .values()
+            .all(|t| t.element_id != "InnerTask" || t.state != state::UserTaskState::Created),
+        "container A's activated tool user task was cancelled, not left Created"
+    );
+}
+
+/// Issue #1170 regression — firing an interrupting boundary on a multi-instance
+/// body must RESOLVE an incident sitting on the body root itself, not only on
+/// its swept descendants. `terminate_subprocess_scope` resolves descendant
+/// incidents (`scope_teardown_events` -> `resolve_incidents_on`) but never the
+/// scope root, so a body parked on a FAILED start-listener job (a `JobNoRetries`
+/// incident) would keep the completed instance carrying a stale incident for a
+/// vanished body. Assert the incident is resolved when the boundary fires.
+#[test]
+fn interrupting_boundary_on_a_multi_instance_body_resolves_a_stale_body_incident() {
+    let def = ProcessBuilder::new("mi")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .timer_boundary_event("timeout", "each", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("each", "done")
+        .connect("timeout", "escalated")
+        .with_listeners(
+            "each",
+            vec![el(ListenerEventType::Start, "mi-start")],
+            Vec::new(),
+        )
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The body parks on its start-listener job; fail it with no retries so the
+    // body element instance carries a JobNoRetries incident.
+    let listener = engine.activate_jobs("mi-start", "W", 10, 1_000, 0);
+    assert_eq!(
+        listener.len(),
+        1,
+        "the body is parked on a start-listener job"
+    );
+    engine
+        .apply_command(Command::fail_job(listener[0].key, 0, "boom"))
+        .unwrap();
+    assert_eq!(
+        engine.active_incidents().len(),
+        1,
+        "the failed body start-listener job raised an incident on the body"
+    );
+
+    // The boundary fires while the body carries that stale incident.
+    let fired = engine.trigger_timers(5_000);
+    assert!(
+        fired
+            .iter()
+            .any(|e| matches!(e, Event::IncidentResolved { .. })),
+        "firing the boundary resolves the incident on the body root"
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no stale incident remains on the vanished body"
+    );
+    assert!(engine.is_completed(key), "the instance completes (#1170)");
+}
+
+/// Issue #1170 regression — the NORMAL (non-boundary) completion of a
+/// multi-instance CALL ACTIVITY must drain the loop. This PR taught
+/// `run_mi_child_behaviour` to spawn a real callee process instance per loop
+/// item; without a matching completion route a callee that finishes normally is
+/// handled by `complete_call_activity`, which takes the activity's outgoing flow
+/// and never emits `MultiInstanceChildCompleted` — so the callee's key stays in
+/// the body's `active` set and the loop hangs forever. Assert the loop drains,
+/// aggregates each callee's output through the MI `outputElement`, and completes.
+#[test]
+fn multi_instance_call_activity_completes_normally_and_aggregates_output() {
+    // callee: cs -> ct("work") -> ce. The "work" job completes with a `result`
+    // variable that propagates back (propagateAllChildVariables defaults true).
+    let callee = ProcessBuilder::new("callee")
+        .start_event("cs")
+        .service_task("ct", "work")
+        .end_event("ce")
+        .connect("cs", "ct")
+        .connect("ct", "ce")
+        .build()
+        .unwrap();
+    // start -> each(MI call "callee", outputElement `=result`) -> sink -> end.
+    let def = ProcessBuilder::new("mi-call")
+        .start_event("start")
+        .call_activity("each", "callee")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=result".to_string()),
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(callee))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-call",
+            vars(&[("items", Value::List(vec![Value::Int(10), Value::Int(20)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Two callee instances, each parked on its "work" job.
+    let jobs = engine.activate_jobs("work", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 2, "one callee per loop item");
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+
+    // Complete each callee's job with a distinct `result` echoing its item — out
+    // of collection order, to prove index-based aggregation survives the route.
+    let mut ordered = jobs.clone();
+    ordered.sort_by_key(|j| {
+        std::cmp::Reverse(j.variables.get("item").and_then(Value::as_f64).unwrap() as i64)
+    });
+    for job in &ordered {
+        let item = job.variables.get("item").cloned().unwrap();
+        assert!(!engine.is_completed(key), "loop must not drain early");
+        engine
+            .apply_command(Command::complete_job_with_result(
+                job.key,
+                HashMap::from([("result".to_string(), item)]),
+                crate::model::AdHocJobResult::default(),
+            ))
+            .unwrap();
+    }
+
+    // The loop drained: its runtime record is gone and the token advanced to the
+    // sink task (so the aggregate is still observable on the still-active
+    // instance). Results are ordered by loop index regardless of completion order.
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record is cleared — the loop did not hang (#1170)"
+    );
+    assert!(
+        engine
+            .state()
+            .jobs
+            .values()
+            .any(|j| j.job_type == "sink-work" && matches!(j.state, state::JobState::Created)),
+        "the loop advanced to the activity's outgoing flow exactly once"
+    );
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![Value::Int(10), Value::Int(20)])),
+        "each callee's propagated `result` aggregates through the MI outputElement in order"
+    );
+}
+
+/// Issue #1170 regression — the NORMAL completion of a multi-instance JOB_WORKER
+/// ad-hoc container must drain the loop, and each child must seed its own
+/// `outputCollection`. This PR taught `run_mi_child_behaviour` to register an
+/// ad-hoc runtime record per loop item; without a matching completion route the
+/// container's agent turn completes via `complete_adhoc_container`, which takes
+/// the outgoing flow and never emits `MultiInstanceChildCompleted` — hanging the
+/// loop. It also never seeded the child's `outputCollection`, so tool results
+/// would be silently dropped. Assert the seed reaches the tool job and the loop
+/// drains to completion.
+#[test]
+fn multi_instance_adhoc_child_completes_normally_and_seeds_its_output_collection() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics>
+              <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" />
+            </bpmn:multiInstanceLoopCharacteristics>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="f2" sourceRef="Host" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Each MI child is its own ad-hoc container with its own agent job.
+    let agents = engine.activate_jobs("agent-worker", "W", 10, 1_000, 0);
+    assert_eq!(
+        agents.len(),
+        2,
+        "each MI ad-hoc child minted its own agent job"
+    );
+    assert_eq!(engine.instance(inst).unwrap().multi_instances.len(), 1);
+
+    // Each container activates its tool. The tool job must inherit the child
+    // container's seeded (empty) `outputCollection` — proving the seed is present
+    // in the MI child scope, without which tool results would be dropped.
+    for agent in &agents {
+        engine
+            .apply_command(Command::complete_job_with_result(
+                agent.key,
+                HashMap::new(),
+                crate::model::AdHocJobResult {
+                    activate_elements: vec![activate_element("toolA")],
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+    }
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(tool_jobs.len(), 2, "one tool per MI ad-hoc child");
+    assert!(
+        tool_jobs
+            .iter()
+            .all(|j| j.variables.get("results") == Some(&Value::List(Vec::new()))),
+        "each MI ad-hoc child seeded its own outputCollection `results: []` (#1170)"
+    );
+
+    // Complete each tool with a `result`, then let each agent turn finish (no more
+    // tools) so its container completes.
+    for job in &tool_jobs {
+        engine
+            .apply_command(Command::complete_job_with_result(
+                job.key,
+                HashMap::from([("result".to_string(), Value::Int(7))]),
+                crate::model::AdHocJobResult::default(),
+            ))
+            .unwrap();
+    }
+    let agents2 = engine.activate_jobs("agent-worker", "W", 10, 1_000, 0);
+    for agent in &agents2 {
+        engine
+            .apply_command(Command::complete_job_with_result(
+                agent.key,
+                HashMap::new(),
+                crate::model::AdHocJobResult::default(),
+            ))
+            .unwrap();
+    }
+
+    assert!(
+        engine.is_completed(inst),
+        "every MI ad-hoc child completes and the loop drains to completion (#1170)"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || (engine.instance(inst).unwrap().multi_instances.is_empty()
+                && engine.instance(inst).unwrap().adhoc_instances.is_empty()),
+        "no stale multi-instance or ad-hoc runtime records remain"
+    );
+}
+
+/// Issue #1170 regression — a NORMAL multi-instance completion must disarm the
+/// boundary events armed on the body. This PR arms an interrupting boundary on
+/// the MI body (not per child); `complete_multi_instance_body` /
+/// `finalize_multi_instance_body` must cancel those resources when the loop
+/// drains, or a later timer could re-enter the boundary flow of an
+/// already-completed body.
+#[test]
+fn normal_multi_instance_completion_disarms_the_body_boundary() {
+    // start -> each(MI service "handle") --normal--> sink -> done
+    // each --(interrupting timer boundary "timeout")--> escalated
+    let def = ProcessBuilder::new("mi")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .timer_boundary_event("timeout", "each", 5_000)
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let _key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // A timer boundary is armed on the body for the life of the loop.
+    let timeout_armed = |engine: &Engine| {
+        engine.state().timers.values().any(|t| {
+            t.state == state::TimerState::Created
+                && matches!(
+                    &t.kind,
+                    state::TimerKind::InterruptingBoundary { boundary_element_id }
+                        if boundary_element_id == "timeout"
+                )
+        })
+    };
+    assert!(
+        timeout_armed(&engine),
+        "the body boundary timer is armed while the loop runs"
+    );
+
+    // Drain the loop normally.
+    for job in engine.activate_jobs("handle", "W", 10, 60_000, 0) {
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+
+    // The body's boundary timer is disarmed as the loop completes.
+    assert!(
+        !timeout_armed(&engine),
+        "the body boundary timer is cancelled on normal completion (#1170)"
+    );
+    // Firing timers now can never re-enter the (completed) boundary flow.
+    let fired = engine.trigger_timers(10_000);
+    assert!(
+        !fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, .. } if from == "timeout"
+        )),
+        "a late timer must not re-enter the boundary flow of a completed body"
+    );
+}
+
+/// Issue #1170 regression — an EARLY multi-instance completion (satisfied
+/// `completionCondition`) that cancels a still-running call-activity child must
+/// terminate that child's separate callee process instance, not just the child
+/// token. `cancel_mi_child_events` only reaches resources owned by the child
+/// element instance, so the distinct callee would otherwise leak (run forever).
+#[test]
+fn early_multi_instance_completion_terminates_running_call_activity_callees() {
+    let callee = ProcessBuilder::new("callee")
+        .start_event("cs")
+        .service_task("ct", "work")
+        .end_event("ce")
+        .connect("cs", "ct")
+        .connect("ct", "ce")
+        .build()
+        .unwrap();
+    // A parallel MI call activity whose completion condition fires as soon as ONE
+    // child completes — leaving the others' callees still running to be cancelled.
+    let def = ProcessBuilder::new("mi-call")
+        .start_event("start")
+        .call_activity("each", "callee")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: Some("=true".to_string()),
+                sequential: false,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(callee))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-call",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            )]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let jobs = engine.activate_jobs("work", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 3, "three callee instances, one per loop item");
+    fn live_callees(engine: &Engine, parent: Key) -> usize {
+        engine
+            .state()
+            .instances
+            .values()
+            .filter(|i| {
+                i.parent_process_instance_key == Some(parent)
+                    && matches!(i.state, ProcessInstanceState::Active)
+            })
+            .count()
+    }
+    assert_eq!(
+        live_callees(&engine, key),
+        3,
+        "all three callees are running"
+    );
+
+    // Completing one child satisfies `completionCondition` and ends the body
+    // early — the other two callees must be terminated, not orphaned.
+    let fired = engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+    assert!(
+        fired
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessInstanceTerminated { .. }))
+            .count()
+            >= 2,
+        "the two still-running callees are terminated on early completion (#1170)"
+    );
+    assert_eq!(
+        live_callees(&engine, key),
+        0,
+        "no callee process instance leaks past the early completion"
+    );
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the loop's runtime record is cleared"
+    );
+}
+
+/// Issue #1170 regression — an EARLY multi-instance completion (satisfied
+/// `completionCondition`) that cancels a still-running embedded SUB-PROCESS child
+/// must tear down that child's whole INNER scope (its inner job, timers, nested
+/// tokens), not just the child's own sub-process token. The leaf-only
+/// `cancel_mi_child_events` reaches only resources owned directly by the child
+/// element instance, so a sub-process child's inner job would otherwise be
+/// orphaned — leaving the process `Active` forever even though the loop
+/// "completed" early. The early-cancel path must sweep descendants (mirroring the
+/// interrupting-boundary teardown) before completing the child.
+#[test]
+fn early_multi_instance_completion_tears_down_a_running_subprocess_child_scope() {
+    // start -> each(MI sub[ sub_start -> inner("work") -> sub_end ]) -> sink -> done
+    // parallel MI, completionCondition = true (fires as soon as ONE child drains),
+    // leaving the sibling sub-process child's inner job running to be cancelled.
+    let def = ProcessBuilder::new("mi-sub-early")
+        .start_event("start")
+        .sub_process("each", "sub_start")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: Some("=true".to_string()),
+                sequential: false,
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "each")
+        .service_task("inner", "work")
+        .contained_in("inner", "each")
+        .end_event("sub_end")
+        .contained_in("sub_end", "each")
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-sub-early",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let jobs = engine.activate_jobs("work", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 2, "each MI sub-process child runs an inner job");
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+
+    // Completing ONE inner job drains that child's sub-process and satisfies the
+    // completion condition, ending the body early. The sibling child's inner job
+    // must be cancelled with its scope — not orphaned.
+    let sibling = jobs[1].key;
+    engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+
+    assert_eq!(
+        engine.state().jobs[&sibling].state,
+        state::JobState::Canceled,
+        "the still-running sub-process child's inner job is cancelled on early completion (#1170)"
+    );
+    assert!(
+        !engine.pending_jobs().iter().any(|j| j.job_type == "work"),
+        "no inner job leaks past the early completion"
+    );
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the loop's runtime record is cleared"
+    );
+    // The body completed early and advanced to `sink` — the instance is legitimately
+    // parked on the sink job, NOT wedged Active by an orphaned inner job.
+    assert!(
+        engine
+            .pending_jobs()
+            .iter()
+            .any(|j| j.job_type == "sink-work"),
+        "the early completion advances the body to its outgoing flow (`sink`)"
+    );
+}
+
+/// Issue #1170 regression — an EARLY multi-instance completion (satisfied
+/// `completionCondition`) that cancels a still-running MI child parked on a ROOT
+/// incident (a service task's `JobNoRetries`) must RESOLVE that incident, not
+/// merely cancel the job and complete the child. The early-cancel path sweeps a
+/// child's *descendants* (`scope_teardown_events` -> `resolve_incidents_on`) but
+/// `cancel_mi_child_events` completes the child ROOT via `ElementCompleted`,
+/// which touches no incident state — and `ProcessInstanceCompleted` deliberately
+/// RETAINS incidents. Without resolving the child-root incident, the completed
+/// instance would carry a stale active incident tied to a removed element that a
+/// later external resolve could re-drive against a dead token. Assert the
+/// incident is resolved on early completion and no active incident survives.
+#[test]
+fn early_multi_instance_completion_resolves_a_stale_child_root_incident() {
+    // start -> each(MI service "handle", parallel, completionCondition = true)
+    //          -> sink -> done. Two items: one child completes (firing the
+    // condition) while the sibling is parked on a JobNoRetries incident.
+    let def = ProcessBuilder::new("mi-incident-early")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: Some("=true".to_string()),
+                sequential: false,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-incident-early",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let jobs = engine.activate_jobs("handle", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 2, "each MI child runs a `handle` job");
+
+    // Park the sibling on a JobNoRetries incident (fail with no retries).
+    let parked = jobs[1].key;
+    engine
+        .apply_command(Command::fail_job(parked, 0, "boom"))
+        .unwrap();
+    assert_eq!(
+        engine.active_incidents().len(),
+        1,
+        "the failed sibling job raised a root incident on its MI child"
+    );
+
+    // Completing the OTHER child satisfies `completionCondition` and ends the
+    // body early — the parked sibling child is cancelled AND its stale incident
+    // must be resolved, not left tied to the removed element.
+    let fired = engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+    assert!(
+        fired
+            .iter()
+            .any(|e| matches!(e, Event::IncidentResolved { .. })),
+        "the early completion resolves the parked child's root incident (#1170)"
+    );
+    assert_eq!(
+        engine.state().jobs[&parked].state,
+        state::JobState::Canceled,
+        "the parked sibling job is cancelled, not resurrected by its resolve"
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no stale active incident survives on the removed MI child (#1170)"
+    );
+    assert!(
+        engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the loop's runtime record is cleared"
+    );
+    assert!(
+        engine
+            .pending_jobs()
+            .iter()
+            .any(|j| j.job_type == "sink-work"),
+        "the early completion advances the body to its outgoing flow (`sink`)"
+    );
+}
+
+/// Issue #1170 regression — when an interrupting boundary fires while the MI body
+/// is parked on its own `start` execution-listener job (the boundary is armed
+/// BEFORE the start-listener gate), the body-level listener job must be
+/// cancelled, not left live on a removed body.
+#[test]
+fn interrupting_boundary_cancels_the_multi_instance_body_start_listener_job() {
+    let def = ProcessBuilder::new("mi")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .timer_boundary_event("timeout", "each", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("each", "done")
+        .connect("timeout", "escalated")
+        .with_listeners(
+            "each",
+            vec![el(ListenerEventType::Start, "mi-start")],
+            Vec::new(),
+        )
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The body parks on its start-listener job; no children have spawned yet.
+    let listener = engine.activate_jobs("mi-start", "W", 10, 1_000, 0);
+    assert_eq!(
+        listener.len(),
+        1,
+        "the body is parked on a start-listener job"
+    );
+    let listener_key = listener[0].key;
+    assert!(
+        engine.activate_jobs("handle", "W", 10, 1_000, 0).is_empty(),
+        "no child jobs while the body start listener is live"
+    );
+
+    // The boundary fires while the body is parked on that listener.
+    let fired = engine.trigger_timers(5_000);
+    assert_eq!(
+        engine.state().jobs[&listener_key].state,
+        state::JobState::Canceled,
+        "the body's own start-listener job is cancelled, not left live on a removed body (#1170)"
+    );
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+            ))
+            .count(),
+        1,
+        "the boundary flow is taken exactly once"
+    );
+    assert!(
+        engine.instance(key).is_none() || engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record is cleared"
+    );
+    assert!(engine.is_completed(key), "the instance completes (#1170)");
+}
+
 /// Defect-class guard (dead-scope guard, `Step::Activate` branch): a scoped
 /// terminate tears down every descendant token but deliberately leaves the
 /// enclosing sub-process token active until the post-drain completion sweep. A
@@ -14604,6 +15891,214 @@ fn adhoc_agent_activates_a_user_task_tool_and_parks_until_completed() {
     );
 }
 
+fn adhoc_agent_with_interrupting_message_boundary() -> ProcessDefinition {
+    // An `adHocSubProcess` (JOB_WORKER agent) carrying an interrupting message
+    // boundary event, correlating on `customerId`. This is the executable shape
+    // of Camunda's event-driven agent pattern (#1155): a newly-arrived event
+    // must abandon the agent mid-investigation, including while its own
+    // human-consult (`InnerTask`) task is open.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-agent" />
+              <zeebe:adHoc outputCollection="r" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:userTask id="InnerTask">
+              <bpmn:extensionElements>
+                <zeebe:userTask />
+              </bpmn:extensionElements>
+            </bpmn:userTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:boundaryEvent id="Bnd" attachedToRef="Host">
+            <bpmn:messageEventDefinition messageRef="M" />
+          </bpmn:boundaryEvent>
+          <bpmn:endEvent id="EndNormal" />
+          <bpmn:endEvent id="EndInterrupted" />
+          <bpmn:sequenceFlow id="F1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="F2" sourceRef="Host" targetRef="EndNormal" />
+          <bpmn:sequenceFlow id="F3" sourceRef="Bnd" targetRef="EndInterrupted" />
+        </bpmn:process>
+        <bpmn:message id="M" name="probe-cancel">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=customerId" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+#[test]
+fn interrupting_boundary_on_adhoc_cancels_an_activated_tool() {
+    // Issue #1155: an interrupting boundary event on an `adHocSubProcess` must
+    // terminate the attached activity AND everything inside its scope —
+    // including an activated tool and its open user task — then take its own
+    // outgoing flow. Before the fix the boundary fired but left the activated
+    // tool + its `#innerInstance` active, so the instance hung `Active` forever.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_with_interrupting_message_boundary(),
+        ))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("customerId", Value::Str("C1".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // The agent activates the inner user-task tool: it stays active, the
+    // boundary subscription is open, and the instance parks.
+    let agent = engine
+        .activate_jobs("probe-agent", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "Host")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("InnerTask")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "the user-task tool is active before the boundary fires"
+    );
+    assert!(!engine.is_completed(inst));
+
+    // The cancel message arrives: the interrupting boundary fires and must tear
+    // down the whole ad-hoc scope, then route its own outgoing flow to
+    // `EndInterrupted`.
+    let fired = engine.correlate_message("probe-cancel", "C1", HashMap::new(), 0);
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "Bnd" && to == "EndInterrupted"
+        )),
+        "the boundary event fires and takes its outgoing flow"
+    );
+
+    assert!(
+        engine.is_completed(inst),
+        "the instance reaches EndInterrupted and completes"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || engine
+                .instance(inst)
+                .unwrap()
+                .active
+                .values()
+                .all(|id| id != "InnerTask"
+                    && !id.ends_with(crate::engine::ADHOC_INNER_INSTANCE_ID_POSTFIX)),
+        "the activated tool and its #innerInstance were torn down, not orphaned"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || engine.instance(inst).unwrap().adhoc_instances.is_empty(),
+        "the ad-hoc container's runtime record was cleared on cancel"
+    );
+    assert!(
+        engine
+            .state()
+            .user_tasks
+            .values()
+            .all(|t| t.element_id != "InnerTask" || t.state != state::UserTaskState::Created),
+        "the open user task was cancelled, not left Created"
+    );
+}
+
+#[test]
+fn interrupting_boundary_on_adhoc_cancels_an_in_flight_agent_job() {
+    // Issue #1155: the interrupting-boundary teardown must also cancel the
+    // container's OWN agent job when it is still in flight — i.e. the boundary
+    // fires while the ad-hoc worker is mid-turn (its job activated but not yet
+    // completed). This exercises the `active_job_on(container)` /
+    // `Event::JobCanceled` branch in `interrupt_activity_via_boundary`, which
+    // the tool-teardown test above never reaches because it completes the agent
+    // job before correlating (so `active_job_on` returns `None` there).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_with_interrupting_message_boundary(),
+        ))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("customerId", Value::Str("C1".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // The agent job is activated (a worker picked it up) but NOT completed — the
+    // container is mid-investigation with an in-flight job.
+    let agent = engine
+        .activate_jobs("probe-agent", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "Host")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+    assert!(!engine.is_completed(inst));
+
+    // The cancel message arrives while the agent job is still in flight: the
+    // interrupting boundary must cancel that job (not leave it activated) and
+    // route its own outgoing flow to `EndInterrupted`.
+    let fired = engine.correlate_message("probe-cancel", "C1", HashMap::new(), 0);
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::JobCanceled { job_key, .. } if *job_key == agent.key
+        )),
+        "the in-flight agent job is canceled when the boundary fires"
+    );
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "Bnd" && to == "EndInterrupted"
+        )),
+        "the boundary event fires and takes its outgoing flow"
+    );
+
+    assert!(
+        engine.is_completed(inst),
+        "the instance reaches EndInterrupted and completes"
+    );
+    // The agent job must be gone (canceled), not left activated on a dead
+    // container.
+    assert!(
+        engine.active_job_on(container).is_none(),
+        "no agent job survives on the torn-down container"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || engine.instance(inst).unwrap().adhoc_instances.is_empty(),
+        "the ad-hoc container's runtime record was cleared on cancel"
+    );
+}
+
 fn adhoc_agent_chained_tools_process() -> ProcessDefinition {
     // A JOB_WORKER ad-hoc container whose two service-task tools are joined by a
     // plain `bpmn:sequenceFlow` BETWEEN THE CONTAINER'S OWN CHILDREN (issue
@@ -22436,4 +23931,1156 @@ fn link_events_route_by_matching_name() {
         1,
         "the throw hands off to the same-named catch 'B'"
     );
+}
+
+/// A parent process whose ad-hoc agent's only tool is a `bpmn:callActivity`
+/// delegating to a separate `child` process (issue #1159). The tool maps
+/// `askedAbout -> customerRequest` inbound and `{status, summary} ->
+/// toolCallResult` outbound, with both propagate flags off (the child crosses
+/// the instance boundary purely through the mappings). The container's
+/// `outputElement` collects `toolCallResult`.
+fn adhoc_agent_with_call_activity_tool() -> Vec<ProcessDefinition> {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="child"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="={status: status, summary: summary}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+        <bpmn:process id="child">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap()
+}
+
+/// Issue #1159 (red/green): activating a `callActivity` as an ad-hoc tool must
+/// INSTANTIATE its called process (propagating the mapped input), wait for it,
+/// and apply the tool's output mapping to what the child ACTUALLY produced —
+/// instead of the old bug where the call activity was activated but its child
+/// process was never started, so no child instance/job/incident was created and
+/// the output mapping manufactured an all-null `{status: null, summary: null}`.
+#[test]
+fn adhoc_call_activity_tool_spawns_child_and_maps_its_real_output() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_call_activity_tool() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("askedAbout", Value::Str("a mortgage".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    // Turn 1: the agent activates the call-activity tool. This must SPAWN the
+    // child process (its `probe-child` job appears) rather than pass straight
+    // through — and the tool child must stay ACTIVE while the child runs.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "the call-activity tool child stays active while its spawned child runs"
+    );
+
+    let child_jobs = engine.activate_jobs("probe-child", "W", 10, 1_000, 0);
+    assert_eq!(
+        child_jobs.len(),
+        1,
+        "activating a call-activity tool instantiates the called process \
+         (a `probe-child` job is minted) — the #1159 bug minted zero"
+    );
+    let child_job = &child_jobs[0];
+    assert_eq!(
+        child_job.variables.get("customerRequest"),
+        Some(&Value::Str("a mortgage".into())),
+        "the tool's input mapping (askedAbout -> customerRequest) crossed into \
+         the spawned child"
+    );
+
+    // The container must NOT have re-emitted the agent job yet — it parks on the
+    // in-flight child, exactly like it parks on an open user-task tool.
+    assert!(
+        engine
+            .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+            .is_empty(),
+        "the container waits for the child; no premature agent re-emit"
+    );
+
+    // The specialist child answers.
+    engine
+        .apply_command(Command::complete_job_with(
+            child_job.key,
+            vars(&[
+                ("status", Value::Str("resolved".into())),
+                ("summary", Value::Str("Monthly payment is $1,516.".into())),
+            ]),
+        ))
+        .unwrap();
+
+    // The tool child drained, and the child's REAL output flowed through the
+    // tool's output mapping into `toolCallResult` and the container's
+    // `outputCollection` — no all-null result.
+    let adhoc = engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .unwrap();
+    assert_eq!(
+        adhoc.active.len(),
+        0,
+        "the call-activity tool drained once its child completed"
+    );
+
+    let expected = Value::Map(std::collections::BTreeMap::from([
+        ("status".to_string(), Value::Str("resolved".into())),
+        (
+            "summary".to_string(),
+            Value::Str("Monthly payment is $1,516.".into()),
+        ),
+    ]));
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "toolCallResults"),
+        Some(Value::List(vec![expected.clone()])),
+        "the container's outputCollection carries the child's real result, not \
+         a manufactured {{status: null, summary: null}}"
+    );
+
+    // Turn 2: the agent's re-emitted job sees the tool's REAL result in its
+    // working memory (`toolCallResult`, the io-output projection into the
+    // container scope) — the "parent's toolCallResult" the issue tracks — instead
+    // of a manufactured `{status: null, summary: null}`. The agent then signals
+    // completion and the container (and parent instance) complete.
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job re-emitted after the tool drained");
+    assert_eq!(
+        agent2.variables.get("toolCallResult"),
+        Some(&expected),
+        "the tool's output mapping projected the child's real result for the agent"
+    );
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent2.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(engine.is_completed(inst), "the parent instance completed");
+}
+
+/// A parent whose ad-hoc `bpmn:callActivity` tool declares two CHAINED output
+/// mappings (issue #1159): `summary -> summaryCopy`, then a second mapping whose
+/// source references `summaryCopy`. Zeebe's `eval_io_mappings_in` is a SINGLE
+/// pass — every mapping reads the original child-variable view — so the second
+/// mapping sees no `summaryCopy` (it is a sibling target, not a child variable)
+/// and its `summary` field resolves to `null`. This guards against the tool's
+/// output mapping being evaluated TWICE (once against the child variables, then
+/// again against the seeded tool scope): a second pass would see `summaryCopy`
+/// and manufacture a non-null field, and — because `outputElement` reads the
+/// first-pass value while the container projection would read the second — the
+/// collected `outputElement` and the projected `toolCallResult` would DISAGREE.
+fn adhoc_agent_with_chained_output_call_activity_tool() -> Vec<ProcessDefinition> {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="child"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="=summary" target="summaryCopy" />
+                  <zeebe:output source="={status: status, summary: summaryCopy}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+        <bpmn:process id="child">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap()
+}
+
+/// Issue #1159 (Copilot review round 2): the call-activity tool's output mapping
+/// must be evaluated EXACTLY ONCE, against the child's real produced variables —
+/// not once in the bridge and again in the shared completion leaf. A double pass
+/// double-applies chained mappings, so the container's `outputElement`-collected
+/// result and its projected `toolCallResult` disagree. Both must equal the
+/// single-pass projection `{status: "resolved", summary: null}` (the second
+/// mapping's `summaryCopy` is a sibling target, absent from the child view).
+#[test]
+fn adhoc_call_activity_tool_output_mapping_evaluated_once_for_chained_mappings() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_chained_output_call_activity_tool() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("askedAbout", Value::Str("a mortgage".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let child_jobs = engine.activate_jobs("probe-child", "W", 10, 1_000, 0);
+    assert_eq!(child_jobs.len(), 1, "the called process was instantiated");
+    engine
+        .apply_command(Command::complete_job_with(
+            child_jobs[0].key,
+            vars(&[
+                ("status", Value::Str("resolved".into())),
+                ("summary", Value::Str("Monthly payment is $1,516.".into())),
+            ]),
+        ))
+        .unwrap();
+
+    // Single-pass projection: `summaryCopy` is a sibling output target, NOT a
+    // child variable, so the second mapping's `summary: summaryCopy` resolves to
+    // null. A double evaluation would instead see the seeded `summaryCopy` and
+    // manufacture the real summary here.
+    let single_pass = Value::Map(std::collections::BTreeMap::from([
+        ("status".to_string(), Value::Str("resolved".into())),
+        ("summary".to_string(), Value::Null),
+    ]));
+
+    // The container's `outputElement` (`=toolCallResult`) collected exactly the
+    // single-pass projection...
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "toolCallResults"),
+        Some(Value::List(vec![single_pass.clone()])),
+        "outputElement collected the single-pass projection"
+    );
+
+    // ...and the `toolCallResult` projected into the container (the agent's next
+    // working memory) AGREES with it — the double-eval bug made these diverge.
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job re-emitted after the tool drained");
+    assert_eq!(
+        agent2.variables.get("toolCallResult"),
+        Some(&single_pass),
+        "the projected toolCallResult agrees with the collected outputElement \
+         (single evaluation, no double-applied chained mapping)"
+    );
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent2.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(engine.is_completed(inst), "the parent instance completed");
+}
+
+/// A parent process whose ad-hoc agent has a `bpmn:callActivity` tool that is
+/// ALSO the head of a chained inner flow (issue #1154 × #1159): `CallSpecialist`
+/// carries the same chained output mappings as
+/// `adhoc_agent_with_chained_output_call_activity_tool` AND an outgoing
+/// `bpmn:sequenceFlow` to a follow-up sibling `toolB`. Completing the tool
+/// therefore hands off through `continue_adhoc_inner_flow` (the mid-chain path),
+/// not the leaf path — so the precomputed single-pass projection must be carried
+/// through the hand-off too, or the follow-up sees a double-applied mapping.
+fn adhoc_agent_with_chained_flow_call_activity_tool() -> Vec<ProcessDefinition> {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="child"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="=summary" target="summaryCopy" />
+                  <zeebe:output source="={status: status, summary: summaryCopy}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+              <bpmn:outgoing>chain</bpmn:outgoing>
+            </bpmn:callActivity>
+            <bpmn:sequenceFlow id="chain" sourceRef="CallSpecialist" targetRef="toolB" />
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="toolB-type" />
+              </bpmn:extensionElements>
+              <bpmn:incoming>chain</bpmn:incoming>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+        <bpmn:process id="child">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap()
+}
+
+/// Issue #1159 (Copilot review round 3): the single-pass output projection must
+/// be preserved through the CHAINED-FLOW hand-off too, not only the leaf path. A
+/// `callActivity` tool that chains into a follow-up sibling early-returns from
+/// `complete_adhoc_tool` into `continue_adhoc_inner_flow` before the leaf's
+/// output-mapping match — so if the precomputed projection is not threaded
+/// through, the hand-off re-evaluates the SAME chained mappings against the
+/// seeded tool scope and double-applies them. The follow-up `toolB` reads the
+/// container-scoped `toolCallResult`; it must equal the single-pass projection
+/// `{status: "resolved", summary: null}` (its `summaryCopy` is a sibling target,
+/// absent from the child view), not the double-applied `summary: "Monthly…"`.
+#[test]
+fn adhoc_call_activity_tool_output_mapping_single_pass_through_chained_flow() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_chained_flow_call_activity_tool() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let _inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("askedAbout", Value::Str("a mortgage".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let child_jobs = engine.activate_jobs("probe-child", "W", 10, 1_000, 0);
+    assert_eq!(child_jobs.len(), 1, "the called process was instantiated");
+    engine
+        .apply_command(Command::complete_job_with(
+            child_jobs[0].key,
+            vars(&[
+                ("status", Value::Str("resolved".into())),
+                ("summary", Value::Str("Monthly payment is $1,516.".into())),
+            ]),
+        ))
+        .unwrap();
+
+    let single_pass = Value::Map(std::collections::BTreeMap::from([
+        ("status".to_string(), Value::Str("resolved".into())),
+        ("summary".to_string(), Value::Null),
+    ]));
+
+    // The follow-up `toolB` chained into existence and reads the container-scoped
+    // projection the hand-off seeded. It must be the single-pass value — a
+    // re-evaluation in the hand-off would have double-applied `summaryCopy` and
+    // manufactured a non-null `summary` here.
+    let tool_b = engine
+        .activate_jobs("toolB-type", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolB")
+        .expect("toolB chained from CallSpecialist's completed flow");
+    assert_eq!(
+        tool_b.variables.get("toolCallResult"),
+        Some(&single_pass),
+        "the chained-flow hand-off projected the single-pass toolCallResult \
+         (no double-applied chained mapping across the hand-off)"
+    );
+}
+
+/// A parent process whose ad-hoc agent has an UNBOUND `bpmn:callActivity` tool —
+/// a `callActivity` with no `calledElement`/`zeebe:calledElement processId`
+/// (issue #1159). The ad-hoc catalog deliberately supports this shape
+/// (`process_id: None`, round-tripped as `UnboundCall` by `processos`); it names
+/// no callee, so it must pass straight through to completion (its pre-#1159
+/// behaviour), NOT be handed an empty callee that raises a spurious
+/// `CalledElementError`.
+fn adhoc_agent_with_unbound_call_activity_tool() -> ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=toolResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="Unbound">
+              <bpmn:extensionElements>
+                <zeebe:ioMapping>
+                  <zeebe:output source="=42" target="toolResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+/// Issue #1159 (Copilot review round 4): the new `callActivity` spawn arm must
+/// only fire for a BOUND callee. An UNBOUND call-activity tool (no
+/// `calledElement`) must pass through to completion — the previous generic arm
+/// did — instead of spawning with an empty callee and raising a spurious
+/// `CalledElementError`. Activating it raises NO incident, completes the tool
+/// (its output mapping projects into the container), and re-emits the agent job.
+#[test]
+fn adhoc_unbound_call_activity_tool_passes_through_without_incident() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_with_unbound_call_activity_tool(),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "parent");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("Unbound")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // The unbound tool spawns NO child process and raises NO incident — it passes
+    // straight through to completion.
+    assert!(
+        engine
+            .activate_jobs("probe-child", "W", 10, 1_000, 0)
+            .is_empty(),
+        "an unbound call-activity tool spawns no child process"
+    );
+    assert!(
+        engine.instance(inst).unwrap().incidents.is_empty(),
+        "an unbound call-activity tool passes through — no spurious CalledElementError"
+    );
+
+    // It completed like a pass-through tool: its output mapping projected `42`
+    // into the container scope, visible to the next agent turn. (`outputElement`
+    // reads the child scope, where the tool output target is not set, so the
+    // collected entry is null — the projection lands in the container, not the
+    // child.)
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job re-emitted after the unbound tool drained");
+    assert_eq!(
+        agent2.variables.get("toolResult"),
+        Some(&Value::Int(42)),
+        "the unbound tool completed and projected its pass-through output into \
+         the container, got {:?}",
+        agent2.variables.get("toolResult")
+    );
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent2.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(engine.is_completed(inst), "the parent instance completed");
+}
+
+/// A parent process whose ad-hoc agent has a `bpmn:callActivity` tool with BOTH
+/// propagate flags at their Zeebe default (`true`, the attributes absent): the
+/// whole parent scope crosses INTO the child, and the child's whole final scope
+/// crosses BACK into the container (issue #1159). The tool still input-maps
+/// `askedAbout -> customerRequest` and output-maps `{status, summary} ->
+/// toolCallResult`.
+fn adhoc_agent_with_propagating_call_activity_tool() -> Vec<ProcessDefinition> {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="child" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="={status: status, summary: summary}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+        <bpmn:process id="child">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap()
+}
+
+/// Issue #1159 (coverage for the propagate-`true` branches): with
+/// `propagateAllParentVariables=true` the child sees a parent variable that no
+/// input mapping named (`sharedContext`), and with `propagateAllChildVariables=true`
+/// a raw variable the child produced (`childOnly`) crosses back into the
+/// container scope — while the tool's output mapping still projects the real
+/// result. The existing spawn test exercises both flags OFF, so this guards the
+/// separate default/`true` seed + merge behaviour of the new `activate_adhoc_tool`
+/// arm.
+#[test]
+fn adhoc_call_activity_tool_propagates_parent_and_child_variables() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_propagating_call_activity_tool() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[
+                ("askedAbout", Value::Str("a mortgage".into())),
+                ("sharedContext", Value::Str("branch-42".into())),
+            ]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let child_jobs = engine.activate_jobs("probe-child", "W", 10, 1_000, 0);
+    assert_eq!(child_jobs.len(), 1, "the called process is instantiated");
+    let child_job = &child_jobs[0];
+    assert_eq!(
+        child_job.variables.get("customerRequest"),
+        Some(&Value::Str("a mortgage".into())),
+        "the tool's input mapping crossed into the spawned child"
+    );
+    assert_eq!(
+        child_job.variables.get("sharedContext"),
+        Some(&Value::Str("branch-42".into())),
+        "propagateAllParentVariables=true crossed the un-mapped parent variable \
+         into the child"
+    );
+
+    engine
+        .apply_command(Command::complete_job_with(
+            child_job.key,
+            vars(&[
+                ("status", Value::Str("resolved".into())),
+                ("summary", Value::Str("Monthly payment is $1,516.".into())),
+                ("childOnly", Value::Str("scratch".into())),
+            ]),
+        ))
+        .unwrap();
+
+    let expected = Value::Map(std::collections::BTreeMap::from([
+        ("status".to_string(), Value::Str("resolved".into())),
+        (
+            "summary".to_string(),
+            Value::Str("Monthly payment is $1,516.".into()),
+        ),
+    ]));
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "toolCallResults"),
+        Some(Value::List(vec![expected.clone()])),
+        "the output mapping still projects the child's real result"
+    );
+
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job re-emitted after the tool drained");
+    assert_eq!(
+        agent2.variables.get("toolCallResult"),
+        Some(&expected),
+        "the tool's output projection is visible to the re-emitted agent"
+    );
+    assert_eq!(
+        agent2.variables.get("childOnly"),
+        Some(&Value::Str("scratch".into())),
+        "propagateAllChildVariables=true merged the child's raw variable back \
+         into the container scope"
+    );
+}
+
+/// Same ad-hoc `callActivity` tool as `adhoc_agent_with_call_activity_tool`, but
+/// the container sits on ONE branch of a parallel fork whose other branch parks
+/// on an open `hold` user task, so cancelling the container does NOT complete the
+/// parent instance (the join still waits on `hold`). This isolates the #1159
+/// cancellation leak: with the parent instance alive, the generic
+/// `cascade_cancel_children` sweep (which only reaps children of a *terminated*
+/// instance) never reaps the call-activity tool's child — so the tool-local
+/// teardown must terminate it.
+fn adhoc_agent_with_call_activity_tool_and_keepalive() -> Vec<ProcessDefinition> {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:parallelGateway id="fork" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="child"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="={status: status, summary: summary}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:userTask id="hold" />
+          <bpmn:parallelGateway id="join" />
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="fork" />
+          <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="hold" />
+          <bpmn:sequenceFlow id="f3" sourceRef="agent" targetRef="join" />
+          <bpmn:sequenceFlow id="f4" sourceRef="hold" targetRef="join" />
+          <bpmn:sequenceFlow id="f5" sourceRef="join" targetRef="e" />
+        </bpmn:process>
+        <bpmn:process id="child">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap()
+}
+
+/// Issue #1159 (cancellation defect class): a `callActivity` tool drives a
+/// distinct CHILD PROCESS INSTANCE that hangs off the tool element, not off the
+/// parent instance's active tokens. Cancelling the ad-hoc container while that
+/// child is still running must TERMINATE the linked child (and cancel its jobs),
+/// not leave the callee running after the ad-hoc token is gone — the generic
+/// post-command `cascade_cancel_children` sweep only reaps children of a
+/// *terminated* instance, and here the parent instance stays ALIVE (a parallel
+/// `hold` branch keeps it running), so the tool-local teardown must reap it.
+#[test]
+fn adhoc_cancel_remaining_terminates_a_running_call_activity_tool_child() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_call_activity_tool_and_keepalive() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("askedAbout", Value::Str("a mortgage".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    let activated = engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let child_key = activated
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_id,
+                ..
+            } if process_id == "child" => Some(*instance_key),
+            _ => None,
+        })
+        .expect("the call-activity tool spawned a child process instance");
+    let child_job = engine
+        .activate_jobs("probe-child", "W", 10, 1_000, 0)
+        .into_iter()
+        .next()
+        .expect("the spawned child minted its job");
+
+    // Cancel the container's remaining instances while the child is still live.
+    engine
+        .apply_command(Command::ActivateAdHocActivities {
+            ad_hoc_instance_key: container,
+            activate_elements: Vec::new(),
+            cancel_remaining: true,
+        })
+        .expect("cancel-remaining completes the container");
+
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated,
+        "the linked call-activity child is terminated, not left running after the \
+         ad-hoc token is cancelled"
+    );
+    assert_eq!(
+        engine.state().jobs[&child_job.key].state,
+        crate::state::JobState::Canceled,
+        "the child's job is cancelled, not left orphaned/activatable"
+    );
+    assert!(
+        engine
+            .activate_jobs("probe-child", "W", 10, 1_000, 0)
+            .is_empty(),
+        "no child job survives the cancellation"
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "the parent instance stays ALIVE (its `hold` branch is still open) — the \
+         leak is only observable because `cascade_cancel_children` cannot reap the \
+         child of a still-live parent"
+    );
+}
+
+/// A `callActivity` ad-hoc tool whose OUTPUT mapping cannot evaluate against the
+/// child's real result (`=status + 1`, string + int): the tool must park an
+/// `IO_MAPPING_ERROR` incident that PRESERVES the child's produced variables on
+/// its redrive (issue #1159), so resolution re-enters the call-activity→ad-hoc
+/// bridge with the gone child's result rather than completing the tool through
+/// `complete_adhoc_tool` against the pre-child scope (which would manufacture a
+/// wrong answer). A genuinely unfixable mapping therefore stays parked on resolve
+/// instead of silently completing wrong.
+fn adhoc_agent_with_failing_output_call_activity_tool() -> Vec<ProcessDefinition> {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="child"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:output source="=status + 1" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+        <bpmn:process id="child">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap()
+}
+
+#[test]
+fn adhoc_call_activity_tool_output_failure_preserves_child_result_for_redrive() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_failing_output_call_activity_tool() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let inst = engine
+        .apply_command(Command::create_instance("parent"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let child_job = engine
+        .activate_jobs("probe-child", "W", 10, 1_000, 0)
+        .into_iter()
+        .next()
+        .expect("the called process is instantiated");
+    engine
+        .apply_command(Command::complete_job_with(
+            child_job.key,
+            vars(&[("status", Value::Str("resolved".into()))]),
+        ))
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(
+        active.len(),
+        1,
+        "the failing output mapping parks one incident"
+    );
+    assert_eq!(
+        active[0].kind,
+        state::IncidentKind::IoMapping,
+        "a call-activity tool output-mapping failure raises IO_MAPPING_ERROR"
+    );
+    match &active[0].redrive {
+        Some(state::IoMappingRedrive::CallActivityCompletion { child_variables }) => {
+            assert_eq!(
+                child_variables.get("status"),
+                Some(&Value::Str("resolved".into())),
+                "the gone child's real result is captured on the incident redrive, \
+                 not lost to a generic Completion redrive"
+            );
+        }
+        other => panic!("expected CallActivityCompletion redrive, got {other:?}"),
+    }
+    assert!(
+        !engine.is_completed(inst),
+        "the tool must not complete while its output mapping is unresolved"
+    );
+
+    // Resolving an unfixable mapping re-projects the captured child result — which
+    // fails again — so it stays parked, rather than routing `Step::Complete` into
+    // `complete_adhoc_tool` and silently completing the tool with a wrong answer.
+    let incident_key = engine.incidents()[0].key;
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let active = engine.active_incidents();
+    assert_eq!(
+        active.len(),
+        1,
+        "the unfixable output mapping re-raises (context-preserving redrive), not \
+         a silent wrong completion"
+    );
+    assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
+    assert!(!engine.is_completed(inst), "still parked after resolve");
+}
+
+/// A parent whose ad-hoc `callActivity` tool names a callee that is NOT deployed
+/// at activation time — its spawn parks a recoverable `CALLED_ELEMENT_ERROR`
+/// incident (issue #1159). Deploying the callee and resolving the incident must
+/// RE-ATTEMPT the spawn (`RetryCallActivitySpawn` → the ad-hoc respawn path) and
+/// actually create the child, instead of completing the tool with a manufactured
+/// all-null result.
+fn adhoc_agent_tool_calls_undeployed() -> ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="specialist-proc"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="={status: status, summary: summary}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap()
+}
+
+fn specialist_proc() -> ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="specialist-proc">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap()
+}
+
+#[test]
+fn adhoc_call_activity_tool_spawn_incident_recovers_on_resolve() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_tool_calls_undeployed()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("askedAbout", Value::Str("a mortgage".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // The callee is not deployed: the spawn parks a recoverable incident and no
+    // child job is minted.
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "the unknown callee parks one incident");
+    assert_eq!(active[0].kind, state::IncidentKind::CalledElementError);
+    assert_eq!(
+        active[0].redrive,
+        Some(state::IoMappingRedrive::CallActivitySpawn),
+        "the spawn incident carries a spawn-retry redrive, not None"
+    );
+    assert!(
+        engine
+            .activate_jobs("probe-child", "W", 10, 1_000, 0)
+            .is_empty(),
+        "no child is instantiated while the callee is missing"
+    );
+
+    // Deploy the callee and resolve: resolution re-attempts the spawn.
+    engine
+        .apply_command(Command::DeployProcess(specialist_proc()))
+        .unwrap();
+    let incident_key = engine.incidents()[0].key;
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    assert!(
+        engine.active_incidents().is_empty(),
+        "resolving the incident cleared it by spawning the child"
+    );
+    let child_jobs = engine.activate_jobs("probe-child", "W", 10, 1_000, 0);
+    assert_eq!(
+        child_jobs.len(),
+        1,
+        "resolving the spawn incident re-attempted the spawn and instantiated the \
+         callee — it did not silently complete the tool"
+    );
+    assert_eq!(
+        child_jobs[0].variables.get("customerRequest"),
+        Some(&Value::Str("a mortgage".into())),
+        "the retried spawn re-applied the tool's input mapping"
+    );
+    assert!(!engine.is_completed(inst), "the parent waits for the child");
 }

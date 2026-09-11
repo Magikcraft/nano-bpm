@@ -2793,6 +2793,12 @@ impl ProcessAcc {
                         }
                         NodeKind::Call => crate::model::AdHocToolKind::CallActivity {
                             process_id: n.called_process_id.clone(),
+                            propagate_all_parent_variables: n
+                                .propagate_all_parent_variables
+                                .unwrap_or(true),
+                            propagate_all_child_variables: n
+                                .propagate_all_child_variables
+                                .unwrap_or(true),
                         },
                         _ => crate::model::AdHocToolKind::Other,
                     }
