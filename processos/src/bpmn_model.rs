@@ -2122,7 +2122,10 @@ fn emit_element(
                 tool.element_id == id
                     && matches!(
                         tool.kind,
-                        nanobpmn_engine_core::AdHocToolKind::CallActivity { process_id: None }
+                        nanobpmn_engine_core::AdHocToolKind::CallActivity {
+                            process_id: None,
+                            ..
+                        }
                     )
             });
             if !unbound_tool {
@@ -2789,10 +2792,14 @@ fn restore_adhoc_catalog_elements(def: &mut ProcessDefinition) {
                     linked_resources: Vec::new(),
                 },
                 AdHocToolKind::UserTask(props) => ElementKind::UserTask(props.clone()),
-                AdHocToolKind::CallActivity { process_id } => ElementKind::CallActivity {
+                AdHocToolKind::CallActivity {
+                    process_id,
+                    propagate_all_parent_variables,
+                    propagate_all_child_variables,
+                } => ElementKind::CallActivity {
                     called_process_id: process_id.clone().unwrap_or_default(),
-                    propagate_all_parent_variables: true,
-                    propagate_all_child_variables: true,
+                    propagate_all_parent_variables: *propagate_all_parent_variables,
+                    propagate_all_child_variables: *propagate_all_child_variables,
                 },
                 AdHocToolKind::SubProcess { start_event } => ElementKind::SubProcess {
                     start_event: start_event.clone(),
@@ -4492,6 +4499,80 @@ mod tests {
             assert!(preserved.contains(&authored_di.diagram_block));
             assert_eq!(parse_bpmn(&preserved).unwrap()[0].adhoc, original.adhoc);
         }
+    }
+
+    #[test]
+    fn adhoc_catalog_call_activity_tool_round_trips_false_propagation_flags() {
+        // Issue #1159 (Copilot review round 4): the PRUNED ad-hoc catalog
+        // serializer (`AdHocToolKind::CallActivity`, not the normal
+        // `ElementKind::CallActivity` element path) must preserve a tool's
+        // `propagateAllParentVariables` / `propagateAllChildVariables` when set to
+        // `false`. Both default to `true`, so only an explicit-false round trip
+        // proves the pruned-element serializer cannot silently revert tool
+        // propagation semantics — the authored-catalog fixture only exercises the
+        // default-true `Escalate` and the unbound `UnboundCall`.
+        let source = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:adHocSubProcess id="agent">
+      <bpmn:extensionElements>
+        <zeebe:agentDefinition agentType="external"/>
+        <zeebe:taskDefinition type="agent-worker"/>
+        <zeebe:adHoc outputCollection="results" outputElement="= result"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:callActivity id="CallSpecialist">
+        <bpmn:extensionElements>
+          <zeebe:calledElement processId="child" propagateAllParentVariables="false" propagateAllChildVariables="false"/>
+        </bpmn:extensionElements>
+      </bpmn:callActivity>
+    </bpmn:adHocSubProcess>
+    <bpmn:endEvent id="e"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let original = parse_bpmn(source).expect("valid ad-hoc model").remove(0);
+        // Sanity: the authored tool parsed with BOTH flags false (not the default).
+        let tool = original.adhoc[0]
+            .tools
+            .iter()
+            .find(|t| t.element_id == "CallSpecialist")
+            .expect("CallSpecialist tool in the catalog");
+        assert!(
+            matches!(
+                tool.kind,
+                nanobpmn_engine_core::AdHocToolKind::CallActivity {
+                    propagate_all_parent_variables: false,
+                    propagate_all_child_variables: false,
+                    ..
+                }
+            ),
+            "authored tool parsed with both propagation flags false, got {:?}",
+            tool.kind
+        );
+
+        let emitted = definition_to_xml(&original);
+        assert!(
+            emitted.contains("propagateAllParentVariables=\"false\""),
+            "the pruned catalog serializer must emit the false parent flag:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("propagateAllChildVariables=\"false\""),
+            "the pruned catalog serializer must emit the false child flag:\n{emitted}"
+        );
+
+        let restored = parse_bpmn(&emitted)
+            .expect("emitted catalog is valid")
+            .remove(0);
+        assert_eq!(
+            restored.adhoc, original.adhoc,
+            "the ad-hoc catalog (including the tool's false propagation flags) \
+             survives the round trip"
+        );
     }
 
     #[test]
