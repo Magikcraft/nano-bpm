@@ -10806,6 +10806,30 @@ impl Engine {
                     .or_default()
                     .push(element.id.as_str());
             }
+            // An armed reactive boundary event has no *incoming* sequence flow,
+            // but while its host activity is live the boundary can still fire and
+            // route a token along its outgoing flow. So a join reachable through
+            // such a boundary is still reachable from the host: treat the host as
+            // a predecessor of its boundary. Without this edge the sweep would see
+            // no live token reaching the join (the host itself is not a
+            // sequence-flow predecessor of the join) and fire it prematurely,
+            // before an armed boundary on a still-active branch could route a
+            // token in (#1168). Compensation boundaries are excluded — they are
+            // not armed and never fire reactively during normal flow.
+            let boundary_host = match &element.kind {
+                ElementKind::ErrorBoundaryEvent { attached_to, .. }
+                | ElementKind::TimerBoundaryEvent { attached_to, .. }
+                | ElementKind::MessageBoundaryEvent { attached_to, .. }
+                | ElementKind::SignalBoundaryEvent { attached_to, .. }
+                | ElementKind::ConditionalBoundaryEvent { attached_to, .. } => Some(attached_to),
+                _ => None,
+            };
+            if let Some(host) = boundary_host {
+                predecessors
+                    .entry(element.id.as_str())
+                    .or_default()
+                    .push(host.as_str());
+            }
         }
         let mut stack = vec![target];
         while let Some(node) = stack.pop() {

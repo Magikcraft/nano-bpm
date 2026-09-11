@@ -902,16 +902,31 @@ fn parse_with_captures(
                             // reference-integrity validator (#851) rejects a
                             // *dangling* ref first (a more specific diagnosis).
                             "escalationEventDefinition" => {
-                                let escalation_ref =
-                                    attr(attrs, "escalationRef").unwrap_or("").to_string();
+                                // Only record a reference site when `escalationRef`
+                                // is actually present. Recording a *missing* ref as
+                                // `""` would make the reference-integrity validator
+                                // (#851) reject the model as `UnresolvedReference`
+                                // (an empty id is never a declared `<escalation>`)
+                                // — and references run before `unsupported_elements`
+                                // (`validate::run` order), so a ref-less escalation
+                                // carrier would surface that misleading diagnosis
+                                // instead of the promised `UnsupportedElement` that
+                                // names the construct. Always record the carrier as
+                                // unsupported; only add a ref site when there is a
+                                // ref to resolve.
+                                let escalation_ref = attr(attrs, "escalationRef");
                                 if let Some(boundary) = cur_boundary.as_mut() {
                                     // A boundary carrier: mark it so `build`
                                     // rejects its outgoing flow with the naming
                                     // error before the builder can fail on an
                                     // "unknown source element".
                                     boundary.escalation = true;
-                                    acc.escalation_refs
-                                        .push((boundary.id.clone(), escalation_ref));
+                                    if let Some(escalation_ref) = escalation_ref {
+                                        acc.escalation_refs.push((
+                                            boundary.id.clone(),
+                                            escalation_ref.to_string(),
+                                        ));
+                                    }
                                 } else if let Some(node_id) = flow_node_stack
                                     .iter()
                                     .rev()
@@ -919,10 +934,12 @@ fn parse_with_captures(
                                     .map(|i| acc.nodes[i].id.clone())
                                 {
                                     // A throw / end / catch carrier: record the
-                                    // ref for #851 and the placement as an
-                                    // unmodelled element so #853 rejects it.
-                                    acc.escalation_refs
-                                        .push((node_id.clone(), escalation_ref));
+                                    // ref for #851 (when present) and the placement
+                                    // as an unmodelled element so #853 rejects it.
+                                    if let Some(escalation_ref) = escalation_ref {
+                                        acc.escalation_refs
+                                            .push((node_id.clone(), escalation_ref.to_string()));
+                                    }
                                     acc.unmodelled
                                         .push(("escalationEventDefinition".to_string(), node_id));
                                 }
@@ -4452,6 +4469,37 @@ mod tests {
                 assert_eq!(element_id, "Thr");
             }
             other => panic!("expected UnsupportedElement naming the throw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_a_ref_less_escalation_throw_naming_the_construct() {
+        // A ref-*less* escalation carrier (no `escalationRef` attribute) must
+        // still be rejected as an `UnsupportedElement` naming the construct — not
+        // as an `UnresolvedReference`. Recording the absent ref as `""` used to
+        // register an empty reference site that the reference-integrity validator
+        // (which runs *before* the unsupported-elements validator) rejected first
+        // as a dangling `escalationRef`, masking the real diagnosis (#1168).
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:intermediateThrowEvent id="Thr">
+      <bpmn:escalationEventDefinition />
+    </bpmn:intermediateThrowEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Thr" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Thr" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).expect_err("a ref-less escalation throw must be rejected");
+        match err {
+            ParseError::UnsupportedElement { tag, element_id } => {
+                assert_eq!(tag, "escalationEventDefinition");
+                assert_eq!(element_id, "Thr");
+            }
+            other => panic!("expected UnsupportedElement, not a reference error, got {other:?}"),
         }
     }
 
