@@ -14300,6 +14300,214 @@ fn adhoc_agent_activates_a_user_task_tool_and_parks_until_completed() {
     );
 }
 
+fn adhoc_agent_with_interrupting_message_boundary() -> ProcessDefinition {
+    // An `adHocSubProcess` (JOB_WORKER agent) carrying an interrupting message
+    // boundary event, correlating on `customerId`. This is the executable shape
+    // of Camunda's event-driven agent pattern (#1155): a newly-arrived event
+    // must abandon the agent mid-investigation, including while its own
+    // human-consult (`InnerTask`) task is open.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-agent" />
+              <zeebe:adHoc outputCollection="r" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:userTask id="InnerTask">
+              <bpmn:extensionElements>
+                <zeebe:userTask />
+              </bpmn:extensionElements>
+            </bpmn:userTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:boundaryEvent id="Bnd" attachedToRef="Host">
+            <bpmn:messageEventDefinition messageRef="M" />
+          </bpmn:boundaryEvent>
+          <bpmn:endEvent id="EndNormal" />
+          <bpmn:endEvent id="EndInterrupted" />
+          <bpmn:sequenceFlow id="F1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="F2" sourceRef="Host" targetRef="EndNormal" />
+          <bpmn:sequenceFlow id="F3" sourceRef="Bnd" targetRef="EndInterrupted" />
+        </bpmn:process>
+        <bpmn:message id="M" name="probe-cancel">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=customerId" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+#[test]
+fn interrupting_boundary_on_adhoc_cancels_an_activated_tool() {
+    // Issue #1155: an interrupting boundary event on an `adHocSubProcess` must
+    // terminate the attached activity AND everything inside its scope —
+    // including an activated tool and its open user task — then take its own
+    // outgoing flow. Before the fix the boundary fired but left the activated
+    // tool + its `#innerInstance` active, so the instance hung `Active` forever.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_with_interrupting_message_boundary(),
+        ))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("customerId", Value::Str("C1".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // The agent activates the inner user-task tool: it stays active, the
+    // boundary subscription is open, and the instance parks.
+    let agent = engine
+        .activate_jobs("probe-agent", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "Host")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("InnerTask")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "the user-task tool is active before the boundary fires"
+    );
+    assert!(!engine.is_completed(inst));
+
+    // The cancel message arrives: the interrupting boundary fires and must tear
+    // down the whole ad-hoc scope, then route its own outgoing flow to
+    // `EndInterrupted`.
+    let fired = engine.correlate_message("probe-cancel", "C1", HashMap::new(), 0);
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "Bnd" && to == "EndInterrupted"
+        )),
+        "the boundary event fires and takes its outgoing flow"
+    );
+
+    assert!(
+        engine.is_completed(inst),
+        "the instance reaches EndInterrupted and completes"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || engine
+                .instance(inst)
+                .unwrap()
+                .active
+                .values()
+                .all(|id| id != "InnerTask"
+                    && !id.ends_with(crate::engine::ADHOC_INNER_INSTANCE_ID_POSTFIX)),
+        "the activated tool and its #innerInstance were torn down, not orphaned"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || engine.instance(inst).unwrap().adhoc_instances.is_empty(),
+        "the ad-hoc container's runtime record was cleared on cancel"
+    );
+    assert!(
+        engine
+            .state()
+            .user_tasks
+            .values()
+            .all(|t| t.element_id != "InnerTask" || t.state != state::UserTaskState::Created),
+        "the open user task was cancelled, not left Created"
+    );
+}
+
+#[test]
+fn interrupting_boundary_on_adhoc_cancels_an_in_flight_agent_job() {
+    // Issue #1155: the interrupting-boundary teardown must also cancel the
+    // container's OWN agent job when it is still in flight — i.e. the boundary
+    // fires while the ad-hoc worker is mid-turn (its job activated but not yet
+    // completed). This exercises the `active_job_on(container)` /
+    // `Event::JobCanceled` branch in `interrupt_activity_via_boundary`, which
+    // the tool-teardown test above never reaches because it completes the agent
+    // job before correlating (so `active_job_on` returns `None` there).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_with_interrupting_message_boundary(),
+        ))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("customerId", Value::Str("C1".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // The agent job is activated (a worker picked it up) but NOT completed — the
+    // container is mid-investigation with an in-flight job.
+    let agent = engine
+        .activate_jobs("probe-agent", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "Host")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+    assert!(!engine.is_completed(inst));
+
+    // The cancel message arrives while the agent job is still in flight: the
+    // interrupting boundary must cancel that job (not leave it activated) and
+    // route its own outgoing flow to `EndInterrupted`.
+    let fired = engine.correlate_message("probe-cancel", "C1", HashMap::new(), 0);
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::JobCanceled { job_key, .. } if *job_key == agent.key
+        )),
+        "the in-flight agent job is canceled when the boundary fires"
+    );
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "Bnd" && to == "EndInterrupted"
+        )),
+        "the boundary event fires and takes its outgoing flow"
+    );
+
+    assert!(
+        engine.is_completed(inst),
+        "the instance reaches EndInterrupted and completes"
+    );
+    // The agent job must be gone (canceled), not left activated on a dead
+    // container.
+    assert!(
+        engine.active_job_on(container).is_none(),
+        "no agent job survives on the torn-down container"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || engine.instance(inst).unwrap().adhoc_instances.is_empty(),
+        "the ad-hoc container's runtime record was cleared on cancel"
+    );
+}
+
 fn adhoc_agent_chained_tools_process() -> ProcessDefinition {
     // A JOB_WORKER ad-hoc container whose two service-task tools are joined by a
     // plain `bpmn:sequenceFlow` BETWEEN THE CONTAINER'S OWN CHILDREN (issue
