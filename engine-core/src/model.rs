@@ -1045,8 +1045,23 @@ pub enum AdHocToolKind {
     /// tool element is pruned from the executable graph (ADR 0023 seam 4, mirror
     /// of the retained `io` mapping).
     UserTask(UserTaskProps),
-    /// A call activity; `process_id` is the invoked process id, if declared.
-    CallActivity { process_id: Option<String> },
+    /// A call activity tool (issue #1159): activating it spawns a distinct child
+    /// process instance of `process_id` — exactly like a call activity on an
+    /// ordinary sequence flow — rather than passing straight through to
+    /// completion. `process_id` is the invoked process id (a literal or a FEEL
+    /// `=` expression), if declared. `propagate_all_parent_variables` /
+    /// `propagate_all_child_variables` carry the tool's
+    /// `zeebe:calledElement propagateAllParentVariables` /
+    /// `propagateAllChildVariables` flags (Zeebe default `true`) so the
+    /// parent→child seed and child→parent merge honour the model even though the
+    /// tool element is pruned from the executable graph.
+    CallActivity {
+        process_id: Option<String>,
+        #[cfg_attr(feature = "serde", serde(default = "default_true"))]
+        propagate_all_parent_variables: bool,
+        #[cfg_attr(feature = "serde", serde(default = "default_true"))]
+        propagate_all_child_variables: bool,
+    },
     /// An embedded `bpmn:subProcess` tool with a multi-element token-flow body
     /// (ADR 0023 §Subset, issue #872). `start_event` is the id of the body's
     /// inner start event, where a token is injected when the tool is activated;
