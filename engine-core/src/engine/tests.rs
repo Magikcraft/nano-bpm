@@ -3364,6 +3364,85 @@ fn should_run_inclusive_split_and_join_across_unconditional_flows() {
 }
 
 #[test]
+fn end_listener_fires_on_a_multi_incoming_inclusive_join() {
+    // #1168 regression: an inclusive gateway acting as a JOIN fires via the
+    // quiescence sweep (`fire_ready_inclusive_joins`), NOT the split-completion
+    // path (`complete_inclusive_gateway`). That sweep must still honour the
+    // element's `end` execution-listener gate (ADR 0037): the join rests in
+    // COMPLETING while the listener runs, and its outgoing flow is only taken
+    // once the chain drains. Without the gate a multi-incoming inclusive join
+    // silently skips its listener job (and any variable rewrite it performs).
+    let def = ProcessBuilder::new("inc-join-listener")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .connect("s", "isplit")
+        .connect("isplit", "a")
+        .connect("isplit", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "e")
+        .with_listeners(
+            "join",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "join-audit")],
+        )
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("inc-join-listener"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Drive both split branches to the join; the second arrival makes the join
+    // ready at quiescence.
+    complete_one(&mut engine, "ja");
+    let arrive = complete_one(&mut engine, "jb");
+
+    // The ready join parks on its `end` listener: no outgoing flow taken yet, and
+    // the instance is not complete.
+    assert!(
+        !arrive.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, .. } if from == "join"
+        )),
+        "join must not route until its end listener completes"
+    );
+    assert!(
+        !engine.is_completed(instance_key),
+        "instance parked on the inclusive join's end listener"
+    );
+
+    // Completing the listener drains the chain → the join routes its outgoing
+    // flow exactly once and the instance completes.
+    let audit = engine.activate_jobs("join-audit", "W", 10, 1_000, 0);
+    assert_eq!(audit.len(), 1, "one inclusive-join end-listener job");
+    let done = engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    let routed = done
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "join" && to == "e"
+            )
+        })
+        .count();
+    assert_eq!(
+        routed, 1,
+        "join routes its outgoing flow exactly once after the end listener"
+    );
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
 fn inclusive_join_incident_redrive_does_not_duplicate_outgoing_routing() {
     // #1168 regression (join redrive / stale bookkeeping). A multi-incoming
     // inclusive gateway that is ALSO a conditional split: both branches arrive,

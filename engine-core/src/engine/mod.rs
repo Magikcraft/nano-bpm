@@ -10863,6 +10863,34 @@ impl Engine {
             .unwrap_or(false)
     }
 
+    /// Does `element_instance_key` currently carry an in-flight `end`
+    /// execution-listener job? A join deferred behind its end-listener chain
+    /// rests in COMPLETING (its `ElementCompleting` fired but `ElementCompleted`
+    /// has not, so it is still in `active`) — the quiescence sweep must not treat
+    /// it as ready and re-fire it, which would mint a second listener chain and
+    /// double-route. The pending listener job disappears once the chain drains
+    /// and [`finalize_inclusive_gateway`] completes + resets the join.
+    fn has_pending_end_listener(&self, instance_key: Key, element_instance_key: Key) -> bool {
+        self.state
+            .jobs_by_instance
+            .get(&instance_key)
+            .map(|jobs| {
+                jobs.iter().any(|jk| {
+                    self.state.jobs.get(jk).is_some_and(|job| {
+                        job.element_instance_key == element_instance_key
+                            && matches!(
+                                job.kind,
+                                state::JobKind::ExecutionListener {
+                                    event_type: crate::model::ListenerEventType::End,
+                                    ..
+                                }
+                            )
+                    })
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// At token quiescence, fire every open inclusive-gateway join whose branches
     /// have all arrived — i.e. no live token elsewhere in the instance could
     /// still reach it. Firing completes the join and routes its outgoing flow(s)
@@ -10907,6 +10935,15 @@ impl Engine {
             // duplicate/stale-bookkeeping class this join path already guards
             // against on the raise side.
             if self.has_active_incident_on(instance_key, join_eik) {
+                continue;
+            }
+            // A join already resting in COMPLETING behind its `end`
+            // execution-listener chain must not be re-fired: its outgoing routing
+            // is deferred to `finalize_inclusive_gateway` when the chain drains.
+            // Its own resting token is excluded from `still_waiting` below, so
+            // without this guard the next sweep would mint a duplicate listener
+            // chain and double-route.
+            if self.has_pending_end_listener(instance_key, join_eik) {
                 continue;
             }
             // Any live token that could still reach the join blocks firing. The
@@ -10982,6 +11019,23 @@ impl Engine {
                     element_id: element_id.clone(),
                 },
             );
+            // End-listener gate (ADR 0037): if the join declares `end` execution
+            // listeners, defer its reset/outgoing routing behind that chain — the
+            // join rests in COMPLETING until the chain drains and redrives
+            // `finalize_inclusive_gateway`, which re-selects (a listener may have
+            // rewritten a condition variable) and routes. This mirrors the split
+            // path (`complete_inclusive_gateway`); without it a multi-incoming
+            // join would skip its listener job and any variable rewrite. The
+            // `has_pending_end_listener` guard above stops this sweep re-firing
+            // the parked join. `return true` keeps the fire-at-most-one-per-sweep
+            // invariant and makes the caller re-drain.
+            let vars = self.variables(instance_key);
+            if let Some(job) =
+                self.begin_end_listener_chain(instance_key, join_eik, &element_id, scope, &vars)
+            {
+                self.emit(log, job);
+                return true;
+            }
             self.emit(
                 log,
                 Event::ElementCompleted {

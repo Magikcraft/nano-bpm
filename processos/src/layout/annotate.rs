@@ -20,7 +20,8 @@
 //!    gateway's `is_default` (or first) outgoing yields the *primary flow*.
 //!    Every interrupting boundary event (error / timer / message / signal /
 //!    conditional) seeds an *exception flow* spanning everything reachable
-//!    downstream. `ExclusiveGateway → decision`, `UserTask → review`.
+//!    downstream. `ExclusiveGateway`/`InclusiveGateway → decision` (both
+//!    condition-routed gateway kinds), `UserTask → review`.
 //! 2. **Heuristic** ([`heuristic_roles_and_clusters`], slice 2): name and
 //!    `jobType` regex matching upgrades tasks to
 //!    [`Role::Notification`] (`notify|send.?email|send.?sms|escalate`),
@@ -204,7 +205,11 @@ fn infer_roles(def: &ProcessDefinition) -> std::collections::BTreeMap<String, Ro
     let mut roles = std::collections::BTreeMap::new();
     for el in def.elements.values() {
         let role = match &el.kind {
-            ElementKind::ExclusiveGateway => Some(Role::Decision),
+            // Both condition-routed gateway kinds are decisions: an inclusive
+            // (OR) gateway evaluates its branch conditions exactly as an
+            // exclusive (XOR) one does, so it carries the same `Decision` role in
+            // the inferred contract (a parallel/event-based gateway does not).
+            ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway => Some(Role::Decision),
             ElementKind::UserTask(_) => Some(Role::Review),
             _ => None,
         };
@@ -454,6 +459,47 @@ mod tests {
             ann.roles.get(&gw.id).copied(),
             Some(Role::Decision),
             "exclusive gateway {} should be a decision role",
+            gw.id
+        );
+    }
+
+    #[test]
+    fn roles_tag_inclusive_gateways_as_decisions() {
+        // An inclusive (OR) gateway is condition-routed just like an exclusive
+        // one, so `infer_roles` must classify it as a `Decision` too — otherwise
+        // the new gateway kind would silently vanish from the inferred role
+        // contract processos consumers rely on.
+        const INCLUSIVE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="Definitions_or" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="OrProcess" isExecutable="true">
+    <bpmn:startEvent id="Start_1"><bpmn:outgoing>Flow_1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:inclusiveGateway id="GwOr" name="which?" default="Flow_b">
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+      <bpmn:outgoing>Flow_a</bpmn:outgoing>
+      <bpmn:outgoing>Flow_b</bpmn:outgoing>
+    </bpmn:inclusiveGateway>
+    <bpmn:endEvent id="End_a"><bpmn:incoming>Flow_a</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="End_b"><bpmn:incoming>Flow_b</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="GwOr"/>
+    <bpmn:sequenceFlow id="Flow_a" sourceRef="GwOr" targetRef="End_a">
+      <bpmn:conditionExpression>=go</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_b" sourceRef="GwOr" targetRef="End_b"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let defs = parse_bpmn(INCLUSIVE_XML).expect("parse");
+        let def = defs.into_iter().next().expect("one process");
+        let ann = infer(&def);
+        let gw = def
+            .elements
+            .values()
+            .find(|el| matches!(el.kind, ElementKind::InclusiveGateway))
+            .expect("fixture has an inclusive gateway");
+        assert_eq!(
+            ann.roles.get(&gw.id).copied(),
+            Some(Role::Decision),
+            "inclusive gateway {} should be a decision role",
             gw.id
         );
     }
