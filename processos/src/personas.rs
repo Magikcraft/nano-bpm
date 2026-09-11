@@ -370,8 +370,8 @@ the tools. Your VERY FIRST action in this conversation must be to call read_mode
 \n\
 Start from the model. Use read_model to get the distilled structural graph (nodes, kinds, flows, \
 reachability, gateway roles, service-task job types) and analyze_model to get deterministic static \
-findings (missing end events, unreachable or dead-end nodes, exclusive gateways without a default \
-flow, unguarded service tasks, parallel-join deadlock hazards, exclusive joins of parallel paths, \
+findings (missing end events, unreachable or dead-end nodes, exclusive OR inclusive (condition-routed) \
+gateways without a default flow, unguarded service tasks, parallel-join deadlock hazards, exclusive joins of parallel paths, \
 rework loops). These tools work with ZERO trace data — a clean design-time review is valid on its \
 own. Only if read_model itself returns an error saying no model exists should you tell the operator \
 the model is unavailable.\n\
