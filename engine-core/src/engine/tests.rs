@@ -22594,6 +22594,142 @@ fn adhoc_call_activity_tool_output_mapping_evaluated_once_for_chained_mappings()
     assert!(engine.is_completed(inst), "the parent instance completed");
 }
 
+/// A parent process whose ad-hoc agent has a `bpmn:callActivity` tool that is
+/// ALSO the head of a chained inner flow (issue #1154 × #1159): `CallSpecialist`
+/// carries the same chained output mappings as
+/// `adhoc_agent_with_chained_output_call_activity_tool` AND an outgoing
+/// `bpmn:sequenceFlow` to a follow-up sibling `toolB`. Completing the tool
+/// therefore hands off through `continue_adhoc_inner_flow` (the mid-chain path),
+/// not the leaf path — so the precomputed single-pass projection must be carried
+/// through the hand-off too, or the follow-up sees a double-applied mapping.
+fn adhoc_agent_with_chained_flow_call_activity_tool() -> Vec<ProcessDefinition> {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="child"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="=summary" target="summaryCopy" />
+                  <zeebe:output source="={status: status, summary: summaryCopy}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+              <bpmn:outgoing>chain</bpmn:outgoing>
+            </bpmn:callActivity>
+            <bpmn:sequenceFlow id="chain" sourceRef="CallSpecialist" targetRef="toolB" />
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="toolB-type" />
+              </bpmn:extensionElements>
+              <bpmn:incoming>chain</bpmn:incoming>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+        <bpmn:process id="child">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap()
+}
+
+/// Issue #1159 (Copilot review round 3): the single-pass output projection must
+/// be preserved through the CHAINED-FLOW hand-off too, not only the leaf path. A
+/// `callActivity` tool that chains into a follow-up sibling early-returns from
+/// `complete_adhoc_tool` into `continue_adhoc_inner_flow` before the leaf's
+/// output-mapping match — so if the precomputed projection is not threaded
+/// through, the hand-off re-evaluates the SAME chained mappings against the
+/// seeded tool scope and double-applies them. The follow-up `toolB` reads the
+/// container-scoped `toolCallResult`; it must equal the single-pass projection
+/// `{status: "resolved", summary: null}` (its `summaryCopy` is a sibling target,
+/// absent from the child view), not the double-applied `summary: "Monthly…"`.
+#[test]
+fn adhoc_call_activity_tool_output_mapping_single_pass_through_chained_flow() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_chained_flow_call_activity_tool() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let _inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("askedAbout", Value::Str("a mortgage".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let child_jobs = engine.activate_jobs("probe-child", "W", 10, 1_000, 0);
+    assert_eq!(child_jobs.len(), 1, "the called process was instantiated");
+    engine
+        .apply_command(Command::complete_job_with(
+            child_jobs[0].key,
+            vars(&[
+                ("status", Value::Str("resolved".into())),
+                ("summary", Value::Str("Monthly payment is $1,516.".into())),
+            ]),
+        ))
+        .unwrap();
+
+    let single_pass = Value::Map(std::collections::BTreeMap::from([
+        ("status".to_string(), Value::Str("resolved".into())),
+        ("summary".to_string(), Value::Null),
+    ]));
+
+    // The follow-up `toolB` chained into existence and reads the container-scoped
+    // projection the hand-off seeded. It must be the single-pass value — a
+    // re-evaluation in the hand-off would have double-applied `summaryCopy` and
+    // manufactured a non-null `summary` here.
+    let tool_b = engine
+        .activate_jobs("toolB-type", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolB")
+        .expect("toolB chained from CallSpecialist's completed flow");
+    assert_eq!(
+        tool_b.variables.get("toolCallResult"),
+        Some(&single_pass),
+        "the chained-flow hand-off projected the single-pass toolCallResult \
+         (no double-applied chained mapping across the hand-off)"
+    );
+}
+
 /// A parent process whose ad-hoc agent has a `bpmn:callActivity` tool with BOTH
 /// propagate flags at their Zeebe default (`true`, the attributes absent): the
 /// whole parent scope crosses INTO the child, and the child's whole final scope

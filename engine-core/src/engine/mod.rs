@@ -7817,6 +7817,7 @@ impl Engine {
                 container_key,
                 inner_key,
                 chain_targets,
+                precomputed_output,
             );
         }
         // Collect this tool's output (evaluated in its local scope, which is still
@@ -8032,6 +8033,7 @@ impl Engine {
     /// the active set and its follow-up sibling(s) activated in its place, so the
     /// chain simply keeps draining. The agent job is re-emitted only once the
     /// whole chain drains to a leaf (a tool with no taken outgoing inner flow).
+    #[allow(clippy::too_many_arguments)]
     fn continue_adhoc_inner_flow(
         &mut self,
         instance_key: Key,
@@ -8040,6 +8042,17 @@ impl Engine {
         container_key: Key,
         inner_key: Key,
         targets: Vec<String>,
+        // The tool's output projection, ALREADY evaluated once against the real
+        // completion scope (issue #1159) — carried through from
+        // `complete_adhoc_tool` for a `callActivity` tool whose result was
+        // projected by the bridge (`complete_adhoc_call_activity_tool`). A tool
+        // that chains into a follow-up sibling is not a leaf, but its output
+        // mappings must STILL project single-pass: re-evaluating them here against
+        // the seeded child scope would double-apply chained mappings
+        // (`summary -> summaryCopy` then `summaryCopy -> toolCallResult`), exactly
+        // the divergence the leaf path guards against. `Some` ⇒ use verbatim;
+        // an ordinary tool passes `None` and the mapping is evaluated here.
+        precomputed_output: Option<HashMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         // Resolve the container's identity and its active count from live state.
         // The caller already early-returns when this lookup is absent, but resolve
@@ -8088,28 +8101,38 @@ impl Engine {
         // into the container scope so the follow-up can read it — evaluated in the
         // child's local scope while it is still resident (its `ElementCompleted`
         // above tears the scope down only when the caller applies these events).
-        let outputs = self
-            .adhoc_tool_io(instance_key, &container_element_id, &tool_element_id)
-            .outputs;
-        let output_updates = if outputs.is_empty() {
-            HashMap::new()
-        } else {
-            let vars = self.variables_for_element(instance_key, child_eik);
-            match self.eval_io_mappings_in(&vars, &outputs) {
-                Ok(updates) => updates,
-                Err(failure) => {
-                    // A failing tool output mapping halts the tool with an incident
-                    // rather than continuing the chain with a silently-unset output
-                    // (#939); resolution re-drives its completion, re-evaluating the
-                    // chain.
-                    let event = self.io_mapping_incident(
-                        instance_key,
-                        child_eik,
-                        tool_element_id,
-                        failure,
-                        state::IoMappingRedrive::Completion,
-                    );
-                    return (vec![event], Vec::new());
+        let output_updates = match precomputed_output {
+            // Call-activity tool bridge (#1159): the output mapping was already
+            // projected ONCE against the child's real produced variables. Use it
+            // verbatim — re-evaluating it here against the seeded child scope would
+            // double-apply chained mappings, so a chained-flow hand-off must
+            // preserve single-pass semantics exactly like the leaf path.
+            Some(updates) => updates,
+            None => {
+                let outputs = self
+                    .adhoc_tool_io(instance_key, &container_element_id, &tool_element_id)
+                    .outputs;
+                if outputs.is_empty() {
+                    HashMap::new()
+                } else {
+                    let vars = self.variables_for_element(instance_key, child_eik);
+                    match self.eval_io_mappings_in(&vars, &outputs) {
+                        Ok(updates) => updates,
+                        Err(failure) => {
+                            // A failing tool output mapping halts the tool with an incident
+                            // rather than continuing the chain with a silently-unset output
+                            // (#939); resolution re-drives its completion, re-evaluating the
+                            // chain.
+                            let event = self.io_mapping_incident(
+                                instance_key,
+                                child_eik,
+                                tool_element_id,
+                                failure,
+                                state::IoMappingRedrive::Completion,
+                            );
+                            return (vec![event], Vec::new());
+                        }
+                    }
                 }
             }
         };
