@@ -10164,6 +10164,7 @@ impl Engine {
             element_instance_key,
             element_id: element_id.clone(),
         });
+        self.reset_open_inclusive_join(instance_key, element_instance_key, &element_id, &mut events);
         let mut followups = Vec::new();
         for flow_to in selected {
             events.push(Event::SequenceFlowTaken {
@@ -10200,6 +10201,12 @@ impl Engine {
                     element_instance_key,
                     element_id: element_id.clone(),
                 }];
+                self.reset_open_inclusive_join(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                    &mut events,
+                );
                 let mut followups = Vec::new();
                 for flow_to in selected {
                     events.push(Event::SequenceFlowTaken {
@@ -10251,6 +10258,35 @@ impl Engine {
                     Vec::new(),
                 )
             }
+        }
+    }
+
+    /// If `element_id` currently rests as an **open inclusive-gateway join**
+    /// (its bookkeeping still sits in `join_instances`/`join_counts` keyed by the
+    /// element id, opened by [`arrive_at_inclusive_join`]), append a
+    /// [`Event::ParallelJoinReset`] to `events` so the join's shared bookkeeping
+    /// is cleared as it completes. A join normally completes *and* resets inside
+    /// the quiescence sweep ([`fire_ready_inclusive_joins`]); but when that sweep
+    /// raised an incident (no-matching-flow / expression failure) on the join, the
+    /// incident is later resolved by re-driving `Step::Complete`, which dispatches
+    /// to the split-completion path ([`complete_inclusive_gateway`] /
+    /// [`finalize_inclusive_gateway`]). That path emits `ElementCompleted` but the
+    /// reducer does not clear the join maps on `ElementCompleted`, so without this
+    /// reset the stale entry would be swept again next quiescence and duplicate the
+    /// outgoing routing. The guard makes this a no-op for an ordinary
+    /// single-incoming inclusive split (no open join exists).
+    fn reset_open_inclusive_join(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        events: &mut Vec<Event>,
+    ) {
+        if self.join_eik(instance_key, element_id) == Some(element_instance_key) {
+            events.push(Event::ParallelJoinReset {
+                instance_key,
+                element_id: element_id.to_string(),
+            });
         }
     }
 
@@ -10377,11 +10413,23 @@ impl Engine {
         }
         candidates.sort();
 
-        let mut fired_any = false;
         for (instance_key, element_id, join_eik) in candidates {
             // Still open? (an earlier fire this pass may have reset a mutual
             // dependency — re-check against live state).
             if self.join_eik(instance_key, &element_id) != Some(join_eik) {
+                continue;
+            }
+            // A join already parked on an active incident awaits explicit
+            // incident *resolution* — it must not be opportunistically re-fired by
+            // this sweep just because a variable changed to make its selection
+            // satisfiable. Resolution re-drives `Step::Complete`
+            // (`complete_inclusive_gateway`), which is the single completion route
+            // for a parked join and clears its bookkeeping via
+            // `reset_open_inclusive_join`. Firing here instead would complete the
+            // element while leaving its incident stale (never resolved), i.e. the
+            // duplicate/stale-bookkeeping class this join path already guards
+            // against on the raise side.
+            if self.has_active_incident_on(instance_key, join_eik) {
                 continue;
             }
             // Any live token that could still reach the join blocks firing. The
@@ -10487,9 +10535,19 @@ impl Engine {
                     scope,
                 });
             }
-            fired_any = true;
+            // Fire at most one join per sweep. A fired join's outgoing token is
+            // only *queued* here (`state.active` is not updated until the caller
+            // drains that queue), so continuing to another candidate in this same
+            // pass would evaluate its `elements_reaching` guard against stale
+            // `active` — a chained downstream join (`J1 -> J2`) would see no live
+            // token reaching it and fire prematurely on an incomplete set, then
+            // reopen when the queued upstream token finally arrives. Returning now
+            // makes the caller drain the queue (registering the token in
+            // `state.active`) and re-run this sweep, so each downstream join only
+            // fires once its upstream token has genuinely arrived.
+            return true;
         }
-        fired_any
+        false
     }
 
     /// A token reached a parallel-gateway join. Open the join on the first

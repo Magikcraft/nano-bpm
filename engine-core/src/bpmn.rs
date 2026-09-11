@@ -1758,8 +1758,20 @@ fn parse_with_captures(
                             acc.boundaries.push(boundary);
                         } else if boundary.escalation {
                             // An escalation boundary is not modelled for
-                            // execution; record its id so `build` rejects its
-                            // outgoing flow with a naming `UnsupportedElement`.
+                            // execution. Record it two ways: (1) in
+                            // `escalation_boundary_ids` so `build` rejects a
+                            // sequenceFlow wired to/from it with a precise
+                            // naming `UnsupportedElement` (the wired-flow
+                            // diagnostic); and (2) in `unmodelled` so the
+                            // unsupported-elements validator also rejects a
+                            // *detached* escalation boundary (one with no wired
+                            // flow), which would otherwise deploy silently and
+                            // contradict the clean rejection promised for every
+                            // escalation carrier.
+                            acc.unmodelled.push((
+                                "escalationEventDefinition".to_string(),
+                                boundary.id.clone(),
+                            ));
                             acc.escalation_boundary_ids.push(boundary.id);
                         }
                     }
@@ -4311,6 +4323,44 @@ mod tests {
 </bpmn:definitions>"#;
 
         let err = parse_bpmn(xml).expect_err("an escalation boundary must be rejected");
+        match err {
+            ParseError::UnsupportedElement { tag, element_id } => {
+                assert_eq!(tag, "escalationEventDefinition");
+                assert_eq!(element_id, "Bnd");
+            }
+            other => panic!("expected UnsupportedElement naming the boundary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_a_detached_escalation_boundary_that_has_no_wired_flow() {
+        // #1168 regression: an escalation boundary with NO outgoing sequenceFlow
+        // is not caught by the wired-flow diagnostic in `build` (which only fires
+        // when a flow names the boundary). Before recording escalation boundaries
+        // in `unmodelled`, such a detached boundary deployed SILENTLY —
+        // contradicting the clean rejection promised for every escalation carrier.
+        // It must now be rejected with an `UnsupportedElement` naming the boundary.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="ss" />
+      <bpmn:endEvent id="se" />
+      <bpmn:sequenceFlow id="if1" sourceRef="ss" targetRef="se" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="Sub" cancelActivity="false">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Sub" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err =
+            parse_bpmn(xml).expect_err("a detached escalation boundary must still be rejected");
         match err {
             ParseError::UnsupportedElement { tag, element_id } => {
                 assert_eq!(tag, "escalationEventDefinition");

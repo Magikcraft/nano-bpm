@@ -888,9 +888,9 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
                 Some(id),
                 format!(
                     "'{id}' ({}) has {conds} conditional outgoing flow(s), but only an \
-                     exclusive (XOR) gateway evaluates flow conditions here — these conditions \
-                     are ignored and routing is wrong. Put the branch conditions on an exclusive \
-                     gateway, not on this node.",
+                     exclusive (XOR) or inclusive (OR) gateway evaluates flow conditions here — \
+                     these conditions are ignored and routing is wrong. Put the branch conditions \
+                     on an exclusive (XOR) or inclusive (OR) gateway, not on this node.",
                     kind_label(kind)
                 ),
             ));

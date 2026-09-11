@@ -3364,6 +3364,154 @@ fn should_run_inclusive_split_and_join_across_unconditional_flows() {
 }
 
 #[test]
+fn inclusive_join_incident_redrive_does_not_duplicate_outgoing_routing() {
+    // #1168 regression (join redrive / stale bookkeeping). A multi-incoming
+    // inclusive gateway that is ALSO a conditional split: both branches arrive,
+    // the quiescence-time selection matches no flow (and there is no default), so
+    // the join parks on a `NoMatchingSequenceFlow` incident. Resolving that
+    // incident re-drives `Step::Complete`, which lands in the split-completion
+    // path. That path emits `ElementCompleted` but the reducer does NOT clear the
+    // join maps on `ElementCompleted`; without an explicit `ParallelJoinReset` the
+    // stale open-join entry is swept again at the next quiescence and DUPLICATES
+    // the outgoing routing. Assert the join routes its outgoing flow exactly once.
+    let def = ProcessBuilder::new("inc-redrive")
+        .start_event("s")
+        .parallel_gateway("psplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .inclusive_gateway("join")
+        .end_event("out")
+        .connect("s", "psplit")
+        .connect("psplit", "a")
+        .connect("psplit", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect_when("join", "out", "go")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "inc-redrive",
+            HashMap::from([("go".to_string(), Value::Bool(false))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Both branches arrive at the join; with `go=false` the join's single
+    // conditional flow matches nothing and no default exists -> incident.
+    complete_one(&mut engine, "ja");
+    complete_one(&mut engine, "jb");
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "the join must park on a single incident");
+    assert_eq!(active[0].kind, state::IncidentKind::NoMatchingSequenceFlow);
+    assert!(!engine.is_completed(instance_key));
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix the variable and resolve: the join re-selects, now routes `out`, and
+    // completes. The stale join bookkeeping must be cleared so it does not fire a
+    // second time.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("go".to_string(), Value::Bool(true))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    let routed = resolved
+        .iter()
+        .filter(|e| matches!(e, Event::SequenceFlowTaken { from, to, .. } if from == "join" && to == "out"))
+        .count();
+    assert_eq!(
+        routed, 1,
+        "the join must route its outgoing flow exactly once on redrive, not duplicate it"
+    );
+    assert_eq!(
+        resolved
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessInstanceCompleted { .. }))
+            .count(),
+        1,
+        "the instance must complete exactly once"
+    );
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.active_incidents().is_empty());
+}
+
+#[test]
+fn chained_inclusive_joins_do_not_fire_downstream_join_prematurely() {
+    // #1168 regression (queued-activation reachability). Two inclusive joins in a
+    // chain, `j1 -> j2`, where `j2` also has an independent incoming branch `c`.
+    // When both joins are open at quiescence, firing `j1` only *queues* its token
+    // toward `j2` (state.active is not yet updated). If the sweep continued to
+    // evaluate `j2` in the same pass, `j2` would see no live token reaching it and
+    // fire prematurely on an incomplete set (just `c`), then reopen when the queued
+    // `j1` token finally arrives. Firing at most one join per sweep (and re-draining
+    // in between) prevents that; the instance must complete cleanly, once.
+    let def = ProcessBuilder::new("inc-chain")
+        .start_event("s")
+        .parallel_gateway("psplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .service_task("c", "jc")
+        .inclusive_gateway("j1")
+        .inclusive_gateway("j2")
+        .end_event("e")
+        .connect("s", "psplit")
+        .connect("psplit", "a")
+        .connect("psplit", "b")
+        .connect("psplit", "c")
+        .connect("a", "j1")
+        .connect("b", "j1")
+        .connect("j1", "j2")
+        .connect("c", "j2")
+        .connect("j2", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("inc-chain"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(engine.pending_jobs().len(), 3);
+
+    // Complete all three tasks; the last one drives both joins to quiescence.
+    let mut all_events = Vec::new();
+    all_events.extend(complete_one(&mut engine, "ja"));
+    all_events.extend(complete_one(&mut engine, "jb"));
+    all_events.extend(complete_one(&mut engine, "jc"));
+
+    assert!(
+        engine.is_completed(instance_key),
+        "the chained joins must synchronise and complete the instance"
+    );
+    assert!(engine.active_incidents().is_empty());
+    assert_eq!(
+        all_events
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessInstanceCompleted { .. }))
+            .count(),
+        1,
+        "the instance must complete exactly once"
+    );
+    assert_eq!(
+        all_events
+            .iter()
+            .filter(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "e"))
+            .count(),
+        1,
+        "the downstream join must route to the end exactly once (no premature/duplicate fire)"
+    );
+}
+
+#[test]
 fn terminate_end_kills_sibling_branch_and_completes_the_instance() {
     // s -> split =< work (service task), trigger (service task) -> stop (terminate end) >
     //

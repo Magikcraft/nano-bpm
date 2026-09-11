@@ -902,7 +902,7 @@ pub enum NodeShape {
 fn node_shape(el: &Element) -> NodeShape {
     use nanobpmn_engine_core::ElementKind::*;
     match el.kind {
-        ExclusiveGateway | ParallelGateway => NodeShape::Diamond,
+        ExclusiveGateway | ParallelGateway | InclusiveGateway => NodeShape::Diamond,
         StartEvent
         | EndEvent
         | TerminateEndEvent
