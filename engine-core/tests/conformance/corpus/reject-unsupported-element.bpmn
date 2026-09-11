@@ -1,10 +1,10 @@
 <!-- verdict: reject | category: UnsupportedElement -->
-<!-- oracle: Zeebe only transforms known element types; an unmodelled sendTask is rejected at deploy (#853). -->
+<!-- oracle: Zeebe only transforms known element types; an unmodelled complexGateway is rejected at deploy (#853). -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
   <bpmn:process id="reject_unsupported_element" isExecutable="true">
     <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
     <bpmn:endEvent id="e"><bpmn:incoming>f0</bpmn:incoming></bpmn:endEvent>
     <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
-    <bpmn:sendTask id="unmodelled" />
+    <bpmn:complexGateway id="unmodelled" />
   </bpmn:process>
 </bpmn:definitions>

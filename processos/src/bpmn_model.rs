@@ -46,6 +46,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::UserTask(_) => "userTask",
         ElementKind::ExclusiveGateway => "exclusiveGateway",
         ElementKind::ParallelGateway => "parallelGateway",
+        ElementKind::InclusiveGateway => "inclusiveGateway",
         ElementKind::EventBasedGateway => "eventBasedGateway",
         ElementKind::ErrorBoundaryEvent { .. } => "errorBoundaryEvent",
         ElementKind::TimerIntermediateCatchEvent { .. } => "timerIntermediateCatchEvent",
@@ -95,6 +96,7 @@ fn is_gateway(kind: &ElementKind) -> bool {
         kind,
         ElementKind::ExclusiveGateway
             | ElementKind::ParallelGateway
+            | ElementKind::InclusiveGateway
             | ElementKind::EventBasedGateway
     )
 }
@@ -867,14 +869,17 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
             }
         }
 
-        // Conditional sequence flow leaving a node that is NOT an exclusive gateway:
-        // this engine only honours flow conditions on an exclusive (XOR) split. A
-        // condition on a service task's / event's / parallel split's outgoing flow is
-        // silently ignored — a common authoring corruption where branch conditions get
-        // moved off the gateway onto a downstream task (the routing then breaks, but no
-        // exclusive-no-default warning fires). Flag it so the model fixes the topology.
-        if !matches!(kind, ElementKind::ExclusiveGateway)
-            && el.outgoing.iter().any(|f| f.condition.is_some())
+        // Conditional sequence flow leaving a node that is NOT a condition-routed
+        // gateway: this engine only honours flow conditions on an exclusive (XOR)
+        // or inclusive (OR) split. A condition on a service task's / event's /
+        // parallel split's outgoing flow is silently ignored — a common authoring
+        // corruption where branch conditions get moved off the gateway onto a
+        // downstream task (the routing then breaks, but no exclusive-no-default
+        // warning fires). Flag it so the model fixes the topology.
+        if !matches!(
+            kind,
+            ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway
+        ) && el.outgoing.iter().any(|f| f.condition.is_some())
         {
             let conds = el.outgoing.iter().filter(|f| f.condition.is_some()).count();
             findings.push(finding(
@@ -2150,6 +2155,15 @@ propagateAllChildVariables=\"{propagate_all_child_variables}\"/>\n",
         ElementKind::ParallelGateway => {
             out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"{na}/>\n"));
         }
+        ElementKind::InclusiveGateway => {
+            let da = default_flows
+                .get(id)
+                .map(|f| format!(" default=\"{}\"", xml_escape(f)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "    <bpmn:inclusiveGateway id=\"{eid}\"{na}{da}/>\n"
+            ));
+        }
         ElementKind::EventBasedGateway => {
             out.push_str(&format!("    <bpmn:eventBasedGateway id=\"{eid}\"{na}/>\n"));
         }
@@ -3083,6 +3097,7 @@ fn node_dims(kind: &ElementKind) -> (f64, f64) {
         | ElementKind::SubProcess { .. } => (110.0, 80.0),
         ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
+        | ElementKind::InclusiveGateway
         | ElementKind::EventBasedGateway => (50.0, 50.0),
         _ => (36.0, 36.0),
     }

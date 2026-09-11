@@ -3208,6 +3208,162 @@ fn should_run_parallel_split_and_join() {
 }
 
 #[test]
+fn should_run_inclusive_split_taking_every_matching_flow() {
+    // s -> isplit =< a (when x), b (when y), c (when z) >= join -> e
+    // With x=true, y=true, z=false the split takes exactly a and b (an inclusive
+    // OR: every flow whose condition holds), not c.
+    let def = ProcessBuilder::new("inc")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .service_task("c", "jc")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .connect("s", "isplit")
+        .connect_when("isplit", "a", "x")
+        .connect_when("isplit", "b", "y")
+        .connect_when("isplit", "c", "z")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("c", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let vars = HashMap::from([
+        ("x".to_string(), Value::Bool(true)),
+        ("y".to_string(), Value::Bool(true)),
+        ("z".to_string(), Value::Bool(false)),
+    ]);
+    let created = engine
+        .apply_command(Command::create_instance_with("inc", vars))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Exactly the two matching branches forked; `c` never activated.
+    assert!(created
+        .iter()
+        .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "a")));
+    assert!(created
+        .iter()
+        .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "b")));
+    assert!(!created
+        .iter()
+        .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "c")));
+    assert_eq!(engine.pending_jobs().len(), 2);
+    assert!(!engine.is_completed(instance_key));
+
+    // The join must wait until BOTH taken branches arrive — not fire on the
+    // first, and not wait for the untaken `c` branch that has no token.
+    complete_one(&mut engine, "ja");
+    assert!(!engine.is_completed(instance_key));
+
+    let final_events = complete_one(&mut engine, "jb");
+    assert!(engine.is_completed(instance_key));
+    assert_eq!(
+        final_events
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessInstanceCompleted { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn should_take_inclusive_split_default_when_no_condition_matches() {
+    // No non-default flow's condition holds, so the explicit default is taken.
+    let def = ProcessBuilder::new("inc-def")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .end_event("hot")
+        .end_event("cold")
+        .connect("s", "isplit")
+        .connect_when("isplit", "hot", "temp > 100")
+        .connect_default("isplit", "cold")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let vars = HashMap::from([("temp".to_string(), Value::Int(20))]);
+    let events = engine
+        .apply_command(Command::create_instance_with("inc-def", vars))
+        .unwrap();
+
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "cold")));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "hot")));
+}
+
+#[test]
+fn should_raise_incident_when_inclusive_split_matches_no_flow() {
+    // No condition holds and there is no default flow: the split parks on a
+    // NoMatchingSequenceFlow incident rather than silently dropping the token.
+    let def = ProcessBuilder::new("inc-stuck")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .end_event("hot")
+        .connect("s", "isplit")
+        .connect_when("isplit", "hot", "temp > 100")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let vars = HashMap::from([("temp".to_string(), Value::Int(20))]);
+    let events = engine
+        .apply_command(Command::create_instance_with("inc-stuck", vars))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::IncidentRaised { kind: state::IncidentKind::NoMatchingSequenceFlow, .. }
+    )));
+    assert!(!engine.is_completed(instance_key));
+}
+
+#[test]
+fn should_run_inclusive_split_and_join_across_unconditional_flows() {
+    // An inclusive gateway with only unconditional outgoing flows behaves like a
+    // parallel split: every flow is taken, and the join synchronises them.
+    let def = ProcessBuilder::new("inc-all")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .connect("s", "isplit")
+        .connect("isplit", "a")
+        .connect("isplit", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("inc-all"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    assert_eq!(engine.pending_jobs().len(), 2);
+    complete_one(&mut engine, "ja");
+    assert!(!engine.is_completed(instance_key));
+    complete_one(&mut engine, "jb");
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
 fn terminate_end_kills_sibling_branch_and_completes_the_instance() {
     // s -> split =< work (service task), trigger (service task) -> stop (terminate end) >
     //

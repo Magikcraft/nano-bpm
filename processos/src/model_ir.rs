@@ -150,6 +150,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::UserTask(_) => "userTask",
         ElementKind::ExclusiveGateway => "exclusiveGateway",
         ElementKind::ParallelGateway => "parallelGateway",
+        ElementKind::InclusiveGateway => "inclusiveGateway",
         ElementKind::EventBasedGateway => "eventBasedGateway",
         ElementKind::ErrorBoundaryEvent { .. } => "errorBoundaryEvent",
         ElementKind::TimerIntermediateCatchEvent { .. } => "timerIntermediateCatchEvent",
@@ -186,6 +187,7 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         | ElementKind::TerminateEndEvent
         | ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
+        | ElementKind::InclusiveGateway
         | ElementKind::EventBasedGateway
         | ElementKind::IntermediateThrowEvent
         | ElementKind::CompensationThrowEvent
@@ -1134,6 +1136,7 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
         "terminateEndEvent" => ElementKind::TerminateEndEvent,
         "exclusiveGateway" => ElementKind::ExclusiveGateway,
         "parallelGateway" => ElementKind::ParallelGateway,
+        "inclusiveGateway" => ElementKind::InclusiveGateway,
         "eventBasedGateway" => ElementKind::EventBasedGateway,
         "intermediateThrowEvent" => ElementKind::IntermediateThrowEvent,
         "linkIntermediateThrowEvent" => ElementKind::LinkIntermediateThrowEvent {
@@ -1277,6 +1280,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::UserTask(_)
         | ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
+        | ElementKind::InclusiveGateway
         | ElementKind::EventBasedGateway
         | ElementKind::TimerIntermediateCatchEvent { .. }
         | ElementKind::MessageIntermediateCatchEvent { .. }

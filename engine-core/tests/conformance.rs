@@ -592,6 +592,7 @@ fn element_kind_family(kind: &ElementKind) -> ElementFamily {
         | ElementKind::Task => ElementFamily::Task,
         ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
+        | ElementKind::InclusiveGateway
         | ElementKind::EventBasedGateway => ElementFamily::Gateway,
         ElementKind::ErrorBoundaryEvent { .. }
         | ElementKind::TimerBoundaryEvent { .. }

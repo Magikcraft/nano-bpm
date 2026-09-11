@@ -199,6 +199,12 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
         attrs: &[],
     },
     KindSpec {
+        keyword: "inclusiveGateway",
+        doc: "OR gateway. Splits to every outgoing flow whose condition holds (default is fallback); \
+              joins by waiting until no in-flight token could still reach it.",
+        attrs: &[],
+    },
+    KindSpec {
         keyword: "eventBasedGateway",
         doc: "Deferred choice. Arms all downstream intermediate catch events at once; the first \
               to fire wins and the losing siblings are withdrawn.",
@@ -878,6 +884,7 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         UserTask(_) => "userTask",
         ExclusiveGateway => "exclusiveGateway",
         ParallelGateway => "parallelGateway",
+        InclusiveGateway => "inclusiveGateway",
         EventBasedGateway => "eventBasedGateway",
         ErrorBoundaryEvent { .. } => "errorBoundaryEvent",
         TimerIntermediateCatchEvent { .. } => "timerIntermediateCatchEvent",
@@ -945,6 +952,7 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
         ),
         ("exclusiveGateway", ElementKind::ExclusiveGateway),
         ("parallelGateway", ElementKind::ParallelGateway),
+        ("inclusiveGateway", ElementKind::InclusiveGateway),
         ("eventBasedGateway", ElementKind::EventBasedGateway),
         (
             "errorBoundaryEvent",

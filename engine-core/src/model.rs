@@ -530,6 +530,18 @@ pub enum ElementKind {
     /// join (more than one incoming flow) it waits for a token on every incoming
     /// flow before producing one outgoing token.
     ParallelGateway,
+    /// An inclusive (OR) gateway. As a split it takes *every* outgoing flow whose
+    /// condition holds — an unconditional (non-default) flow is always taken —
+    /// falling back to the explicit `default` flow only when no conditional flow
+    /// matches (a no-matching-flow incident when there is no default). As a join
+    /// (more than one incoming flow) it synchronises: it waits until no token
+    /// still in the instance could reach it (every branch that will arrive has
+    /// arrived) and then produces its outgoing token(s). A gateway that is both a
+    /// join and a split first synchronises, then re-evaluates its outgoing
+    /// conditions. Join readiness is evaluated at token quiescence — when no work
+    /// is in flight — so an in-transit sibling token is never mistaken for a
+    /// branch that will not arrive.
+    InclusiveGateway,
     /// An event-based gateway: a *deferred choice* over the intermediate catch
     /// events (timer/message/signal/conditional) that immediately follow it.
     /// On arrival it takes *all* outgoing flows — arming every downstream catch
@@ -904,6 +916,7 @@ impl ElementKind {
             | ElementKind::CompensationThrowEvent
             | ElementKind::ExclusiveGateway
             | ElementKind::ParallelGateway
+            | ElementKind::InclusiveGateway
             | ElementKind::EventBasedGateway => false,
         }
     }
@@ -943,6 +956,7 @@ impl ElementKind {
             ElementKind::UserTask(_) => "USER_TASK",
             ElementKind::ExclusiveGateway => "EXCLUSIVE_GATEWAY",
             ElementKind::ParallelGateway => "PARALLEL_GATEWAY",
+            ElementKind::InclusiveGateway => "INCLUSIVE_GATEWAY",
             ElementKind::EventBasedGateway => "EVENT_BASED_GATEWAY",
             ElementKind::SubProcess { .. } => "SUB_PROCESS",
             ElementKind::CallActivity { .. } => "CALL_ACTIVITY",
@@ -1970,6 +1984,15 @@ impl ProcessBuilder {
     /// Adds a parallel (AND) gateway.
     pub fn parallel_gateway(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::ParallelGateway)
+    }
+
+    /// Adds an inclusive (OR) gateway. As a split it takes every outgoing flow
+    /// whose condition holds (an unconditional non-default flow is always taken),
+    /// falling back to the `default` flow when none match. As a join it waits
+    /// until no token still in the instance could reach it before producing its
+    /// outgoing token(s).
+    pub fn inclusive_gateway(self, id: impl Into<String>) -> Self {
+        self.add(id, ElementKind::InclusiveGateway)
     }
 
     /// Adds an event-based gateway: a deferred choice over the intermediate

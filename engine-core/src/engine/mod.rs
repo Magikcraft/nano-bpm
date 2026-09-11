@@ -4256,6 +4256,20 @@ impl Engine {
             if !queue.is_empty() {
                 continue;
             }
+            // In-transit quiescence: the step queue is empty, so every token that
+            // was travelling toward an inclusive-gateway join has been counted.
+            // Fire any open inclusive join whose branches have all arrived (no
+            // live token could still reach it); a fire enqueues its outgoing
+            // activation(s), so loop to drain them before declaring completion.
+            let inclusive_from = log.len();
+            if self.fire_ready_inclusive_joins(log, &mut queue) {
+                if log.len() > inclusive_from {
+                    if let Drive::Pause = driver.after_step(&log[inclusive_from..]) {
+                        return Some(Paused { queue, cursor });
+                    }
+                }
+                continue;
+            }
             // Token quiescence. Complete any instance whose tokens have all
             // retired — the terminal tail shared with `apply_command_at`, folded
             // into the loop (rather than run post-return in `finish_command`) so a
@@ -5175,6 +5189,18 @@ impl Engine {
             && self.incoming_count(instance_key, &element_id) > 1
         {
             return self.arrive_at_parallel_join(instance_key, element_id, scope);
+        }
+
+        // An inclusive gateway with more than one incoming flow is a join: each
+        // arriving token is counted onto the open join; whether the join *fires*
+        // is decided later, at token quiescence, by [`fire_ready_inclusive_joins`]
+        // (when no in-flight token could still reach it). Counting-only here keeps
+        // an in-transit sibling arrival from being mistaken for a branch that will
+        // never come.
+        if matches!(kind, Some(ElementKind::InclusiveGateway))
+            && self.incoming_count(instance_key, &element_id) > 1
+        {
+            return self.arrive_at_inclusive_join(instance_key, element_id, scope);
         }
 
         // A multi-instance activity: unless we are already inside its body (i.e.
@@ -8418,6 +8444,16 @@ impl Engine {
             return self.complete_exclusive_gateway(instance_key, element_instance_key, element_id);
         }
 
+        // An inclusive gateway reaching completion is a pure split (a join is
+        // intercepted at `activate` and completed via its quiescence-time fire).
+        // It routes every outgoing flow whose condition holds (else the default).
+        if matches!(
+            self.element_kind(instance_key, &element_id),
+            Some(ElementKind::InclusiveGateway)
+        ) {
+            return self.complete_inclusive_gateway(instance_key, element_instance_key, element_id);
+        }
+
         // A terminate end event (`<endEvent>` with `<terminateEventDefinition>`):
         // it does not merely consume its own token — it kills every other active
         // token in its enclosing scope and completes that scope (Zeebe/Camunda
@@ -8866,6 +8902,12 @@ impl Engine {
         }
         match self.element_kind(instance_key, &element_id) {
             Some(ElementKind::ExclusiveGateway) => self.finalize_exclusive_gateway(
+                instance_key,
+                element_instance_key,
+                element_id,
+                scope,
+            ),
+            Some(ElementKind::InclusiveGateway) => self.finalize_inclusive_gateway(
                 instance_key,
                 element_instance_key,
                 element_id,
@@ -10004,6 +10046,450 @@ impl Engine {
                 )
             }
         }
+    }
+
+    /// Inclusive gateway: selects **every** outgoing flow whose condition holds
+    /// (an unconditional non-default flow is always taken), falling back to the
+    /// explicit `default` flow only when no conditional flow matches. Returns the
+    /// chosen targets (`Ok(vec)`; an empty vec means nothing matched and there is
+    /// no default — the caller raises a no-matching-flow incident), or
+    /// `Err(reason)` when a condition failed to evaluate. Pure over the current
+    /// variables so the end-listener gate can re-select without captured state.
+    fn select_inclusive_flows(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let variables = self.variables(instance_key);
+        let mut default_flow = None;
+        let mut selected = Vec::new();
+        for flow in self.outgoing(instance_key, element_id) {
+            if flow.is_default {
+                default_flow = Some(flow.to);
+                continue;
+            }
+            match &flow.condition {
+                None => selected.push(flow.to),
+                Some(condition) => match condition.eval(&variables) {
+                    Ok(true) => selected.push(flow.to),
+                    Ok(false) => continue,
+                    Err(err) => {
+                        return Err(format!(
+                            "failed to evaluate condition '{}' at inclusive gateway \
+                             '{element_id}': {}",
+                            condition.expression, err.0
+                        ));
+                    }
+                },
+            }
+        }
+        if selected.is_empty() {
+            if let Some(d) = default_flow {
+                selected.push(d);
+            }
+        }
+        Ok(selected)
+    }
+
+    /// Completes an inclusive-gateway **split** (single incoming): routes every
+    /// selected outgoing flow, gating the deferred completion behind the `end`
+    /// execution-listener chain (ADR 0037). A condition that fails to evaluate
+    /// raises an `ExpressionEvaluation` incident; a selection that matches no flow
+    /// (and no default) raises a `NoMatchingSequenceFlow` incident and parks the
+    /// token, mirroring the exclusive gateway.
+    fn complete_inclusive_gateway(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let selected = match self.select_inclusive_flows(instance_key, &element_id) {
+            Ok(sel) => sel,
+            Err(reason) => {
+                let incident_key = self.mint_key();
+                return (
+                    vec![Event::IncidentRaised {
+                        incident_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        kind: state::IncidentKind::ExpressionEvaluation,
+                        redrive: None,
+                        reason,
+                        job_key: None,
+                        created_at: self.now,
+                    }],
+                    Vec::new(),
+                );
+            }
+        };
+        if selected.is_empty() {
+            let incident_key = self.mint_key();
+            return (
+                vec![Event::IncidentRaised {
+                    incident_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                    kind: state::IncidentKind::NoMatchingSequenceFlow,
+                    redrive: None,
+                    reason: format!(
+                        "no matching outgoing sequence flow at inclusive gateway '{element_id}'"
+                    ),
+                    job_key: None,
+                    created_at: self.now,
+                }],
+                Vec::new(),
+            );
+        }
+        let scope = self.scope_of(instance_key, element_instance_key);
+        let mut events = vec![Event::ElementCompleting {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+        }];
+        let vars = self.variables(instance_key);
+        if let Some(job) = self.begin_end_listener_chain(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            scope,
+            &vars,
+        ) {
+            events.push(job);
+            return (events, Vec::new());
+        }
+        events.push(Event::ElementCompleted {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+        });
+        let mut followups = Vec::new();
+        for flow_to in selected {
+            events.push(Event::SequenceFlowTaken {
+                instance_key,
+                from: element_id.clone(),
+                to: flow_to.clone(),
+            });
+            followups.push(Step::Activate {
+                instance_key,
+                element_id: flow_to,
+                scope,
+            });
+        }
+        (events, followups)
+    }
+
+    /// Deferred completion of an inclusive-gateway split whose `end`
+    /// execution-listener chain has drained (ADR 0037). Re-selects from the
+    /// resident scope; a listener may have rewritten a condition variable, so a
+    /// re-selection that now matches nothing (or fails to evaluate) parks the
+    /// token on the same incident the non-listener path would raise rather than
+    /// completing with nowhere to go.
+    fn finalize_inclusive_gateway(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        match self.select_inclusive_flows(instance_key, &element_id) {
+            Ok(selected) if !selected.is_empty() => {
+                let mut events = vec![Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                }];
+                let mut followups = Vec::new();
+                for flow_to in selected {
+                    events.push(Event::SequenceFlowTaken {
+                        instance_key,
+                        from: element_id.clone(),
+                        to: flow_to.clone(),
+                    });
+                    followups.push(Step::Activate {
+                        instance_key,
+                        element_id: flow_to,
+                        scope,
+                    });
+                }
+                (events, followups)
+            }
+            Ok(_) => {
+                let incident_key = self.mint_key();
+                (
+                    vec![Event::IncidentRaised {
+                        incident_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id: element_id.clone(),
+                        kind: state::IncidentKind::NoMatchingSequenceFlow,
+                        redrive: None,
+                        reason: format!(
+                            "no matching outgoing sequence flow at inclusive gateway '{element_id}'"
+                        ),
+                        job_key: None,
+                        created_at: self.now,
+                    }],
+                    Vec::new(),
+                )
+            }
+            Err(reason) => {
+                let incident_key = self.mint_key();
+                (
+                    vec![Event::IncidentRaised {
+                        incident_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        kind: state::IncidentKind::ExpressionEvaluation,
+                        redrive: None,
+                        reason,
+                        job_key: None,
+                        created_at: self.now,
+                    }],
+                    Vec::new(),
+                )
+            }
+        }
+    }
+
+    /// A token reached an inclusive-gateway join. Open the join on the first
+    /// arrival and count every arrival (reusing the parallel-join bookkeeping —
+    /// the count/instance maps are element-kind-agnostic). Unlike a parallel join
+    /// it does **not** fire here: firing is decided at token quiescence by
+    /// [`fire_ready_inclusive_joins`], once no in-flight token could still reach
+    /// it — so an in-transit sibling arrival is never mistaken for a branch that
+    /// will not arrive.
+    fn arrive_at_inclusive_join(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let mut events = Vec::new();
+        if self.join_eik(instance_key, &element_id).is_none() {
+            let eik = self.mint_key();
+            events.push(Event::ElementActivating {
+                instance_key,
+                element_instance_key: eik,
+                element_id: element_id.clone(),
+            });
+            events.push(Event::ElementActivated {
+                instance_key,
+                element_instance_key: eik,
+                element_id: element_id.clone(),
+                scope,
+            });
+            events.push(Event::ParallelJoinOpened {
+                instance_key,
+                element_instance_key: eik,
+                element_id: element_id.clone(),
+            });
+        }
+        events.push(Event::ParallelJoinTokenArrived {
+            instance_key,
+            element_id,
+        });
+        (events, Vec::new())
+    }
+
+    /// The set of element ids from which the flow graph can reach `target` (over
+    /// directed sequence flows). A live token resting on any such element could
+    /// still arrive at an inclusive-gateway join at `target`, so the join must
+    /// keep waiting while one exists.
+    fn elements_reaching(
+        &self,
+        instance_key: Key,
+        target: &str,
+    ) -> std::collections::HashSet<String> {
+        let mut reaching = std::collections::HashSet::new();
+        let Some(process) = self.process_of_instance(instance_key) else {
+            return reaching;
+        };
+        // Reverse adjacency: for each flow src -> dst, record src as a
+        // predecessor of dst.
+        let mut predecessors: HashMap<&str, Vec<&str>> = HashMap::new();
+        for element in process.elements.values() {
+            for flow in &element.outgoing {
+                predecessors
+                    .entry(flow.to.as_str())
+                    .or_default()
+                    .push(element.id.as_str());
+            }
+        }
+        let mut stack = vec![target];
+        while let Some(node) = stack.pop() {
+            if let Some(preds) = predecessors.get(node) {
+                for &pred in preds {
+                    if reaching.insert(pred.to_string()) {
+                        stack.push(pred);
+                    }
+                }
+            }
+        }
+        reaching
+    }
+
+    /// Whether an active incident already rests on this element instance (guards
+    /// the inclusive-join fire sweep from re-raising the same incident every
+    /// quiescence pass when a ready join's outgoing selection cannot be routed).
+    fn has_active_incident_on(&self, instance_key: Key, element_instance_key: Key) -> bool {
+        self.state
+            .instances
+            .get(&instance_key)
+            .map(|instance| {
+                instance.incidents.iter().any(|k| {
+                    self.state
+                        .incidents
+                        .get(k)
+                        .map(|inc| inc.element_instance_key == element_instance_key)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// At token quiescence, fire every open inclusive-gateway join whose branches
+    /// have all arrived — i.e. no live token elsewhere in the instance could
+    /// still reach it. Firing completes the join and routes its outgoing flow(s)
+    /// through the same conditional selection an inclusive split uses (a join that
+    /// is also a split re-evaluates its conditions). Enqueues the resulting
+    /// activations and returns whether it fired anything, so the caller re-runs
+    /// the drain loop.
+    fn fire_ready_inclusive_joins(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: &mut VecDeque<Step>,
+    ) -> bool {
+        // Snapshot the open joins that are inclusive gateways (deterministic
+        // order: by instance, then element id).
+        let mut candidates: Vec<(Key, String, Key)> = Vec::new();
+        for (instance_key, instance) in &self.state.instances {
+            for (element_id, join_eik) in &instance.join_instances {
+                if matches!(
+                    self.element_kind(*instance_key, element_id),
+                    Some(ElementKind::InclusiveGateway)
+                ) {
+                    candidates.push((*instance_key, element_id.clone(), *join_eik));
+                }
+            }
+        }
+        candidates.sort();
+
+        let mut fired_any = false;
+        for (instance_key, element_id, join_eik) in candidates {
+            // Still open? (an earlier fire this pass may have reset a mutual
+            // dependency — re-check against live state).
+            if self.join_eik(instance_key, &element_id) != Some(join_eik) {
+                continue;
+            }
+            // Any live token that could still reach the join blocks firing. The
+            // join's own resting instance carries the element id, so exclude it.
+            let reaching = self.elements_reaching(instance_key, &element_id);
+            let still_waiting = self
+                .state
+                .instances
+                .get(&instance_key)
+                .map(|instance| {
+                    instance.active.iter().any(|(eik, elid)| {
+                        *eik != join_eik && elid != &element_id && reaching.contains(elid)
+                    })
+                })
+                .unwrap_or(false);
+            if still_waiting {
+                continue;
+            }
+
+            let scope = self.scope_of(instance_key, join_eik);
+            let selected = match self.select_inclusive_flows(instance_key, &element_id) {
+                Ok(sel) => sel,
+                Err(reason) => {
+                    if !self.has_active_incident_on(instance_key, join_eik) {
+                        let incident_key = self.mint_key();
+                        self.emit(
+                            log,
+                            Event::IncidentRaised {
+                                incident_key,
+                                instance_key,
+                                element_instance_key: join_eik,
+                                element_id: element_id.clone(),
+                                kind: state::IncidentKind::ExpressionEvaluation,
+                                redrive: None,
+                                reason,
+                                job_key: None,
+                                created_at: self.now,
+                            },
+                        );
+                    }
+                    continue;
+                }
+            };
+            if selected.is_empty() {
+                if !self.has_active_incident_on(instance_key, join_eik) {
+                    let incident_key = self.mint_key();
+                    self.emit(
+                        log,
+                        Event::IncidentRaised {
+                            incident_key,
+                            instance_key,
+                            element_instance_key: join_eik,
+                            element_id: element_id.clone(),
+                            kind: state::IncidentKind::NoMatchingSequenceFlow,
+                            redrive: None,
+                            reason: format!(
+                                "no matching outgoing sequence flow at inclusive gateway \
+                                 '{element_id}'"
+                            ),
+                            job_key: None,
+                            created_at: self.now,
+                        },
+                    );
+                }
+                continue;
+            }
+
+            self.emit(
+                log,
+                Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key: join_eik,
+                    element_id: element_id.clone(),
+                },
+            );
+            self.emit(
+                log,
+                Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key: join_eik,
+                    element_id: element_id.clone(),
+                },
+            );
+            self.emit(
+                log,
+                Event::ParallelJoinReset {
+                    instance_key,
+                    element_id: element_id.clone(),
+                },
+            );
+            for flow_to in selected {
+                self.emit(
+                    log,
+                    Event::SequenceFlowTaken {
+                        instance_key,
+                        from: element_id.clone(),
+                        to: flow_to.clone(),
+                    },
+                );
+                queue.push_back(Step::Activate {
+                    instance_key,
+                    element_id: flow_to,
+                    scope,
+                });
+            }
+            fired_any = true;
+        }
+        fired_any
     }
 
     /// A token reached a parallel-gateway join. Open the join on the first
