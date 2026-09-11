@@ -4319,12 +4319,22 @@ impl Engine {
             // live token could still reach it); a fire enqueues its outgoing
             // activation(s), so loop to drain them before declaring completion.
             let inclusive_from = log.len();
-            if self.fire_ready_inclusive_joins(log, &mut queue) {
-                if log.len() > inclusive_from {
-                    if let Drive::Pause = driver.after_step(&log[inclusive_from..]) {
-                        return Some(Paused { queue, cursor });
-                    }
+            let fired_inclusive = self.fire_ready_inclusive_joins(log, &mut queue);
+            // Notify the driver whenever this sweep grew the log — not only when it
+            // fired a join. `fire_ready_inclusive_joins` also emits `IncidentRaised`
+            // (unselectable / no-matching-flow at a ready join) and then returns
+            // `false`, so gating the notification on the boolean would let those
+            // events slip past a `BreakCondition::EveryStep` debugger session,
+            // unlike every other sweep in this loop. The boolean only decides
+            // whether to keep draining. Idempotent on resume: a re-entered sweep
+            // finds the join already carrying its active incident and re-raises
+            // nothing, so the log does not grow and the driver is not re-notified.
+            if log.len() > inclusive_from {
+                if let Drive::Pause = driver.after_step(&log[inclusive_from..]) {
+                    return Some(Paused { queue, cursor });
                 }
+            }
+            if fired_inclusive {
                 continue;
             }
             // Token quiescence. Complete any instance whose tokens have all

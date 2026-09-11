@@ -185,6 +185,35 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("deploy order"),
     );
 
+    // An inclusive-gateway (OR split/join) witness process. Deployed but never
+    // instantiated: its only purpose is to embed an `ElementKind::InclusiveGateway`
+    // — plus a condition-routed default flow — in the snapshot's persisted process
+    // definitions, so the checked-in golden pins that variant's serialized bytes.
+    // Without a witness here the #1069 drift guard would stay green if a field were
+    // added to (or the tag of) `InclusiveGateway` changed, exactly the variant-
+    // exhaustiveness blind spot `snapshot_forward_compat.rs` documents.
+    let review: ProcessDefinition = ProcessBuilder::new("review")
+        .start_event("s")
+        .inclusive_gateway("split")
+        .service_task("audit", "audit")
+        .service_task("notify", "notify")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .connect("s", "split")
+        .connect_when("split", "audit", "= risk > 10")
+        .connect_default("split", "notify")
+        .connect("audit", "join")
+        .connect("notify", "join")
+        .connect("join", "e")
+        .build()
+        .expect("build review process");
+
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(review), T0)
+            .expect("deploy review"),
+    );
+
     // Instance A: created with variables, its one job activated + completed, so
     // it walks the full lifecycle to a retained-terminal instance. Leaves the
     // `Activated` set empty again (the job completed).

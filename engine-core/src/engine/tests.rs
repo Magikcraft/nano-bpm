@@ -3443,6 +3443,88 @@ fn inclusive_join_incident_redrive_does_not_duplicate_outgoing_routing() {
     assert!(engine.active_incidents().is_empty());
 }
 
+/// Regression (#1168 debugger observability): the in-transit-quiescence inclusive-
+/// join sweep can emit an `IncidentRaised` (unselectable / no-matching-flow at a
+/// ready join) and then return `false` without firing. The run loop must still
+/// notify the `StepDriver` of those events — otherwise a `BreakCondition::EveryStep`
+/// debug session silently skips this event-producing sweep, unlike every other
+/// sweep in the loop. Before the fix, `after_step` was gated on the "fired"
+/// boolean, so the incident landed in the log only in the post-quiescence tail,
+/// never at a pause boundary. This drives the second branch's completion under the
+/// debugger and asserts the incident is observed in a pause *delta* (a slice the
+/// driver was actually consulted on), not merely present in the final tail.
+#[test]
+fn inclusive_join_incident_sweep_is_observed_by_the_step_driver() {
+    let def = ProcessBuilder::new("inc-redrive")
+        .start_event("s")
+        .parallel_gateway("psplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .inclusive_gateway("join")
+        .end_event("out")
+        .connect("s", "psplit")
+        .connect("psplit", "a")
+        .connect("psplit", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect_when("join", "out", "go")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "inc-redrive",
+            HashMap::from([("go".to_string(), Value::Bool(false))]),
+        ))
+        .unwrap();
+
+    // First branch arrives at the join via a plain command.
+    complete_one(&mut engine, "ja");
+
+    // Drive the SECOND branch's completion under the debugger, single-stepping on
+    // every step. Completing `jb` reaches in-transit quiescence, where the join
+    // sweep raises `NoMatchingSequenceFlow` (go=false, no default) without firing.
+    let jb = engine
+        .activate_jobs("jb", "test-worker", 10, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("jb activatable");
+    let mut session = engine
+        .debug_command_at(
+            Command::complete_job(jb.key),
+            0,
+            vec![BreakCondition::EveryStep],
+        )
+        .expect("debug complete jb");
+
+    // Walk pause-to-pause; the incident must appear in a pause DELTA (an event
+    // slice the driver was actually consulted on), not merely in the final tail.
+    let mut incident_observed_at_a_pause = false;
+    let mut seen = 0usize;
+    while session.is_paused() {
+        let delta = &session.log()[seen..];
+        if delta
+            .iter()
+            .any(|e| matches!(e, Event::IncidentRaised { .. }))
+        {
+            incident_observed_at_a_pause = true;
+        }
+        seen = session.log().len();
+        engine.debug_step(&mut session);
+    }
+    assert!(
+        incident_observed_at_a_pause,
+        "EveryStep must observe the inclusive-join incident sweep at a pause boundary"
+    );
+    // Sanity: the incident really was raised on this run.
+    assert!(session
+        .log()
+        .iter()
+        .any(|e| matches!(e, Event::IncidentRaised { .. })));
+}
+
 #[test]
 fn chained_inclusive_joins_do_not_fire_downstream_join_prematurely() {
     // #1168 regression (queued-activation reachability). Two inclusive joins in a

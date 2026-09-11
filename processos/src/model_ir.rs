@@ -29,7 +29,8 @@
 //! sub-process parent).
 //!
 //! A **flow statement** is `<from> -> <to> [when "<expr>"] [default]`: `when` carries a guard
-//! condition, `default` marks an exclusive gateway's fallback flow — the exact construct the
+//! condition, `default` marks a condition-routed gateway's fallback flow (an exclusive or
+//! inclusive gateway) — the exact construct the
 //! imperative `edit_model` API could not express.
 //!
 //! The kind dispatch (`render_kind_attrs`) is an **exhaustive match** over `ElementKind`, so adding
@@ -1745,7 +1746,7 @@ mod tests {
     #[test]
     fn analyze_ir_surfaces_semantic_warnings() {
         // A gateway with two conditional flows and no default should trip the existing
-        // `exclusive-no-default` advisory, proving analyze_model is reused over the parsed IR.
+        // `gateway-no-default` advisory, proving analyze_model is reused over the parsed IR.
         let ir = "process \"p\" {\n  start S\n  startEvent S\n  exclusiveGateway G\n  \
                   endEvent A\n  endEvent B\n  S -> G\n  G -> A when \"= x > 1\"\n  \
                   G -> B when \"= x <= 1\"\n}";

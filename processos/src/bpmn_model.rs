@@ -874,7 +874,7 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
         // or inclusive (OR) split. A condition on a service task's / event's /
         // parallel split's outgoing flow is silently ignored — a common authoring
         // corruption where branch conditions get moved off the gateway onto a
-        // downstream task (the routing then breaks, but no exclusive-no-default
+        // downstream task (the routing then breaks, but no gateway-no-default
         // warning fires). Flag it so the model fixes the topology.
         if !matches!(
             kind,
@@ -897,19 +897,25 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
         }
 
         match kind {
-            // Exclusive split with every branch guarded: if no condition matches and there
-            // is no default flow, the token has nowhere to go.
-            ElementKind::ExclusiveGateway if el.outgoing.len() > 1 => {
+            // A condition-routed split (XOR or OR) with every branch guarded: if no
+            // condition matches and there is no default flow, the token has nowhere
+            // to go (an exclusive gateway gets stuck; an inclusive gateway raises a
+            // `NoMatchingSequenceFlow` incident at quiescence). Same defect, so one
+            // gateway-neutral advisory covers both condition-routed kinds.
+            ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway
+                if el.outgoing.len() > 1 =>
+            {
                 let has_default = el.outgoing.iter().any(|f| f.condition.is_none());
                 if !has_default {
                     findings.push(finding(
                         "warn",
-                        "exclusive-no-default",
+                        "gateway-no-default",
                         Some(id),
                         format!(
-                            "Exclusive gateway '{id}' splits {} ways but every flow is \
+                            "{} '{id}' splits {} ways but every flow is \
                              conditional (no default) — if no condition holds the token gets \
                              stuck.",
+                            kind_label(kind),
                             el.outgoing.len()
                         ),
                     ));
@@ -4046,8 +4052,8 @@ mod tests {
     fn analyze_model_flags_unguarded_service_tasks() {
         let v = analyze_model(LOAN_BPMN).expect("analyze");
         let findings = v["findings"].as_array().unwrap();
-        // Default flow f3 exists, so NO exclusive-no-default finding.
-        assert!(!findings.iter().any(|f| f["code"] == "exclusive-no-default"));
+        // Default flow f3 exists, so NO gateway-no-default finding.
+        assert!(!findings.iter().any(|f| f["code"] == "gateway-no-default"));
         // All three service tasks lack error/timer boundaries -> unguarded info.
         let unguarded: Vec<&str> = findings
             .iter()
@@ -4122,6 +4128,46 @@ mod tests {
             .any(|f| f["code"] == "condition-on-non-gateway"
                 && f["element"] == "Handler"
                 && f["severity"] == "warn"));
+    }
+
+    #[test]
+    fn analyze_model_flags_gateways_with_no_default_flow() {
+        // Both a condition-routed exclusive (XOR) and inclusive (OR) split with
+        // every outgoing flow guarded and no default flow trip the gateway-neutral
+        // `gateway-no-default` advisory: if no condition holds the token is stuck
+        // (XOR) or the OR join raises a no-matching-flow incident at quiescence.
+        for (kw, gw_id) in [("exclusiveGateway", "X"), ("inclusiveGateway", "O")] {
+            let bpmn = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="d">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:{kw} id="{gw_id}">
+      <bpmn:incoming>a</bpmn:incoming>
+      <bpmn:outgoing>hi</bpmn:outgoing>
+      <bpmn:outgoing>lo</bpmn:outgoing>
+    </bpmn:{kw}>
+    <bpmn:endEvent id="EHi"><bpmn:incoming>hi</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="ELo"><bpmn:incoming>lo</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="a" sourceRef="S" targetRef="{gw_id}"/>
+    <bpmn:sequenceFlow id="hi" sourceRef="{gw_id}" targetRef="EHi">
+      <bpmn:conditionExpression>= x &gt;= 1</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="lo" sourceRef="{gw_id}" targetRef="ELo">
+      <bpmn:conditionExpression>= x &lt; 1</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+  </bpmn:process>
+</bpmn:definitions>"#
+            );
+            let v = analyze_model(&bpmn).expect("analyze");
+            let findings = v["findings"].as_array().unwrap();
+            assert!(
+                findings.iter().any(|f| f["code"] == "gateway-no-default"
+                    && f["element"] == gw_id
+                    && f["severity"] == "warn"),
+                "expected gateway-no-default for {kw} '{gw_id}', got: {v}"
+            );
+        }
     }
 
     #[test]

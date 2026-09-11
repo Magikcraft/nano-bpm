@@ -785,7 +785,7 @@ pub fn describe(kind: Option<&str>) -> Value {
             ],
             "flowAnnotations": [
                 { "key": "when",    "doc": "FEEL boolean guarding the flow." },
-                { "key": "default", "doc": "Bare keyword marking an exclusive gateway's fallback flow." },
+                { "key": "default", "doc": "Bare keyword marking a condition-routed gateway's fallback flow (an exclusive or inclusive gateway)." },
             ],
             "note": "Call describe_ir_grammar(kind: \"<keyword>\") for a scoped reference for one element kind.",
         }),
@@ -805,7 +805,7 @@ pub fn describe(kind: Option<&str>) -> Value {
                 "attrs": s.attrs.iter().map(attr_json).collect::<Vec<_>>(),
                 "flowAnnotations": [
                     { "key": "when",    "doc": "FEEL boolean guarding an outgoing flow." },
-                    { "key": "default", "doc": "Bare keyword; only meaningful on an exclusiveGateway's outgoing flow." },
+                    { "key": "default", "doc": "Bare keyword; meaningful on a condition-routed gateway's outgoing flow (an exclusiveGateway or inclusiveGateway)." },
                 ],
                 "sharedAttrs": ["parent", "retries", "timer", "input", "output", "multiInstance"],
                 "note": "All attributes go inside a `{ ... }` block, one per line. \

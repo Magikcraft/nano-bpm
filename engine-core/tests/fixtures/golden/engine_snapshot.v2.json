@@ -1,5 +1,5 @@
 {
-  "next_local": 11,
+  "next_local": 13,
   "now": 1700000000007,
   "num_partitions": 1,
   "partition_id": 0,
@@ -9,7 +9,7 @@
       "payment": [
         [
           -50,
-          11
+          13
         ]
       ]
     },
@@ -29,36 +29,9 @@
       "order": 1
     },
     "instances": {
-      "3": {
-        "active": {},
-        "adhoc_instances": {},
-        "agent_history": {},
-        "agent_instances": {},
-        "business_id": null,
-        "compensable": [],
-        "compensation_waits": {},
-        "created_at": 1700000000001,
-        "incidents": [],
-        "join_counts": {},
-        "join_instances": {},
-        "key": 3,
-        "multi_instances": {},
-        "parent_element_instance_key": null,
-        "parent_process_instance_key": null,
-        "process_definition_key": 2,
-        "process_id": "order",
-        "scope_parents": {},
-        "scope_variables": {},
-        "scopes": {},
-        "state": "Completed",
-        "suspended_at": null,
-        "tags": [],
-        "variables": {},
-        "variables_spilled": false
-      },
-      "8": {
+      "10": {
         "active": {
-          "10": "charge"
+          "12": "charge"
         },
         "adhoc_instances": {},
         "agent_history": {},
@@ -70,7 +43,7 @@
         "incidents": [],
         "join_counts": {},
         "join_instances": {},
-        "key": 8,
+        "key": 10,
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
@@ -88,20 +61,47 @@
           }
         },
         "variables_spilled": false
+      },
+      "5": {
+        "active": {},
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000001,
+        "incidents": [],
+        "join_counts": {},
+        "join_instances": {},
+        "key": 5,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "process_definition_key": 2,
+        "process_id": "order",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Completed",
+        "suspended_at": null,
+        "tags": [],
+        "variables": {},
+        "variables_spilled": false
       }
     },
     "jobs": {
-      "11": {
+      "13": {
         "activated": false,
         "activated_at": null,
         "activation_timeout": null,
         "created_at": 1700000000004,
         "deadline": null,
         "element_id": "charge",
-        "element_instance_key": 10,
-        "instance_key": 8,
+        "element_instance_key": 12,
+        "instance_key": 10,
         "job_type": "payment",
-        "key": 11,
+        "key": 13,
         "kind": "BpmnElement",
         "lease_token": null,
         "priority": 50,
@@ -109,7 +109,7 @@
         "state": "Created",
         "worker": null
       },
-      "6": {
+      "8": {
         "activated": true,
         "activated_at": null,
         "activation_timeout": null,
@@ -117,10 +117,10 @@
         "deadline": null,
         "durable_activation": true,
         "element_id": "charge",
-        "element_instance_key": 5,
-        "instance_key": 3,
+        "element_instance_key": 7,
+        "instance_key": 5,
         "job_type": "payment",
-        "key": 6,
+        "key": 8,
         "kind": "BpmnElement",
         "lease_token": null,
         "priority": 50,
@@ -130,11 +130,11 @@
       }
     },
     "jobs_by_instance": {
-      "3": [
-        6
+      "10": [
+        13
       ],
-      "8": [
-        11
+      "5": [
+        8
       ]
     },
     "message_start_subscriptions": {},
@@ -223,6 +223,173 @@
         },
         "key": 2,
         "version": 1
+      },
+      "4": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "audit": {
+              "end_listeners": [],
+              "id": "audit",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "ServiceTask": {
+                  "custom_headers": {},
+                  "job_type": "audit",
+                  "linked_resources": [],
+                  "priority": null
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "join"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "e": {
+              "end_listeners": [],
+              "id": "e",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "join": {
+              "end_listeners": [],
+              "id": "join",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "InclusiveGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "e"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "notify": {
+              "end_listeners": [],
+              "id": "notify",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "ServiceTask": {
+                  "custom_headers": {},
+                  "job_type": "notify",
+                  "linked_resources": [],
+                  "priority": null
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "join"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "split"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "split": {
+              "end_listeners": [],
+              "id": "split",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "InclusiveGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": {
+                    "expression": "= risk > 10"
+                  },
+                  "is_default": false,
+                  "to": "audit"
+                },
+                {
+                  "condition": null,
+                  "is_default": true,
+                  "to": "notify"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "review",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 4,
+        "version": 1
       }
     },
     "processes": {
@@ -308,6 +475,173 @@
           "xml": ""
         },
         "key": 2,
+        "version": 1
+      },
+      "review": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "audit": {
+              "end_listeners": [],
+              "id": "audit",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "ServiceTask": {
+                  "custom_headers": {},
+                  "job_type": "audit",
+                  "linked_resources": [],
+                  "priority": null
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "join"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "e": {
+              "end_listeners": [],
+              "id": "e",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "join": {
+              "end_listeners": [],
+              "id": "join",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "InclusiveGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "e"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "notify": {
+              "end_listeners": [],
+              "id": "notify",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "ServiceTask": {
+                  "custom_headers": {},
+                  "job_type": "notify",
+                  "linked_resources": [],
+                  "priority": null
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "join"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "split"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "split": {
+              "end_listeners": [],
+              "id": "split",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "InclusiveGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": {
+                    "expression": "= risk > 10"
+                  },
+                  "is_default": false,
+                  "to": "audit"
+                },
+                {
+                  "condition": null,
+                  "is_default": true,
+                  "to": "notify"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "review",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 4,
         "version": 1
       }
     },
