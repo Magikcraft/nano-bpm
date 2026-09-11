@@ -3709,6 +3709,424 @@ fn subprocess_terminate_end_clears_a_multi_instance_body_in_its_scope() {
     );
 }
 
+/// Issue #1170 — regression guard, service-task multi-instance child.
+///
+/// An interrupting boundary event on a multi-instance activity is armed on the
+/// BODY and must tear down the WHOLE loop: every active child (here, each MI
+/// child's job), the body's `MultiInstanceState` runtime record, and route the
+/// boundary's outgoing flow exactly once. Before the fix,
+/// `interrupt_activity_via_boundary` had no multi-instance branch, so the body's
+/// `active` set kept the (now-cancelled) child keys and the instance hung
+/// `Active` forever after the boundary flow finished.
+#[test]
+fn interrupting_boundary_on_a_multi_instance_service_task_tears_down_the_whole_loop() {
+    // start -> each(MI svc "work") --normal--> done
+    // each --(interrupting timer boundary "timeout")--> escalated
+    let def = ProcessBuilder::new("mi-svc")
+        .start_event("start")
+        .service_task("each", "work")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .timer_boundary_event("timeout", "each", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("each", "done")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-svc",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Two parallel children, each with a "work" job; the body registered its
+    // multi-instance runtime record and armed the boundary timer on itself.
+    let job_keys: Vec<_> = engine.pending_jobs().iter().map(|j| j.key).collect();
+    assert_eq!(job_keys.len(), 2, "two MI children each minted a job");
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+    assert!(engine.timers().iter().any(|t| t.element_id == "each"));
+
+    // The timer interrupts the whole loop.
+    let fired = engine.trigger_timers(5_000);
+    for job_key in &job_keys {
+        assert_eq!(
+            engine.state().jobs[job_key].state,
+            state::JobState::Canceled,
+            "every MI child job is cancelled by the interrupting boundary"
+        );
+    }
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+            ))
+            .count(),
+        1,
+        "the boundary flow is taken exactly once"
+    );
+    assert!(
+        !fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "done"
+        )),
+        "the normal outgoing flow is never taken"
+    );
+    assert!(
+        engine.instance(key).is_none() || engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record is cleared (no stale active set)"
+    );
+    assert!(
+        engine.is_completed(key),
+        "the instance completes after the loop is torn down (#1170)"
+    );
+}
+
+/// Issue #1170 — regression guard, embedded-sub-process multi-instance child.
+///
+/// Each MI child opens its own inner token scope with a running job. The
+/// interrupting boundary on the body must terminate every child scope (and its
+/// inner jobs), clear the body record, and route the boundary flow once.
+#[test]
+fn interrupting_boundary_on_a_multi_instance_subprocess_tears_down_every_child_scope() {
+    // start -> each(MI sub[ sub_start -> inner("work") -> sub_end ]) --normal--> done
+    // each --(interrupting timer boundary "timeout")--> escalated
+    let def = ProcessBuilder::new("mi-sub")
+        .start_event("start")
+        .sub_process("each", "sub_start")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "each")
+        .service_task("inner", "work")
+        .contained_in("inner", "each")
+        .end_event("sub_end")
+        .contained_in("sub_end", "each")
+        .timer_boundary_event("timeout", "each", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("each", "done")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-sub",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let job_keys: Vec<_> = engine.pending_jobs().iter().map(|j| j.key).collect();
+    assert_eq!(
+        job_keys.len(),
+        2,
+        "each MI sub-process child runs an inner job"
+    );
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+
+    let fired = engine.trigger_timers(5_000);
+    for job_key in &job_keys {
+        assert_eq!(
+            engine.state().jobs[job_key].state,
+            state::JobState::Canceled,
+            "every inner job is cancelled with its child scope"
+        );
+    }
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+            ))
+            .count(),
+        1,
+        "the boundary flow is taken exactly once"
+    );
+    assert!(
+        !fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "done"
+        )),
+        "the normal outgoing flow is never taken"
+    );
+    assert!(
+        engine.instance(key).is_none() || engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record is cleared"
+    );
+    assert!(engine.is_completed(key), "the instance completes (#1170)");
+}
+
+/// Issue #1170 — regression guard, call-activity multi-instance child.
+///
+/// Each MI child spawns its own child process instance (Zeebe parity). The
+/// interrupting boundary on the body must cancel every spawned child instance,
+/// clear the body record, and route the boundary flow once.
+#[test]
+fn interrupting_boundary_on_a_multi_instance_call_activity_cancels_every_child_instance() {
+    // callee: cs -> ct("work") -> ce
+    let callee = ProcessBuilder::new("callee")
+        .start_event("cs")
+        .service_task("ct", "work")
+        .end_event("ce")
+        .connect("cs", "ct")
+        .connect("ct", "ce")
+        .build()
+        .unwrap();
+    // start -> each(MI call "callee") --normal--> done
+    // each --(interrupting timer boundary "timeout")--> escalated
+    let def = ProcessBuilder::new("mi-call")
+        .start_event("start")
+        .call_activity("each", "callee")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .timer_boundary_event("timeout", "each", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "each")
+        .connect("each", "done")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(callee))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-call",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Each MI child spawned a "callee" child instance parked on its "work" job.
+    let job_keys: Vec<_> = engine.pending_jobs().iter().map(|j| j.key).collect();
+    assert_eq!(
+        job_keys.len(),
+        2,
+        "two child process instances, each on a job"
+    );
+    assert_eq!(engine.instance(key).unwrap().multi_instances.len(), 1);
+
+    let fired = engine.trigger_timers(5_000);
+    assert!(
+        fired
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })),
+        "the spawned child process instances are terminated"
+    );
+    for job_key in &job_keys {
+        assert_eq!(
+            engine.state().jobs[job_key].state,
+            state::JobState::Canceled,
+            "each child instance's job is cancelled"
+        );
+    }
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+            ))
+            .count(),
+        1,
+        "the boundary flow is taken exactly once"
+    );
+    assert!(
+        !fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "done"
+        )),
+        "the normal outgoing flow is never taken"
+    );
+    assert!(
+        engine.instance(key).is_none() || engine.instance(key).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record is cleared"
+    );
+    assert!(
+        engine.is_completed(key),
+        "the parent instance completes (#1170)"
+    );
+}
+
+/// Issue #1170 — regression guard, ad-hoc (JOB_WORKER) multi-instance child.
+///
+/// Each MI child is a JOB_WORKER `adHocSubProcess`: it mints an agent job and
+/// registers its own ad-hoc runtime record, into which the agent can activate
+/// tools. The interrupting boundary on the body must tear down every child's
+/// ad-hoc scope (its agent job, activated tools and their inner instances),
+/// clear both the ad-hoc records and the body record, and route the boundary
+/// flow once.
+#[test]
+fn interrupting_boundary_on_a_multi_instance_adhoc_tears_down_every_container() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-agent" />
+              <zeebe:adHoc outputCollection="r" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics>
+              <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" />
+            </bpmn:multiInstanceLoopCharacteristics>
+            <bpmn:userTask id="InnerTask">
+              <bpmn:extensionElements>
+                <zeebe:userTask />
+              </bpmn:extensionElements>
+            </bpmn:userTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:boundaryEvent id="Bnd" attachedToRef="Host">
+            <bpmn:messageEventDefinition messageRef="M" />
+          </bpmn:boundaryEvent>
+          <bpmn:endEvent id="EndNormal" />
+          <bpmn:endEvent id="EndInterrupted" />
+          <bpmn:sequenceFlow id="F1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="F2" sourceRef="Host" targetRef="EndNormal" />
+          <bpmn:sequenceFlow id="F3" sourceRef="Bnd" targetRef="EndInterrupted" />
+        </bpmn:process>
+        <bpmn:message id="M" name="probe-cancel">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=customerId" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[
+                ("customerId", Value::Str("C1".into())),
+                ("items", Value::List(vec![Value::Int(1), Value::Int(2)])),
+            ]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Each MI child is its own ad-hoc container with its own agent job.
+    let agents = engine.activate_jobs("probe-agent", "W", 10, 1_000, 0);
+    assert_eq!(
+        agents.len(),
+        2,
+        "each MI ad-hoc child minted its own agent job"
+    );
+    assert_eq!(engine.instance(inst).unwrap().multi_instances.len(), 1);
+    // One container activates an inner user-task tool into its own scope.
+    let container = agents[0].element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agents[0].key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("InnerTask")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "the tool is active in its container before the boundary fires"
+    );
+    assert!(!engine.is_completed(inst));
+
+    // The cancel message fires the interrupting boundary on the whole loop.
+    let fired = engine.correlate_message("probe-cancel", "C1", HashMap::new(), 0);
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "Bnd" && to == "EndInterrupted"
+            ))
+            .count(),
+        1,
+        "the boundary flow is taken exactly once"
+    );
+    assert!(
+        engine.is_completed(inst),
+        "the instance reaches EndInterrupted and completes (#1170)"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || engine.instance(inst).unwrap().multi_instances.is_empty(),
+        "the multi-instance runtime record is cleared (no stale active set)"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || engine.instance(inst).unwrap().adhoc_instances.is_empty(),
+        "every ad-hoc container record was cleared on cancel"
+    );
+    assert!(
+        engine
+            .state()
+            .user_tasks
+            .values()
+            .all(|t| t.element_id != "InnerTask" || t.state != state::UserTaskState::Created),
+        "the activated tool's open user task was cancelled, not left Created"
+    );
+}
+
 /// Defect-class guard (dead-scope guard, `Step::Activate` branch): a scoped
 /// terminate tears down every descendant token but deliberately leaves the
 /// enclosing sub-process token active until the post-drain completion sweep. A

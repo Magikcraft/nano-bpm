@@ -6077,6 +6077,18 @@ impl Engine {
             completion_condition: mi.completion_condition.clone(),
         });
 
+        // Arm timers/subscriptions for every boundary event attached to the
+        // multi-instance activity, ON THE BODY. A boundary on an MI activity
+        // interrupts the whole loop, so it belongs to the body (whose flow scope
+        // is the activity's enclosing scope — giving the boundary's outgoing flow
+        // the correct level) rather than to any one child. Firing routes through
+        // `interrupt_activity_via_boundary`, which recognises the body and tears
+        // down every active child plus the body record (#1170). Armed here, before
+        // the start-listener gate below, so the boundary is live for the whole
+        // life of the activity. A body with no attached boundaries yields no
+        // events (the common case), so this is a no-op for every ordinary loop.
+        events.extend(self.arm_boundary_events(instance_key, body_key, scope, &element_id));
+
         // Start-listener gate (ADR 0037): the body rests in ACTIVATING while its
         // `start` chain runs. Zeebe fires the activity's start listeners at the
         // body boundary, before any child is instantiated, so child spawning is
@@ -6315,21 +6327,27 @@ impl Engine {
     /// Runs a multi-instance child's own behaviour once its `inputElement` /
     /// `loopCounter` bindings and per-child input mappings have been applied
     /// (`child_vars` is the child's resolved scope view): a service-task child
-    /// mints its job, an embedded-sub-process child opens its scope and activates
-    /// its inner start event, any other kind passes straight through to
+    /// mints its job (registering an ad-hoc runtime record too when the activity
+    /// is a JOB_WORKER ad-hoc container), an embedded-sub-process child opens its
+    /// scope and activates its inner start event, a call-activity child spawns its
+    /// own child process instance, any other kind passes straight through to
     /// completion. Shared by the first activation ([`activate_mi_child`]) and the
     /// incident re-drive ([`retry_mi_child_activation`]) so both enact identical
-    /// behaviour.
+    /// behaviour. Boundary events on the multi-instance activity are armed on the
+    /// body, not here (see [`run_mi_body_activation`]).
     fn run_mi_child_behaviour(
         &mut self,
         instance_key: Key,
         element_id: String,
-        body_key: Key,
+        _body_key: Key,
         child_key: Key,
         child_vars: &HashMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut events = Vec::new();
         let mut followups = Vec::new();
+        // Boundary events attached to a multi-instance activity are armed once, on
+        // the BODY (`run_mi_body_activation`), never per child — a boundary on the
+        // activity interrupts the whole loop. So no child branch arms them.
         match self.element_kind(instance_key, &element_id) {
             Some(ElementKind::ServiceTask {
                 job_type, priority, ..
@@ -6345,12 +6363,39 @@ impl Engine {
                     job_key,
                     instance_key,
                     element_instance_key: child_key,
-                    element_id,
+                    element_id: element_id.clone(),
                     job_type,
                     created_at: self.now,
                     priority,
                     retries,
                 });
+                // A multi-instance child that is a JOB_WORKER ad-hoc container
+                // (`adHocSubProcess` with a `zeebe:taskDefinition`) registers its
+                // own ad-hoc runtime record alongside the agent job — exactly like
+                // a normally-activated container (see `run_activation_body`) — so
+                // the agent can activate tools into THIS child's scope and an
+                // interrupting boundary on the loop can tear that scope down
+                // (#1170). The container element instance is the ad-hoc scope
+                // (`child_key`); its tool catalog is advertised local to it.
+                if let Some(def) = self.adhoc_def_of(instance_key, &element_id) {
+                    events.push(Event::AdHocActivated {
+                        instance_key,
+                        container_key: child_key,
+                        element_id: element_id.clone(),
+                        output_collection: def.output_collection.clone(),
+                        output_element: def.output_element.clone(),
+                    });
+                    let mut catalog_var = HashMap::new();
+                    catalog_var.insert(
+                        "adHocSubProcessElements".to_string(),
+                        Value::List(Self::advertised_adhoc_catalog(&def)),
+                    );
+                    events.push(Event::ScopedVariablesUpdated {
+                        instance_key,
+                        scope_key: child_key,
+                        variables: catalog_var,
+                    });
+                }
             }
             // A multi-instance child that is an embedded SUB-PROCESS opens its own
             // token scope (this child element instance) and activates its inner
@@ -6363,17 +6408,34 @@ impl Engine {
             // flow. This is what makes the nested "wave" pattern — a sequential MI
             // over waves wrapping a parallel MI over a wave's tasks — executable.
             Some(ElementKind::SubProcess { start_event }) => {
-                events.extend(self.arm_boundary_events(
-                    instance_key,
-                    child_key,
-                    body_key,
-                    &element_id,
-                ));
                 followups.push(Step::Activate {
                     instance_key,
                     element_id: start_event,
                     scope: child_key,
                 });
+            }
+            // A multi-instance child that is a CALL ACTIVITY parks its token on a
+            // distinct spawned child process instance (Zeebe parity), one per
+            // loop item — exactly like a normally-activated call activity (see
+            // `run_activation_body`). When the child process drains,
+            // `complete_call_activity` routes the loop back through
+            // `complete_mi_child`. An interrupting boundary on the loop cancels
+            // every one of these child instances via the body teardown (#1170).
+            Some(ElementKind::CallActivity {
+                called_process_id,
+                propagate_all_parent_variables,
+                ..
+            }) => {
+                let (spawn_events, spawn_followups) = self.spawn_call_activity_child(
+                    instance_key,
+                    child_key,
+                    &element_id,
+                    &called_process_id,
+                    propagate_all_parent_variables,
+                    child_vars,
+                );
+                events.extend(spawn_events);
+                followups.extend(spawn_followups);
             }
             _ => {
                 followups.push(Step::Complete {
