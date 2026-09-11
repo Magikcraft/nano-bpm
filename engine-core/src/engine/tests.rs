@@ -3208,6 +3208,617 @@ fn should_run_parallel_split_and_join() {
 }
 
 #[test]
+fn should_run_inclusive_split_taking_every_matching_flow() {
+    // s -> isplit =< a (when x), b (when y), c (when z) >= join -> e
+    // With x=true, y=true, z=false the split takes exactly a and b (an inclusive
+    // OR: every flow whose condition holds), not c.
+    let def = ProcessBuilder::new("inc")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .service_task("c", "jc")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .connect("s", "isplit")
+        .connect_when("isplit", "a", "x")
+        .connect_when("isplit", "b", "y")
+        .connect_when("isplit", "c", "z")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("c", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let vars = HashMap::from([
+        ("x".to_string(), Value::Bool(true)),
+        ("y".to_string(), Value::Bool(true)),
+        ("z".to_string(), Value::Bool(false)),
+    ]);
+    let created = engine
+        .apply_command(Command::create_instance_with("inc", vars))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Exactly the two matching branches forked; `c` never activated.
+    assert!(created
+        .iter()
+        .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "a")));
+    assert!(created
+        .iter()
+        .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "b")));
+    assert!(!created
+        .iter()
+        .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "c")));
+    assert_eq!(engine.pending_jobs().len(), 2);
+    assert!(!engine.is_completed(instance_key));
+
+    // The join must wait until BOTH taken branches arrive — not fire on the
+    // first, and not wait for the untaken `c` branch that has no token.
+    complete_one(&mut engine, "ja");
+    assert!(!engine.is_completed(instance_key));
+
+    let final_events = complete_one(&mut engine, "jb");
+    assert!(engine.is_completed(instance_key));
+    assert_eq!(
+        final_events
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessInstanceCompleted { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn should_take_inclusive_split_default_when_no_condition_matches() {
+    // No non-default flow's condition holds, so the explicit default is taken.
+    let def = ProcessBuilder::new("inc-def")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .end_event("hot")
+        .end_event("cold")
+        .connect("s", "isplit")
+        .connect_when("isplit", "hot", "temp > 100")
+        .connect_default("isplit", "cold")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let vars = HashMap::from([("temp".to_string(), Value::Int(20))]);
+    let events = engine
+        .apply_command(Command::create_instance_with("inc-def", vars))
+        .unwrap();
+
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "cold")));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "hot")));
+}
+
+#[test]
+fn should_raise_incident_when_inclusive_split_matches_no_flow() {
+    // No condition holds and there is no default flow: the split parks on a
+    // NoMatchingSequenceFlow incident rather than silently dropping the token.
+    let def = ProcessBuilder::new("inc-stuck")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .end_event("hot")
+        .connect("s", "isplit")
+        .connect_when("isplit", "hot", "temp > 100")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let vars = HashMap::from([("temp".to_string(), Value::Int(20))]);
+    let events = engine
+        .apply_command(Command::create_instance_with("inc-stuck", vars))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::IncidentRaised {
+            kind: state::IncidentKind::NoMatchingSequenceFlow,
+            ..
+        }
+    )));
+    assert!(!engine.is_completed(instance_key));
+}
+
+#[test]
+fn should_run_inclusive_split_and_join_across_unconditional_flows() {
+    // An inclusive gateway with only unconditional outgoing flows behaves like a
+    // parallel split: every flow is taken, and the join synchronises them.
+    let def = ProcessBuilder::new("inc-all")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .connect("s", "isplit")
+        .connect("isplit", "a")
+        .connect("isplit", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("inc-all"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    assert_eq!(engine.pending_jobs().len(), 2);
+    complete_one(&mut engine, "ja");
+    assert!(!engine.is_completed(instance_key));
+    complete_one(&mut engine, "jb");
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn end_listener_fires_on_a_multi_incoming_inclusive_join() {
+    // #1168 regression: an inclusive gateway acting as a JOIN fires via the
+    // quiescence sweep (`fire_ready_inclusive_joins`), NOT the split-completion
+    // path (`complete_inclusive_gateway`). That sweep must still honour the
+    // element's `end` execution-listener gate (ADR 0037): the join rests in
+    // COMPLETING while the listener runs, and its outgoing flow is only taken
+    // once the chain drains. Without the gate a multi-incoming inclusive join
+    // silently skips its listener job (and any variable rewrite it performs).
+    let def = ProcessBuilder::new("inc-join-listener")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .connect("s", "isplit")
+        .connect("isplit", "a")
+        .connect("isplit", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "e")
+        .with_listeners(
+            "join",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "join-audit")],
+        )
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("inc-join-listener"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Drive both split branches to the join; the second arrival makes the join
+    // ready at quiescence.
+    complete_one(&mut engine, "ja");
+    let arrive = complete_one(&mut engine, "jb");
+
+    // The ready join parks on its `end` listener: no outgoing flow taken yet, and
+    // the instance is not complete.
+    assert!(
+        !arrive.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, .. } if from == "join"
+        )),
+        "join must not route until its end listener completes"
+    );
+    assert!(
+        !engine.is_completed(instance_key),
+        "instance parked on the inclusive join's end listener"
+    );
+
+    // Completing the listener drains the chain → the join routes its outgoing
+    // flow exactly once and the instance completes.
+    let audit = engine.activate_jobs("join-audit", "W", 10, 1_000, 0);
+    assert_eq!(audit.len(), 1, "one inclusive-join end-listener job");
+    let done = engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    let routed = done
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "join" && to == "e"
+            )
+        })
+        .count();
+    assert_eq!(
+        routed, 1,
+        "join routes its outgoing flow exactly once after the end listener"
+    );
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn inclusive_join_incident_redrive_does_not_duplicate_outgoing_routing() {
+    // #1168 regression (join redrive / stale bookkeeping). A multi-incoming
+    // inclusive gateway that is ALSO a conditional split: both branches arrive,
+    // the quiescence-time selection matches no flow (and there is no default), so
+    // the join parks on a `NoMatchingSequenceFlow` incident. Resolving that
+    // incident re-drives `Step::Complete`, which lands in the split-completion
+    // path. That path emits `ElementCompleted` but the reducer does NOT clear the
+    // join maps on `ElementCompleted`; without an explicit `ParallelJoinReset` the
+    // stale open-join entry is swept again at the next quiescence and DUPLICATES
+    // the outgoing routing. Assert the join routes its outgoing flow exactly once.
+    let def = ProcessBuilder::new("inc-redrive")
+        .start_event("s")
+        .parallel_gateway("psplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .inclusive_gateway("join")
+        .end_event("out")
+        .connect("s", "psplit")
+        .connect("psplit", "a")
+        .connect("psplit", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect_when("join", "out", "go")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "inc-redrive",
+            HashMap::from([("go".to_string(), Value::Bool(false))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Both branches arrive at the join; with `go=false` the join's single
+    // conditional flow matches nothing and no default exists -> incident.
+    complete_one(&mut engine, "ja");
+    complete_one(&mut engine, "jb");
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "the join must park on a single incident");
+    assert_eq!(active[0].kind, state::IncidentKind::NoMatchingSequenceFlow);
+    assert!(!engine.is_completed(instance_key));
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix the variable and resolve: the join re-selects, now routes `out`, and
+    // completes. The stale join bookkeeping must be cleared so it does not fire a
+    // second time.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("go".to_string(), Value::Bool(true))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    let routed = resolved
+        .iter()
+        .filter(|e| matches!(e, Event::SequenceFlowTaken { from, to, .. } if from == "join" && to == "out"))
+        .count();
+    assert_eq!(
+        routed, 1,
+        "the join must route its outgoing flow exactly once on redrive, not duplicate it"
+    );
+    assert_eq!(
+        resolved
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessInstanceCompleted { .. }))
+            .count(),
+        1,
+        "the instance must complete exactly once"
+    );
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.active_incidents().is_empty());
+}
+
+/// Regression (#1168 debugger observability): the in-transit-quiescence inclusive-
+/// join sweep can emit an `IncidentRaised` (unselectable / no-matching-flow at a
+/// ready join) and then return `false` without firing. The run loop must still
+/// notify the `StepDriver` of those events — otherwise a `BreakCondition::EveryStep`
+/// debug session silently skips this event-producing sweep, unlike every other
+/// sweep in the loop. Before the fix, `after_step` was gated on the "fired"
+/// boolean, so the incident landed in the log only in the post-quiescence tail,
+/// never at a pause boundary. This drives the second branch's completion under the
+/// debugger and asserts the incident is observed in a pause *delta* (a slice the
+/// driver was actually consulted on), not merely present in the final tail.
+#[test]
+fn inclusive_join_incident_sweep_is_observed_by_the_step_driver() {
+    let def = ProcessBuilder::new("inc-redrive")
+        .start_event("s")
+        .parallel_gateway("psplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .inclusive_gateway("join")
+        .end_event("out")
+        .connect("s", "psplit")
+        .connect("psplit", "a")
+        .connect("psplit", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect_when("join", "out", "go")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "inc-redrive",
+            HashMap::from([("go".to_string(), Value::Bool(false))]),
+        ))
+        .unwrap();
+
+    // First branch arrives at the join via a plain command.
+    complete_one(&mut engine, "ja");
+
+    // Drive the SECOND branch's completion under the debugger, single-stepping on
+    // every step. Completing `jb` reaches in-transit quiescence, where the join
+    // sweep raises `NoMatchingSequenceFlow` (go=false, no default) without firing.
+    let jb = engine
+        .activate_jobs("jb", "test-worker", 10, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("jb activatable");
+    let mut session = engine
+        .debug_command_at(
+            Command::complete_job(jb.key),
+            0,
+            vec![BreakCondition::EveryStep],
+        )
+        .expect("debug complete jb");
+
+    // Walk pause-to-pause; the incident must appear in a pause DELTA (an event
+    // slice the driver was actually consulted on), not merely in the final tail.
+    let mut incident_observed_at_a_pause = false;
+    let mut seen = 0usize;
+    while session.is_paused() {
+        let delta = &session.log()[seen..];
+        if delta
+            .iter()
+            .any(|e| matches!(e, Event::IncidentRaised { .. }))
+        {
+            incident_observed_at_a_pause = true;
+        }
+        seen = session.log().len();
+        engine.debug_step(&mut session);
+    }
+    assert!(
+        incident_observed_at_a_pause,
+        "EveryStep must observe the inclusive-join incident sweep at a pause boundary"
+    );
+    // Sanity: the incident really was raised on this run.
+    assert!(session
+        .log()
+        .iter()
+        .any(|e| matches!(e, Event::IncidentRaised { .. })));
+}
+
+#[test]
+fn chained_inclusive_joins_do_not_fire_downstream_join_prematurely() {
+    // #1168 regression (queued-activation reachability). Two inclusive joins in a
+    // chain, `j1 -> j2`, where `j2` also has an independent incoming branch `c`.
+    // When both joins are open at quiescence, firing `j1` only *queues* its token
+    // toward `j2` (state.active is not yet updated). If the sweep continued to
+    // evaluate `j2` in the same pass, `j2` would see no live token reaching it and
+    // fire prematurely on an incomplete set (just `c`), then reopen when the queued
+    // `j1` token finally arrives. Firing at most one join per sweep (and re-draining
+    // in between) prevents that; the instance must complete cleanly, once.
+    let def = ProcessBuilder::new("inc-chain")
+        .start_event("s")
+        .parallel_gateway("psplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .service_task("c", "jc")
+        .inclusive_gateway("j1")
+        .inclusive_gateway("j2")
+        .end_event("e")
+        .connect("s", "psplit")
+        .connect("psplit", "a")
+        .connect("psplit", "b")
+        .connect("psplit", "c")
+        .connect("a", "j1")
+        .connect("b", "j1")
+        .connect("j1", "j2")
+        .connect("c", "j2")
+        .connect("j2", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("inc-chain"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(engine.pending_jobs().len(), 3);
+
+    // Complete all three tasks; the last one drives both joins to quiescence.
+    let mut all_events = Vec::new();
+    all_events.extend(complete_one(&mut engine, "ja"));
+    all_events.extend(complete_one(&mut engine, "jb"));
+    all_events.extend(complete_one(&mut engine, "jc"));
+
+    assert!(
+        engine.is_completed(instance_key),
+        "the chained joins must synchronise and complete the instance"
+    );
+    assert!(engine.active_incidents().is_empty());
+    assert_eq!(
+        all_events
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessInstanceCompleted { .. }))
+            .count(),
+        1,
+        "the instance must complete exactly once"
+    );
+    assert_eq!(
+        all_events
+            .iter()
+            .filter(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "e"))
+            .count(),
+        1,
+        "the downstream join must route to the end exactly once (no premature/duplicate fire)"
+    );
+}
+
+#[test]
+fn inclusive_join_waits_while_a_boundary_that_reaches_it_is_still_armed() {
+    // #1168 regression (boundary-event reachability). An inclusive join `j` is
+    // reachable from branch `a` (normal flow `a -> j`) AND from branch `b`'s timer
+    // boundary `be` (`be -> j`). Crucially, `b`'s *own* completion flows elsewhere
+    // (`b -> eb`), so `b` is not a sequence-flow predecessor of `j` — only its
+    // armed boundary is. When `a` arrives at the open join while `b` is still
+    // parked on its job (boundary armed), the quiescence sweep must NOT fire `j`:
+    // the still-armed boundary could yet route a token in, and firing early would
+    // then mis-route that later boundary token. Only once `b` resolves (its job
+    // completes, disarming the boundary) may `j` fire, with the single `a` token.
+    let def = ProcessBuilder::new("inc-boundary")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .timer_boundary_event("be", "b", 5_000)
+        .inclusive_gateway("j")
+        .end_event("e")
+        .end_event("eb")
+        .connect("s", "isplit")
+        .connect("isplit", "a")
+        .connect("isplit", "b")
+        .connect("a", "j")
+        .connect("be", "j")
+        .connect("b", "eb")
+        .connect("j", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("inc-boundary"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(engine.pending_jobs().len(), 2);
+
+    // Complete branch `a`; its token reaches the open inclusive join `j`. Branch
+    // `b` is still parked with its boundary armed, so `j` must not fire yet.
+    let after_a = complete_one(&mut engine, "ja");
+    assert!(
+        !after_a
+            .iter()
+            .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "e")),
+        "the inclusive join must not fire while `b`'s armed boundary can still reach it"
+    );
+    assert!(
+        !engine.is_completed(instance_key),
+        "the instance must still be running with `b` parked and the join held open"
+    );
+
+    // Complete branch `b`; the boundary disarms, `b` flows to its own end, and now
+    // no live token can reach `j` — it fires once, with the single `a` token.
+    let after_b = complete_one(&mut engine, "jb");
+    assert!(
+        engine.is_completed(instance_key),
+        "once `b` resolves, the join fires and the instance completes"
+    );
+    assert_eq!(
+        after_b
+            .iter()
+            .filter(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "e"))
+            .count(),
+        1,
+        "the join routes to the end exactly once (no premature fire, no duplicate)"
+    );
+    assert!(engine.active_incidents().is_empty());
+}
+
+#[test]
+fn inclusive_join_waits_while_a_link_throw_that_reaches_it_is_pending() {
+    // #1168 regression (link-event reachability). An inclusive join `j` is
+    // reachable from branch `a` (normal flow `a -> j`) AND from branch `b` via a
+    // link hop: `b -> thr` (link *throw*) hands its token directly to the
+    // matching same-scope link *catch* `cat` (no sequence flow), and `cat -> j`.
+    // Because the throw→catch transition is invisible to the sequence-flow graph,
+    // a token parked on `b` (upstream of the throw) is NOT a sequence-flow
+    // predecessor of `j` — only the link edge makes `b` reach `j`. When `a`
+    // arrives at the open join while `b` is still parked on its job, the
+    // quiescence sweep must NOT fire `j`: the pending link hop could yet route a
+    // token in, and firing early would then create a second, late arrival at `j`.
+    let def = ProcessBuilder::new("inc-link")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .link_intermediate_throw_event("thr", "L")
+        .link_intermediate_catch_event("cat", "L")
+        .inclusive_gateway("j")
+        .end_event("e")
+        .connect("s", "isplit")
+        .connect("isplit", "a")
+        .connect("isplit", "b")
+        .connect("a", "j")
+        .connect("b", "thr")
+        .connect("cat", "j")
+        .connect("j", "e")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("inc-link"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(engine.pending_jobs().len(), 2);
+
+    // Complete branch `a`; its token reaches the open inclusive join `j`. Branch
+    // `b` is still parked on its job, and `b` reaches `j` through the pending link
+    // hop, so `j` must not fire yet.
+    let after_a = complete_one(&mut engine, "ja");
+    assert!(
+        !after_a
+            .iter()
+            .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "e")),
+        "the inclusive join must not fire while `b` can still reach it via the link throw"
+    );
+    assert!(
+        !engine.is_completed(instance_key),
+        "the instance must still be running with `b` parked and the join held open"
+    );
+
+    // Complete branch `b`; its token flows `b -> thr -> (link) -> cat -> j`. Now no
+    // live token can reach `j` other than the two that arrived — it fires once and
+    // routes to the end exactly once (no premature fire, no duplicate).
+    let after_b = complete_one(&mut engine, "jb");
+    assert!(
+        engine.is_completed(instance_key),
+        "once `b` arrives through the link hop, the join fires and the instance completes"
+    );
+    assert_eq!(
+        after_b
+            .iter()
+            .filter(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "e"))
+            .count(),
+        1,
+        "the join routes to the end exactly once (no premature fire, no duplicate)"
+    );
+    assert!(engine.active_incidents().is_empty());
+}
+
+#[test]
 fn terminate_end_kills_sibling_branch_and_completes_the_instance() {
     // s -> split =< work (service task), trigger (service task) -> stop (terminate end) >
     //
@@ -19688,6 +20299,100 @@ fn migration_rejects_open_join_with_different_incoming_arity() {
     assert!(
         instance.join_instances.contains_key("join"),
         "the open join is left intact on the source id"
+    );
+}
+
+/// An **inclusive**-gateway join reuses the same `join_instances` bookkeeping as
+/// a parallel join, but it fires on token *quiescence/reachability*
+/// (`fire_ready_inclusive_joins`), never by comparing a durable arrival count
+/// against the definition's incoming-flow count. So the arity-parity restriction
+/// that guards parallel joins must **not** apply to it: an open inclusive join
+/// remapped onto a target join with a *different* incoming arity is perfectly
+/// compatible and must migrate. Red/Green guard that the new element (#1168)
+/// did not silently inherit `MigratedParallelJoinArityChanged` by sharing the
+/// join maps.
+#[test]
+fn migration_allows_open_inclusive_join_with_different_incoming_arity() {
+    fn inc_join_2(id: &str, split: &str, a: &str, b: &str, join: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .inclusive_gateway(split)
+            .service_task(a, "ja")
+            .service_task(b, "jb")
+            .inclusive_gateway(join)
+            .end_event("e")
+            .connect("s", split)
+            .connect(split, a)
+            .connect(split, b)
+            .connect(a, join)
+            .connect(b, join)
+            .connect(join, "e")
+            .build()
+            .unwrap()
+    }
+    // Target inclusive join `join2` has THREE incoming flows, versus the two of
+    // the source — an arity change that would reject a *parallel* join.
+    fn inc_join_3(id: &str, split: &str, join: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .inclusive_gateway(split)
+            .service_task("a2", "ja")
+            .service_task("b2", "jb")
+            .service_task("c2", "jc")
+            .inclusive_gateway(join)
+            .end_event("e")
+            .connect("s", split)
+            .connect(split, "a2")
+            .connect(split, "b2")
+            .connect(split, "c2")
+            .connect("a2", join)
+            .connect("b2", join)
+            .connect("c2", join)
+            .connect(join, "e")
+            .build()
+            .unwrap()
+    }
+
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, inc_join_2("source", "split", "a", "b", "join"));
+    let target_key = deploy_for_migration(&mut engine, inc_join_3("target", "split2", "join2"));
+
+    let inst = create_instance_key(&mut engine, "source");
+    // Open the join: branch `a` arrives, leaving it half-open (branch `b` still
+    // parked and able to reach the join, so it has not fired).
+    complete_one(&mut engine, "ja");
+    let instance = engine.instance(inst).unwrap();
+    assert!(
+        instance.join_instances.contains_key("join"),
+        "precondition: the inclusive join is open before migration"
+    );
+
+    // Map the parked branch `b` and the open join onto the 3-flow target join.
+    // Unlike a parallel join, the arity change must be accepted.
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("b".to_string(), "b2".to_string()),
+                ("join".to_string(), "join2".to_string()),
+            ],
+        ))
+        .expect("an open inclusive join tolerates an incoming-arity change on migration");
+
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(instance.process_id, "target", "instance migrated");
+    assert!(
+        instance.join_instances.contains_key("join2"),
+        "the open inclusive join is re-pointed at the target id"
+    );
+
+    // The migrated instance still drives to completion: the parked branch `b`
+    // (now `b2`) finishes and the inclusive join synchronises and completes.
+    complete_one(&mut engine, "jb");
+    assert!(
+        engine.is_completed(inst),
+        "the migrated inclusive join synchronises its branches and completes"
     );
 }
 

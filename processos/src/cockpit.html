@@ -3342,7 +3342,10 @@ async function elkBpmnLayout(xml){
     const el = byId[c.id];
     const attrs = { id: c.id+'_di', bpmnElement: el,
       bounds: moddle.create('dc:Bounds', { x: c.x, y: c.y, width: c.width, height: c.height }) };
-    if(el && el.$type === 'bpmn:ExclusiveGateway') attrs.isMarkerVisible = true;
+    // A gateway only shows its distinguishing marker (X / O) when the shape
+    // opts in via isMarkerVisible; without it an exclusive or inclusive gateway
+    // renders as an empty diamond indistinguishable from a parallel gateway.
+    if(el && (el.$type === 'bpmn:ExclusiveGateway' || el.$type === 'bpmn:InclusiveGateway')) attrs.isMarkerVisible = true;
     shapes.push(moddle.create('bpmndi:BPMNShape', attrs));
     // Boundary-event ports -> their own shapes, positioned absolutely on the host edge.
     (c.ports||[]).forEach(p => {

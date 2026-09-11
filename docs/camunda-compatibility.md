@@ -26,7 +26,7 @@ source is marked **unverified** rather than guessed.
 | **partial** | Supported with a documented deviation or a subset of sub-behaviours. |
 | **parsed-not-executed** | The XML parser accepts the element, but the runtime ignores it or treats it as a no-op pass-through. **This is the distinction that bites hardest** — the model deploys clean and then silently does not do what it says. |
 | **stubbed (501)** | (REST) The route exists but returns `501 Not Implemented`. |
-| **unsupported** | Not handled: no parser arm, no runtime dispatch. |
+| **unsupported** | Not handled: no runtime semantics. An unmodelled **flow element / event definition** is **rejected at deploy** with an actionable `UnsupportedElement` naming the construct (the `unsupported_elements` validator, #853) — it is *not* silently dropped. Some constructs (e.g. `escalation`) additionally carry an explicit parser arm that rejects them by name. |
 | **planned** | A committed compatibility target that is not built yet (linked to an ADR/issue). |
 | **unverified** | Could not be confirmed from the source at audit time. |
 
@@ -36,19 +36,24 @@ source is marked **unverified** rather than guessed.
 
 Grounded in `engine-core` (the parser is `engine-core/src/bpmn.rs`; execution is
 `engine-core/src/engine/`). The parser's element arms are the enumerable set of
-what Nano *recognizes*; everything not listed there is dropped on parse.
+what Nano *recognizes*. A flow element or event definition not modelled by any
+parser arm is **rejected at deploy** with an actionable `UnsupportedElement`
+(the `unsupported_elements` validator, #853) — matching Zeebe, which transforms
+only known element types and rejects the rest — rather than being silently
+dropped. (Genuinely-ignorable non-flow noise — diagram interchange,
+documentation, foreign `zeebe:*`/`nano:*` extension children — is still ignored.)
 
 ### Tasks
 
 | Element | Status | Evidence |
 |---|---|---|
-| `serviceTask` | **executed** | `bpmn.rs:269`; job created at `engine/mod.rs:3228` |
+| `serviceTask` | **executed** | `bpmn.rs:269`; job created at the `JobCreated` emission in the service-task activation path, `engine/mod.rs` |
 | `businessRuleTask` (DMN) | **executed** | `bpmn.rs:289`; in-engine DMN eval at `engine/mod.rs:4695` (via `zeebe:calledDecision`, `bpmn.rs:301`) |
 | `scriptTask` | **executed** | `bpmn.rs:289`; inline FEEL, no job, at `engine/mod.rs:4650` |
 | `userTask` | **executed** | `bpmn.rs:310`; user-task record + listeners at `engine/mod.rs:3273` |
 | `receiveTask` | **parsed-not-executed** | Parsed as an inert throw/pass-through, `bpmn.rs:540`. Use a message intermediate **catch** event to wait for a message instead. |
-| `manualTask` | **unsupported** | No parser arm in `bpmn.rs`. |
-| `sendTask` | **unsupported** | No parser arm in `bpmn.rs`. |
+| `manualTask` | **executed** | Parsed as an abstract `task` pass-through (`ElementKind::Task`), `bpmn.rs:1294`; activates and immediately completes, taking its outgoing flow, `engine/mod.rs`. |
+| `sendTask` | **executed** | `bpmn.rs` (`sendTask` arm); a job-based service task — the throwing cousin of `receiveTask` — job created at the shared `JobCreated` emission in the service-task activation path, `engine/mod.rs` (#1168). |
 
 ### Gateways
 
@@ -57,7 +62,7 @@ what Nano *recognizes*; everything not listed there is dropped on parse.
 | `exclusiveGateway` | **executed** | `bpmn.rs:255`; routing at `engine/mod.rs:5000`. `default` flow honoured (`bpmn.rs:259`). |
 | `parallelGateway` | **executed** | `bpmn.rs:263`; fork/join at `engine/mod.rs:3066`. |
 | `eventBasedGateway` | **executed** | `bpmn.rs:266`; deferred choice at `engine/mod.rs:5047`. |
-| `inclusiveGateway` | **unsupported** | No parser arm in `bpmn.rs`. |
+| `inclusiveGateway` | **executed** | `bpmn.rs` (`inclusiveGateway` arm); conditional OR-split + synchronising join at `engine/mod.rs`. `default` flow honoured (#1168). |
 | `complexGateway` | **unsupported** | No parser arm in `bpmn.rs`. |
 
 ### Events
@@ -74,7 +79,7 @@ what Nano *recognizes*; everything not listed there is dropped on parse.
 | `boundaryEvent` — signal | **executed** (interrupting + non-interrupting) | `engine/boundary.rs:588` |
 | `boundaryEvent` — conditional | **executed** (interrupting + non-interrupting) | `engine/boundary.rs:616` |
 | `terminateEndEvent` | **executed** | An `endEvent` carrying a `terminateEventDefinition` kills every other active token in its enclosing scope (parallel-split siblings, pending timers, open jobs/subscriptions) and completes that scope. A top-level terminate end kills every inner token but **completes** the whole instance (`ProcessInstanceCompleted` — Zeebe parity: only the inner element instances record `TERMINATED`, the process instance's own terminal record is `ELEMENT_COMPLETED`); a sub-process-scoped one ends only that sub-process scope and the parent continues on the sub-process's outgoing flow. `bpmn.rs` (`terminateEventDefinition` arm); `model.rs` (`ElementKind::TerminateEndEvent`); `engine/mod.rs` (`complete_terminate_end`). |
-| `escalation` events | **unsupported** | No parser arm / dispatch. |
+| `escalation` events | **unsupported** | Deploy-rejected like any unmodelled construct (see the status vocabulary), but via an explicit parser arm: every escalation carrier (throw / end / boundary) is cleanly rejected at deploy with an `UnsupportedElement` naming the construct (`bpmn.rs` `escalationEventDefinition` arm; #1168), rather than silently mis-executing. Not modelled for execution. |
 | `compensation` events | **unsupported** | No parser arm / dispatch. |
 
 Event definitions that are wired: `timerEventDefinition` (`timeDuration` /

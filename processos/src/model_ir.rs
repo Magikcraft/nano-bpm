@@ -29,7 +29,8 @@
 //! sub-process parent).
 //!
 //! A **flow statement** is `<from> -> <to> [when "<expr>"] [default]`: `when` carries a guard
-//! condition, `default` marks an exclusive gateway's fallback flow — the exact construct the
+//! condition, `default` marks a condition-routed gateway's fallback flow (an exclusive or
+//! inclusive gateway) — the exact construct the
 //! imperative `edit_model` API could not express.
 //!
 //! The kind dispatch (`render_kind_attrs`) is an **exhaustive match** over `ElementKind`, so adding
@@ -150,6 +151,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::UserTask(_) => "userTask",
         ElementKind::ExclusiveGateway => "exclusiveGateway",
         ElementKind::ParallelGateway => "parallelGateway",
+        ElementKind::InclusiveGateway => "inclusiveGateway",
         ElementKind::EventBasedGateway => "eventBasedGateway",
         ElementKind::ErrorBoundaryEvent { .. } => "errorBoundaryEvent",
         ElementKind::TimerIntermediateCatchEvent { .. } => "timerIntermediateCatchEvent",
@@ -186,6 +188,7 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         | ElementKind::TerminateEndEvent
         | ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
+        | ElementKind::InclusiveGateway
         | ElementKind::EventBasedGateway
         | ElementKind::IntermediateThrowEvent
         | ElementKind::CompensationThrowEvent
@@ -1134,6 +1137,7 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
         "terminateEndEvent" => ElementKind::TerminateEndEvent,
         "exclusiveGateway" => ElementKind::ExclusiveGateway,
         "parallelGateway" => ElementKind::ParallelGateway,
+        "inclusiveGateway" => ElementKind::InclusiveGateway,
         "eventBasedGateway" => ElementKind::EventBasedGateway,
         "intermediateThrowEvent" => ElementKind::IntermediateThrowEvent,
         "linkIntermediateThrowEvent" => ElementKind::LinkIntermediateThrowEvent {
@@ -1277,6 +1281,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::UserTask(_)
         | ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
+        | ElementKind::InclusiveGateway
         | ElementKind::EventBasedGateway
         | ElementKind::TimerIntermediateCatchEvent { .. }
         | ElementKind::MessageIntermediateCatchEvent { .. }
@@ -1741,7 +1746,7 @@ mod tests {
     #[test]
     fn analyze_ir_surfaces_semantic_warnings() {
         // A gateway with two conditional flows and no default should trip the existing
-        // `exclusive-no-default` advisory, proving analyze_model is reused over the parsed IR.
+        // `gateway-no-default` advisory, proving analyze_model is reused over the parsed IR.
         let ir = "process \"p\" {\n  start S\n  startEvent S\n  exclusiveGateway G\n  \
                   endEvent A\n  endEvent B\n  S -> G\n  G -> A when \"= x > 1\"\n  \
                   G -> B when \"= x <= 1\"\n}";

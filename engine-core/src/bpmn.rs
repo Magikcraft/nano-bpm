@@ -17,8 +17,9 @@
 //! * Flow nodes: `startEvent`, `endEvent` (plain none end, or — with a nested
 //!   `terminateEventDefinition` — a terminate end that kills the remaining
 //!   tokens in its enclosing scope), `task`/`manualTask` (abstract
-//!   pass-through), `serviceTask`, `userTask`, `exclusiveGateway`,
-//!   `parallelGateway`, `eventBasedGateway`.
+//!   pass-through), `serviceTask`, `sendTask` (a job-based service task — its
+//!   throwing cousin of `receiveTask`), `userTask`, `exclusiveGateway`,
+//!   `parallelGateway`, `inclusiveGateway`, `eventBasedGateway`.
 //! * `subProcess` (embedded): its nested flow nodes/flows are scoped to it, and
 //!   a `boundaryEvent` with an `errorEventDefinition` attached to it becomes an
 //!   interrupting error boundary on the sub-process.
@@ -47,6 +48,11 @@
 //!   triggers compensation: the completed compensable activities in scope have
 //!   their handlers run (reverse completion order), and the throw event rests
 //!   until they finish before routing onward (single-activity path).
+//! * Escalation is **not** modelled for execution: an `escalationEventDefinition`
+//!   on a throw / end / boundary event is rejected at deploy with an
+//!   `UnsupportedElement` naming the construct (rather than a throw/end silently
+//!   demoting to a none pass-through, or a boundary failing with a misleading
+//!   "unknown source element" at its outgoing flow).
 //! * Definitions-level `message` elements (`<message id="…" name="…">`) with a
 //!   nested `zeebe:subscription correlationKey="=var"`, referenced by message
 //!   catch/boundary events via `messageRef`.
@@ -66,8 +72,9 @@
 //!   `externalReference` for an external form).
 //! * `sequenceFlow` with `sourceRef`/`targetRef`, and an optional
 //!   `conditionExpression` whose FEEL body is stored verbatim and evaluated by
-//!   [`crate::feel`] at the exclusive gateway (comparisons, arithmetic, boolean
-//!   logic, member access — not just equality). A condition that fails to
+//!   [`crate::feel`] at a condition-routed gateway — exclusive (XOR) or
+//!   inclusive (OR) (comparisons, arithmetic, boolean logic, member access — not
+//!   just equality). A condition that fails to
 //!   evaluate to a boolean raises an `ExpressionEvaluation` incident.
 //! * A `serviceTask` bearing a `zeebe:agentDefinition agentType="aiAgentTask"`
 //!   (or `"external"`) extension marker remains an ordinary
@@ -436,6 +443,11 @@ fn parse_with_captures(
     let mut current: Option<ProcessAcc> = None;
     // Index of the service task currently being read (to attach its job type).
     let mut cur_service_task: Option<usize> = None;
+    // Index of the plain `task`/`manualTask` currently being read. Tracked purely
+    // so its close handler can pop the io_stack only when the open handler
+    // actually pushed (an id-less task is never pushed) — mirroring the
+    // service/user/call trackers.
+    let mut cur_plain_task: Option<usize> = None;
     // Index of the user task currently being read (to attach assignment,
     // scheduling and priority expressions from its Zeebe extension elements).
     let mut cur_user_task: Option<usize> = None;
@@ -660,10 +672,39 @@ fn parse_with_captures(
                             "parallelGateway" => {
                                 acc.add_node(attrs, NodeKind::Parallel);
                             }
+                            // An inclusive (OR) gateway: a conditional split that
+                            // may take several outgoing flows, and a synchronising
+                            // join. Capture its `default` flow so it is only taken
+                            // when no conditional flow matches (mirroring the
+                            // exclusive gateway).
+                            "inclusiveGateway" => {
+                                let idx = acc.add_node(attrs, NodeKind::Inclusive);
+                                if let (Some(i), Some(d)) = (idx, attr(attrs, "default")) {
+                                    acc.nodes[i].default_flow = Some(d.to_string());
+                                }
+                            }
                             "eventBasedGateway" => {
                                 acc.add_node(attrs, NodeKind::EventBased);
                             }
                             "serviceTask" => {
+                                let idx = acc.add_node(attrs, NodeKind::Service);
+                                if !self_closing {
+                                    cur_service_task = idx;
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
+                                }
+                            }
+                            // A send task performs work via a job worker exactly
+                            // like a service task: Zeebe/C8 execute it against its
+                            // `zeebe:taskDefinition` (job type from that, else the
+                            // element id). It is the throwing cousin of
+                            // `receiveTask` (#1009); model it as a job-based
+                            // service task so a flow into it resolves and it
+                            // activates a single job rather than being dropped as
+                            // an unmodelled element (the misleading
+                            // "unknown target element" deploy error, #1168).
+                            "sendTask" => {
                                 let idx = acc.add_node(attrs, NodeKind::Service);
                                 if !self_closing {
                                     cur_service_task = idx;
@@ -836,6 +877,7 @@ fn parse_with_captures(
                                         signal_ref: None,
                                         condition: None,
                                         compensation: false,
+                                        escalation: false,
                                     });
                                 }
                             }
@@ -855,22 +897,57 @@ fn parse_with_captures(
                                 }
                             }
                             // `escalationEventDefinition escalationRef="…"` on an
-                            // escalation throw/catch/boundary event. Not modelled
-                            // for execution; the ref is recorded for #851.
+                            // escalation throw / end / boundary event. Escalation
+                            // is not modelled for execution, so every carrier is
+                            // rejected at deploy with a clear `UnsupportedElement`
+                            // naming the construct rather than silently
+                            // mis-executing (a throw/end demoted to a none
+                            // pass-through) or failing with a misleading "unknown
+                            // source element" at a boundary's outgoing flow. The
+                            // `escalationRef` is still recorded so the
+                            // reference-integrity validator (#851) rejects a
+                            // *dangling* ref first (a more specific diagnosis).
                             "escalationEventDefinition" => {
-                                let escalation_ref =
-                                    attr(attrs, "escalationRef").unwrap_or("").to_string();
-                                let owner = if let Some(boundary) = cur_boundary.as_ref() {
-                                    Some(boundary.id.clone())
-                                } else {
-                                    flow_node_stack
-                                        .iter()
-                                        .rev()
-                                        .find_map(|e| *e)
-                                        .map(|i| acc.nodes[i].id.clone())
-                                };
-                                if let Some(node_id) = owner {
-                                    acc.escalation_refs.push((node_id, escalation_ref));
+                                // Only record a reference site when `escalationRef`
+                                // is actually present. Recording a *missing* ref as
+                                // `""` would make the reference-integrity validator
+                                // (#851) reject the model as `UnresolvedReference`
+                                // (an empty id is never a declared `<escalation>`)
+                                // — and references run before `unsupported_elements`
+                                // (`validate::run` order), so a ref-less escalation
+                                // carrier would surface that misleading diagnosis
+                                // instead of the promised `UnsupportedElement` that
+                                // names the construct. Always record the carrier as
+                                // unsupported; only add a ref site when there is a
+                                // ref to resolve.
+                                let escalation_ref = attr(attrs, "escalationRef");
+                                if let Some(boundary) = cur_boundary.as_mut() {
+                                    // A boundary carrier: mark it so `build`
+                                    // rejects its outgoing flow with the naming
+                                    // error before the builder can fail on an
+                                    // "unknown source element".
+                                    boundary.escalation = true;
+                                    if let Some(escalation_ref) = escalation_ref {
+                                        acc.escalation_refs.push((
+                                            boundary.id.clone(),
+                                            escalation_ref.to_string(),
+                                        ));
+                                    }
+                                } else if let Some(node_id) = flow_node_stack
+                                    .iter()
+                                    .rev()
+                                    .find_map(|e| *e)
+                                    .map(|i| acc.nodes[i].id.clone())
+                                {
+                                    // A throw / end / catch carrier: record the
+                                    // ref for #851 (when present) and the placement
+                                    // as an unmodelled element so #853 rejects it.
+                                    if let Some(escalation_ref) = escalation_ref {
+                                        acc.escalation_refs
+                                            .push((node_id.clone(), escalation_ref.to_string()));
+                                    }
+                                    acc.unmodelled
+                                        .push(("escalationEventDefinition".to_string(), node_id));
                                 }
                             }
                             // `linkEventDefinition name="…"` on an intermediate
@@ -1217,6 +1294,7 @@ fn parse_with_captures(
                             "task" | "manualTask" => {
                                 let idx = acc.add_node(attrs, NodeKind::Task);
                                 if !self_closing {
+                                    cur_plain_task = idx;
                                     if let Some(i) = idx {
                                         io_stack.push(i);
                                     }
@@ -1621,6 +1699,7 @@ fn parse_with_captures(
                         processes.push(acc);
                     }
                     cur_service_task = None;
+                    cur_plain_task = None;
                     cur_flow = None;
                     cur_boundary = None;
                     cur_intermediate = None;
@@ -1643,23 +1722,48 @@ fn parse_with_captures(
                     extension_depth = 0;
                 }
                 "serviceTask" => {
+                    // Only pop when the open handler actually pushed. The push is
+                    // conditional on `add_node` returning `Some` (the task carries
+                    // an `id`); an id-less task is never pushed, so an
+                    // unconditional pop would detach the enclosing activity's
+                    // mapping owner and misattribute later `zeebe:ioMapping` data
+                    // — the same defect class the id-less event handlers guard
+                    // against. Safe because a task cannot nest another activity, so
+                    // `cur_service_task` here is still this task's own index.
+                    if cur_service_task.is_some() {
+                        io_stack.pop();
+                    }
                     cur_service_task = None;
-                    io_stack.pop();
+                }
+                "sendTask" => {
+                    if cur_service_task.is_some() {
+                        io_stack.pop();
+                    }
+                    cur_service_task = None;
                 }
                 "businessRuleTask" | "scriptTask" => {
+                    if cur_service_task.is_some() {
+                        io_stack.pop();
+                    }
                     cur_service_task = None;
-                    io_stack.pop();
                 }
                 "userTask" => {
+                    if cur_user_task.is_some() {
+                        io_stack.pop();
+                    }
                     cur_user_task = None;
-                    io_stack.pop();
                 }
                 "task" | "manualTask" => {
-                    io_stack.pop();
+                    if cur_plain_task.is_some() {
+                        io_stack.pop();
+                    }
+                    cur_plain_task = None;
                 }
                 "callActivity" => {
+                    if cur_call.is_some() {
+                        io_stack.pop();
+                    }
                     cur_call = None;
-                    io_stack.pop();
                 }
                 "subProcess" => {
                     if let Some(acc) = current.as_mut() {
@@ -1689,7 +1793,30 @@ fn parse_with_captures(
                     // boundaries (timerEventDefinition) and message boundaries
                     // (messageEventDefinition); ignore the rest.
                     if let (Some(acc), Some(boundary)) = (current.as_mut(), cur_boundary.take()) {
-                        if boundary.error_ref.is_some()
+                        if boundary.escalation {
+                            // An escalation boundary is not modelled for
+                            // execution. Reject it FIRST — before the
+                            // supported-definition branch below — so a boundary
+                            // that carries escalation *plus* a supported
+                            // definition (e.g. an `errorEventDefinition` or a
+                            // `timerEventDefinition` on the same boundary) is
+                            // still rejected rather than having the supported
+                            // definition silently mask the escalation and let
+                            // the model deploy, violating the promise that every
+                            // escalation carrier is cleanly rejected. Record it
+                            // two ways: (1) in `escalation_boundary_ids` so
+                            // `build` rejects a sequenceFlow wired to/from it
+                            // with a precise naming `UnsupportedElement` (the
+                            // wired-flow diagnostic); and (2) in `unmodelled` so
+                            // the unsupported-elements validator also rejects a
+                            // *detached* escalation boundary (one with no wired
+                            // flow), which would otherwise deploy silently.
+                            acc.unmodelled.push((
+                                "escalationEventDefinition".to_string(),
+                                boundary.id.clone(),
+                            ));
+                            acc.escalation_boundary_ids.push(boundary.id);
+                        } else if boundary.error_ref.is_some()
                             || boundary.timer_duration_millis.is_some()
                             || boundary.timer_expr.is_some()
                             || boundary.message_ref.is_some()
@@ -2062,6 +2189,7 @@ enum NodeKind {
     User,
     Exclusive,
     Parallel,
+    Inclusive,
     EventBased,
     IntermediateCatch,
     IntermediateThrow,
@@ -2126,6 +2254,12 @@ struct PendingBoundary {
     /// Its handler activity is resolved from the `<association>` wiring it to the
     /// `isForCompensation` handler at build.
     compensation: bool,
+    /// True when this boundary event carries an `escalationEventDefinition`.
+    /// Escalation is not modelled for execution, so such a boundary is not built
+    /// into an element; its id is collected so `build` rejects its outgoing flow
+    /// with a clear `UnsupportedElement` (naming the construct) instead of the
+    /// builder failing on an "unknown source element".
+    escalation: bool,
 }
 
 /// A definitions-level `<message>` declaration: its `name` and the instance
@@ -2184,6 +2318,12 @@ struct ProcessAcc {
     /// `<association>` `(sourceRef, targetRef)` pairs, used to wire a
     /// compensation boundary event to its `isForCompensation` handler activity.
     associations: Vec<(String, String)>,
+    /// Ids of `boundaryEvent`s carrying an `escalationEventDefinition`. Escalation
+    /// is not modelled for execution, so these are not built into elements;
+    /// `build` rejects any sequence flow touching one with a clear
+    /// `UnsupportedElement` (naming the construct) rather than letting the builder
+    /// fail on an "unknown source element" at the boundary's outgoing flow.
+    escalation_boundary_ids: Vec<String>,
     /// Stack of open embedded sub-process ids, used to scope nested nodes.
     scope_stack: Vec<String>,
 }
@@ -2203,6 +2343,7 @@ impl ProcessAcc {
             link_catches: Vec::new(),
             unmodelled: Vec::new(),
             associations: Vec::new(),
+            escalation_boundary_ids: Vec::new(),
             scope_stack: Vec::new(),
         }
     }
@@ -2959,6 +3100,7 @@ impl ProcessAcc {
                 NodeKind::Task => builder.task(node.id),
                 NodeKind::Exclusive => builder.exclusive_gateway(node.id),
                 NodeKind::Parallel => builder.parallel_gateway(node.id),
+                NodeKind::Inclusive => builder.inclusive_gateway(node.id),
                 NodeKind::EventBased => builder.event_based_gateway(node.id),
                 NodeKind::Service => {
                     // Agent classification is metadata on the job worker. Placement rules
@@ -3309,6 +3451,17 @@ impl ProcessAcc {
                 .into_iter()
                 .flatten()
             {
+                // An escalation boundary event is not modelled for execution.
+                // Reject its outgoing (or incoming) flow with a clear
+                // `UnsupportedElement` naming the construct rather than letting
+                // `builder.build()` fail below with a misleading "unknown source
+                // element" — the boundary was never built into an element.
+                if self.escalation_boundary_ids.iter().any(|id| id == endpoint) {
+                    return Err(ParseError::UnsupportedElement {
+                        tag: "escalationEventDefinition".to_string(),
+                        element_id: endpoint.to_string(),
+                    });
+                }
                 if compensation_boundary_ids.contains(endpoint) {
                     return Err(ParseError::InvalidProcess {
                         process_id: self.id.clone(),
@@ -4127,6 +4280,283 @@ mod tests {
             }
         );
         assert_eq!(def.element("start").unwrap().outgoing[0].to, "charge");
+    }
+
+    #[test]
+    fn should_parse_a_send_task_as_a_job_based_service_task() {
+        // A `sendTask` with a `zeebe:taskDefinition` is executed by a job worker
+        // exactly like a service task (its throwing cousin of `receiveTask`,
+        // #1168). A flow into it must resolve to a modelled element rather than
+        // failing deploy with the misleading "unknown target element" error.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="notify" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:sendTask id="send" name="Send Notification">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="notifier" retries="4" />
+      </bpmn:extensionElements>
+    </bpmn:sendTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="send" />
+    <bpmn:sequenceFlow id="f2" sourceRef="send" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(
+            def.element("send").unwrap().kind,
+            ElementKind::ServiceTask {
+                job_type: "notifier".to_string(),
+                priority: None,
+                agent_type: None,
+                custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
+            }
+        );
+        // The job type falls back to the element id when no taskDefinition type
+        // is given, mirroring a serviceTask.
+        assert_eq!(def.element("s").unwrap().outgoing[0].to, "send");
+        assert_eq!(def.element("send").unwrap().outgoing[0].to, "e");
+    }
+
+    #[test]
+    fn should_parse_a_bare_send_task_defaulting_job_type_to_its_id() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="notify" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:sendTask id="send" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="send" />
+    <bpmn:sequenceFlow id="f2" sourceRef="send" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(
+            def.element("send").unwrap().kind,
+            ElementKind::ServiceTask {
+                job_type: "send".to_string(),
+                priority: None,
+                agent_type: None,
+                custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn should_reject_a_non_interrupting_escalation_boundary_naming_the_construct() {
+        // The #1168 probe: a non-interrupting escalation boundary on a sub-process
+        // catching an escalation thrown from inside it. Escalation is not modelled
+        // for execution, so this must be rejected with an `UnsupportedElement`
+        // naming the construct — NOT the misleading "unknown source element Bnd"
+        // build error the boundary's dropped element used to produce.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="ss" />
+      <bpmn:intermediateThrowEvent id="Thr">
+        <bpmn:escalationEventDefinition escalationRef="Esc" />
+      </bpmn:intermediateThrowEvent>
+      <bpmn:endEvent id="se" />
+      <bpmn:sequenceFlow id="if1" sourceRef="ss" targetRef="Thr" />
+      <bpmn:sequenceFlow id="if2" sourceRef="Thr" targetRef="se" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="Sub" cancelActivity="false">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Handler" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Sub" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="Bnd" targetRef="Handler" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).expect_err("an escalation boundary must be rejected");
+        match err {
+            ParseError::UnsupportedElement { tag, element_id } => {
+                assert_eq!(tag, "escalationEventDefinition");
+                assert_eq!(element_id, "Bnd");
+            }
+            other => panic!("expected UnsupportedElement naming the boundary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_a_detached_escalation_boundary_that_has_no_wired_flow() {
+        // #1168 regression: an escalation boundary with NO outgoing sequenceFlow
+        // is not caught by the wired-flow diagnostic in `build` (which only fires
+        // when a flow names the boundary). Before recording escalation boundaries
+        // in `unmodelled`, such a detached boundary deployed SILENTLY —
+        // contradicting the clean rejection promised for every escalation carrier.
+        // It must now be rejected with an `UnsupportedElement` naming the boundary.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="ss" />
+      <bpmn:endEvent id="se" />
+      <bpmn:sequenceFlow id="if1" sourceRef="ss" targetRef="se" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="Sub" cancelActivity="false">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Sub" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err =
+            parse_bpmn(xml).expect_err("a detached escalation boundary must still be rejected");
+        match err {
+            ParseError::UnsupportedElement { tag, element_id } => {
+                assert_eq!(tag, "escalationEventDefinition");
+                assert_eq!(element_id, "Bnd");
+            }
+            other => panic!("expected UnsupportedElement naming the boundary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_a_boundary_that_carries_escalation_alongside_a_supported_definition() {
+        // #1168 regression: a boundary event carrying an `escalationEventDefinition`
+        // AND a supported definition (here an interrupting `errorEventDefinition`).
+        // Escalation must take precedence at boundary close, so the whole carrier
+        // is rejected with an `UnsupportedElement` naming the boundary. Before
+        // giving escalation precedence, the supported (error) branch built the
+        // boundary first and SILENTLY ignored the escalation flag — deploying a
+        // model that contradicts the clean rejection promised for every escalation
+        // carrier.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:error id="Err" name="Boom" errorCode="BOOM" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="ss" />
+      <bpmn:endEvent id="se" />
+      <bpmn:sequenceFlow id="if1" sourceRef="ss" targetRef="se" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="Sub">
+      <bpmn:errorEventDefinition errorRef="Err" />
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Handler" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Sub" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="Bnd" targetRef="Handler" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).expect_err(
+            "a boundary carrying escalation must be rejected even with a supported def",
+        );
+        match err {
+            ParseError::UnsupportedElement { tag, element_id } => {
+                assert_eq!(tag, "escalationEventDefinition");
+                assert_eq!(element_id, "Bnd");
+            }
+            other => panic!("expected UnsupportedElement naming the boundary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_an_escalation_throw_event_naming_the_construct() {
+        // An escalation intermediate throw event is not modelled for execution.
+        // It must be rejected with an `UnsupportedElement` rather than silently
+        // deploying as a none pass-through (the #1009 silent-skip class).
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:intermediateThrowEvent id="Thr">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:intermediateThrowEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Thr" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Thr" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).expect_err("an escalation throw must be rejected");
+        match err {
+            ParseError::UnsupportedElement { tag, element_id } => {
+                assert_eq!(tag, "escalationEventDefinition");
+                assert_eq!(element_id, "Thr");
+            }
+            other => panic!("expected UnsupportedElement naming the throw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_a_ref_less_escalation_throw_naming_the_construct() {
+        // A ref-*less* escalation carrier (no `escalationRef` attribute) must
+        // still be rejected as an `UnsupportedElement` naming the construct — not
+        // as an `UnresolvedReference`. Recording the absent ref as `""` used to
+        // register an empty reference site that the reference-integrity validator
+        // (which runs *before* the unsupported-elements validator) rejected first
+        // as a dangling `escalationRef`, masking the real diagnosis (#1168).
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:intermediateThrowEvent id="Thr">
+      <bpmn:escalationEventDefinition />
+    </bpmn:intermediateThrowEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Thr" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Thr" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).expect_err("a ref-less escalation throw must be rejected");
+        match err {
+            ParseError::UnsupportedElement { tag, element_id } => {
+                assert_eq!(tag, "escalationEventDefinition");
+                assert_eq!(element_id, "Thr");
+            }
+            other => panic!("expected UnsupportedElement, not a reference error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_an_escalation_end_event_naming_the_construct() {
+        // An escalation end event is likewise not modelled: rejected, not demoted
+        // to a plain none end event.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="EscEnd">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="EscEnd" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).expect_err("an escalation end event must be rejected");
+        match err {
+            ParseError::UnsupportedElement { tag, element_id } => {
+                assert_eq!(tag, "escalationEventDefinition");
+                assert_eq!(element_id, "EscEnd");
+            }
+            other => panic!("expected UnsupportedElement naming the end event, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5827,6 +6257,54 @@ mod tests {
         assert_eq!(io.outputs.len(), 1);
         assert_eq!(io.outputs[0].source, "=result");
         assert_eq!(io.outputs[0].target, "chargeResult");
+    }
+
+    #[test]
+    fn should_not_misattribute_io_mapping_after_an_id_less_activity() {
+        // given — a sub-process (pushed onto the io_stack) whose first child is an
+        // id-less `sendTask` (so `add_node` returns `None` and the task is never
+        // pushed), followed by the sub-process's own `zeebe:ioMapping`. A
+        // previously unconditional pop on `</sendTask>` would remove the enclosing
+        // sub-process from the io_stack, so the sub-process's own output mapping
+        // would fall onto a stray node (or be dropped). Same defect class as the
+        // id-less event handlers — every leaf-activity close path must guard its
+        // pop on having actually pushed.
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="sub" />
+              <bpmn:subProcess id="sub">
+                <bpmn:sendTask></bpmn:sendTask>
+                <bpmn:extensionElements>
+                  <zeebe:ioMapping>
+                    <zeebe:output source="=&#34;done&#34;" target="subOut" />
+                  </zeebe:ioMapping>
+                </bpmn:extensionElements>
+                <bpmn:startEvent id="ss" />
+                <bpmn:sequenceFlow id="f1" sourceRef="ss" targetRef="se" />
+                <bpmn:endEvent id="se" />
+              </bpmn:subProcess>
+              <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+              <bpmn:endEvent id="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then — the mapping still attaches to the enclosing sub-process, because
+        // the id-less send task never popped it off the io_stack.
+        let io = &def.element("sub").unwrap().io;
+        assert_eq!(
+            io.outputs.len(),
+            1,
+            "sub-process must keep its own output mapping after an id-less child activity"
+        );
+        assert_eq!(io.outputs[0].source, "=\"done\"");
+        assert_eq!(io.outputs[0].target, "subOut");
     }
 
     #[test]

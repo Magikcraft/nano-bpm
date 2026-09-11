@@ -131,9 +131,9 @@ mod tests {
                 r#"<bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
                    <bpmn:endEvent id="e"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
                    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />
-                   <bpmn:sendTask id="snd" />"#,
-                "sendTask",
-                "snd",
+                   <bpmn:callChoreographyTask id="cct" />"#,
+                "callChoreographyTask",
+                "cct",
             ),
             // Unsupported event definitions: an event the engine does not model
             // must reject, not silently degrade to a bare none event. The owning
@@ -221,23 +221,23 @@ mod tests {
     /// unsupported when the engine does not model it is accepted the moment the
     /// engine models it — and this file never mentions the tag. `receiveTask`
     /// (a modelled `ElementKind`) stands in for "a synthetic 'known' kind":
-    /// swapping the unsupported `sendTask` for the modelled `receiveTask` flips
-    /// reject → accept with no edit here, because the decision is derived from
-    /// the parser's registry, not a list maintained in this validator.
+    /// swapping the unsupported `complexGateway` for the modelled `receiveTask`
+    /// flips reject → accept with no edit here, because the decision is derived
+    /// from the parser's registry, not a list maintained in this validator.
     #[test]
     fn supported_set_is_derived_from_the_parser_not_a_local_list() {
         let unsupported = defs_xml(
             r#"<bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
                <bpmn:endEvent id="e"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
                <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />
-               <bpmn:sendTask id="t" />"#,
+               <bpmn:complexGateway id="t" />"#,
         );
         assert!(
             matches!(
                 parse_err(&unsupported),
                 Some(ParseError::UnsupportedElement { .. })
             ),
-            "an unmodelled `sendTask` must reject",
+            "an unmodelled `complexGateway` must reject",
         );
 
         let supported = defs_xml(

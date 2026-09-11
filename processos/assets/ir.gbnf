@@ -12,7 +12,7 @@
 root      ::= ws "process" sp string sp "{" nl indent "start" sp id nl elements flows "}" ws
 elements  ::= element*
 flows     ::= flow*
-element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-linkIntermediateThrowEvent | elem-linkIntermediateCatchEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
+element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-inclusiveGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-linkIntermediateThrowEvent | elem-linkIntermediateCatchEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
 
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
@@ -66,6 +66,11 @@ attr-line-exclusiveGateway  ::= attr-parent | attr-retries | attr-timer | attr-i
 elem-parallelGateway  ::= indent "parallelGateway" sp id (sp string)? (sp attrs-parallelGateway)? nl
 attrs-parallelGateway   ::= "{" nl (indent2 attr-line-parallelGateway nl)+ indent "}"
 attr-line-parallelGateway  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+
+# inclusiveGateway — OR gateway. Splits to every outgoing flow whose condition holds (default is fallback); joins by waiting until no in-flight token could still reach it.
+elem-inclusiveGateway  ::= indent "inclusiveGateway" sp id (sp string)? (sp attrs-inclusiveGateway)? nl
+attrs-inclusiveGateway   ::= "{" nl (indent2 attr-line-inclusiveGateway nl)+ indent "}"
+attr-line-inclusiveGateway  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
 
 # eventBasedGateway — Deferred choice. Arms all downstream intermediate catch events at once; the first to fire wins and the losing siblings are withdrawn.
 elem-eventBasedGateway  ::= indent "eventBasedGateway" sp id (sp string)? (sp attrs-eventBasedGateway)? nl

@@ -396,6 +396,7 @@ fn callactivity_variant_witness_is_exhaustive() {
             UserTask(_) => "userTask",
             ExclusiveGateway => "exclusiveGateway",
             ParallelGateway => "parallelGateway",
+            InclusiveGateway => "inclusiveGateway",
             EventBasedGateway => "eventBasedGateway",
             ErrorBoundaryEvent { .. } => "errorBoundaryEvent",
             TimerIntermediateCatchEvent { .. } => "timerIntermediateCatchEvent",

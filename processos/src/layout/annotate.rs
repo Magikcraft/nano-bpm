@@ -16,11 +16,14 @@
 //! their outputs into a single [`SemanticAnnotations`]:
 //!
 //! 1. **Structural** ([`infer`], slice 1): tracing from `start_event` through
-//!    every non-gateway element's outgoing flows and each exclusive
-//!    gateway's `is_default` (or first) outgoing yields the *primary flow*.
+//!    every non-gateway element's outgoing flows and each exclusive **or
+//!    inclusive** gateway's `is_default` (or first) outgoing yields the
+//!    *primary flow* (both condition-routed gateway kinds pick a single
+//!    representative branch for the spine).
 //!    Every interrupting boundary event (error / timer / message / signal /
 //!    conditional) seeds an *exception flow* spanning everything reachable
-//!    downstream. `ExclusiveGateway → decision`, `UserTask → review`.
+//!    downstream. `ExclusiveGateway`/`InclusiveGateway → decision` (both
+//!    condition-routed gateway kinds), `UserTask → review`.
 //! 2. **Heuristic** ([`heuristic_roles_and_clusters`], slice 2): name and
 //!    `jobType` regex matching upgrades tasks to
 //!    [`Role::Notification`] (`notify|send.?email|send.?sms|escalate`),
@@ -112,7 +115,13 @@ fn trace_primary(def: &ProcessDefinition) -> Option<Vec<String>> {
         order.push(id.clone());
         let Some(el) = def.element(&id) else { continue };
         let next: Vec<String> = match &el.kind {
-            ElementKind::ExclusiveGateway => el
+            // Both condition-routed gateway kinds pick a single representative
+            // branch for the primary spine — its `is_default` (or first)
+            // outgoing. An inclusive gateway can fire several branches at
+            // runtime, but following *all* of them here would mark every branch
+            // as primary (the exact flat-line failure this module fixes), so it
+            // is traced like an exclusive gateway.
+            ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway => el
                 .outgoing
                 .iter()
                 .find(|f| f.is_default)
@@ -204,7 +213,11 @@ fn infer_roles(def: &ProcessDefinition) -> std::collections::BTreeMap<String, Ro
     let mut roles = std::collections::BTreeMap::new();
     for el in def.elements.values() {
         let role = match &el.kind {
-            ElementKind::ExclusiveGateway => Some(Role::Decision),
+            // Both condition-routed gateway kinds are decisions: an inclusive
+            // (OR) gateway evaluates its branch conditions exactly as an
+            // exclusive (XOR) one does, so it carries the same `Decision` role in
+            // the inferred contract (a parallel/event-based gateway does not).
+            ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway => Some(Role::Decision),
             ElementKind::UserTask(_) => Some(Role::Review),
             _ => None,
         };
@@ -455,6 +468,98 @@ mod tests {
             Some(Role::Decision),
             "exclusive gateway {} should be a decision role",
             gw.id
+        );
+    }
+
+    #[test]
+    fn roles_tag_inclusive_gateways_as_decisions() {
+        // An inclusive (OR) gateway is condition-routed just like an exclusive
+        // one, so `infer_roles` must classify it as a `Decision` too — otherwise
+        // the new gateway kind would silently vanish from the inferred role
+        // contract processos consumers rely on.
+        const INCLUSIVE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  id="Definitions_or" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="OrProcess" isExecutable="true">
+    <bpmn:startEvent id="Start_1"><bpmn:outgoing>Flow_1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:inclusiveGateway id="GwOr" name="which?" default="Flow_b">
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+      <bpmn:outgoing>Flow_a</bpmn:outgoing>
+      <bpmn:outgoing>Flow_b</bpmn:outgoing>
+    </bpmn:inclusiveGateway>
+    <bpmn:endEvent id="End_a"><bpmn:incoming>Flow_a</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="End_b"><bpmn:incoming>Flow_b</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="GwOr"/>
+    <bpmn:sequenceFlow id="Flow_a" sourceRef="GwOr" targetRef="End_a">
+      <bpmn:conditionExpression>=go</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_b" sourceRef="GwOr" targetRef="End_b"/>
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="Diagram_or">
+    <bpmndi:BPMNPlane id="Plane_or" bpmnElement="OrProcess">
+      <bpmndi:BPMNShape id="Start_1_di" bpmnElement="Start_1">
+        <dc:Bounds x="150" y="102" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="GwOr_di" bpmnElement="GwOr" isMarkerVisible="true">
+        <dc:Bounds x="255" y="95" width="50" height="50"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_a_di" bpmnElement="End_a">
+        <dc:Bounds x="412" y="52" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_b_di" bpmnElement="End_b">
+        <dc:Bounds x="412" y="152" width="36" height="36"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1">
+        <di:waypoint x="186" y="120"/>
+        <di:waypoint x="255" y="120"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_a_di" bpmnElement="Flow_a">
+        <di:waypoint x="305" y="112"/>
+        <di:waypoint x="412" y="70"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_b_di" bpmnElement="Flow_b">
+        <di:waypoint x="305" y="128"/>
+        <di:waypoint x="412" y="170"/>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>"#;
+        let defs = parse_bpmn(INCLUSIVE_XML).expect("parse");
+        let def = defs.into_iter().next().expect("one process");
+        let ann = infer(&def);
+        let gw = def
+            .elements
+            .values()
+            .find(|el| matches!(el.kind, ElementKind::InclusiveGateway))
+            .expect("fixture has an inclusive gateway");
+        assert_eq!(
+            ann.roles.get(&gw.id).copied(),
+            Some(Role::Decision),
+            "inclusive gateway {} should be a decision role",
+            gw.id
+        );
+        // `trace_primary` must treat the inclusive gateway like an exclusive
+        // one: follow its `default` branch (Flow_b → End_b) for the primary
+        // spine, not fan out across every outgoing branch (which would mark the
+        // non-default End_a as primary too — the flat-line failure this module
+        // exists to prevent).
+        let primary = ann
+            .flows
+            .iter()
+            .find(|f| f.kind == FlowKind::Primary)
+            .expect("primary flow inferred");
+        assert!(
+            primary.nodes.iter().any(|n| n == "End_b"),
+            "primary follows the inclusive gateway's default branch, got {:?}",
+            primary.nodes
+        );
+        assert!(
+            !primary.nodes.iter().any(|n| n == "End_a"),
+            "primary must not visit the non-default inclusive branch, got {:?}",
+            primary.nodes
         );
     }
 

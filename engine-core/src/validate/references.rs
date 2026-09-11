@@ -577,12 +577,19 @@ mod tests {
                 expect: Expect::Unresolved("escalationRef", "M", "e"),
             },
             Case {
-                name: "resolved escalationRef",
+                // The escalation *reference* resolves, but escalation is not
+                // modelled for execution, so the construct is now rejected
+                // downstream by the unsupported-elements validator (#853, #1168)
+                // rather than silently deploying as a none pass-through. The
+                // reference-integrity pass here still accepts it — the rejection
+                // is a later, separate diagnosis — so from this suite's vantage
+                // the definition is simply rejected, not accepted.
+                name: "resolved escalationRef (construct still unsupported)",
                 defs: r#"<bpmn:escalation id="M" escalationCode="C1"/>"#,
                 body: r#"<bpmn:startEvent id="s"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
                          <bpmn:endEvent id="e"><bpmn:incoming>a</bpmn:incoming><bpmn:escalationEventDefinition escalationRef="M"/></bpmn:endEvent>
                          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="e"/>"#,
-                expect: Expect::Accepted,
+                expect: Expect::Rejected,
             },
             Case {
                 name: "dangling default flow",

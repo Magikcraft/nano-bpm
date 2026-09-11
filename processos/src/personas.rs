@@ -370,8 +370,8 @@ the tools. Your VERY FIRST action in this conversation must be to call read_mode
 \n\
 Start from the model. Use read_model to get the distilled structural graph (nodes, kinds, flows, \
 reachability, gateway roles, service-task job types) and analyze_model to get deterministic static \
-findings (missing end events, unreachable or dead-end nodes, exclusive gateways without a default \
-flow, unguarded service tasks, parallel-join deadlock hazards, exclusive joins of parallel paths, \
+findings (missing end events, unreachable or dead-end nodes, exclusive OR inclusive (condition-routed) \
+gateways without a default flow, unguarded service tasks, parallel-join deadlock hazards, exclusive joins of parallel paths, \
 rework loops). These tools work with ZERO trace data — a clean design-time review is valid on its \
 own. Only if read_model itself returns an error saying no model exists should you tell the operator \
 the model is unavailable.\n\
@@ -565,8 +565,9 @@ type) so the existing worker output replays; do not invent a new worker for it. 
 a `structuralDivergence` hint (or a non-empty `divergentWorkers`), an EXISTING worker with real \
 recorded history was issued more often than history did — your topology routes a branch that did not \
 occur (a broken gateway, a condition on the wrong element, or a duplicated path). Do NOT add \
-mockWorkers for those job types; instead FIX THE STRUCTURE — note that this engine only evaluates flow \
-conditions on an exclusive (XOR) gateway, so branch conditions belong on a `<bpmn:exclusiveGateway>`, \
+mockWorkers for those job types; instead FIX THE STRUCTURE — note that this engine evaluates flow \
+conditions only on an exclusive (XOR) or inclusive (OR) gateway, so branch conditions belong on a \
+`<bpmn:exclusiveGateway>` or `<bpmn:inclusiveGateway>`, \
 never on a service task's or event's outgoing flows (run analyze_model and heed any \
 `condition-on-non-gateway` warning). Worker COUNT / concurrency is DEPLOYMENT CONFIG, not a BPMN \
 property: when the bottleneck is UNDER-PROVISIONING — a high queue_ms tail, a growing backlog, or \

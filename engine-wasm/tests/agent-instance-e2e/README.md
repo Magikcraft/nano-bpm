@@ -12,6 +12,11 @@ These probes exercise real `@nanobpm/engine-wasm` lean and read-model artifacts:
   cleanup. Response field lists come directly from `spec/agent-instances.yaml`.
 - `external-routing.mjs`: external/aiAgentTask routing, expression and element-id
   fallback, priority/retries, headers, and linked prompt resources.
+- `element-support.mjs`: deploy + createInstance for `sendTask` and
+  `inclusiveGateway` (#1168) against both committed wasm variants, so the
+  advertised element support cannot regress on a stale/un-regenerated `pkg`
+  even while the native Rust tests pass. Uses the shared canonical diagrams in
+  `engine-core/tests/fixtures/`.
 
 Run against freshly generated artifacts:
 

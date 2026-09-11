@@ -17,14 +17,16 @@
 //! A gateway with a single outgoing flow is exempt (there is nothing to gate),
 //! matching Zeebe.
 //!
-//! Only **exclusive** gateways are reachable here today: Nano does not model the
-//! **inclusive** gateway, so an `<inclusiveGateway>` is rejected earlier — by the
-//! `unsupported_elements` validator (#853) as an `UnsupportedElement`, or, before
-//! that lands, by the builder as a dangling flow target — and never reaches this
-//! pass. The rule is written to cover every condition-routed gateway kind Nano
-//! models; when inclusive-gateway support is added to
-//! [`ElementKind`](crate::model::ElementKind), extend [`is_condition_routed`] to
-//! include it and this rule guards it with no further change.
+//! Only **exclusive** gateways were reachable here historically: before Nano
+//! modelled the **inclusive** gateway an `<inclusiveGateway>` was rejected
+//! earlier — by the `unsupported_elements` validator (#853) as an
+//! `UnsupportedElement`, or, before that landed, by the builder as a dangling
+//! flow target — and never reached this pass. Now that
+//! [`ElementKind`](crate::model::ElementKind) models the inclusive gateway
+//! ([`ElementKind::InclusiveGateway`]), [`is_condition_routed`] includes it and
+//! this rule guards it directly — an inclusive gateway with a conditionless,
+//! non-default branch is rejected here with the same `InvalidGateway` error as
+//! an exclusive one, matching Zeebe's *"Must have a condition"*.
 //!
 //! [`SequenceFlow`]: crate::model::SequenceFlow
 
@@ -38,7 +40,10 @@ use crate::model::ElementKind;
 /// event-based gateways (a deferred choice over downstream catch events, not
 /// conditions) are deliberately excluded.
 fn is_condition_routed(kind: &ElementKind) -> bool {
-    matches!(kind, ElementKind::ExclusiveGateway)
+    matches!(
+        kind,
+        ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway
+    )
 }
 
 pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
@@ -218,13 +223,12 @@ mod tests {
         assert!(parse_one(body).is_ok());
     }
 
-    /// Inclusive gateways are equally condition-routed in Zeebe, but Nano does
-    /// not model them, so an `<inclusiveGateway>` with a conditionless
-    /// non-default branch never deploys — it is rejected upstream (as an
-    /// unsupported element / a dangling flow target) before this pass runs. This
-    /// guards the parity outcome (an invalid inclusive gateway does not silently
-    /// deploy) and will fail loudly if inclusive support is ever added without
-    /// extending this rule to cover it.
+    /// Inclusive gateways are equally condition-routed in Zeebe, and now that
+    /// Nano models them ([`ElementKind::InclusiveGateway`]) this rule guards them
+    /// directly: an `<inclusiveGateway>` with a conditionless, non-default branch
+    /// is rejected here with `InvalidGateway` — the same parity outcome Zeebe's
+    /// *"Must have a condition"* produces — rather than silently deploying and
+    /// selecting the unconditional branch by document order.
     #[test]
     fn inclusive_gateway_conditionless_branch_does_not_deploy() {
         let body = r#"<bpmn:startEvent id="s"/>
@@ -234,6 +238,20 @@ mod tests {
             <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="gw"/>
             <bpmn:sequenceFlow id="f1" sourceRef="gw" targetRef="e1"><bpmn:conditionExpression>=x&gt;1</bpmn:conditionExpression></bpmn:sequenceFlow>
             <bpmn:sequenceFlow id="f2" sourceRef="gw" targetRef="e2"/>"#;
-        assert!(parse_one(body).is_err());
+        assert!(is_invalid_gateway(&parse_one(body)));
+    }
+
+    /// An inclusive gateway whose non-default branches all carry a condition
+    /// deploys — the inclusive-OR split is a legitimate, modelled construct.
+    #[test]
+    fn inclusive_gateway_with_conditioned_branches_deploys() {
+        let body = r#"<bpmn:startEvent id="s"/>
+            <bpmn:inclusiveGateway id="gw"/>
+            <bpmn:endEvent id="e1"/>
+            <bpmn:endEvent id="e2"/>
+            <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="gw"/>
+            <bpmn:sequenceFlow id="f1" sourceRef="gw" targetRef="e1"><bpmn:conditionExpression>=x&gt;1</bpmn:conditionExpression></bpmn:sequenceFlow>
+            <bpmn:sequenceFlow id="f2" sourceRef="gw" targetRef="e2"><bpmn:conditionExpression>=x&lt;=1</bpmn:conditionExpression></bpmn:sequenceFlow>"#;
+        assert!(parse_one(body).is_ok());
     }
 }

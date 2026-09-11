@@ -321,7 +321,10 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > **exclusive (XOR) gateways** (FEEL condition-based routing with a default flow,
 > raising an incident when nothing matches or a condition fails to evaluate),
 > **parallel (AND) gateways**
-> (split takes all branches; join synchronises them), **timer intermediate
+> (split takes all branches; join synchronises them),
+> **inclusive (OR) gateways** (split takes every outgoing flow whose FEEL
+> condition holds, falling back to the default flow; the join waits at token
+> quiescence until no still-in-flight token could reach it), **timer intermediate
 > catch events** (a token parks until its `timeDuration` elapses, fired by a
 > host clock tick) and **message events** — **message intermediate catch events**
 > (a token parks until a matching message is correlated) and **interrupting
@@ -381,6 +384,11 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > `zeebe:subscription` and `startEvent` message/timer definitions) via the
 > [`bpmn`] module (`bpmn::parse_bpmn`), a tiny dependency-free scanner.
 > Deployments assign a per-id **version** and a unique process-definition key.
+> A `sendTask` is parsed as a job-backed **service task** (Zeebe models
+> send tasks as ordinary job workers). Constructs the engine does not execute —
+> notably `escalationEventDefinition` (escalation throw, end and boundary
+> events) — are **rejected at deploy** with an `UnsupportedElement` error that
+> names the construct, rather than being silently dropped.
 > Deeper sub-process nesting is an intended extension point — new element kinds
 > plug into `process_step` without touching the
 > architecture.

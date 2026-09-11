@@ -129,8 +129,9 @@ impl Condition {
     }
 
     /// Evaluates the condition against a set of variables, returning the FEEL
-    /// error on a parse/type failure or a non-boolean result. The exclusive
-    /// gateway turns such an error into an `ExpressionEvaluation` incident.
+    /// error on a parse/type failure or a non-boolean result. A condition-routed
+    /// gateway (exclusive or inclusive) turns such an error into an
+    /// `ExpressionEvaluation` incident.
     pub fn eval(&self, variables: &HashMap<String, Value>) -> Result<bool, crate::feel::FeelError> {
         crate::feel::eval_bool(&self.expression, variables)
     }
@@ -141,13 +142,19 @@ impl Condition {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SequenceFlow {
     pub to: ElementId,
-    /// `None` means an unconditional flow. On an exclusive gateway an
-    /// unconditional flow acts as the default (place it last).
+    /// `None` means an unconditional flow (its absent guard always holds). The
+    /// two condition-routed gateways treat that differently: an **exclusive**
+    /// gateway takes only the *first* matching flow in document order, so an
+    /// unconditional flow placed last acts as a de-facto default; an
+    /// **inclusive** gateway takes *every* matching flow, so an unconditional
+    /// non-default flow is **always** selected (never a fallback). For an
+    /// inclusive fallback use the explicit [`is_default`](Self::is_default) flow,
+    /// which is chosen only when no other flow matches (see `select_inclusive_flows`).
     pub condition: Option<Condition>,
-    /// True when this is the exclusive gateway's explicit **default** flow (the
-    /// gateway's `default="..."` attribute). A default flow is selected only as a
-    /// fallback — after every non-default flow's condition has evaluated false —
-    /// regardless of its document order among the outgoing flows.
+    /// True when this is the condition-routed gateway's explicit **default** flow
+    /// (the gateway's `default="..."` attribute). A default flow is selected only
+    /// as a fallback — after every non-default flow's condition has evaluated
+    /// false — regardless of its document order among the outgoing flows.
     #[cfg_attr(feature = "serde", serde(default))]
     pub is_default: bool,
 }
@@ -530,6 +537,18 @@ pub enum ElementKind {
     /// join (more than one incoming flow) it waits for a token on every incoming
     /// flow before producing one outgoing token.
     ParallelGateway,
+    /// An inclusive (OR) gateway. As a split it takes *every* outgoing flow whose
+    /// condition holds — an unconditional (non-default) flow is always taken —
+    /// falling back to the explicit `default` flow only when no conditional flow
+    /// matches (a no-matching-flow incident when there is no default). As a join
+    /// (more than one incoming flow) it synchronises: it waits until no token
+    /// still in the instance could reach it (every branch that will arrive has
+    /// arrived) and then produces its outgoing token(s). A gateway that is both a
+    /// join and a split first synchronises, then re-evaluates its outgoing
+    /// conditions. Join readiness is evaluated at token quiescence — when no work
+    /// is in flight — so an in-transit sibling token is never mistaken for a
+    /// branch that will not arrive.
+    InclusiveGateway,
     /// An event-based gateway: a *deferred choice* over the intermediate catch
     /// events (timer/message/signal/conditional) that immediately follow it.
     /// On arrival it takes *all* outgoing flows — arming every downstream catch
@@ -904,6 +923,7 @@ impl ElementKind {
             | ElementKind::CompensationThrowEvent
             | ElementKind::ExclusiveGateway
             | ElementKind::ParallelGateway
+            | ElementKind::InclusiveGateway
             | ElementKind::EventBasedGateway => false,
         }
     }
@@ -943,6 +963,7 @@ impl ElementKind {
             ElementKind::UserTask(_) => "USER_TASK",
             ElementKind::ExclusiveGateway => "EXCLUSIVE_GATEWAY",
             ElementKind::ParallelGateway => "PARALLEL_GATEWAY",
+            ElementKind::InclusiveGateway => "INCLUSIVE_GATEWAY",
             ElementKind::EventBasedGateway => "EVENT_BASED_GATEWAY",
             ElementKind::SubProcess { .. } => "SUB_PROCESS",
             ElementKind::CallActivity { .. } => "CALL_ACTIVITY",
@@ -1987,6 +2008,15 @@ impl ProcessBuilder {
         self.add(id, ElementKind::ParallelGateway)
     }
 
+    /// Adds an inclusive (OR) gateway. As a split it takes every outgoing flow
+    /// whose condition holds (an unconditional non-default flow is always taken),
+    /// falling back to the `default` flow when none match. As a join it waits
+    /// until no token still in the instance could reach it before producing its
+    /// outgoing token(s).
+    pub fn inclusive_gateway(self, id: impl Into<String>) -> Self {
+        self.add(id, ElementKind::InclusiveGateway)
+    }
+
     /// Adds an event-based gateway: a deferred choice over the intermediate
     /// catch events that immediately follow it. On arrival it takes every
     /// outgoing flow (arming each downstream catch event); the first to fire
@@ -2404,10 +2434,10 @@ impl ProcessBuilder {
         self
     }
 
-    /// Adds an exclusive gateway's explicit **default** sequence flow from `from`
-    /// to `to`. It carries no condition and is taken only as a fallback (when no
-    /// non-default flow's condition is satisfied), irrespective of its position
-    /// in the outgoing-flow order.
+    /// Adds a condition-routed gateway's (exclusive or inclusive) explicit
+    /// **default** sequence flow from `from` to `to`. It carries no condition and
+    /// is taken only as a fallback (when no non-default flow's condition is
+    /// satisfied), irrespective of its position in the outgoing-flow order.
     pub fn connect_default(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
         self.edges.push((
             from.into(),
@@ -2420,8 +2450,9 @@ impl ProcessBuilder {
         self
     }
 
-    /// Adds a conditional sequence flow from `from` to `to`, taken (on an
-    /// exclusive gateway) only when the FEEL `expression` evaluates to `true`.
+    /// Adds a conditional sequence flow from `from` to `to`, taken (on a
+    /// condition-routed gateway — exclusive or inclusive) only when the FEEL
+    /// `expression` evaluates to `true`.
     pub fn connect_when(
         mut self,
         from: impl Into<String>,

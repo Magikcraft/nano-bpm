@@ -46,6 +46,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::UserTask(_) => "userTask",
         ElementKind::ExclusiveGateway => "exclusiveGateway",
         ElementKind::ParallelGateway => "parallelGateway",
+        ElementKind::InclusiveGateway => "inclusiveGateway",
         ElementKind::EventBasedGateway => "eventBasedGateway",
         ElementKind::ErrorBoundaryEvent { .. } => "errorBoundaryEvent",
         ElementKind::TimerIntermediateCatchEvent { .. } => "timerIntermediateCatchEvent",
@@ -95,6 +96,7 @@ fn is_gateway(kind: &ElementKind) -> bool {
         kind,
         ElementKind::ExclusiveGateway
             | ElementKind::ParallelGateway
+            | ElementKind::InclusiveGateway
             | ElementKind::EventBasedGateway
     )
 }
@@ -867,14 +869,17 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
             }
         }
 
-        // Conditional sequence flow leaving a node that is NOT an exclusive gateway:
-        // this engine only honours flow conditions on an exclusive (XOR) split. A
-        // condition on a service task's / event's / parallel split's outgoing flow is
-        // silently ignored — a common authoring corruption where branch conditions get
-        // moved off the gateway onto a downstream task (the routing then breaks, but no
-        // exclusive-no-default warning fires). Flag it so the model fixes the topology.
-        if !matches!(kind, ElementKind::ExclusiveGateway)
-            && el.outgoing.iter().any(|f| f.condition.is_some())
+        // Conditional sequence flow leaving a node that is NOT a condition-routed
+        // gateway: this engine only honours flow conditions on an exclusive (XOR)
+        // or inclusive (OR) split. A condition on a service task's / event's /
+        // parallel split's outgoing flow is silently ignored — a common authoring
+        // corruption where branch conditions get moved off the gateway onto a
+        // downstream task (the routing then breaks, but no gateway-no-default
+        // warning fires). Flag it so the model fixes the topology.
+        if !matches!(
+            kind,
+            ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway
+        ) && el.outgoing.iter().any(|f| f.condition.is_some())
         {
             let conds = el.outgoing.iter().filter(|f| f.condition.is_some()).count();
             findings.push(finding(
@@ -883,28 +888,34 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
                 Some(id),
                 format!(
                     "'{id}' ({}) has {conds} conditional outgoing flow(s), but only an \
-                     exclusive (XOR) gateway evaluates flow conditions here — these conditions \
-                     are ignored and routing is wrong. Put the branch conditions on an exclusive \
-                     gateway, not on this node.",
+                     exclusive (XOR) or inclusive (OR) gateway evaluates flow conditions here — \
+                     these conditions are ignored and routing is wrong. Put the branch conditions \
+                     on an exclusive (XOR) or inclusive (OR) gateway, not on this node.",
                     kind_label(kind)
                 ),
             ));
         }
 
         match kind {
-            // Exclusive split with every branch guarded: if no condition matches and there
-            // is no default flow, the token has nowhere to go.
-            ElementKind::ExclusiveGateway if el.outgoing.len() > 1 => {
+            // A condition-routed split (XOR or OR) with every branch guarded: if no
+            // condition matches and there is no default flow, the token has nowhere
+            // to go (an exclusive gateway gets stuck; an inclusive gateway raises a
+            // `NoMatchingSequenceFlow` incident at quiescence). Same defect, so one
+            // gateway-neutral advisory covers both condition-routed kinds.
+            ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway
+                if el.outgoing.len() > 1 =>
+            {
                 let has_default = el.outgoing.iter().any(|f| f.condition.is_none());
                 if !has_default {
                     findings.push(finding(
                         "warn",
-                        "exclusive-no-default",
+                        "gateway-no-default",
                         Some(id),
                         format!(
-                            "Exclusive gateway '{id}' splits {} ways but every flow is \
+                            "{} '{id}' splits {} ways but every flow is \
                              conditional (no default) — if no condition holds the token gets \
                              stuck.",
+                            kind_label(kind),
                             el.outgoing.len()
                         ),
                     ));
@@ -940,23 +951,29 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
         // Join hazards (heuristic, via ancestry).
         if matches!(kind, ElementKind::ParallelGateway) && def.incoming_count(id) > 1 {
             let anc = ancestors(id, &rev);
-            let exclusive_split_upstream = anc.iter().any(|a| {
+            let conditional_split_upstream = anc.iter().any(|a| {
                 def.elements
                     .get(a)
                     .map(|e| {
-                        matches!(e.kind, ElementKind::ExclusiveGateway) && e.outgoing.len() > 1
+                        // A condition-routed split (XOR or OR) may activate only
+                        // some of its outgoing branches, so a downstream parallel
+                        // (AND) join that waits for all of them can deadlock.
+                        matches!(
+                            e.kind,
+                            ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway
+                        ) && e.outgoing.len() > 1
                     })
                     .unwrap_or(false)
             });
-            if exclusive_split_upstream {
+            if conditional_split_upstream {
                 findings.push(finding(
                     "info",
                     "parallel-join-may-deadlock",
                     Some(id),
                     format!(
-                        "Parallel (AND) join '{id}' waits for all incoming branches, but an \
-                         exclusive split upstream may activate only some of them — risk of a \
-                         token waiting forever. Verify branch arrival in the traces."
+                        "Parallel (AND) join '{id}' waits for all incoming branches, but a \
+                         conditional (XOR/OR) split upstream may activate only some of them — \
+                         risk of a token waiting forever. Verify branch arrival in the traces."
                     ),
                 ));
             }
@@ -2153,6 +2170,15 @@ propagateAllChildVariables=\"{propagate_all_child_variables}\"/>\n",
         ElementKind::ParallelGateway => {
             out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"{na}/>\n"));
         }
+        ElementKind::InclusiveGateway => {
+            let da = default_flows
+                .get(id)
+                .map(|f| format!(" default=\"{}\"", xml_escape(f)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "    <bpmn:inclusiveGateway id=\"{eid}\"{na}{da}/>\n"
+            ));
+        }
         ElementKind::EventBasedGateway => {
             out.push_str(&format!("    <bpmn:eventBasedGateway id=\"{eid}\"{na}/>\n"));
         }
@@ -3090,6 +3116,7 @@ fn node_dims(kind: &ElementKind) -> (f64, f64) {
         | ElementKind::SubProcess { .. } => (110.0, 80.0),
         ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
+        | ElementKind::InclusiveGateway
         | ElementKind::EventBasedGateway => (50.0, 50.0),
         _ => (36.0, 36.0),
     }
@@ -3423,9 +3450,14 @@ fn append_diagram(
     ));
     for id in &ids {
         if let Some(b) = rects.get(id) {
-            // An exclusive gateway only shows its X marker when the shape opts in; without this it
-            // renders as an empty diamond indistinguishable from a parallel gateway.
-            let marker = if matches!(def.elements[id].kind, ElementKind::ExclusiveGateway) {
+            // A gateway only shows its distinguishing marker when the shape
+            // opts in via `isMarkerVisible`; without it an exclusive (X) or
+            // inclusive (O) gateway renders as an empty diamond
+            // indistinguishable from a parallel gateway.
+            let marker = if matches!(
+                def.elements[id].kind,
+                ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway
+            ) {
                 " isMarkerVisible=\"true\""
             } else {
                 ""
@@ -4026,8 +4058,8 @@ mod tests {
     fn analyze_model_flags_unguarded_service_tasks() {
         let v = analyze_model(LOAN_BPMN).expect("analyze");
         let findings = v["findings"].as_array().unwrap();
-        // Default flow f3 exists, so NO exclusive-no-default finding.
-        assert!(!findings.iter().any(|f| f["code"] == "exclusive-no-default"));
+        // Default flow f3 exists, so NO gateway-no-default finding.
+        assert!(!findings.iter().any(|f| f["code"] == "gateway-no-default"));
         // All three service tasks lack error/timer boundaries -> unguarded info.
         let unguarded: Vec<&str> = findings
             .iter()
@@ -4102,6 +4134,96 @@ mod tests {
             .any(|f| f["code"] == "condition-on-non-gateway"
                 && f["element"] == "Handler"
                 && f["severity"] == "warn"));
+    }
+
+    #[test]
+    fn analyze_model_flags_gateways_with_no_default_flow() {
+        // Both a condition-routed exclusive (XOR) and inclusive (OR) split with
+        // every outgoing flow guarded and no default flow trip the gateway-neutral
+        // `gateway-no-default` advisory: if no condition holds the token is stuck
+        // (XOR) or the OR join raises a no-matching-flow incident at quiescence.
+        for (kw, gw_id) in [("exclusiveGateway", "X"), ("inclusiveGateway", "O")] {
+            let bpmn = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="d">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:{kw} id="{gw_id}">
+      <bpmn:incoming>a</bpmn:incoming>
+      <bpmn:outgoing>hi</bpmn:outgoing>
+      <bpmn:outgoing>lo</bpmn:outgoing>
+    </bpmn:{kw}>
+    <bpmn:endEvent id="EHi"><bpmn:incoming>hi</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="ELo"><bpmn:incoming>lo</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="a" sourceRef="S" targetRef="{gw_id}"/>
+    <bpmn:sequenceFlow id="hi" sourceRef="{gw_id}" targetRef="EHi">
+      <bpmn:conditionExpression>= x &gt;= 1</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="lo" sourceRef="{gw_id}" targetRef="ELo">
+      <bpmn:conditionExpression>= x &lt; 1</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+  </bpmn:process>
+</bpmn:definitions>"#
+            );
+            let v = analyze_model(&bpmn).expect("analyze");
+            let findings = v["findings"].as_array().unwrap();
+            assert!(
+                findings.iter().any(|f| f["code"] == "gateway-no-default"
+                    && f["element"] == gw_id
+                    && f["severity"] == "warn"),
+                "expected gateway-no-default for {kw} '{gw_id}', got: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn analyze_model_flags_a_parallel_join_fed_by_a_conditional_split() {
+        // A parallel (AND) join waits for ALL its incoming branches, but a
+        // condition-routed split upstream — exclusive (XOR) OR inclusive (OR) —
+        // may activate only some of them, so the join can wait forever. The
+        // `parallel-join-may-deadlock` heuristic must fire for both split kinds
+        // (regression: it originally recognised only the exclusive split).
+        for kw in ["exclusiveGateway", "inclusiveGateway"] {
+            let bpmn = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="d">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:{kw} id="Split">
+      <bpmn:incoming>a</bpmn:incoming>
+      <bpmn:outgoing>hi</bpmn:outgoing>
+      <bpmn:outgoing>lo</bpmn:outgoing>
+    </bpmn:{kw}>
+    <bpmn:task id="Ta"><bpmn:incoming>hi</bpmn:incoming><bpmn:outgoing>ja</bpmn:outgoing></bpmn:task>
+    <bpmn:task id="Tb"><bpmn:incoming>lo</bpmn:incoming><bpmn:outgoing>jb</bpmn:outgoing></bpmn:task>
+    <bpmn:parallelGateway id="Join">
+      <bpmn:incoming>ja</bpmn:incoming>
+      <bpmn:incoming>jb</bpmn:incoming>
+      <bpmn:outgoing>done</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:endEvent id="E"><bpmn:incoming>done</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="a" sourceRef="S" targetRef="Split"/>
+    <bpmn:sequenceFlow id="hi" sourceRef="Split" targetRef="Ta">
+      <bpmn:conditionExpression>= x &gt;= 1</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="lo" sourceRef="Split" targetRef="Tb">
+      <bpmn:conditionExpression>= x &lt; 1</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="ja" sourceRef="Ta" targetRef="Join"/>
+    <bpmn:sequenceFlow id="jb" sourceRef="Tb" targetRef="Join"/>
+    <bpmn:sequenceFlow id="done" sourceRef="Join" targetRef="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#
+            );
+            let v = analyze_model(&bpmn).expect("analyze");
+            let findings = v["findings"].as_array().unwrap();
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f["code"] == "parallel-join-may-deadlock" && f["element"] == "Join"),
+                "expected parallel-join-may-deadlock for {kw} split feeding 'Join', got: {v}"
+            );
+        }
     }
 
     #[test]
@@ -5549,6 +5671,56 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         assert!(
             xml.contains("name=\"Screen for fraud\""),
             "labels the inserted task: {xml}"
+        );
+    }
+
+    #[test]
+    fn definition_to_xml_marks_inclusive_gateways() {
+        // An inclusive (OR) gateway must also opt into `isMarkerVisible` so its
+        // circle marker renders; without it the generated diagram shows an empty
+        // diamond indistinguishable from a parallel gateway (#1168).
+        const INCLUSIVE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:inclusiveGateway id="Split" default="toB" />
+    <bpmn:task id="a" />
+    <bpmn:task id="b" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="Split" />
+    <bpmn:sequenceFlow id="toA" sourceRef="Split" targetRef="a">
+      <bpmn:conditionExpression>=go</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="toB" sourceRef="Split" targetRef="b" />
+    <bpmn:sequenceFlow id="fa" sourceRef="a" targetRef="e" />
+    <bpmn:sequenceFlow id="fb" sourceRef="b" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let (def, _) = first_def(INCLUSIVE).expect("parse inclusive");
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("bpmnElement=\"Split\" isMarkerVisible=\"true\""),
+            "inclusive gateway opts into the marker: {xml}"
+        );
+        // The marker is not the only routing metadata the emitter adds for an
+        // inclusive gateway: it also serializes the `default` flow and the guarded
+        // branch's `conditionExpression`. Asserting only `isMarkerVisible` would
+        // still pass if either were silently dropped, so protect the round-trip.
+        // Flow ids are synthesized on emit, so `default` references a synthesized
+        // id (not `toB`); re-parse the emitted XML and assert the semantics survive.
+        assert!(
+            xml.contains("<bpmn:conditionExpression>=go</bpmn:conditionExpression>"),
+            "guarded branch's condition is emitted: {xml}"
+        );
+        let (round, _) = first_def(&xml).expect("re-parse emitted inclusive");
+        let split = &round.elements["Split"];
+        assert!(
+            split.outgoing.iter().any(|f| f.is_default),
+            "default flow survives the round-trip: {xml}"
+        );
+        assert!(
+            split.outgoing.iter().any(|f| f.condition.is_some()),
+            "guarded branch survives the round-trip: {xml}"
         );
     }
 

@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Real-WASM probes for canonical opt-in job leases, fenced mutations, replay, history-based agent requests, pending-history commitment, and routing metadata in both entrypoints.",
   "scripts": {
-    "test": "node lease-fencing.mjs && node verify.mjs && node external-routing.mjs"
+    "test": "node lease-fencing.mjs && node verify.mjs && node external-routing.mjs && node element-support.mjs"
   },
   "dependencies": {
     "@nanobpm/engine-wasm": "file:../../pkg"

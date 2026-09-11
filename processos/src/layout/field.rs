@@ -902,7 +902,7 @@ pub enum NodeShape {
 fn node_shape(el: &Element) -> NodeShape {
     use nanobpmn_engine_core::ElementKind::*;
     match el.kind {
-        ExclusiveGateway | ParallelGateway => NodeShape::Diamond,
+        ExclusiveGateway | ParallelGateway | InclusiveGateway => NodeShape::Diamond,
         StartEvent
         | EndEvent
         | TerminateEndEvent
@@ -1109,5 +1109,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1168 regression guard: an inclusive gateway must render as a 50×50
+    /// diamond (like an exclusive/parallel gateway), NOT fall through to the
+    /// `_ => Rect` arm as a rectangle. If the `InclusiveGateway` arm of
+    /// [`node_shape`] is dropped, both the shape and the dimensions revert to
+    /// a rectangle and its edge endpoints project onto the box instead of the
+    /// diamond perimeter — exactly the "disconnected edge" defect the shape
+    /// distinction exists to prevent.
+    #[test]
+    fn inclusive_gateway_renders_as_diamond() {
+        let bpmn = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="Definitions_or" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="OrProcess" isExecutable="true">
+    <bpmn:startEvent id="Start_1"><bpmn:outgoing>Flow_1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:inclusiveGateway id="OrSplit" default="Flow_2">
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+      <bpmn:outgoing>Flow_2</bpmn:outgoing>
+    </bpmn:inclusiveGateway>
+    <bpmn:endEvent id="End_1"><bpmn:incoming>Flow_2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="OrSplit"/>
+    <bpmn:sequenceFlow id="Flow_2" sourceRef="OrSplit" targetRef="End_1"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let defs = parse_bpmn(bpmn).unwrap();
+        let def = defs.into_iter().next().unwrap();
+        let gw = &def.elements["OrSplit"];
+
+        // node_shape path: diamond, not the rectangle fallthrough.
+        assert_eq!(
+            node_shape(gw),
+            NodeShape::Diamond,
+            "inclusive gateway must be a diamond, not a rectangle"
+        );
+        // field-layout dimensions: 50×50 gateway box, not the task rect.
+        assert_eq!(
+            node_dims(gw),
+            (50.0, 50.0),
+            "inclusive gateway must be 50×50, not the task rect ({NODE_W}×{NODE_H})"
+        );
+
+        // Diamond edge projection differs from the rect projection: for a ray
+        // that is not purely axis-aligned, the diamond endpoint lands strictly
+        // inside the bounding box on the |x'/hw|+|y'/hh|=1 perimeter, whereas
+        // the rect projection would pin it to a box edge. Guards the
+        // "mismatched edge endpoints" half of the advisory.
+        let (hw, hh) = (25.0, 25.0);
+        let (dx, dy) = (1.0_f64, 1.0_f64);
+        let (px, py) = project_to_shape(NodeShape::Diamond, 0.0, 0.0, hw, hh, dx, dy);
+        assert!(
+            (px.abs() / hw + py.abs() / hh - 1.0).abs() < 1e-6,
+            "diamond endpoint ({px},{py}) must sit on the diamond perimeter"
+        );
+        let (rx, ry) = project_to_shape(NodeShape::Rect, 0.0, 0.0, hw, hh, dx, dy);
+        assert!(
+            (px, py) != (rx, ry),
+            "diamond projection must differ from the rect projection"
+        );
     }
 }
