@@ -21907,3 +21907,135 @@ fn declaration_free_job_activated_is_byte_identical() {
     let back: Event = serde_json::from_str(&json).unwrap();
     assert_eq!(back, declared);
 }
+
+/// Regression (#1157): a link throw hands its token to the matching link catch;
+/// the second half of the model (everything downstream of the catch) must
+/// actually run, not silently vanish while the instance reports success.
+#[test]
+fn link_events_hand_the_token_from_throw_to_catch() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="links" isExecutable="true">
+          <bpmn:startEvent id="LStart"><bpmn:outgoing>LF1</bpmn:outgoing></bpmn:startEvent>
+          <bpmn:sequenceFlow id="LF1" sourceRef="LStart" targetRef="Throw" />
+          <bpmn:intermediateThrowEvent id="Throw">
+            <bpmn:incoming>LF1</bpmn:incoming>
+            <bpmn:linkEventDefinition id="LD1" name="hop" />
+          </bpmn:intermediateThrowEvent>
+          <bpmn:intermediateCatchEvent id="Catch">
+            <bpmn:outgoing>LF2</bpmn:outgoing>
+            <bpmn:linkEventDefinition id="LD2" name="hop" />
+          </bpmn:intermediateCatchEvent>
+          <bpmn:sequenceFlow id="LF2" sourceRef="Catch" targetRef="AfterLink" />
+          <bpmn:serviceTask id="AfterLink">
+            <bpmn:incoming>LF2</bpmn:incoming>
+            <bpmn:outgoing>LF3</bpmn:outgoing>
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-after-link" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:sequenceFlow id="LF3" sourceRef="AfterLink" targetRef="LEnd" />
+          <bpmn:endEvent id="LEnd"><bpmn:incoming>LF3</bpmn:incoming></bpmn:endEvent>
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    assert_eq!(
+        def.element("Throw").unwrap().kind,
+        ElementKind::LinkIntermediateThrowEvent {
+            link_name: "hop".to_string()
+        }
+    );
+    assert_eq!(
+        def.element("Catch").unwrap().kind,
+        ElementKind::LinkIntermediateCatchEvent {
+            link_name: "hop".to_string()
+        }
+    );
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("links"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // The token must reach `AfterLink` (a job appears) rather than vanishing at
+    // the throw — and the instance must NOT be reported completed while that
+    // second-half work is still pending (the #1157 false success).
+    assert!(
+        !engine.is_completed(inst),
+        "instance must not complete while AfterLink is still pending"
+    );
+    let jobs = engine.activate_jobs("probe-after-link", "w", 5, 1_000, 0);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "the link catch's downstream service task must run (got {} jobs)",
+        jobs.len()
+    );
+
+    // Completing the second half drives the instance to a genuine completion.
+    engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+    assert!(engine.is_completed(inst));
+}
+
+/// A link throw hands its token to the matching catch *by name*, so multiple
+/// distinct link pairs in one model each route to their own catch.
+#[test]
+fn link_events_route_by_matching_name() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="two-links" isExecutable="true">
+          <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="ThrowB" />
+          <bpmn:intermediateThrowEvent id="ThrowB">
+            <bpmn:incoming>f0</bpmn:incoming>
+            <bpmn:linkEventDefinition name="B" />
+          </bpmn:intermediateThrowEvent>
+          <bpmn:intermediateCatchEvent id="CatchA">
+            <bpmn:outgoing>fa</bpmn:outgoing>
+            <bpmn:linkEventDefinition name="A" />
+          </bpmn:intermediateCatchEvent>
+          <bpmn:sequenceFlow id="fa" sourceRef="CatchA" targetRef="TaskA" />
+          <bpmn:serviceTask id="TaskA">
+            <bpmn:incoming>fa</bpmn:incoming>
+            <bpmn:extensionElements><zeebe:taskDefinition type="job-a" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:intermediateCatchEvent id="CatchB">
+            <bpmn:outgoing>fb</bpmn:outgoing>
+            <bpmn:linkEventDefinition name="B" />
+          </bpmn:intermediateCatchEvent>
+          <bpmn:sequenceFlow id="fb" sourceRef="CatchB" targetRef="TaskB" />
+          <bpmn:serviceTask id="TaskB">
+            <bpmn:incoming>fb</bpmn:incoming>
+            <bpmn:extensionElements><zeebe:taskDefinition type="job-b" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("two-links"))
+        .unwrap();
+
+    // The throw named "B" must reach CatchB's task, not CatchA's.
+    assert_eq!(
+        engine.activate_jobs("job-a", "w", 5, 1_000, 0).len(),
+        0,
+        "the unrelated link 'A' catch must not fire"
+    );
+    assert_eq!(
+        engine.activate_jobs("job-b", "w", 5, 1_000, 0).len(),
+        1,
+        "the throw hands off to the same-named catch 'B'"
+    );
+}

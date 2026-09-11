@@ -8748,6 +8748,26 @@ impl Engine {
             });
         }
 
+        // A link intermediate *throw* event has no outgoing sequence flow: it
+        // hands its token to the matching link *catch* event (same link name,
+        // same scope), activating it directly. Without this the throw completes
+        // into the empty outgoing loop below and the token silently vanishes
+        // (#1157). Mirrors the deferred `finalize_completion` handoff for the
+        // end-listener path.
+        if let Some(ElementKind::LinkIntermediateThrowEvent { link_name }) =
+            self.element_kind(instance_key, &element_id)
+        {
+            let mut followups = Vec::new();
+            if let Some(catch_id) = self.resolve_link_catch(instance_key, &element_id, &link_name) {
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: catch_id,
+                    scope,
+                });
+            }
+            return (events, followups);
+        }
+
         let mut followups = Vec::new();
         for flow in self.outgoing(instance_key, &element_id) {
             events.push(Event::SequenceFlowTaken {
@@ -8887,6 +8907,23 @@ impl Engine {
             element_id: element_id.clone(),
         }];
         let mut followups = Vec::new();
+        // A link intermediate *throw* event has no outgoing sequence flow: on
+        // completion it hands its token to the matching link *catch* event (same
+        // link name, same scope), activating it directly. Without this the throw
+        // completes into the pass-through outgoing loop below, finds no flow, and
+        // the token silently vanishes (#1157).
+        if let Some(ElementKind::LinkIntermediateThrowEvent { link_name }) =
+            self.element_kind(instance_key, &element_id)
+        {
+            if let Some(catch_id) = self.resolve_link_catch(instance_key, &element_id, &link_name) {
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: catch_id,
+                    scope,
+                });
+            }
+            return (events, followups);
+        }
         // A completing activity that carries a compensation boundary event
         // becomes compensable: record it so a later compensation throw event in
         // the same scope can run its handler.
@@ -10750,6 +10787,34 @@ impl Engine {
         self.process_of_instance(instance_key)?
             .element(element_id)
             .map(|e| e.kind.clone())
+    }
+
+    /// Resolves the matching link *catch* element for a link *throw*: the
+    /// [`LinkIntermediateCatchEvent`](crate::model::ElementKind::LinkIntermediateCatchEvent)
+    /// with the same `link_name` in the same scope (`parent`) as the throw. Deploy
+    /// validation guarantees a matching, unique, **same-scope** catch exists (a
+    /// cross-scope or empty-named pairing is rejected at deploy), so a well-formed
+    /// model always resolves. Only a same-scope catch is returned: activating a
+    /// different-scope catch in the throw's runtime scope would corrupt variable
+    /// scoping, so that is never done. Returns the catch element id, or `None`
+    /// when the process/element is unknown or (defensively) no same-scope catch
+    /// exists.
+    fn resolve_link_catch(
+        &self,
+        instance_key: Key,
+        throw_id: &str,
+        link_name: &str,
+    ) -> Option<String> {
+        let def = self.process_of_instance(instance_key)?;
+        let throw_parent = def.element(throw_id).and_then(|e| e.parent.clone());
+        for element in def.elements.values() {
+            if let ElementKind::LinkIntermediateCatchEvent { link_name: name } = &element.kind {
+                if name == link_name && element.parent == throw_parent {
+                    return Some(element.id.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Whether the process instance owning `instance_key` is currently

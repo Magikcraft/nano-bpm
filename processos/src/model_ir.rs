@@ -160,6 +160,8 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
+        ElementKind::LinkIntermediateThrowEvent { .. } => "linkIntermediateThrowEvent",
+        ElementKind::LinkIntermediateCatchEvent { .. } => "linkIntermediateCatchEvent",
         ElementKind::Task => "task",
         ElementKind::ScriptTask { .. } => "scriptTask",
         ElementKind::CallActivity { .. } => "callActivity",
@@ -319,6 +321,10 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         }
         ElementKind::SignalIntermediateCatchEvent { signal_name } => {
             attrs.push(format!("signal {}", quote(signal_name)));
+        }
+        ElementKind::LinkIntermediateThrowEvent { link_name }
+        | ElementKind::LinkIntermediateCatchEvent { link_name } => {
+            attrs.push(format!("link {}", quote(link_name)));
         }
         ElementKind::SignalBoundaryEvent {
             attached_to,
@@ -1130,6 +1136,12 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
         "parallelGateway" => ElementKind::ParallelGateway,
         "eventBasedGateway" => ElementKind::EventBasedGateway,
         "intermediateThrowEvent" => ElementKind::IntermediateThrowEvent,
+        "linkIntermediateThrowEvent" => ElementKind::LinkIntermediateThrowEvent {
+            link_name: attrs.require("link", id)?,
+        },
+        "linkIntermediateCatchEvent" => ElementKind::LinkIntermediateCatchEvent {
+            link_name: attrs.require("link", id)?,
+        },
         "task" => ElementKind::Task,
         "serviceTask" | "agentTask" => {
             let raw = if keyword == "agentTask" {
@@ -1277,6 +1289,8 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::ScriptTask { .. }
         | ElementKind::CallActivity { .. }
         | ElementKind::SignalIntermediateCatchEvent { .. }
+        | ElementKind::LinkIntermediateThrowEvent { .. }
+        | ElementKind::LinkIntermediateCatchEvent { .. }
         | ElementKind::ConditionalIntermediateCatchEvent { .. }
         | ElementKind::AgentTask { .. } => None,
     }

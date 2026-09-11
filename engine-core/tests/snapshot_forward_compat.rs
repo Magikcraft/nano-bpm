@@ -363,6 +363,8 @@ fn callactivity_variant_witness_is_exhaustive() {
             TimerStartEvent { .. } => "timerStartEvent",
             SubProcess { .. } => "subProcess",
             IntermediateThrowEvent => "intermediateThrowEvent",
+            LinkIntermediateThrowEvent { .. } => "linkIntermediateThrowEvent",
+            LinkIntermediateCatchEvent { .. } => "linkIntermediateCatchEvent",
             Task => "task",
             ScriptTask { .. } => "scriptTask",
             CallActivity { .. } => "callActivity",

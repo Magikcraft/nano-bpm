@@ -24,6 +24,14 @@
 //!   interrupting error boundary on the sub-process.
 //! * `intermediateCatchEvent` with a nested `timerEventDefinition`/`timeDuration`
 //!   (timer catch) or a nested `messageEventDefinition` (message catch).
+//! * Link events: an `intermediateThrowEvent` with a `linkEventDefinition name`
+//!   (a link *throw*) and an `intermediateCatchEvent` with a matching
+//!   `linkEventDefinition name` (a link *catch*). The throw has no outgoing flow
+//!   and the catch no incoming flow; on completion the throw hands its token to
+//!   the matching catch in the same scope, which then routes onward — the
+//!   standard "page-break connector" idiom. Reference integrity (every throw has
+//!   a matching, unique catch) is enforced at deploy
+//!   (Zeebe `ModelUtil.verifyLinkIntermediateEvents`).
 //! * `boundaryEvent` with `attachedToRef` and a nested `errorEventDefinition`
 //!   `errorRef`, resolved against definitions-level `error` elements
 //!   (`<error id="…" errorCode="…">`) into an error boundary event; or a nested
@@ -934,9 +942,13 @@ fn parse_with_captures(
                                 let link_name = attr(attrs, "name").unwrap_or("").to_string();
                                 if let Some(idx) = cur_throw {
                                     let from_node = acc.nodes[idx].id.clone();
-                                    acc.link_throws.push((link_name, from_node));
-                                } else if cur_intermediate.is_some() {
-                                    acc.link_catches.push(link_name);
+                                    let scope = acc.nodes[idx].parent.clone();
+                                    acc.nodes[idx].link_name = Some(link_name.clone());
+                                    acc.link_throws.push((link_name, from_node, scope));
+                                } else if let Some(idx) = cur_intermediate {
+                                    let scope = acc.nodes[idx].parent.clone();
+                                    acc.nodes[idx].link_name = Some(link_name.clone());
+                                    acc.link_catches.push((link_name, scope));
                                 }
                             }
                             "messageEventDefinition" => {
@@ -2019,6 +2031,12 @@ struct NodeAcc {
     /// `compensateEventDefinition`, making it a
     /// [`CompensationThrowEvent`](crate::model::ElementKind::CompensationThrowEvent).
     is_compensation_throw: bool,
+    /// The `linkEventDefinition name` on an `intermediateThrowEvent`
+    /// (link *throw*) or `intermediateCatchEvent` (link *catch*), making the node
+    /// a [`LinkIntermediateThrowEvent`](crate::model::ElementKind::LinkIntermediateThrowEvent)
+    /// / [`LinkIntermediateCatchEvent`](crate::model::ElementKind::LinkIntermediateCatchEvent)
+    /// at build. `None` on nodes without a `linkEventDefinition`.
+    link_name: Option<String>,
     /// True when this `endEvent` carries a `terminateEventDefinition`, making it
     /// a [`TerminateEndEvent`](crate::model::ElementKind::TerminateEndEvent)
     /// rather than a plain none end event.
@@ -2147,13 +2165,15 @@ struct ProcessAcc {
     /// error_ref)`. Boundary `errorRef`s are resolved in `build`; these are the
     /// extra sites the reference-integrity validator (#851) generalises over.
     error_refs_extra: Vec<(String, String)>,
-    /// `(link name, throwing element id)` for each `linkEventDefinition` on an
-    /// intermediate *throw* event (consumed by #851's throw↔catch pairing
-    /// check; the element id is the `from_node` on a rejected unpaired throw).
-    link_throws: Vec<(String, String)>,
+    /// `(link name, throwing element id, enclosing scope)` for each
+    /// `linkEventDefinition` on an intermediate *throw* event (consumed by #851's
+    /// throw↔catch pairing check; the element id is the `from_node` on a rejected
+    /// unpaired throw, and the scope enforces same-scope pairing at deploy).
+    link_throws: Vec<(String, String, Option<String>)>,
     /// Link names declared on `linkEventDefinition`s of intermediate *catch*
-    /// events (consumed by #851's throw↔catch pairing check).
-    link_catches: Vec<String>,
+    /// events, paired with their enclosing scope (consumed by #851's throw↔catch
+    /// pairing check).
+    link_catches: Vec<(String, Option<String>)>,
     /// Flow-element tags / event definitions the streaming parser does not
     /// model, recorded as `(tag, element_id)` instead of being silently
     /// dropped. `element_id` is the tag's own `id`, or — when the tag is
@@ -2229,6 +2249,7 @@ impl ProcessAcc {
             linked_resources: Vec::new(),
             start_form_id: None,
             is_compensation_throw: false,
+            link_name: None,
             is_terminate: false,
             is_for_compensation: attr(attrs, "isForCompensation") == Some("true"),
             agent_type: None,
@@ -2923,6 +2944,8 @@ impl ProcessAcc {
                 NodeKind::IntermediateThrow => {
                     if node.is_compensation_throw {
                         builder.compensation_throw_event(node.id)
+                    } else if let Some(link_name) = node.link_name.clone() {
+                        builder.link_intermediate_throw_event(node.id, link_name)
                     } else {
                         builder.intermediate_throw_event(node.id)
                     }
@@ -2990,11 +3013,16 @@ impl ProcessAcc {
                 }
                 NodeKind::User => builder.user_task_with(node.id, node.user_task),
                 NodeKind::IntermediateCatch => {
-                    // Ordering: a conditional catch (event_condition) has no
-                    // message/signal/timer ref; a messageRef makes it a message
-                    // catch; a signalRef a signal catch; otherwise a timer catch
-                    // carrying a (possibly zero) duration.
-                    if let Some(condition) = node.event_condition {
+                    // Ordering: a link catch (linkEventDefinition) is a
+                    // pass-through activated by its throw and carries no
+                    // message/signal/timer/condition ref; a conditional catch
+                    // (event_condition) has no message/signal/timer ref; a
+                    // messageRef makes it a message catch; a signalRef a signal
+                    // catch; otherwise a timer catch carrying a (possibly zero)
+                    // duration.
+                    if let Some(link_name) = node.link_name.clone() {
+                        builder.link_intermediate_catch_event(node.id, link_name)
+                    } else if let Some(condition) = node.event_condition {
                         builder.conditional_intermediate_catch_event(node.id, condition)
                     } else if let Some(message_ref) = node.message_ref {
                         let decl = messages.get(&message_ref).ok_or_else(|| {
@@ -6147,6 +6175,47 @@ mod tests {
             ElementKind::IntermediateThrowEvent,
             "surplus signal start is demoted (no dedicated signal-start kind)"
         );
+    }
+
+    #[test]
+    fn should_parse_link_throw_and_catch_events() {
+        // A linkEventDefinition on an intermediateThrowEvent / intermediateCatchEvent
+        // parses to the dedicated link kinds (#1157), preserving the link name —
+        // not to a plain throw or a timer catch.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="throw" />
+              <bpmn:intermediateThrowEvent id="throw">
+                <bpmn:incoming>f0</bpmn:incoming>
+                <bpmn:linkEventDefinition name="hop" />
+              </bpmn:intermediateThrowEvent>
+              <bpmn:intermediateCatchEvent id="catch">
+                <bpmn:outgoing>f1</bpmn:outgoing>
+                <bpmn:linkEventDefinition name="hop" />
+              </bpmn:intermediateCatchEvent>
+              <bpmn:sequenceFlow id="f1" sourceRef="catch" targetRef="e" />
+              <bpmn:endEvent id="e"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(
+            def.element("throw").unwrap().kind,
+            ElementKind::LinkIntermediateThrowEvent {
+                link_name: "hop".to_string()
+            }
+        );
+        assert_eq!(
+            def.element("catch").unwrap().kind,
+            ElementKind::LinkIntermediateCatchEvent {
+                link_name: "hop".to_string()
+            }
+        );
+        // The throw has no outgoing flow; the catch has no incoming flow.
+        assert!(def.element("throw").unwrap().outgoing.is_empty());
+        assert_eq!(def.incoming_count("catch"), 0);
     }
 
     #[test]

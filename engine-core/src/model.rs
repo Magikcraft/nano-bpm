@@ -659,6 +659,30 @@ pub enum ElementKind {
     /// don't block a forward path) and as the inert demotion target for the
     /// surplus start events of a process that declares more than one.
     IntermediateThrowEvent,
+    /// A link intermediate *throw* event: an `intermediateThrowEvent` carrying a
+    /// `linkEventDefinition`. Unlike an [`IntermediateThrowEvent`] it has **no**
+    /// outgoing sequence flow — instead of routing along a flow, on completion it
+    /// hands the token to the matching link *catch* event (a
+    /// [`LinkIntermediateCatchEvent`](ElementKind::LinkIntermediateCatchEvent)
+    /// with the same `link_name` in the same scope), activating it directly.
+    /// Link events are the standard "page-break connector" idiom for keeping a
+    /// wide model readable; multiple throws may target one catch. Reference
+    /// integrity (every throw has a matching, unique catch) is enforced at deploy
+    /// (Zeebe `ModelUtil.verifyLinkIntermediateEvents`).
+    LinkIntermediateThrowEvent {
+        /// The `linkEventDefinition name` this throw hands its token to.
+        link_name: String,
+    },
+    /// A link intermediate *catch* event: an `intermediateCatchEvent` carrying a
+    /// `linkEventDefinition`. It has **no** incoming sequence flow; it is
+    /// activated directly by the matching link *throw* event
+    /// ([`LinkIntermediateThrowEvent`](ElementKind::LinkIntermediateThrowEvent)
+    /// with the same `link_name`). Once activated it is a pure pass-through: it
+    /// completes immediately and routes the token along its outgoing flow.
+    LinkIntermediateCatchEvent {
+        /// The `linkEventDefinition name` a matching throw hands its token to.
+        link_name: String,
+    },
     /// An abstract BPMN `task` (also `manualTask`): a task with no execution
     /// semantics. Zeebe/C8 accept it and treat it as a **pass-through** — on
     /// activation the token completes immediately and routes along the
@@ -865,6 +889,8 @@ impl ElementKind {
             | ElementKind::MessageStartEvent { .. }
             | ElementKind::TimerStartEvent { .. }
             | ElementKind::IntermediateThrowEvent
+            | ElementKind::LinkIntermediateThrowEvent { .. }
+            | ElementKind::LinkIntermediateCatchEvent { .. }
             | ElementKind::TimerIntermediateCatchEvent { .. }
             | ElementKind::MessageIntermediateCatchEvent { .. }
             | ElementKind::SignalIntermediateCatchEvent { .. }
@@ -896,11 +922,13 @@ impl ElementKind {
             ElementKind::EndEvent => "END_EVENT",
             ElementKind::TerminateEndEvent => "END_EVENT",
             ElementKind::IntermediateThrowEvent => "INTERMEDIATE_THROW_EVENT",
+            ElementKind::LinkIntermediateThrowEvent { .. } => "INTERMEDIATE_THROW_EVENT",
             ElementKind::CompensationThrowEvent => "INTERMEDIATE_THROW_EVENT",
             ElementKind::Task => "TASK",
             ElementKind::TimerIntermediateCatchEvent { .. }
             | ElementKind::MessageIntermediateCatchEvent { .. }
             | ElementKind::SignalIntermediateCatchEvent { .. }
+            | ElementKind::LinkIntermediateCatchEvent { .. }
             | ElementKind::ConditionalIntermediateCatchEvent { .. } => "INTERMEDIATE_CATCH_EVENT",
             ElementKind::ErrorBoundaryEvent { .. }
             | ElementKind::TimerBoundaryEvent { .. }
@@ -1706,6 +1734,40 @@ impl ProcessBuilder {
     /// [`ElementKind::IntermediateThrowEvent`]).
     pub fn intermediate_throw_event(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::IntermediateThrowEvent)
+    }
+
+    /// Adds a link intermediate *throw* event (`intermediateThrowEvent` with a
+    /// `linkEventDefinition`; see [`ElementKind::LinkIntermediateThrowEvent`]).
+    /// On completion it hands its token to the matching link *catch* event with
+    /// the same `link_name` rather than routing along an outgoing flow.
+    pub fn link_intermediate_throw_event(
+        self,
+        id: impl Into<String>,
+        link_name: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::LinkIntermediateThrowEvent {
+                link_name: link_name.into(),
+            },
+        )
+    }
+
+    /// Adds a link intermediate *catch* event (`intermediateCatchEvent` with a
+    /// `linkEventDefinition`; see [`ElementKind::LinkIntermediateCatchEvent`]).
+    /// It has no incoming flow — the matching link throw activates it directly —
+    /// and is a pass-through once activated, routing along its outgoing flow.
+    pub fn link_intermediate_catch_event(
+        self,
+        id: impl Into<String>,
+        link_name: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::LinkIntermediateCatchEvent {
+                link_name: link_name.into(),
+            },
+        )
     }
 
     /// Adds a compensation throw event (`compensateEventDefinition` on an

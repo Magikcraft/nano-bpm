@@ -153,6 +153,20 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   one is rejected). `Engine::incidents()` returns the whole history;
   `Engine::active_incidents()` filters to open ones, and the per-instance active
   index (`ProcessInstance::incidents`) drives `hasIncident`.
+- **Link intermediate events** wire a throw to a matching catch **within the same
+  scope** by name instead of by an explicit sequence flow — the modeller's
+  "go-to" for keeping a diagram uncluttered. An `intermediateThrowEvent` carrying a
+  `linkEventDefinition` completes its incoming flow and then hands its token
+  **directly** to the `intermediateCatchEvent` whose `linkEventDefinition` shares
+  the same `name` **in the same scope** (link events never cross a (sub)process
+  boundary), which resumes as a pass-through out its own outgoing flow. No
+  synthetic sequence flow is emitted (the handoff never appears in
+  `takenSequenceFlows`). Many throws may target one catch; two catches sharing a
+  link name, a throw/catch pair split across scopes, an empty link `name`, or a
+  throw with an outgoing (or a catch with an incoming) sequence flow are all
+  rejected at deploy (Zeebe `verifyLinkIntermediateEvents` parity). Before
+  this an unrecognised link throw silently swallowed the token and the catch never
+  fired.
 - **Timer intermediate catch events** park a token mid-flow until a deadline.
   Reaching one arms a `Timer` (`due_at = now + duration`) and rests in
   `ACTIVATED`; a host-driven `TriggerTimers { now }` tick fires every due timer,

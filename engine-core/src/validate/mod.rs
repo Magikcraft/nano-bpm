@@ -98,12 +98,13 @@ pub(crate) struct ProcessCapture {
     /// `messageRef`/`errorRef`/`signalRef`/`escalationRef`/`default`/
     /// `attachedToRef` reference sites.
     pub references: Vec<RefSite>,
-    /// `(link name, throwing element id)` for each intermediate *throw* link
-    /// event. The element id is used as the `from_node` when a throw link is
-    /// rejected as unpaired.
-    pub link_throws: Vec<(String, String)>,
-    /// Link names on intermediate *catch* link events.
-    pub link_catches: Vec<String>,
+    /// `(link name, throwing element id, enclosing scope)` for each intermediate
+    /// *throw* link event. The element id is used as the `from_node` when a throw
+    /// link is rejected as unpaired; the scope (enclosing subprocess id, or `None`
+    /// at the process root) enforces same-scope throw↔catch pairing at deploy.
+    pub link_throws: Vec<(String, String, Option<String>)>,
+    /// `(link name, enclosing scope)` for each intermediate *catch* link event.
+    pub link_catches: Vec<(String, Option<String>)>,
     /// Unmodelled flow elements / event definitions.
     pub unmodelled: Vec<UnmodelledElement>,
     /// Declared definitions-level `<message>` ids.
