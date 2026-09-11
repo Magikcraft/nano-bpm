@@ -2933,6 +2933,24 @@ impl Engine {
                                 element_instance_key,
                                 element_id,
                             });
+                        } else if matches!(
+                            redrive,
+                            Some(state::IoMappingRedrive::CallActivitySpawn)
+                        ) {
+                            // A failed call-activity spawn (bad `=calledElement`
+                            // expression, unknown callee, or depth overflow — issue
+                            // #1159) parks the still-activated call activity / ad-hoc
+                            // tool with no child. Re-driving `Complete` would advance
+                            // the token (or, for an ad-hoc tool, complete it through
+                            // `complete_adhoc_tool` with a manufactured all-null
+                            // result) without ever instantiating the callee. Re-attempt
+                            // the spawn instead, so resolving the incident (after the
+                            // operator fixes the callee) actually creates the child.
+                            queue.push_back(Step::RetryCallActivitySpawn {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
                         } else {
                             queue.push_back(Step::Complete {
                                 instance_key,
@@ -6950,6 +6968,19 @@ impl Engine {
             }
             events.extend(self.cancel_mi_child_events(instance_key, child));
         }
+        // A `callActivity` tool (issue #1159) is a leaf in the ad-hoc scope tree
+        // but drives a distinct CHILD PROCESS INSTANCE hanging off this tool
+        // element (`parentElementInstanceKey == child`). Cancelling the tool
+        // (a completion condition or `cancelRemainingInstances`) leaves the parent
+        // process instance alive, so the generic post-command `cascade_cancel_children`
+        // sweep — which only reaps children of a *terminated* instance — never
+        // reaps it. Terminate the linked child here so the callee and its jobs do
+        // not outlive the ad-hoc token; emitting `ProcessInstanceTerminated` also
+        // seeds `cascade_cancel_children` to reap any of the callee's own
+        // grandchildren transitively.
+        if let Some(call_child) = self.call_activity_child_of(child) {
+            events.extend(self.discard_instance_events(call_child));
+        }
         // Each tool child hangs off a dedicated inner instance; tear it down too
         // so the read-model element-instance tree does not leak an orphan. Only
         // when the inner instance is still active does its element id resolve —
@@ -7191,6 +7222,31 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Evaluates an ad-hoc tool's own `zeebe:ioMapping` INPUT mappings (sourced
+    /// from the container catalog — the tool element is pruned from the flat
+    /// graph) against `view`, the activating variable view. Returns the projected
+    /// input updates (empty when the tool declares no inputs), or the evaluation
+    /// failure so the caller can park the correct incident. Single source of truth
+    /// for the tool-input projection shared by the tool's first activation
+    /// (`activate_adhoc_tool`) and a call-activity tool's spawn retry
+    /// (`respawn_adhoc_call_activity_tool`, issue #1159), so the two cannot drift.
+    fn adhoc_tool_input_updates(
+        &self,
+        instance_key: Key,
+        container_element_id: &str,
+        tool_element_id: &str,
+        view: &HashMap<String, Value>,
+    ) -> Result<HashMap<String, Value>, IoMappingFailure> {
+        let inputs = self
+            .adhoc_tool_io(instance_key, container_element_id, tool_element_id)
+            .inputs;
+        if inputs.is_empty() {
+            Ok(HashMap::new())
+        } else {
+            self.eval_io_mappings_in(view, &inputs)
+        }
+    }
+
     /// Evaluates a declarative ad-hoc container's `activeElementsCollection` FEEL
     /// expression to the ordered inner element ids to activate (Camunda BPMN_TASK
     /// variant; `AdHocSubProcessProcessor.readActivateElementsCollection`
@@ -7262,35 +7318,32 @@ impl Engine {
         // `propagateAllParentVariables=false` (issue #1159).
         let mut applied_inputs: HashMap<String, Value> = HashMap::new();
         if let Some(cid) = container_element_id.as_deref() {
-            let inputs = self.adhoc_tool_io(instance_key, cid, &element_id).inputs;
-            if !inputs.is_empty() {
-                match self.eval_io_mappings_in(&child_vars, &inputs) {
-                    Ok(input_updates) => {
-                        child_vars.extend(input_updates.clone());
-                        local_variables.extend(input_updates.clone());
-                        applied_inputs = input_updates;
-                    }
-                    Err(failure) => {
-                        // A tool input mapping that fails to evaluate halts the
-                        // ad-hoc container with an `IO_MAPPING_ERROR` incident
-                        // rather than running the tool against a silently-unset
-                        // variable (#939/#946). The tool child is not created; the
-                        // container parks on the incident, and resolution re-drives
-                        // the tool's *activation* (`AdHocToolActivation`) with its
-                        // original seed variables — a clean retry, since nothing was
-                        // created on this pass.
-                        let event = self.io_mapping_incident(
-                            instance_key,
-                            container_key,
-                            cid.to_string(),
-                            failure,
-                            state::IoMappingRedrive::AdHocToolActivation {
-                                element_id: element_id.clone(),
-                                variables: local_variables.clone(),
-                            },
-                        );
-                        return (vec![event], Vec::new());
-                    }
+            match self.adhoc_tool_input_updates(instance_key, cid, &element_id, &child_vars) {
+                Ok(input_updates) => {
+                    child_vars.extend(input_updates.clone());
+                    local_variables.extend(input_updates.clone());
+                    applied_inputs = input_updates;
+                }
+                Err(failure) => {
+                    // A tool input mapping that fails to evaluate halts the
+                    // ad-hoc container with an `IO_MAPPING_ERROR` incident
+                    // rather than running the tool against a silently-unset
+                    // variable (#939/#946). The tool child is not created; the
+                    // container parks on the incident, and resolution re-drives
+                    // the tool's *activation* (`AdHocToolActivation`) with its
+                    // original seed variables — a clean retry, since nothing was
+                    // created on this pass.
+                    let event = self.io_mapping_incident(
+                        instance_key,
+                        container_key,
+                        cid.to_string(),
+                        failure,
+                        state::IoMappingRedrive::AdHocToolActivation {
+                            element_id: element_id.clone(),
+                            variables: local_variables.clone(),
+                        },
+                    );
+                    return (vec![event], Vec::new());
                 }
             }
         }
@@ -10228,6 +10281,21 @@ impl Engine {
         element_instance_key: Key,
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
+        // Ad-hoc call-activity tool (issue #1159): the tool element is pruned from
+        // the flat element graph, so `element_kind` returns `None` for it and the
+        // ordinary spawn path below would silently no-op. Re-run the ad-hoc tool
+        // spawn (its catalog callee id + input mappings + `propagateAllParentVariables`
+        // seed) instead, so resolving a spawn incident actually creates the child.
+        if let Some((container_key, _inner_key)) =
+            self.adhoc_tool_container_of(instance_key, element_instance_key)
+        {
+            return self.respawn_adhoc_call_activity_tool(
+                instance_key,
+                element_instance_key,
+                container_key,
+                element_id,
+            );
+        }
         let (called, propagate_all_parent) = match self.element_kind(instance_key, &element_id) {
             Some(ElementKind::CallActivity {
                 called_process_id,
@@ -10245,6 +10313,86 @@ impl Engine {
             &called,
             propagate_all_parent,
             &element_vars,
+        )
+    }
+
+    /// Re-attempts the child-process spawn for a `callActivity` ad-hoc tool
+    /// (issue #1159) whose first spawn parked a recoverable incident (bad
+    /// `=calledElement` expression, unknown callee, or depth overflow). The tool
+    /// child element instance is still ACTIVATED in the container's active set and
+    /// its local scope already carries the agent seed + the tool's applied input
+    /// mappings from the first pass, so this re-derives the callee id and
+    /// `propagateAllParentVariables` from the container catalog, re-evaluates the
+    /// tool's inputs against that scope (idempotent — the same
+    /// `adhoc_tool_input_updates` the activation used), and re-runs the shared
+    /// spawn with the same seed decision. Creating the child on success routes its
+    /// completion back through `complete_adhoc_call_activity_tool` exactly as a
+    /// first-pass spawn would.
+    fn respawn_adhoc_call_activity_tool(
+        &mut self,
+        instance_key: Key,
+        child_eik: Key,
+        container_key: Key,
+        element_id: String,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let container_element_id = match self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+        {
+            Some(a) => a.element_id.clone(),
+            None => return (Vec::new(), Vec::new()),
+        };
+        let (process_id, propagate_all_parent) = match self
+            .adhoc_def_of(instance_key, &container_element_id)
+            .and_then(|def| {
+                def.tools
+                    .iter()
+                    .find(|t| t.element_id == element_id)
+                    .map(|t| t.kind.clone())
+            }) {
+            Some(crate::model::AdHocToolKind::CallActivity {
+                process_id,
+                propagate_all_parent_variables,
+                ..
+            }) => (
+                process_id.unwrap_or_default(),
+                propagate_all_parent_variables,
+            ),
+            _ => return (Vec::new(), Vec::new()),
+        };
+        let view = (*self.variables_for_element(instance_key, child_eik)).clone();
+        let applied_inputs = match self.adhoc_tool_input_updates(
+            instance_key,
+            &container_element_id,
+            &element_id,
+            &view,
+        ) {
+            Ok(updates) => updates,
+            Err(failure) => {
+                let event = self.io_mapping_incident(
+                    instance_key,
+                    child_eik,
+                    element_id,
+                    failure,
+                    state::IoMappingRedrive::CallActivitySpawn,
+                );
+                return (vec![event], Vec::new());
+            }
+        };
+        let child_seed = if propagate_all_parent {
+            view.clone()
+        } else {
+            applied_inputs
+        };
+        self.spawn_call_activity_instance(
+            instance_key,
+            child_eik,
+            &element_id,
+            &process_id,
+            &view,
+            child_seed,
         )
     }
 
@@ -10358,7 +10506,13 @@ impl Engine {
                                 element_instance_key: call_eik,
                                 element_id: element_id.to_string(),
                                 kind: state::IncidentKind::ExpressionEvaluation,
-                                redrive: None,
+                                // Recoverable via a spawn retry (issue #1159): once
+                                // the operator fixes the variables the `=calledElement`
+                                // expression reads, resolving the incident re-attempts
+                                // the spawn (`RetryCallActivitySpawn`) rather than
+                                // completing the parked call activity / ad-hoc tool
+                                // with no child.
+                                redrive: Some(state::IoMappingRedrive::CallActivitySpawn),
                                 reason: format!(
                                     "call activity '{element_id}' could not evaluate \
                                      calledElement expression '{called_process_id}': {err}"
@@ -10384,7 +10538,7 @@ impl Engine {
                     element_instance_key: call_eik,
                     element_id: element_id.to_string(),
                     kind: state::IncidentKind::CalledElementError,
-                    redrive: None,
+                    redrive: Some(state::IoMappingRedrive::CallActivitySpawn),
                     reason: format!(
                         "call activity '{element_id}' exceeded the maximum child-instance depth \
                          of {MAX_CALL_ACTIVITY_DEPTH} calling '{called}' (possible unbounded \
@@ -10412,7 +10566,10 @@ impl Engine {
                     element_instance_key: call_eik,
                     element_id: element_id.to_string(),
                     kind: state::IncidentKind::CalledElementError,
-                    redrive: None,
+                    // Recoverable via a spawn retry (issue #1159): deploying the
+                    // missing callee and resolving the incident re-attempts the
+                    // spawn instead of completing the parent with no child.
+                    redrive: Some(state::IoMappingRedrive::CallActivitySpawn),
                     reason: format!(
                         "call activity '{element_id}' references unknown called process '{called}'"
                     ),
@@ -10666,12 +10823,25 @@ impl Engine {
             match self.eval_io_mappings_in(&child_variables, &outputs) {
                 Ok(updates) => updates,
                 Err(failure) => {
+                    // Preserve the child's produced variables on the incident's
+                    // redrive (issue #1159): the child process instance that
+                    // produced them has already completed and is gone by
+                    // resolution time, so a generic `Completion` redrive (which
+                    // re-drives `Step::Complete` into `complete_adhoc_tool`
+                    // against the pre-child tool scope) could never re-project
+                    // them. `CallActivityCompletion` re-drives
+                    // `Step::CompleteCallActivity`, which re-enters
+                    // `complete_call_activity` → this same bridge with the
+                    // captured `child_variables`, so the now-fixed output mapping
+                    // re-projects the real result.
                     let event = self.io_mapping_incident(
                         instance_key,
                         child_eik,
                         element_id,
                         failure,
-                        state::IoMappingRedrive::Completion,
+                        state::IoMappingRedrive::CallActivityCompletion {
+                            child_variables: child_variables.clone(),
+                        },
                     );
                     return (vec![event], Vec::new());
                 }

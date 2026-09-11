@@ -323,6 +323,49 @@ fn explicit_call_activity_flags_round_trip_verbatim() {
     assert_eq!(back, original);
 }
 
+/// Issue #1159 forward-compat guard, at the `AdHocToolKind` granularity. The
+/// call-activity **tool** variant (`AdHocToolKind::CallActivity`) gained the same
+/// two propagation flags, each `#[serde(default = "default_true")]`. This is a
+/// distinct persisted enum from `ElementKind` (it lives in the ad-hoc tool
+/// catalog carried in the snapshot), so it needs its own old-shape guard: a
+/// catalog serialized before #1159's flags — its tool carrying only
+/// `process_id` — must still deserialize under the current build, defaulting
+/// both flags to `true` (the Zeebe / parse-time default a redeploy produces).
+/// Before the `serde(default)` this would panic with a missing-field error on an
+/// upgrade boot, exactly like the pre-#1057 `ElementKind::CallActivity` crash.
+#[test]
+fn legacy_adhoc_call_activity_tool_deserializes_to_true_defaults() {
+    use nanobpmn_engine_core::AdHocToolKind;
+    let legacy = r#"{"CallActivity":{"process_id":"child"}}"#;
+    let kind: AdHocToolKind = serde_json::from_str(legacy)
+        .expect("legacy AdHocToolKind::CallActivity (no propagation flags) must deserialize");
+    assert_eq!(
+        kind,
+        AdHocToolKind::CallActivity {
+            process_id: Some("child".to_string()),
+            propagate_all_parent_variables: true,
+            propagate_all_child_variables: true,
+        }
+    );
+}
+
+/// The inverse for the tool variant: an explicitly-persisted `false` on either
+/// propagation flag must survive the round-trip verbatim — `serde(default)` may
+/// only fill an *absent* field, never override a present one.
+#[test]
+fn explicit_adhoc_call_activity_tool_flags_round_trip_verbatim() {
+    use nanobpmn_engine_core::AdHocToolKind;
+    let original = AdHocToolKind::CallActivity {
+        process_id: Some("child".to_string()),
+        propagate_all_parent_variables: false,
+        propagate_all_child_variables: false,
+    };
+    let json = serde_json::to_string(&original).expect("serialize AdHocToolKind::CallActivity");
+    let back: AdHocToolKind =
+        serde_json::from_str(&json).expect("deserialize AdHocToolKind::CallActivity");
+    assert_eq!(back, original);
+}
+
 /// Compile-time forcing function (mirrors `processos`'s `variant_witness`): an
 /// exhaustive `match` over `ElementKind` that does nothing at runtime. Its sole
 /// job is to **fail to compile when a new variant is added**, dropping the author

@@ -22443,3 +22443,559 @@ fn adhoc_call_activity_tool_spawns_child_and_maps_its_real_output() {
         .unwrap();
     assert!(engine.is_completed(inst), "the parent instance completed");
 }
+
+/// A parent process whose ad-hoc agent has a `bpmn:callActivity` tool with BOTH
+/// propagate flags at their Zeebe default (`true`, the attributes absent): the
+/// whole parent scope crosses INTO the child, and the child's whole final scope
+/// crosses BACK into the container (issue #1159). The tool still input-maps
+/// `askedAbout -> customerRequest` and output-maps `{status, summary} ->
+/// toolCallResult`.
+fn adhoc_agent_with_propagating_call_activity_tool() -> Vec<ProcessDefinition> {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="child" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="={status: status, summary: summary}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+        <bpmn:process id="child">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap()
+}
+
+/// Issue #1159 (coverage for the propagate-`true` branches): with
+/// `propagateAllParentVariables=true` the child sees a parent variable that no
+/// input mapping named (`sharedContext`), and with `propagateAllChildVariables=true`
+/// a raw variable the child produced (`childOnly`) crosses back into the
+/// container scope — while the tool's output mapping still projects the real
+/// result. The existing spawn test exercises both flags OFF, so this guards the
+/// separate default/`true` seed + merge behaviour of the new `activate_adhoc_tool`
+/// arm.
+#[test]
+fn adhoc_call_activity_tool_propagates_parent_and_child_variables() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_propagating_call_activity_tool() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[
+                ("askedAbout", Value::Str("a mortgage".into())),
+                ("sharedContext", Value::Str("branch-42".into())),
+            ]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let child_jobs = engine.activate_jobs("probe-child", "W", 10, 1_000, 0);
+    assert_eq!(child_jobs.len(), 1, "the called process is instantiated");
+    let child_job = &child_jobs[0];
+    assert_eq!(
+        child_job.variables.get("customerRequest"),
+        Some(&Value::Str("a mortgage".into())),
+        "the tool's input mapping crossed into the spawned child"
+    );
+    assert_eq!(
+        child_job.variables.get("sharedContext"),
+        Some(&Value::Str("branch-42".into())),
+        "propagateAllParentVariables=true crossed the un-mapped parent variable \
+         into the child"
+    );
+
+    engine
+        .apply_command(Command::complete_job_with(
+            child_job.key,
+            vars(&[
+                ("status", Value::Str("resolved".into())),
+                ("summary", Value::Str("Monthly payment is $1,516.".into())),
+                ("childOnly", Value::Str("scratch".into())),
+            ]),
+        ))
+        .unwrap();
+
+    let expected = Value::Map(std::collections::BTreeMap::from([
+        ("status".to_string(), Value::Str("resolved".into())),
+        (
+            "summary".to_string(),
+            Value::Str("Monthly payment is $1,516.".into()),
+        ),
+    ]));
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "toolCallResults"),
+        Some(Value::List(vec![expected.clone()])),
+        "the output mapping still projects the child's real result"
+    );
+
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job re-emitted after the tool drained");
+    assert_eq!(
+        agent2.variables.get("toolCallResult"),
+        Some(&expected),
+        "the tool's output projection is visible to the re-emitted agent"
+    );
+    assert_eq!(
+        agent2.variables.get("childOnly"),
+        Some(&Value::Str("scratch".into())),
+        "propagateAllChildVariables=true merged the child's raw variable back \
+         into the container scope"
+    );
+}
+
+/// Same ad-hoc `callActivity` tool as `adhoc_agent_with_call_activity_tool`, but
+/// the container sits on ONE branch of a parallel fork whose other branch parks
+/// on an open `hold` user task, so cancelling the container does NOT complete the
+/// parent instance (the join still waits on `hold`). This isolates the #1159
+/// cancellation leak: with the parent instance alive, the generic
+/// `cascade_cancel_children` sweep (which only reaps children of a *terminated*
+/// instance) never reaps the call-activity tool's child — so the tool-local
+/// teardown must terminate it.
+fn adhoc_agent_with_call_activity_tool_and_keepalive() -> Vec<ProcessDefinition> {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:parallelGateway id="fork" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="child"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="={status: status, summary: summary}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:userTask id="hold" />
+          <bpmn:parallelGateway id="join" />
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="fork" />
+          <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="hold" />
+          <bpmn:sequenceFlow id="f3" sourceRef="agent" targetRef="join" />
+          <bpmn:sequenceFlow id="f4" sourceRef="hold" targetRef="join" />
+          <bpmn:sequenceFlow id="f5" sourceRef="join" targetRef="e" />
+        </bpmn:process>
+        <bpmn:process id="child">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap()
+}
+
+/// Issue #1159 (cancellation defect class): a `callActivity` tool drives a
+/// distinct CHILD PROCESS INSTANCE that hangs off the tool element, not off the
+/// parent instance's active tokens. Cancelling the ad-hoc container while that
+/// child is still running must TERMINATE the linked child (and cancel its jobs),
+/// not leave the callee running after the ad-hoc token is gone — the generic
+/// post-command `cascade_cancel_children` sweep only reaps children of a
+/// *terminated* instance, and here the parent instance stays ALIVE (a parallel
+/// `hold` branch keeps it running), so the tool-local teardown must reap it.
+#[test]
+fn adhoc_cancel_remaining_terminates_a_running_call_activity_tool_child() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_call_activity_tool_and_keepalive() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("askedAbout", Value::Str("a mortgage".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    let activated = engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let child_key = activated
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_id,
+                ..
+            } if process_id == "child" => Some(*instance_key),
+            _ => None,
+        })
+        .expect("the call-activity tool spawned a child process instance");
+    let child_job = engine
+        .activate_jobs("probe-child", "W", 10, 1_000, 0)
+        .into_iter()
+        .next()
+        .expect("the spawned child minted its job");
+
+    // Cancel the container's remaining instances while the child is still live.
+    engine
+        .apply_command(Command::ActivateAdHocActivities {
+            ad_hoc_instance_key: container,
+            activate_elements: Vec::new(),
+            cancel_remaining: true,
+        })
+        .expect("cancel-remaining completes the container");
+
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated,
+        "the linked call-activity child is terminated, not left running after the \
+         ad-hoc token is cancelled"
+    );
+    assert_eq!(
+        engine.state().jobs[&child_job.key].state,
+        crate::state::JobState::Canceled,
+        "the child's job is cancelled, not left orphaned/activatable"
+    );
+    assert!(
+        engine
+            .activate_jobs("probe-child", "W", 10, 1_000, 0)
+            .is_empty(),
+        "no child job survives the cancellation"
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "the parent instance stays ALIVE (its `hold` branch is still open) — the \
+         leak is only observable because `cascade_cancel_children` cannot reap the \
+         child of a still-live parent"
+    );
+}
+
+/// A `callActivity` ad-hoc tool whose OUTPUT mapping cannot evaluate against the
+/// child's real result (`=status + 1`, string + int): the tool must park an
+/// `IO_MAPPING_ERROR` incident that PRESERVES the child's produced variables on
+/// its redrive (issue #1159), so resolution re-enters the call-activity→ad-hoc
+/// bridge with the gone child's result rather than completing the tool through
+/// `complete_adhoc_tool` against the pre-child scope (which would manufacture a
+/// wrong answer). A genuinely unfixable mapping therefore stays parked on resolve
+/// instead of silently completing wrong.
+fn adhoc_agent_with_failing_output_call_activity_tool() -> Vec<ProcessDefinition> {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="child"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:output source="=status + 1" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+        <bpmn:process id="child">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap()
+}
+
+#[test]
+fn adhoc_call_activity_tool_output_failure_preserves_child_result_for_redrive() {
+    let mut engine = Engine::new();
+    for def in adhoc_agent_with_failing_output_call_activity_tool() {
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+    }
+    let inst = engine
+        .apply_command(Command::create_instance("parent"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let child_job = engine
+        .activate_jobs("probe-child", "W", 10, 1_000, 0)
+        .into_iter()
+        .next()
+        .expect("the called process is instantiated");
+    engine
+        .apply_command(Command::complete_job_with(
+            child_job.key,
+            vars(&[("status", Value::Str("resolved".into()))]),
+        ))
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "the failing output mapping parks one incident");
+    assert_eq!(
+        active[0].kind,
+        state::IncidentKind::IoMapping,
+        "a call-activity tool output-mapping failure raises IO_MAPPING_ERROR"
+    );
+    match &active[0].redrive {
+        Some(state::IoMappingRedrive::CallActivityCompletion { child_variables }) => {
+            assert_eq!(
+                child_variables.get("status"),
+                Some(&Value::Str("resolved".into())),
+                "the gone child's real result is captured on the incident redrive, \
+                 not lost to a generic Completion redrive"
+            );
+        }
+        other => panic!("expected CallActivityCompletion redrive, got {other:?}"),
+    }
+    assert!(
+        !engine.is_completed(inst),
+        "the tool must not complete while its output mapping is unresolved"
+    );
+
+    // Resolving an unfixable mapping re-projects the captured child result — which
+    // fails again — so it stays parked, rather than routing `Step::Complete` into
+    // `complete_adhoc_tool` and silently completing the tool with a wrong answer.
+    let incident_key = engine.incidents()[0].key;
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let active = engine.active_incidents();
+    assert_eq!(
+        active.len(),
+        1,
+        "the unfixable output mapping re-raises (context-preserving redrive), not \
+         a silent wrong completion"
+    );
+    assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
+    assert!(!engine.is_completed(inst), "still parked after resolve");
+}
+
+/// A parent whose ad-hoc `callActivity` tool names a callee that is NOT deployed
+/// at activation time — its spawn parks a recoverable `CALLED_ELEMENT_ERROR`
+/// incident (issue #1159). Deploying the callee and resolving the incident must
+/// RE-ATTEMPT the spawn (`RetryCallActivitySpawn` → the ad-hoc respawn path) and
+/// actually create the child, instead of completing the tool with a manufactured
+/// all-null result.
+fn adhoc_agent_tool_calls_undeployed() -> ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="specialist-proc"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="={status: status, summary: summary}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap()
+}
+
+fn specialist_proc() -> ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="specialist-proc">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap()
+}
+
+#[test]
+fn adhoc_call_activity_tool_spawn_incident_recovers_on_resolve() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_tool_calls_undeployed()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("askedAbout", Value::Str("a mortgage".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // The callee is not deployed: the spawn parks a recoverable incident and no
+    // child job is minted.
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "the unknown callee parks one incident");
+    assert_eq!(active[0].kind, state::IncidentKind::CalledElementError);
+    assert_eq!(
+        active[0].redrive,
+        Some(state::IoMappingRedrive::CallActivitySpawn),
+        "the spawn incident carries a spawn-retry redrive, not None"
+    );
+    assert!(
+        engine
+            .activate_jobs("probe-child", "W", 10, 1_000, 0)
+            .is_empty(),
+        "no child is instantiated while the callee is missing"
+    );
+
+    // Deploy the callee and resolve: resolution re-attempts the spawn.
+    engine
+        .apply_command(Command::DeployProcess(specialist_proc()))
+        .unwrap();
+    let incident_key = engine.incidents()[0].key;
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    assert!(
+        engine.active_incidents().is_empty(),
+        "resolving the incident cleared it by spawning the child"
+    );
+    let child_jobs = engine.activate_jobs("probe-child", "W", 10, 1_000, 0);
+    assert_eq!(
+        child_jobs.len(),
+        1,
+        "resolving the spawn incident re-attempted the spawn and instantiated the \
+         callee — it did not silently complete the tool"
+    );
+    assert_eq!(
+        child_jobs[0].variables.get("customerRequest"),
+        Some(&Value::Str("a mortgage".into())),
+        "the retried spawn re-applied the tool's input mapping"
+    );
+    assert!(!engine.is_completed(inst), "the parent waits for the child");
+}
