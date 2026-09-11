@@ -5702,6 +5702,26 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             xml.contains("bpmnElement=\"Split\" isMarkerVisible=\"true\""),
             "inclusive gateway opts into the marker: {xml}"
         );
+        // The marker is not the only routing metadata the emitter adds for an
+        // inclusive gateway: it also serializes the `default` flow and the guarded
+        // branch's `conditionExpression`. Asserting only `isMarkerVisible` would
+        // still pass if either were silently dropped, so protect the round-trip.
+        // Flow ids are synthesized on emit, so `default` references a synthesized
+        // id (not `toB`); re-parse the emitted XML and assert the semantics survive.
+        assert!(
+            xml.contains("<bpmn:conditionExpression>=go</bpmn:conditionExpression>"),
+            "guarded branch's condition is emitted: {xml}"
+        );
+        let (round, _) = first_def(&xml).expect("re-parse emitted inclusive");
+        let split = &round.elements["Split"];
+        assert!(
+            split.outgoing.iter().any(|f| f.is_default),
+            "default flow survives the round-trip: {xml}"
+        );
+        assert!(
+            split.outgoing.iter().any(|f| f.condition.is_some()),
+            "guarded branch survives the round-trip: {xml}"
+        );
     }
 
     #[test]
