@@ -1747,7 +1747,30 @@ fn parse_with_captures(
                     // boundaries (timerEventDefinition) and message boundaries
                     // (messageEventDefinition); ignore the rest.
                     if let (Some(acc), Some(boundary)) = (current.as_mut(), cur_boundary.take()) {
-                        if boundary.error_ref.is_some()
+                        if boundary.escalation {
+                            // An escalation boundary is not modelled for
+                            // execution. Reject it FIRST — before the
+                            // supported-definition branch below — so a boundary
+                            // that carries escalation *plus* a supported
+                            // definition (e.g. an `errorEventDefinition` or a
+                            // `timerEventDefinition` on the same boundary) is
+                            // still rejected rather than having the supported
+                            // definition silently mask the escalation and let
+                            // the model deploy, violating the promise that every
+                            // escalation carrier is cleanly rejected. Record it
+                            // two ways: (1) in `escalation_boundary_ids` so
+                            // `build` rejects a sequenceFlow wired to/from it
+                            // with a precise naming `UnsupportedElement` (the
+                            // wired-flow diagnostic); and (2) in `unmodelled` so
+                            // the unsupported-elements validator also rejects a
+                            // *detached* escalation boundary (one with no wired
+                            // flow), which would otherwise deploy silently.
+                            acc.unmodelled.push((
+                                "escalationEventDefinition".to_string(),
+                                boundary.id.clone(),
+                            ));
+                            acc.escalation_boundary_ids.push(boundary.id);
+                        } else if boundary.error_ref.is_some()
                             || boundary.timer_duration_millis.is_some()
                             || boundary.timer_expr.is_some()
                             || boundary.message_ref.is_some()
@@ -1756,23 +1779,6 @@ fn parse_with_captures(
                             || boundary.compensation
                         {
                             acc.boundaries.push(boundary);
-                        } else if boundary.escalation {
-                            // An escalation boundary is not modelled for
-                            // execution. Record it two ways: (1) in
-                            // `escalation_boundary_ids` so `build` rejects a
-                            // sequenceFlow wired to/from it with a precise
-                            // naming `UnsupportedElement` (the wired-flow
-                            // diagnostic); and (2) in `unmodelled` so the
-                            // unsupported-elements validator also rejects a
-                            // *detached* escalation boundary (one with no wired
-                            // flow), which would otherwise deploy silently and
-                            // contradict the clean rejection promised for every
-                            // escalation carrier.
-                            acc.unmodelled.push((
-                                "escalationEventDefinition".to_string(),
-                                boundary.id.clone(),
-                            ));
-                            acc.escalation_boundary_ids.push(boundary.id);
                         }
                     }
                 }
@@ -4361,6 +4367,50 @@ mod tests {
 
         let err =
             parse_bpmn(xml).expect_err("a detached escalation boundary must still be rejected");
+        match err {
+            ParseError::UnsupportedElement { tag, element_id } => {
+                assert_eq!(tag, "escalationEventDefinition");
+                assert_eq!(element_id, "Bnd");
+            }
+            other => panic!("expected UnsupportedElement naming the boundary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_a_boundary_that_carries_escalation_alongside_a_supported_definition() {
+        // #1168 regression: a boundary event carrying an `escalationEventDefinition`
+        // AND a supported definition (here an interrupting `errorEventDefinition`).
+        // Escalation must take precedence at boundary close, so the whole carrier
+        // is rejected with an `UnsupportedElement` naming the boundary. Before
+        // giving escalation precedence, the supported (error) branch built the
+        // boundary first and SILENTLY ignored the escalation flag — deploying a
+        // model that contradicts the clean rejection promised for every escalation
+        // carrier.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:error id="Err" name="Boom" errorCode="BOOM" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="ss" />
+      <bpmn:endEvent id="se" />
+      <bpmn:sequenceFlow id="if1" sourceRef="ss" targetRef="se" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="Sub">
+      <bpmn:errorEventDefinition errorRef="Err" />
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Handler" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Sub" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="Bnd" targetRef="Handler" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml)
+            .expect_err("a boundary carrying escalation must be rejected even with a supported def");
         match err {
             ParseError::UnsupportedElement { tag, element_id } => {
                 assert_eq!(tag, "escalationEventDefinition");

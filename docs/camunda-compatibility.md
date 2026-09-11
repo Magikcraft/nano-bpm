@@ -48,7 +48,7 @@ what Nano *recognizes*; everything not listed there is dropped on parse.
 | `userTask` | **executed** | `bpmn.rs:310`; user-task record + listeners at `engine/mod.rs:3273` |
 | `receiveTask` | **parsed-not-executed** | Parsed as an inert throw/pass-through, `bpmn.rs:540`. Use a message intermediate **catch** event to wait for a message instead. |
 | `manualTask` | **unsupported** | No parser arm in `bpmn.rs`. |
-| `sendTask` | **unsupported** | No parser arm in `bpmn.rs`. |
+| `sendTask` | **executed** | `bpmn.rs` (`sendTask` arm); a job-based service task — the throwing cousin of `receiveTask` — job created at `engine/mod.rs:3228` (#1168). |
 
 ### Gateways
 
@@ -57,7 +57,7 @@ what Nano *recognizes*; everything not listed there is dropped on parse.
 | `exclusiveGateway` | **executed** | `bpmn.rs:255`; routing at `engine/mod.rs:5000`. `default` flow honoured (`bpmn.rs:259`). |
 | `parallelGateway` | **executed** | `bpmn.rs:263`; fork/join at `engine/mod.rs:3066`. |
 | `eventBasedGateway` | **executed** | `bpmn.rs:266`; deferred choice at `engine/mod.rs:5047`. |
-| `inclusiveGateway` | **unsupported** | No parser arm in `bpmn.rs`. |
+| `inclusiveGateway` | **executed** | `bpmn.rs` (`inclusiveGateway` arm); conditional OR-split + synchronising join at `engine/mod.rs`. `default` flow honoured (#1168). |
 | `complexGateway` | **unsupported** | No parser arm in `bpmn.rs`. |
 
 ### Events
@@ -74,7 +74,7 @@ what Nano *recognizes*; everything not listed there is dropped on parse.
 | `boundaryEvent` — signal | **executed** (interrupting + non-interrupting) | `engine/boundary.rs:588` |
 | `boundaryEvent` — conditional | **executed** (interrupting + non-interrupting) | `engine/boundary.rs:616` |
 | `terminateEndEvent` | **executed** | An `endEvent` carrying a `terminateEventDefinition` kills every other active token in its enclosing scope (parallel-split siblings, pending timers, open jobs/subscriptions) and completes that scope. A top-level terminate end kills every inner token but **completes** the whole instance (`ProcessInstanceCompleted` — Zeebe parity: only the inner element instances record `TERMINATED`, the process instance's own terminal record is `ELEMENT_COMPLETED`); a sub-process-scoped one ends only that sub-process scope and the parent continues on the sub-process's outgoing flow. `bpmn.rs` (`terminateEventDefinition` arm); `model.rs` (`ElementKind::TerminateEndEvent`); `engine/mod.rs` (`complete_terminate_end`). |
-| `escalation` events | **unsupported** | No parser arm / dispatch. |
+| `escalation` events | **unsupported (deploy-rejected)** | Not modelled for execution; every escalation carrier (throw / end / boundary) is cleanly rejected at deploy with an `UnsupportedElement` naming the construct (`bpmn.rs` `escalationEventDefinition` arm; #1168), rather than silently mis-executing. |
 | `compensation` events | **unsupported** | No parser arm / dispatch. |
 
 Event definitions that are wired: `timerEventDefinition` (`timeDuration` /
