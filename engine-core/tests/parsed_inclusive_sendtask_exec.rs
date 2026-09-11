@@ -9,26 +9,18 @@ use std::collections::HashMap;
 
 use nanobpmn_engine_core::{bpmn::parse_bpmn, Command, Engine, Event, Value};
 
+/// The `sendTask` model, shared verbatim with the `@nanobpm/engine-wasm`
+/// package-level end-to-end probe (`engine-wasm/tests/agent-instance-e2e/
+/// element-support.mjs`) so the native and browser execution surfaces exercise
+/// one canonical diagram — no drifting second copy.
+const SEND_TASK_XML: &str = include_str!("fixtures/send-task.bpmn");
+
 /// A `sendTask` parsed from BPMN XML is executed by a job worker exactly like a
 /// service task: deploying it, starting an instance, activating its job and
 /// completing it must drive the process to `ProcessInstanceCompleted`.
 #[test]
 fn send_task_parsed_from_bpmn_activates_a_job_and_completes() {
-    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
-  <bpmn:process id="notify" isExecutable="true">
-    <bpmn:startEvent id="s" />
-    <bpmn:sendTask id="send" name="Send Notification">
-      <bpmn:extensionElements>
-        <zeebe:taskDefinition type="notifier" retries="4" />
-      </bpmn:extensionElements>
-    </bpmn:sendTask>
-    <bpmn:endEvent id="e" />
-    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="send" />
-    <bpmn:sequenceFlow id="f2" sourceRef="send" targetRef="e" />
-  </bpmn:process>
-</bpmn:definitions>"#;
+    let xml = SEND_TASK_XML;
 
     let mut engine = Engine::new();
     engine
@@ -56,30 +48,7 @@ fn send_task_parsed_from_bpmn_activates_a_job_and_completes() {
     );
 }
 
-const INCLUSIVE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
-  <bpmn:process id="review" isExecutable="true">
-    <bpmn:startEvent id="s" />
-    <bpmn:inclusiveGateway id="split" default="toB" />
-    <bpmn:serviceTask id="a">
-      <bpmn:extensionElements><zeebe:taskDefinition type="ta" /></bpmn:extensionElements>
-    </bpmn:serviceTask>
-    <bpmn:serviceTask id="b">
-      <bpmn:extensionElements><zeebe:taskDefinition type="tb" /></bpmn:extensionElements>
-    </bpmn:serviceTask>
-    <bpmn:inclusiveGateway id="join" />
-    <bpmn:endEvent id="e" />
-    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="split" />
-    <bpmn:sequenceFlow id="toA" sourceRef="split" targetRef="a">
-      <bpmn:conditionExpression>=go</bpmn:conditionExpression>
-    </bpmn:sequenceFlow>
-    <bpmn:sequenceFlow id="toB" sourceRef="split" targetRef="b" />
-    <bpmn:sequenceFlow id="fa" sourceRef="a" targetRef="join" />
-    <bpmn:sequenceFlow id="fb" sourceRef="b" targetRef="join" />
-    <bpmn:sequenceFlow id="fj" sourceRef="join" targetRef="e" />
-  </bpmn:process>
-</bpmn:definitions>"#;
+const INCLUSIVE_XML: &str = include_str!("fixtures/inclusive-gateway.bpmn");
 
 /// An `inclusiveGateway` split/join parsed from BPMN XML routes and completes at
 /// runtime, honouring the conditional branch when its condition holds and the

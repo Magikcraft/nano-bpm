@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="notify" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:sendTask id="send" name="Send Notification">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="notifier" retries="4" />
+      </bpmn:extensionElements>
+    </bpmn:sendTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="send" />
+    <bpmn:sequenceFlow id="f2" sourceRef="send" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>

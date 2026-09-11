@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="review" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:inclusiveGateway id="split" default="toB" />
+    <bpmn:serviceTask id="a">
+      <bpmn:extensionElements><zeebe:taskDefinition type="ta" /></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="b">
+      <bpmn:extensionElements><zeebe:taskDefinition type="tb" /></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:inclusiveGateway id="join" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="split" />
+    <bpmn:sequenceFlow id="toA" sourceRef="split" targetRef="a">
+      <bpmn:conditionExpression>=go</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="toB" sourceRef="split" targetRef="b" />
+    <bpmn:sequenceFlow id="fa" sourceRef="a" targetRef="join" />
+    <bpmn:sequenceFlow id="fb" sourceRef="b" targetRef="join" />
+    <bpmn:sequenceFlow id="fj" sourceRef="join" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>
