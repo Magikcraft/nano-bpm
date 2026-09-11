@@ -37,7 +37,8 @@ somewhere to go when no condition matches. It could not — and the engine
    symptom.
 
 The irony: `analyze_model` *detects* the missing default
-(`exclusive-no-default` warning) and instructs the model to fix the topology, but
+(`gateway-no-default` warning — it covers both the exclusive/XOR and inclusive/OR
+condition-routed gateways) and instructs the model to fix the topology, but
 hands it no tool to do so. The model is diagnosed into a dead end.
 
 Generalising: every new BPMN capability we want the LLM to author demands (a) a
@@ -153,7 +154,7 @@ The LLM composes them: the grammar says `[default]` is a legal edge annotation;
 `analyze_model` says *"review_gw has no default and every branch is
 conditional"*; the model writes `review_gw -> manual_review [default]`. Neither
 map alone suffices — the context-sensitive half already exists (the
-`exclusive-no-default` warning); the context-free half is what this ADR adds.
+`gateway-no-default` warning); the context-free half is what this ADR adds.
 
 **The grammar is emitted from the engine surface, not hand-maintained — with one
 precise caveat about what is auto-derived.** The engine's possibility space is a
@@ -217,7 +218,7 @@ matched to need:
   static, model-independent language reference; `analyze_model` remains the
   model-*aware* half.
 - **Pair with the analyzer.** A context-sensitive finding names the context-free
-  entry to consult: the `exclusive-no-default` warning points at
+  entry to consult: the `gateway-no-default` warning points at
   `describe_ir_grammar(exclusiveGateway)`. The two maps compose exactly at the
   moment of need.
 - **Push-on-error.** `write_model_ir` parse failures echo the relevant production
@@ -333,7 +334,7 @@ desirability stratifies into a tiered fitness function — cheap to expensive,
 mirroring the existing `limit:1 → 25 → full` replay sampling:
 
 1. **Static well-formedness (cheap, ms).** `analyze_model` smell count. The
-   `exclusive-no-default` warning is *already* a desirability signal, not merely a
+   `gateway-no-default` warning is *already* a desirability signal, not merely a
    "you could": all-conditional branches with no default is a **liveness defect** —
    a token can get stuck. Adding the default *eliminates a defect*. Reducing
    warnings is a coarse monotone gradient, but a proxy: a model can be

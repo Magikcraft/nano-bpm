@@ -129,8 +129,9 @@ impl Condition {
     }
 
     /// Evaluates the condition against a set of variables, returning the FEEL
-    /// error on a parse/type failure or a non-boolean result. The exclusive
-    /// gateway turns such an error into an `ExpressionEvaluation` incident.
+    /// error on a parse/type failure or a non-boolean result. A condition-routed
+    /// gateway (exclusive or inclusive) turns such an error into an
+    /// `ExpressionEvaluation` incident.
     pub fn eval(&self, variables: &HashMap<String, Value>) -> Result<bool, crate::feel::FeelError> {
         crate::feel::eval_bool(&self.expression, variables)
     }
@@ -141,13 +142,14 @@ impl Condition {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SequenceFlow {
     pub to: ElementId,
-    /// `None` means an unconditional flow. On an exclusive gateway an
-    /// unconditional flow acts as the default (place it last).
+    /// `None` means an unconditional flow. On a condition-routed gateway
+    /// (exclusive or inclusive) an unconditional flow acts as the default (place
+    /// it last).
     pub condition: Option<Condition>,
-    /// True when this is the exclusive gateway's explicit **default** flow (the
-    /// gateway's `default="..."` attribute). A default flow is selected only as a
-    /// fallback — after every non-default flow's condition has evaluated false —
-    /// regardless of its document order among the outgoing flows.
+    /// True when this is the condition-routed gateway's explicit **default** flow
+    /// (the gateway's `default="..."` attribute). A default flow is selected only
+    /// as a fallback — after every non-default flow's condition has evaluated
+    /// false — regardless of its document order among the outgoing flows.
     #[cfg_attr(feature = "serde", serde(default))]
     pub is_default: bool,
 }
@@ -2427,10 +2429,10 @@ impl ProcessBuilder {
         self
     }
 
-    /// Adds an exclusive gateway's explicit **default** sequence flow from `from`
-    /// to `to`. It carries no condition and is taken only as a fallback (when no
-    /// non-default flow's condition is satisfied), irrespective of its position
-    /// in the outgoing-flow order.
+    /// Adds a condition-routed gateway's (exclusive or inclusive) explicit
+    /// **default** sequence flow from `from` to `to`. It carries no condition and
+    /// is taken only as a fallback (when no non-default flow's condition is
+    /// satisfied), irrespective of its position in the outgoing-flow order.
     pub fn connect_default(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
         self.edges.push((
             from.into(),
@@ -2443,8 +2445,9 @@ impl ProcessBuilder {
         self
     }
 
-    /// Adds a conditional sequence flow from `from` to `to`, taken (on an
-    /// exclusive gateway) only when the FEEL `expression` evaluates to `true`.
+    /// Adds a conditional sequence flow from `from` to `to`, taken (on a
+    /// condition-routed gateway — exclusive or inclusive) only when the FEEL
+    /// `expression` evaluates to `true`.
     pub fn connect_when(
         mut self,
         from: impl Into<String>,

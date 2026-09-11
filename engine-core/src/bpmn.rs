@@ -72,8 +72,9 @@
 //!   `externalReference` for an external form).
 //! * `sequenceFlow` with `sourceRef`/`targetRef`, and an optional
 //!   `conditionExpression` whose FEEL body is stored verbatim and evaluated by
-//!   [`crate::feel`] at the exclusive gateway (comparisons, arithmetic, boolean
-//!   logic, member access — not just equality). A condition that fails to
+//!   [`crate::feel`] at a condition-routed gateway — exclusive (XOR) or
+//!   inclusive (OR) (comparisons, arithmetic, boolean logic, member access — not
+//!   just equality). A condition that fails to
 //!   evaluate to a boolean raises an `ExpressionEvaluation` incident.
 //! * A `serviceTask` bearing a `zeebe:agentDefinition agentType="aiAgentTask"`
 //!   (or `"external"`) extension marker remains an ordinary
@@ -442,6 +443,11 @@ fn parse_with_captures(
     let mut current: Option<ProcessAcc> = None;
     // Index of the service task currently being read (to attach its job type).
     let mut cur_service_task: Option<usize> = None;
+    // Index of the plain `task`/`manualTask` currently being read. Tracked purely
+    // so its close handler can pop the io_stack only when the open handler
+    // actually pushed (an id-less task is never pushed) — mirroring the
+    // service/user/call trackers.
+    let mut cur_plain_task: Option<usize> = None;
     // Index of the user task currently being read (to attach assignment,
     // scheduling and priority expressions from its Zeebe extension elements).
     let mut cur_user_task: Option<usize> = None;
@@ -1288,6 +1294,7 @@ fn parse_with_captures(
                             "task" | "manualTask" => {
                                 let idx = acc.add_node(attrs, NodeKind::Task);
                                 if !self_closing {
+                                    cur_plain_task = idx;
                                     if let Some(i) = idx {
                                         io_stack.push(i);
                                     }
@@ -1692,6 +1699,7 @@ fn parse_with_captures(
                         processes.push(acc);
                     }
                     cur_service_task = None;
+                    cur_plain_task = None;
                     cur_flow = None;
                     cur_boundary = None;
                     cur_intermediate = None;
@@ -1714,27 +1722,48 @@ fn parse_with_captures(
                     extension_depth = 0;
                 }
                 "serviceTask" => {
+                    // Only pop when the open handler actually pushed. The push is
+                    // conditional on `add_node` returning `Some` (the task carries
+                    // an `id`); an id-less task is never pushed, so an
+                    // unconditional pop would detach the enclosing activity's
+                    // mapping owner and misattribute later `zeebe:ioMapping` data
+                    // — the same defect class the id-less event handlers guard
+                    // against. Safe because a task cannot nest another activity, so
+                    // `cur_service_task` here is still this task's own index.
+                    if cur_service_task.is_some() {
+                        io_stack.pop();
+                    }
                     cur_service_task = None;
-                    io_stack.pop();
                 }
                 "sendTask" => {
+                    if cur_service_task.is_some() {
+                        io_stack.pop();
+                    }
                     cur_service_task = None;
-                    io_stack.pop();
                 }
                 "businessRuleTask" | "scriptTask" => {
+                    if cur_service_task.is_some() {
+                        io_stack.pop();
+                    }
                     cur_service_task = None;
-                    io_stack.pop();
                 }
                 "userTask" => {
+                    if cur_user_task.is_some() {
+                        io_stack.pop();
+                    }
                     cur_user_task = None;
-                    io_stack.pop();
                 }
                 "task" | "manualTask" => {
-                    io_stack.pop();
+                    if cur_plain_task.is_some() {
+                        io_stack.pop();
+                    }
+                    cur_plain_task = None;
                 }
                 "callActivity" => {
+                    if cur_call.is_some() {
+                        io_stack.pop();
+                    }
                     cur_call = None;
-                    io_stack.pop();
                 }
                 "subProcess" => {
                     if let Some(acc) = current.as_mut() {
@@ -6227,6 +6256,54 @@ mod tests {
         assert_eq!(io.outputs.len(), 1);
         assert_eq!(io.outputs[0].source, "=result");
         assert_eq!(io.outputs[0].target, "chargeResult");
+    }
+
+    #[test]
+    fn should_not_misattribute_io_mapping_after_an_id_less_activity() {
+        // given — a sub-process (pushed onto the io_stack) whose first child is an
+        // id-less `sendTask` (so `add_node` returns `None` and the task is never
+        // pushed), followed by the sub-process's own `zeebe:ioMapping`. A
+        // previously unconditional pop on `</sendTask>` would remove the enclosing
+        // sub-process from the io_stack, so the sub-process's own output mapping
+        // would fall onto a stray node (or be dropped). Same defect class as the
+        // id-less event handlers — every leaf-activity close path must guard its
+        // pop on having actually pushed.
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="sub" />
+              <bpmn:subProcess id="sub">
+                <bpmn:sendTask></bpmn:sendTask>
+                <bpmn:extensionElements>
+                  <zeebe:ioMapping>
+                    <zeebe:output source="=&#34;done&#34;" target="subOut" />
+                  </zeebe:ioMapping>
+                </bpmn:extensionElements>
+                <bpmn:startEvent id="ss" />
+                <bpmn:sequenceFlow id="f1" sourceRef="ss" targetRef="se" />
+                <bpmn:endEvent id="se" />
+              </bpmn:subProcess>
+              <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+              <bpmn:endEvent id="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then — the mapping still attaches to the enclosing sub-process, because
+        // the id-less send task never popped it off the io_stack.
+        let io = &def.element("sub").unwrap().io;
+        assert_eq!(
+            io.outputs.len(),
+            1,
+            "sub-process must keep its own output mapping after an id-less child activity"
+        );
+        assert_eq!(io.outputs[0].source, "=\"done\"");
+        assert_eq!(io.outputs[0].target, "subOut");
     }
 
     #[test]
