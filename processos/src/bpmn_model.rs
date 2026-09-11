@@ -3431,9 +3431,14 @@ fn append_diagram(
     ));
     for id in &ids {
         if let Some(b) = rects.get(id) {
-            // An exclusive gateway only shows its X marker when the shape opts in; without this it
-            // renders as an empty diamond indistinguishable from a parallel gateway.
-            let marker = if matches!(def.elements[id].kind, ElementKind::ExclusiveGateway) {
+            // A gateway only shows its distinguishing marker when the shape
+            // opts in via `isMarkerVisible`; without it an exclusive (X) or
+            // inclusive (O) gateway renders as an empty diamond
+            // indistinguishable from a parallel gateway.
+            let marker = if matches!(
+                def.elements[id].kind,
+                ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway
+            ) {
                 " isMarkerVisible=\"true\""
             } else {
                 ""
@@ -5483,6 +5488,36 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         assert!(
             xml.contains("name=\"Screen for fraud\""),
             "labels the inserted task: {xml}"
+        );
+    }
+
+    #[test]
+    fn definition_to_xml_marks_inclusive_gateways() {
+        // An inclusive (OR) gateway must also opt into `isMarkerVisible` so its
+        // circle marker renders; without it the generated diagram shows an empty
+        // diamond indistinguishable from a parallel gateway (#1168).
+        const INCLUSIVE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:inclusiveGateway id="Split" default="toB" />
+    <bpmn:task id="a" />
+    <bpmn:task id="b" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="Split" />
+    <bpmn:sequenceFlow id="toA" sourceRef="Split" targetRef="a">
+      <bpmn:conditionExpression>=go</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="toB" sourceRef="Split" targetRef="b" />
+    <bpmn:sequenceFlow id="fa" sourceRef="a" targetRef="e" />
+    <bpmn:sequenceFlow id="fb" sourceRef="b" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let (def, _) = first_def(INCLUSIVE).expect("parse inclusive");
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("bpmnElement=\"Split\" isMarkerVisible=\"true\""),
+            "inclusive gateway opts into the marker: {xml}"
         );
     }
 

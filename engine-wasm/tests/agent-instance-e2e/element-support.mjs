@@ -28,7 +28,11 @@ for (const variant of ["lean", "readmodel"]) {
   )) });
 
   // sendTask: deploy, start an instance, and confirm it activates a worker job
-  // exactly like a service task (the advertised sendTask execution semantics).
+  // exactly like a service task (the advertised sendTask execution semantics),
+  // then complete that job and assert the instance drives to `Completed` — a
+  // stale/broken committed wasm could activate the job yet fail the completion
+  // path, so the smoke test must exercise the full run, matching the native
+  // `parsed_inclusive_sendtask_exec.rs` coverage.
   {
     const engine = new TestEngine();
     engine.deploy(sendTask);
@@ -36,17 +40,27 @@ for (const variant of ["lean", "readmodel"]) {
     const jobs = JSON.parse(engine.activateJobs("notifier", 1, 1000, "W", true));
     assert.equal(jobs.length, 1, `${variant}: sendTask must activate one 'notifier' job`);
     assert.equal(jobs[0].elementId, "send", `${variant}: sendTask job carries its element id`);
+    const snap = JSON.parse(engine.completeJob(jobs[0].key, "{}", jobs[0].leaseToken ?? null));
+    const inst = snap.instances.find((i) => i.processId === "notify");
+    assert.equal(inst?.state, "Completed",
+      `${variant}: completing the sendTask job must drive the instance to Completed`);
   }
 
   // inclusiveGateway split/join: deploy and start an instance with the branch
-  // condition satisfied — the committed wasm must accept the gateway kind and
-  // route it (the conditional branch activates its job).
+  // condition satisfied — the committed wasm must accept the gateway kind, route
+  // the conditional branch, and (critically) synchronise the join and complete
+  // the instance once that branch's job finishes. Stopping at job activation
+  // would let a broken join/completion path pass, so drive it to `Completed`.
   {
     const engine = new TestEngine();
     engine.deploy(inclusive);
     engine.createInstance("review", JSON.stringify({ go: true }));
     const jobs = JSON.parse(engine.activateJobs("ta", 1, 1000, "W", true));
     assert.equal(jobs.length, 1, `${variant}: inclusiveGateway must route the conditional branch`);
+    const snap = JSON.parse(engine.completeJob(jobs[0].key, "{}", jobs[0].leaseToken ?? null));
+    const inst = snap.instances.find((i) => i.processId === "review");
+    assert.equal(inst?.state, "Completed",
+      `${variant}: the inclusive join must synchronise and complete the instance`);
   }
 
   console.log(`[${variant}] sendTask + inclusiveGateway deploy/createInstance OK`);

@@ -3924,6 +3924,28 @@ impl Engine {
                 let mut open_joins: Vec<String> = instance.join_instances.keys().cloned().collect();
                 open_joins.sort();
                 for src in open_joins {
+                    // Inclusive-gateway joins reuse this same `join_instances`
+                    // bookkeeping (the count/instance maps are element-kind
+                    // agnostic), but they do **not** fire on a durable
+                    // count-vs-threshold comparison: readiness is decided at
+                    // token quiescence by reachability
+                    // (`fire_ready_inclusive_joins`), never by comparing the
+                    // arrival count against `incoming_count`. So the "durable
+                    // count re-interpreted against a migrated-in threshold"
+                    // hazard this guard exists for cannot occur for them, and
+                    // requiring incoming-arity parity would reject an otherwise
+                    // compatible inclusive migration for an unrelated reason.
+                    // Guard *only* parallel-gateway joins — the sole element
+                    // whose durable count is compared to a definition-resident
+                    // threshold.
+                    let is_parallel_join = source_def
+                        .definition
+                        .elements
+                        .get(&src)
+                        .is_some_and(|e| e.kind == ElementKind::ParallelGateway);
+                    if !is_parallel_join {
+                        continue;
+                    }
                     let tgt = mapped
                         .get(&src)
                         .expect("an open join is active, so step 5 guarantees it is mapped");

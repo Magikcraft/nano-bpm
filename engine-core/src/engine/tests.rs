@@ -18500,6 +18500,100 @@ fn migration_rejects_open_join_with_different_incoming_arity() {
     );
 }
 
+/// An **inclusive**-gateway join reuses the same `join_instances` bookkeeping as
+/// a parallel join, but it fires on token *quiescence/reachability*
+/// (`fire_ready_inclusive_joins`), never by comparing a durable arrival count
+/// against the definition's incoming-flow count. So the arity-parity restriction
+/// that guards parallel joins must **not** apply to it: an open inclusive join
+/// remapped onto a target join with a *different* incoming arity is perfectly
+/// compatible and must migrate. Red/Green guard that the new element (#1168)
+/// did not silently inherit `MigratedParallelJoinArityChanged` by sharing the
+/// join maps.
+#[test]
+fn migration_allows_open_inclusive_join_with_different_incoming_arity() {
+    fn inc_join_2(id: &str, split: &str, a: &str, b: &str, join: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .inclusive_gateway(split)
+            .service_task(a, "ja")
+            .service_task(b, "jb")
+            .inclusive_gateway(join)
+            .end_event("e")
+            .connect("s", split)
+            .connect(split, a)
+            .connect(split, b)
+            .connect(a, join)
+            .connect(b, join)
+            .connect(join, "e")
+            .build()
+            .unwrap()
+    }
+    // Target inclusive join `join2` has THREE incoming flows, versus the two of
+    // the source — an arity change that would reject a *parallel* join.
+    fn inc_join_3(id: &str, split: &str, join: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .inclusive_gateway(split)
+            .service_task("a2", "ja")
+            .service_task("b2", "jb")
+            .service_task("c2", "jc")
+            .inclusive_gateway(join)
+            .end_event("e")
+            .connect("s", split)
+            .connect(split, "a2")
+            .connect(split, "b2")
+            .connect(split, "c2")
+            .connect("a2", join)
+            .connect("b2", join)
+            .connect("c2", join)
+            .connect(join, "e")
+            .build()
+            .unwrap()
+    }
+
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, inc_join_2("source", "split", "a", "b", "join"));
+    let target_key = deploy_for_migration(&mut engine, inc_join_3("target", "split2", "join2"));
+
+    let inst = create_instance_key(&mut engine, "source");
+    // Open the join: branch `a` arrives, leaving it half-open (branch `b` still
+    // parked and able to reach the join, so it has not fired).
+    complete_one(&mut engine, "ja");
+    let instance = engine.instance(inst).unwrap();
+    assert!(
+        instance.join_instances.contains_key("join"),
+        "precondition: the inclusive join is open before migration"
+    );
+
+    // Map the parked branch `b` and the open join onto the 3-flow target join.
+    // Unlike a parallel join, the arity change must be accepted.
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("b".to_string(), "b2".to_string()),
+                ("join".to_string(), "join2".to_string()),
+            ],
+        ))
+        .expect("an open inclusive join tolerates an incoming-arity change on migration");
+
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(instance.process_id, "target", "instance migrated");
+    assert!(
+        instance.join_instances.contains_key("join2"),
+        "the open inclusive join is re-pointed at the target id"
+    );
+
+    // The migrated instance still drives to completion: the parked branch `b`
+    // (now `b2`) finishes and the inclusive join synchronises and completes.
+    complete_one(&mut engine, "jb");
+    assert!(
+        engine.is_completed(inst),
+        "the migrated inclusive join synchronises its branches and completes"
+    );
+}
+
 #[test]
 fn migration_rejects_unknown_instance() {
     let mut engine = Engine::new();
