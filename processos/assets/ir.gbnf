@@ -12,7 +12,7 @@
 root      ::= ws "process" sp string sp "{" nl indent "start" sp id nl elements flows "}" ws
 elements  ::= element*
 flows     ::= flow*
-element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-inclusiveGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-linkIntermediateThrowEvent | elem-linkIntermediateCatchEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
+element   ::= elem-startEvent | elem-endEvent | elem-terminateEndEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-inclusiveGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-escalationThrowEvent | elem-escalationBoundaryEvent | elem-intermediateThrowEvent | elem-linkIntermediateThrowEvent | elem-linkIntermediateCatchEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent | elem-compensationBoundaryEvent | elem-compensationThrowEvent
 
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
@@ -133,6 +133,20 @@ elem-subProcess  ::= indent "subProcess" sp id (sp string)? (sp attrs-subProcess
 attrs-subProcess   ::= "{" nl (indent2 attr-line-subProcess nl)+ indent "}"
 attr-line-subProcess  ::= attr-subProcess-startEvent | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
 attr-subProcess-startEvent  ::= "startEvent" sp attr-id   # Id of the sub-process's inner (none) start event.
+
+# escalationThrowEvent — Escalation throw (intermediate throw or end event). Raises `escalationCode` up the enclosing scopes; non-critical, so the token always continues / drains (an uncaught escalation is ignored).
+elem-escalationThrowEvent  ::= indent "escalationThrowEvent" sp id (sp string)? (sp attrs-escalationThrowEvent)? nl
+attrs-escalationThrowEvent   ::= "{" nl (indent2 attr-line-escalationThrowEvent nl)+ indent "}"
+attr-line-escalationThrowEvent  ::= attr-escalationThrowEvent-escalationCode | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-escalationThrowEvent-escalationCode  ::= "escalationCode" sp attr-str   # The BPMN escalation code raised (empty raises an unnamed escalation).
+
+# escalationBoundaryEvent — Escalation boundary on an activity. Catches an escalation raised inside it (exact `escalationCode`, or empty for catch-all); interrupting or non-interrupting.
+elem-escalationBoundaryEvent  ::= indent "escalationBoundaryEvent" sp id (sp string)? (sp attrs-escalationBoundaryEvent)? nl
+attrs-escalationBoundaryEvent   ::= "{" nl (indent2 attr-line-escalationBoundaryEvent nl)+ indent "}"
+attr-line-escalationBoundaryEvent  ::= attr-escalationBoundaryEvent-attachedTo | attr-escalationBoundaryEvent-escalationCode | attr-escalationBoundaryEvent-interrupting | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-escalationBoundaryEvent-attachedTo  ::= "attachedTo" sp attr-id   # Id of the activity this boundary is attached to.
+attr-escalationBoundaryEvent-escalationCode  ::= "escalationCode" sp attr-str   # The BPMN escalation code caught (empty is a catch-all).
+attr-escalationBoundaryEvent-interrupting  ::= "interrupting" sp attr-bool   # `true` cancels the activity on fire; `false` spawns a parallel token.
 
 # intermediateThrowEvent — None intermediate throw. Pure pass-through.
 elem-intermediateThrowEvent  ::= indent "intermediateThrowEvent" sp id (sp string)? (sp attrs-intermediateThrowEvent)? nl

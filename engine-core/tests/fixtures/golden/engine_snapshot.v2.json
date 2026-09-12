@@ -1,5 +1,5 @@
 {
-  "next_local": 13,
+  "next_local": 15,
   "now": 1700000000007,
   "num_partitions": 1,
   "partition_id": 0,
@@ -9,7 +9,7 @@
       "payment": [
         [
           -50,
-          13
+          15
         ]
       ]
     },
@@ -29,9 +29,9 @@
       "order": 1
     },
     "instances": {
-      "10": {
+      "12": {
         "active": {
-          "12": "charge"
+          "14": "charge"
         },
         "adhoc_instances": {},
         "agent_history": {},
@@ -43,7 +43,7 @@
         "incidents": [],
         "join_counts": {},
         "join_instances": {},
-        "key": 10,
+        "key": 12,
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
@@ -62,7 +62,7 @@
         },
         "variables_spilled": false
       },
-      "5": {
+      "7": {
         "active": {},
         "adhoc_instances": {},
         "agent_history": {},
@@ -74,7 +74,7 @@
         "incidents": [],
         "join_counts": {},
         "join_instances": {},
-        "key": 5,
+        "key": 7,
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
@@ -91,25 +91,7 @@
       }
     },
     "jobs": {
-      "13": {
-        "activated": false,
-        "activated_at": null,
-        "activation_timeout": null,
-        "created_at": 1700000000004,
-        "deadline": null,
-        "element_id": "charge",
-        "element_instance_key": 12,
-        "instance_key": 10,
-        "job_type": "payment",
-        "key": 13,
-        "kind": "BpmnElement",
-        "lease_token": null,
-        "priority": 50,
-        "retries": 3,
-        "state": "Created",
-        "worker": null
-      },
-      "8": {
+      "10": {
         "activated": true,
         "activated_at": null,
         "activation_timeout": null,
@@ -117,24 +99,42 @@
         "deadline": null,
         "durable_activation": true,
         "element_id": "charge",
-        "element_instance_key": 7,
-        "instance_key": 5,
+        "element_instance_key": 9,
+        "instance_key": 7,
         "job_type": "payment",
-        "key": 8,
+        "key": 10,
         "kind": "BpmnElement",
         "lease_token": null,
         "priority": 50,
         "retries": 3,
         "state": "Completed",
         "worker": null
+      },
+      "15": {
+        "activated": false,
+        "activated_at": null,
+        "activation_timeout": null,
+        "created_at": 1700000000004,
+        "deadline": null,
+        "element_id": "charge",
+        "element_instance_key": 14,
+        "instance_key": 12,
+        "job_type": "payment",
+        "key": 15,
+        "kind": "BpmnElement",
+        "lease_token": null,
+        "priority": 50,
+        "retries": 3,
+        "state": "Created",
+        "worker": null
       }
     },
     "jobs_by_instance": {
-      "10": [
-        13
+      "12": [
+        15
       ],
-      "5": [
-        8
+      "7": [
+        10
       ]
     },
     "message_start_subscriptions": {},
@@ -390,9 +390,489 @@
         },
         "key": 4,
         "version": 1
+      },
+      "6": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "b_int": {
+              "end_listeners": [],
+              "id": "b_int",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "EscalationBoundaryEvent": {
+                  "attached_to": "sub",
+                  "escalation_code": "OVERLOAD",
+                  "interrupting": true
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "h_int"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "b_non": {
+              "end_listeners": [],
+              "id": "b_non",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "EscalationBoundaryEvent": {
+                  "attached_to": "sub",
+                  "escalation_code": "",
+                  "interrupting": false
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "h_non"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "e": {
+              "end_listeners": [],
+              "id": "e",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "h_int": {
+              "end_listeners": [],
+              "id": "h_int",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "h_non": {
+              "end_listeners": [],
+              "id": "h_non",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "sub"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub": {
+              "end_listeners": [],
+              "id": "sub",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "SubProcess": {
+                  "start_event": "sub_start"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "e"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub_end": {
+              "end_listeners": [],
+              "id": "sub_end",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub_start": {
+              "end_listeners": [],
+              "id": "sub_start",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "throw"
+                }
+              ],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "throw": {
+              "end_listeners": [],
+              "id": "throw",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "EscalationThrowEvent": {
+                  "escalation_code": "OVERLOAD"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "sub_end"
+                }
+              ],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "escalate",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 6,
+        "version": 1
       }
     },
     "processes": {
+      "escalate": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "b_int": {
+              "end_listeners": [],
+              "id": "b_int",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "EscalationBoundaryEvent": {
+                  "attached_to": "sub",
+                  "escalation_code": "OVERLOAD",
+                  "interrupting": true
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "h_int"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "b_non": {
+              "end_listeners": [],
+              "id": "b_non",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "EscalationBoundaryEvent": {
+                  "attached_to": "sub",
+                  "escalation_code": "",
+                  "interrupting": false
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "h_non"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "e": {
+              "end_listeners": [],
+              "id": "e",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "h_int": {
+              "end_listeners": [],
+              "id": "h_int",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "h_non": {
+              "end_listeners": [],
+              "id": "h_non",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "sub"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub": {
+              "end_listeners": [],
+              "id": "sub",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "SubProcess": {
+                  "start_event": "sub_start"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "e"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub_end": {
+              "end_listeners": [],
+              "id": "sub_end",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub_start": {
+              "end_listeners": [],
+              "id": "sub_start",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "throw"
+                }
+              ],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "throw": {
+              "end_listeners": [],
+              "id": "throw",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "EscalationThrowEvent": {
+                  "escalation_code": "OVERLOAD"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "sub_end"
+                }
+              ],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "escalate",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 6,
+        "version": 1
+      },
       "order": {
         "definition": {
           "adhoc": [],
