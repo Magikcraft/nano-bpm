@@ -1954,11 +1954,13 @@ fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
 ///
 /// Generated ids are allocated **collision-free**: `id_fragment` is not injective (distinct legal
 /// codes such as `A/B` and `A_B` both fragment to `A_B`), and a generated `Escalation_…` id could
-/// also clash with an existing element id — either would emit duplicate BPMN ids and ambiguous
-/// `escalationRef`s. Codes are assigned in sorted order (deterministic regardless of the element
-/// map's iteration order), each getting the base id or the first free `…_2`, `…_3`, … suffix that
-/// is not already taken by a model element id or an earlier escalation id.
-fn collect_escalations(def: &ProcessDefinition) -> BTreeMap<String, String> {
+/// also clash with any id the document already emits — a model element id, the `<bpmn:process>` id,
+/// or a (preserved or synthesized) sequence-flow id — either would emit duplicate BPMN ids and
+/// ambiguous `escalationRef`s. `reserved` carries that full set of already-emitted ids. Codes are
+/// assigned in sorted order (deterministic regardless of the element map's iteration order), each
+/// getting the base id or the first free `…_2`, `…_3`, … suffix not already taken by a reserved id
+/// or an earlier escalation id.
+fn collect_escalations(def: &ProcessDefinition, reserved: &HashSet<String>) -> BTreeMap<String, String> {
     let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for el in def.elements.values() {
         match &el.kind {
@@ -1971,9 +1973,12 @@ fn collect_escalations(def: &ProcessDefinition) -> BTreeMap<String, String> {
             _ => {}
         }
     }
-    // Reserve every model element id so a generated declaration id can never
-    // shadow an existing node.
-    let mut used: HashSet<String> = def.elements.keys().cloned().collect();
+    // Reserve every id this document will emit — model element ids, the
+    // `<bpmn:process>` id, and every (preserved or synthesized) sequence-flow id
+    // — so a generated `Escalation_…` declaration id can never shadow one of
+    // them (a process/flow literally named `Escalation_OVERLOAD` would otherwise
+    // duplicate a `<bpmn:escalation id>`; #1173).
+    let mut used: HashSet<String> = reserved.clone();
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     for code in codes {
         let id = alloc_unique_id(format!("Escalation_{}", id_fragment(&code)), &mut used);
@@ -2969,6 +2974,38 @@ fn restore_adhoc_catalog_elements(def: &mut ProcessDefinition) {
     }
 }
 
+/// Resolve a stable id for every sequence flow once, in the canonical order the
+/// process body and the diagram-interchange both use (sorted sources, outgoing in
+/// declaration order), plus the per-source `default` flow map. When a preserved
+/// diagram covers the topology, the original flow ids are reused so its
+/// `<bpmndi:BPMNEdge>`s still reference live flows; otherwise a `Flow_{n}` id
+/// (n starting at 1) is synthesized. This is the single source of truth for flow
+/// ids: [`serialize_definition`] both reserves them against generated declaration
+/// ids and emits them, so the two can never drift.
+fn flow_id_resolution(
+    def: &ProcessDefinition,
+    preserve: Option<&PreservedDi>,
+) -> (Vec<String>, HashMap<String, String>) {
+    let mut flow_ids: Vec<String> = Vec::new();
+    let mut default_flows: HashMap<String, String> = HashMap::new();
+    let mut sources: Vec<&String> = def.elements.keys().collect();
+    sources.sort();
+    let mut k = 0usize;
+    for src in sources {
+        for flow in &def.elements[src].outgoing {
+            k += 1;
+            let id = preserve
+                .and_then(|d| d.flow_id(src, &flow.to))
+                .unwrap_or_else(|| format!("Flow_{k}"));
+            if flow.is_default {
+                default_flows.insert(src.clone(), id.clone());
+            }
+            flow_ids.push(id);
+        }
+    }
+    (flow_ids, default_flows)
+}
+
 fn serialize_definition(
     def: &ProcessDefinition,
     overrides: &HashMap<String, String>,
@@ -2979,10 +3016,24 @@ fn serialize_definition(
     normalized.normalize_legacy_agent_tasks();
     restore_adhoc_catalog_elements(&mut normalized);
     let def = &normalized;
+    // Resolve the preserved hand-layout (if it still covers the topology) and the
+    // canonical sequence-flow ids up front, so declaration-id allocation can
+    // reserve *every* id this document will emit. A generated declaration id
+    // (`Escalation_…`, `Signal_…`, …) must not collide with the `<bpmn:process>`
+    // id or a preserved/synthesized `<bpmn:sequenceFlow>` id — e.g. a process or
+    // preserved flow literally named `Escalation_OVERLOAD` would otherwise
+    // duplicate a `<bpmn:escalation id>` and emit an ambiguous `escalationRef`
+    // (#1173). `flow_id_resolution` is the single source of truth for flow ids,
+    // reused verbatim when the flows are emitted below.
+    let preserve = di.filter(|d| d.covers(def));
+    let (flow_ids, default_flows) = flow_id_resolution(def, preserve);
+    let mut reserved_ids: HashSet<String> = def.elements.keys().cloned().collect();
+    reserved_ids.insert(def.id.clone());
+    reserved_ids.extend(flow_ids.iter().cloned());
     let errors = collect_error_ids(def);
     let (messages, msg_lookup) = collect_messages(def);
     let signals = collect_signals(def);
-    let escalations = collect_escalations(def);
+    let escalations = collect_escalations(def, &reserved_ids);
 
     // Resolve a human label for every element: an operator-set name wins, else a readable label
     // derived from the id (so an authored node like `FraudScreen` shows as "Fraud Screen").
@@ -3073,34 +3124,10 @@ fn serialize_definition(
         "  <bpmn:process id=\"{}\" isExecutable=\"true\">\n",
         xml_escape(&def.id)
     ));
-    // Decide whether a preserved hand-layout can be re-attached verbatim: its shapes and edges must
-    // cover exactly the current node + flow topology (a pure attribute/condition/default edit).
-    let preserve = di.filter(|d| d.covers(def));
+    // `preserve`, `flow_ids` and `default_flows` were resolved once at the top of
+    // this function (so declaration-id allocation could reserve every emitted id);
+    // reuse them here for the flow body/DI emission.
 
-    // Assign a stable id to every sequence flow once, in the canonical order the body and DI both
-    // use (sorted sources, outgoing in declaration order). When a preserved diagram covers the
-    // topology, reuse the original flow ids so its `<bpmndi:BPMNEdge>`s still reference live flows;
-    // otherwise synthesize `Flow_{n}` (n starting at 1). A gateway emits `default="<id>"` referencing
-    // the same id, so the parser re-flags the branch as the default fallback on the round-trip.
-    let mut flow_ids: Vec<String> = Vec::new();
-    let mut default_flows: HashMap<String, String> = HashMap::new();
-    {
-        let mut sources: Vec<&String> = def.elements.keys().collect();
-        sources.sort();
-        let mut k = 0usize;
-        for src in sources {
-            for flow in &def.elements[src].outgoing {
-                k += 1;
-                let id = preserve
-                    .and_then(|d| d.flow_id(src, &flow.to))
-                    .unwrap_or_else(|| format!("Flow_{k}"));
-                if flow.is_default {
-                    default_flows.insert(src.clone(), id.clone());
-                }
-                flow_ids.push(id);
-            }
-        }
-    }
     // Emit top-level nodes (parent == None) in a stable order; sub-processes recurse.
     let mut top: Vec<&String> = def
         .elements
@@ -5475,7 +5502,8 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .connect("Sub", "Done")
             .build()
             .unwrap();
-        let escalations = collect_escalations(&def);
+        let reserved: std::collections::HashSet<String> = def.elements.keys().cloned().collect();
+        let escalations = collect_escalations(&def, &reserved);
         assert_eq!(escalations.len(), 2, "both codes get a declaration");
         let ids: std::collections::HashSet<&String> = escalations.values().collect();
         assert_eq!(
@@ -5486,6 +5514,76 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         );
         // And every code still round-trips through serialize -> parse.
         let xml = definition_to_xml(&def);
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn collect_escalations_reserves_ids_emitted_outside_the_element_map() {
+        // Regression (#1173): a generated `Escalation_…` declaration id must not
+        // collide with an id the document emits that is NOT a model element id —
+        // the `<bpmn:process>` id or a preserved `<bpmn:sequenceFlow>` id. Here a
+        // reserved id (e.g. a preserved flow literally named `Escalation_OVERLOAD`)
+        // is passed alongside the element ids; the mint must skip it.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Collide")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw", "OVERLOAD")
+            .contained_in("Throw", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .end_event("Done")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw")
+            .connect("Throw", "SubEnd")
+            .connect("Sub", "Done")
+            .build()
+            .unwrap();
+        let mut reserved: std::collections::HashSet<String> = def.elements.keys().cloned().collect();
+        // A preserved sequence-flow id (or the process id) that happens to equal
+        // the escalation base id.
+        reserved.insert("Escalation_OVERLOAD".to_string());
+        let escalations = collect_escalations(&def, &reserved);
+        assert_eq!(
+            escalations.get("OVERLOAD").map(String::as_str),
+            Some("Escalation_OVERLOAD_2"),
+            "the mint must skip the reserved id, got {escalations:?}"
+        );
+    }
+
+    #[test]
+    fn definition_to_xml_avoids_an_escalation_id_colliding_with_the_process_id() {
+        // End-to-end (#1173): a process literally named `Escalation_OVERLOAD` and
+        // an escalation code `OVERLOAD` (which fragments to the same base id) must
+        // not emit two elements with id `Escalation_OVERLOAD`. The escalation
+        // declaration is bumped to a free suffix and the document still re-parses.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Escalation_OVERLOAD")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw", "OVERLOAD")
+            .contained_in("Throw", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .end_event("Done")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw")
+            .connect("Throw", "SubEnd")
+            .connect("Sub", "Done")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<bpmn:process id=\"Escalation_OVERLOAD\""),
+            "the process keeps its id"
+        );
+        assert!(
+            xml.contains("<bpmn:escalation id=\"Escalation_OVERLOAD_2\""),
+            "the escalation declaration avoids the process id, got:\n{xml}"
+        );
         let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
         assert_same_structure(&def, &reparsed[0]);
     }

@@ -12964,7 +12964,8 @@ fn unsupported_migration_reason(kind: &crate::model::ElementKind) -> Option<&'st
         | ElementKind::TimerBoundaryEvent { .. }
         | ElementKind::MessageBoundaryEvent { .. }
         | ElementKind::SignalBoundaryEvent { .. }
-        | ElementKind::ConditionalBoundaryEvent { .. } => {
+        | ElementKind::ConditionalBoundaryEvent { .. }
+        | ElementKind::EscalationBoundaryEvent { .. } => {
             Some("boundary events are not migratable yet")
         }
         ElementKind::CallActivity { .. } => Some("call activities are not migratable yet"),

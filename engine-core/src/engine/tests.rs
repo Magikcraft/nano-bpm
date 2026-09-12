@@ -8318,6 +8318,150 @@ fn should_raise_an_escalation_via_an_escalation_end_event() {
 }
 
 #[test]
+fn should_raise_an_escalation_only_after_a_throws_end_listener_drains() {
+    // Regression (#1173): an escalation throw with an *end execution listener*
+    // defers completion — its `finalize_completion` (which raises the escalation
+    // and continues) must run only *after* the listener job chain drains. The
+    // existing escalation coverage builds listener-free throws, leaving this
+    // replay-sensitive deferred path uncovered. Assert the escalation is not
+    // raised while the end listener is pending, then is caught once it drains.
+    let def = ProcessBuilder::new("esc-throw-listener")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .escalation_throw_event("throw", "OVERLOAD")
+        .contained_in("throw", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .escalation_boundary_event("boundary", "sub", "OVERLOAD")
+        .service_task("handler", "handle")
+        .end_event("done")
+        .end_event("handler_end")
+        .connect("start", "sub")
+        .connect("sub_start", "throw")
+        .connect("throw", "sub_end")
+        .connect("sub", "done")
+        .connect("boundary", "handler")
+        .connect("handler", "handler_end")
+        .with_listeners(
+            "throw",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "esc-audit")],
+        )
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("esc-throw-listener"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The throw parks on its end listener: the escalation is not raised yet, so
+    // the boundary has not fired.
+    assert!(
+        created.iter().all(|e| !matches!(
+            e,
+            Event::SequenceFlowTaken { from, .. } if from == "boundary"
+        )),
+        "escalation must not be raised until the throw's end listener drains"
+    );
+    assert!(
+        engine.pending_jobs().iter().any(|j| j.job_type == "esc-audit"),
+        "the throw's end execution listener job is pending"
+    );
+
+    // Draining the end listener completes the throw, which now raises the
+    // escalation; the interrupting boundary catches it and routes to the handler.
+    let after = complete_one(&mut engine, "esc-audit");
+    assert!(
+        after.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "boundary" && to == "handler"
+        )),
+        "escalation is raised and caught once the end listener drains"
+    );
+
+    complete_one(&mut engine, "handle");
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+}
+
+#[test]
+fn should_raise_an_escalation_end_event_only_after_its_end_listener_drains() {
+    // Companion to the throw case (#1173) for an escalation *end* event carrying
+    // an end execution listener: the escalation must be raised only after the
+    // listener chain drains, and the catch/continue semantics (boundary → handler,
+    // sub-process does not take its normal outgoing flow) must be preserved.
+    let def = ProcessBuilder::new("esc-end-listener")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .escalation_throw_event("esc_end", "OVERLOAD")
+        .contained_in("esc_end", "sub")
+        .escalation_boundary_event("boundary", "sub", "OVERLOAD")
+        .service_task("handler", "handle")
+        .end_event("done")
+        .end_event("handler_end")
+        .connect("start", "sub")
+        .connect("sub_start", "esc_end")
+        .connect("sub", "done")
+        .connect("boundary", "handler")
+        .connect("handler", "handler_end")
+        .with_listeners(
+            "esc_end",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "esc-audit")],
+        )
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("esc-end-listener"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The escalation end event parks on its end listener; the escalation is not
+    // raised yet.
+    assert!(
+        created.iter().all(|e| !matches!(
+            e,
+            Event::SequenceFlowTaken { from, .. } if from == "boundary"
+        )),
+        "escalation must not be raised until the end event's listener drains"
+    );
+    assert!(
+        engine.pending_jobs().iter().any(|j| j.job_type == "esc-audit"),
+        "the escalation end event's end listener job is pending"
+    );
+
+    let after = complete_one(&mut engine, "esc-audit");
+    // The end event completed and the escalation was caught by the boundary.
+    assert!(after.iter().any(|e| matches!(
+        e,
+        Event::ElementCompleted { element_id, .. } if element_id == "esc_end"
+    )));
+    assert!(after.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "boundary" && to == "handler"
+    )));
+    // The sub-process did not take its normal outgoing flow.
+    assert!(after.iter().all(|e| !matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "sub" && to == "done"
+    )));
+
+    complete_one(&mut engine, "handle");
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+}
+
+#[test]
 fn should_propagate_an_escalation_up_to_an_outer_scope() {
     // An escalation thrown in an inner sub-process with no matching boundary
     // propagates to the nearest enclosing scope that catches it — here the
@@ -20998,6 +21142,59 @@ fn migration_rejects_unsupported_boundary_event() {
         err,
         EngineError::UnsupportedMigration { element_id, .. } if element_id == "boundary"
     ));
+}
+
+#[test]
+fn unsupported_migration_reason_covers_every_reactive_boundary_kind() {
+    // Defect-class guard (#1173): every *reactive* boundary-event kind (one that
+    // can be armed on a still-active scope and fire during flow) must be rejected
+    // by the migration phase — "boundary events are not migratable yet". The
+    // escalation boundary was added to join reachability yet was initially
+    // omitted from `unsupported_migration_reason`; enumerate the whole class so a
+    // future boundary type cannot silently become "migratable" by omission.
+    // (`CompensationBoundaryEvent` is intentionally excluded — it is a passive
+    // marker that never fires reactively, so it is not in this guard.)
+    use crate::model::ElementKind;
+    let boundaries = [
+        ElementKind::ErrorBoundaryEvent {
+            attached_to: "host".to_string(),
+            error_code: "E".to_string(),
+        },
+        ElementKind::TimerBoundaryEvent {
+            attached_to: "host".to_string(),
+            duration_millis: 1_000,
+            interrupting: true,
+            repeating: false,
+        },
+        ElementKind::MessageBoundaryEvent {
+            attached_to: "host".to_string(),
+            message_name: "M".to_string(),
+            correlation_key: "k".to_string(),
+            interrupting: true,
+        },
+        ElementKind::SignalBoundaryEvent {
+            attached_to: "host".to_string(),
+            signal_name: "S".to_string(),
+            interrupting: true,
+        },
+        ElementKind::ConditionalBoundaryEvent {
+            attached_to: "host".to_string(),
+            condition: "=true".to_string(),
+            interrupting: true,
+        },
+        ElementKind::EscalationBoundaryEvent {
+            attached_to: "host".to_string(),
+            escalation_code: "OVERLOAD".to_string(),
+            interrupting: true,
+        },
+    ];
+    for kind in boundaries {
+        assert_eq!(
+            unsupported_migration_reason(&kind),
+            Some("boundary events are not migratable yet"),
+            "{kind:?} must be rejected by the migration phase"
+        );
+    }
 }
 
 #[test]

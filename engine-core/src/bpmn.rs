@@ -3016,6 +3016,35 @@ impl ProcessAcc {
             .filter(|n| n.is_for_compensation && n.kind.is_activity())
             .map(|n| n.id.clone())
             .collect();
+        // Ids of every node that is the *source* of at least one sequence flow —
+        // i.e. it declares an outgoing flow. Used to enforce, at the one site
+        // that still knows an element came from an `<endEvent>`, that an end
+        // event has no outgoing flow *regardless of its event-definition
+        // flavour*. An escalation/compensation end event is remapped to a
+        // *throw* element below, which the model-level
+        // `cheap_rules::end_events_have_no_outgoing` rule cannot police (an
+        // *intermediate* escalation/compensation throw legitimately has an
+        // outgoing flow), so a malformed `<endEvent>…<escalationEventDefinition/>`
+        // with an outgoing flow would otherwise silently deploy as a routing
+        // intermediate throw (#1173).
+        let flow_source_ids: std::collections::HashSet<String> = self
+            .flows
+            .iter()
+            .filter_map(|f| f.source.clone())
+            .collect();
+        // Ids of every node an escalation boundary event may legally attach to.
+        // An escalation propagates *out* of the inner token scope it is raised
+        // in, so only a container that opens such a scope — an embedded
+        // sub-process or an ad-hoc sub-process — can catch it. A boundary on any
+        // other activity (plain service/user task, call activity) is a dead
+        // boundary that `find_catching_escalation_boundary` can never reach
+        // (#1173).
+        let escalation_container_ids: std::collections::HashSet<String> = self
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::SubProcess) || n.is_adhoc)
+            .map(|n| n.id.clone())
+            .collect();
         for node in self.nodes {
             let node_id = node.id.clone();
             let io_id = node.id.clone();
@@ -3075,6 +3104,20 @@ impl ProcessAcc {
                     }
                 }
                 NodeKind::End => {
+                    // An `<endEvent>` must not declare an outgoing sequence flow,
+                    // whatever its event-definition flavour. The escalation and
+                    // compensation flavours are remapped to *throw* elements just
+                    // below, so the model-level `end_events_have_no_outgoing` rule
+                    // (which only sees `EndEvent`/`TerminateEndEvent`) cannot catch
+                    // them — guard the end-event flavour here, at the one site that
+                    // still knows it came from an `<endEvent>` (#1173).
+                    if flow_source_ids.contains(&node.id) {
+                        return Err(ParseError::InvalidEndEvent {
+                            process_id: self.id.clone(),
+                            element_id: node.id.clone(),
+                            reason: "an end event must have no outgoing sequence flow".to_string(),
+                        });
+                    }
                     if node.is_escalation_throw {
                         let code = node
                             .escalation_ref
@@ -3295,6 +3338,21 @@ impl ProcessAcc {
             // interrupting per `cancelActivity`. Built before the flavour cascade
             // below since it carries no error/timer/message/signal ref.
             if boundary.escalation {
+                // An escalation boundary can only catch an escalation raised in
+                // the inner scope of the container it is attached to. Reject an
+                // attachment to anything that opens no such scope (plain task,
+                // call activity, …) so a dead boundary can never deploy (#1173).
+                if !escalation_container_ids.contains(&attached_to) {
+                    return Err(ParseError::InvalidBoundaryEvent {
+                        process_id: self.id.clone(),
+                        reason: format!(
+                            "escalation boundary event {} must be attached to an embedded \
+                             sub-process or ad-hoc sub-process (attachedToRef '{attached_to}' \
+                             is not a container that can raise an escalation)",
+                            boundary.id
+                        ),
+                    });
+                }
                 let escalation_code = boundary
                     .escalation_ref
                     .as_ref()
@@ -4555,6 +4613,148 @@ mod tests {
             def.element("EscEnd").unwrap().kind,
             ElementKind::EscalationThrowEvent {
                 escalation_code: "OVERLOAD".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn should_reject_an_escalation_end_event_with_an_outgoing_flow() {
+        // Regression (#1173): an escalation `<endEvent>` is remapped to an
+        // `EscalationThrowEvent`, so the model-level `end_events_have_no_outgoing`
+        // rule (which only matches `EndEvent`/`TerminateEndEvent`) cannot see it.
+        // A malformed escalation end event that declares an outgoing flow would
+        // otherwise deploy as a *routing* intermediate throw and continue past the
+        // end event. Reject it at parse time like any other end-event flavour.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="EscEnd">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="after" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="EscEnd" />
+    <bpmn:sequenceFlow id="f2" sourceRef="EscEnd" targetRef="after" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).expect_err("escalation end event with outgoing flow is rejected");
+        assert!(
+            matches!(
+                &err,
+                ParseError::InvalidEndEvent { element_id, .. } if element_id == "EscEnd"
+            ),
+            "expected InvalidEndEvent for EscEnd, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_a_compensation_end_event_with_an_outgoing_flow() {
+        // Same failure class as the escalation end event: a compensation
+        // `<endEvent>` is remapped to a `CompensationThrowEvent`, bypassing the
+        // end-event rule. Guard every end-event flavour (#1173).
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="CompEnd">
+      <bpmn:compensateEventDefinition />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="after" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="CompEnd" />
+    <bpmn:sequenceFlow id="f2" sourceRef="CompEnd" targetRef="after" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err =
+            parse_bpmn(xml).expect_err("compensation end event with outgoing flow is rejected");
+        assert!(
+            matches!(
+                &err,
+                ParseError::InvalidEndEvent { element_id, .. } if element_id == "CompEnd"
+            ),
+            "expected InvalidEndEvent for CompEnd, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_an_escalation_boundary_on_a_non_container_activity() {
+        // Regression (#1173): an escalation propagates out of the inner scope it
+        // is raised in, so an escalation boundary attached to a plain activity
+        // (here a service task) — which opens no such scope — is a dead boundary
+        // `find_catching_escalation_boundary` can never reach. Reject it at deploy
+        // rather than silently accepting an inert boundary.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="task">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="task">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Handler" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="task" />
+    <bpmn:sequenceFlow id="f2" sourceRef="task" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="Bnd" targetRef="Handler" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err =
+            parse_bpmn(xml).expect_err("escalation boundary on a service task is rejected");
+        assert!(
+            matches!(&err, ParseError::InvalidBoundaryEvent { reason, .. } if reason.contains("Bnd")),
+            "expected InvalidBoundaryEvent for Bnd, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_accept_an_escalation_boundary_on_an_adhoc_sub_process() {
+        // The ad-hoc sub-process is a supported escalation container (#1173): it
+        // opens an inner scope, so a boundary attached to it is reachable. It
+        // flattens to a job-backed service element, so this guards that the
+        // container check keys off `is_adhoc`, not only `NodeKind::SubProcess`.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:adHocSubProcess id="Agent">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="agent" />
+      </bpmn:extensionElements>
+      <bpmn:serviceTask id="tool">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="tool" />
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+    </bpmn:adHocSubProcess>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="Agent">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Handler" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Agent" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Agent" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="Bnd" targetRef="Handler" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).expect("escalation boundary on an ad-hoc sub-process is valid")[0];
+        assert_eq!(
+            def.element("Bnd").unwrap().kind,
+            ElementKind::EscalationBoundaryEvent {
+                attached_to: "Agent".to_string(),
+                escalation_code: "OVERLOAD".to_string(),
+                interrupting: true,
             }
         );
     }

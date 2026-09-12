@@ -489,6 +489,71 @@ mod tests {
     }
 
     #[test]
+    fn escalation_flow_captures_the_boundary_handler_path() {
+        // An escalation boundary (#1173) must produce a `FlowKind::Escalation`
+        // band starting at the boundary and covering its downstream handler
+        // nodes, and that path must NOT be folded onto the primary spine —
+        // otherwise the escalation handler renders on the main flow line. Built
+        // via `ProcessBuilder` (no fixture needed) so the assertion is exact.
+        use nanobpmn_engine_core::ProcessBuilder;
+        let def = ProcessBuilder::new("esc")
+            .start_event("start")
+            .sub_process("sub", "sub_start")
+            .start_event("sub_start")
+            .contained_in("sub_start", "sub")
+            .escalation_throw_event("throw", "OVERLOAD")
+            .contained_in("throw", "sub")
+            .end_event("sub_end")
+            .contained_in("sub_end", "sub")
+            .escalation_boundary_event("boundary", "sub", "OVERLOAD")
+            .service_task("notify", "notify")
+            .end_event("done")
+            .end_event("handled")
+            .connect("start", "sub")
+            .connect("sub_start", "throw")
+            .connect("throw", "sub_end")
+            .connect("sub", "done")
+            .connect("boundary", "notify")
+            .connect("notify", "handled")
+            .build()
+            .expect("valid escalation model");
+        let ann = infer(&def);
+        let esc = ann
+            .flows
+            .iter()
+            .find(|f| f.kind == FlowKind::Escalation)
+            .expect("escalation flow inferred for the escalation boundary");
+        assert_eq!(esc.id, "escalation.boundary");
+        assert_eq!(
+            esc.nodes.first().map(String::as_str),
+            Some("boundary"),
+            "escalation flow starts at the boundary, got {:?}",
+            esc.nodes
+        );
+        assert!(
+            esc.nodes.iter().any(|n| n == "notify"),
+            "escalation flow includes the downstream handler, got {:?}",
+            esc.nodes
+        );
+        assert!(
+            esc.nodes.iter().any(|n| n == "handled"),
+            "escalation flow reaches the handler end, got {:?}",
+            esc.nodes
+        );
+        // The handler path is out-of-band: it must not appear on the primary spine.
+        let primary = ann
+            .flows
+            .iter()
+            .find(|f| f.kind == FlowKind::Primary)
+            .expect("primary flow inferred");
+        assert!(
+            !primary.nodes.iter().any(|n| n == "notify"),
+            "escalation handler must not be folded onto the primary spine, got {:?}",
+            primary.nodes
+        );
+    }
+
+    #[test]
     fn roles_tag_exclusive_gateways_as_decisions() {
         let defs = parse_bpmn(TINY_XML).expect("parse");
         let def = defs.into_iter().next().expect("one process");
