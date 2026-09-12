@@ -122,6 +122,53 @@ const MARKER_TASK_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
   </bpmndi:BPMNDiagram>
 </bpmn:definitions>`;
 
+/** A DI-complete process whose service task is a PLAIN service task — no prompt
+ *  link and no external-agent marker. Authoring the marker onto it from the
+ *  panel exercises the `value=true` toggle path (`moddle.create("zeebe:Agent\
+ *  Definition")` + live bpmn-js wiring) from an unmarked task, which the
+ *  marker-seeded fixtures above never reach (issue #1186). */
+const PLAIN_TASK_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="plaintest" targetNamespace="http://nanobpm.io">
+  <bpmn:process id="agent-task-demo" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="work" name="work">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="demo-job" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="work" />
+    <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="D">
+    <bpmndi:BPMNPlane id="P" bpmnElement="agent-task-demo">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="180" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="work_di" bpmnElement="work">
+        <dc:Bounds x="270" y="78" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="430" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="216" y="118" />
+        <di:waypoint x="270" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="370" y="118" />
+        <di:waypoint x="430" y="118" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>`;
+
 /** The file tree the workspace renders — `resources/processes/agent-task.bpmn`
  *  plus the usual project scaffolding. */
 const FILE_TREE = {
@@ -484,6 +531,57 @@ test.describe("modeler — external agent marker + opt-out", () => {
     // Neither the marker nor the orphaned opt-out survives the save.
     await expect.poll(() => savedXml).not.toContain("agentDefinition");
     expect(savedXml).not.toContain("io.nanobpm.agentTask.autoSubscribe");
+
+    noCrash();
+  });
+});
+
+test.describe("modeler — authoring the external marker from an unmarked task", () => {
+  test.beforeEach(async ({ page }) => {
+    await stubConsoleApi(page, { projects: [{ name: PROJECT, lang: "node" }] });
+    // A PLAIN service task — no prompt link, no marker — so toggling the marker
+    // ON drives the `value=true` panel path from scratch (issue #1186).
+    await stubProjectFiles(page, PLAIN_TASK_BPMN);
+    await resetTourState(page);
+    await suppressStartupPanel(page);
+  });
+
+  test("toggling the marker ON authors the marker and round-trips it through saveXML", async ({
+    page,
+  }) => {
+    const noCrash = assertNoPageCrash(page);
+
+    let savedXml = "";
+    await captureSavedXml(page, (xml) => {
+      savedXml = xml;
+    });
+
+    await page.goto(`projects/${PROJECT}`);
+    await openAgentModel(page);
+
+    // Nothing agentic yet: the plain service task carries no marker, so the
+    // renderer draws no AGENT badge.
+    await expect(
+      page.locator("svg").getByText("AGENT", { exact: true }),
+    ).toHaveCount(0);
+
+    // Toggle the external-agent marker ON — a real `setValue` through the panel
+    // wiring, which calls `moddle.create("zeebe:AgentDefinition")` on a task that
+    // never had the marker (the exact path the marker-seeded fixtures skip).
+    await selectAgentTaskAndOpenGroup(page);
+    await toggleSwitch(page, "nano-agent-external-toggle");
+
+    // `isAgentTask` now recognises the task from the freshly-authored marker, so
+    // the renderer decorates it live — proof the marker was created and wired.
+    await expect(
+      page.locator("svg").getByText("AGENT", { exact: true }),
+    ).toBeVisible();
+
+    await clickSave(page);
+    // The authored marker round-trips through the real serialiser (the augmented
+    // `zeebeModdleWithAgent` descriptor), rather than being dropped on save.
+    await expect.poll(() => savedXml).toContain('agentType="external"');
+    expect(savedXml).toContain("agentDefinition");
 
     noCrash();
   });

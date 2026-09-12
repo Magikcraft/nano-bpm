@@ -533,7 +533,7 @@ test("writeExternalAgentMarker is idempotent and corrects a stale agentType", ()
 
 test("removeExternalAgentMarker strips the marker and tears down the empty wrapper", () => {
   const bo = serviceTaskBo([agentMarker()]);
-  removeExternalAgentMarker(applyingModeling(), {}, bo);
+  removeExternalAgentMarker(moddle, applyingModeling(), {}, bo);
   assert.equal(agentDefinition(bo), undefined);
   // It was the only extension child, so the wrapper is gone.
   assert.equal(bo.extensionElements, undefined);
@@ -544,11 +544,16 @@ test("removeExternalAgentMarker also clears an orphaned --auto opt-out", () => {
   // gone, so removing the marker must not strand `autoSubscribe="false"` in the
   // saved BPMN with no visible control to clear it.
   const bo = serviceTaskBo([agentMarker(), zeebeProps(optOutProperty())]);
-  removeExternalAgentMarker(applyingModeling(), {}, bo);
+  const modeling = applyingModeling();
+  removeExternalAgentMarker(moddle, modeling, {}, bo);
   assert.equal(hasExternalAgentMarker(bo), false);
   assert.equal(readAutoSubscribeOptOut(bo), false);
   // Both children (and the empty wrapper) are gone — no orphan left behind.
   assert.equal(bo.extensionElements, undefined);
+  // Marker + opt-out are torn down in ONE command, so a single undo restores
+  // both together (issue #1186) — never two commands where one undo revives the
+  // opt-out while the marker stays gone.
+  assert.equal(modeling.calls.length, 1);
 });
 
 test("removeExternalAgentMarker clears the opt-out but keeps unrelated siblings", () => {
@@ -557,11 +562,10 @@ test("removeExternalAgentMarker clears the opt-out but keeps unrelated siblings"
     name: "some.other.prop",
     value: "keep-me",
   };
-  const bo = serviceTaskBo([
-    agentMarker(),
-    zeebeProps(optOutProperty(), other),
-  ]);
-  removeExternalAgentMarker(applyingModeling(), {}, bo);
+  const originalContainer = zeebeProps(optOutProperty(), other);
+  const bo = serviceTaskBo([agentMarker(), originalContainer]);
+  const modeling = applyingModeling();
+  removeExternalAgentMarker(moddle, modeling, {}, bo);
   assert.equal(hasExternalAgentMarker(bo), false);
   assert.equal(readAutoSubscribeOptOut(bo), false);
   // The unrelated property (and its container) survive.
@@ -571,6 +575,16 @@ test("removeExternalAgentMarker clears the opt-out but keeps unrelated siblings"
   assert.deepEqual(
     container?.properties?.map((p) => p.name),
     ["some.other.prop"],
+  );
+  // Still a single command (marker drop + opt-out drop applied together).
+  assert.equal(modeling.calls.length, 1);
+  // The surviving container is a FRESH object, not the original mutated in
+  // place — so the original (with its opt-out) is left intact for undo to
+  // restore, rather than losing the opt-out on the command's reversal.
+  assert.notEqual(container, originalContainer);
+  assert.deepEqual(
+    originalContainer.properties?.map((p) => p.name),
+    [AUTO_SUBSCRIBE_PROPERTY, "some.other.prop"],
   );
 });
 

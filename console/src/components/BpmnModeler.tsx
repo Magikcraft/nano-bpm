@@ -293,7 +293,14 @@ class AgentTaskRenderer extends BaseRenderer {
     // Second badge (below the AGENT badge) when the task opts OUT of the
     // harness `--auto` subscription set (`autoSubscribe="false"`) — so a
     // manual-subscription-only agent task is distinguishable on the canvas.
-    if (readAutoSubscribeOptOut(element.businessObject)) {
+    // Gated on the external marker (not merely the opt-out property): the
+    // `--auto` contract is marker-only, so a prompt-only task carrying a stray
+    // `autoSubscribe="false"` is not in the `--auto` set at all and must not be
+    // badged as opting out of it (mirrors the panel provider's opt-out gating).
+    if (
+      hasExternalAgentMarker(element.businessObject) &&
+      readAutoSubscribeOptOut(element.businessObject)
+    ) {
       const optW = 56;
       const optH = 15;
       const optX = width - optW - 4;
@@ -898,7 +905,8 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
             if (!svc || !bo) return;
             if (value)
               writeExternalAgentMarker(svc.moddle, svc.modeling, element, bo);
-            else removeExternalAgentMarker(svc.modeling, element, bo);
+            else
+              removeExternalAgentMarker(svc.moddle, svc.modeling, element, bo);
           },
           description: `Mark this task agentic with the canonical <zeebe:agentDefinition agentType="${AGENT_TYPE_EXTERNAL}"/> marker (the harness --auto scan keys on it).`,
         });
