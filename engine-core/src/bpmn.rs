@@ -887,6 +887,7 @@ fn parse_with_captures(
                                         compensation: false,
                                         escalation: false,
                                         escalation_ref: None,
+                                        escalation_dup: false,
                                     });
                                 }
                             }
@@ -921,7 +922,14 @@ fn parse_with_captures(
                                 if let Some(boundary) = cur_boundary.as_mut() {
                                     // A boundary carrier → an escalation boundary
                                     // event, built in `build` from the resolved
-                                    // escalation code.
+                                    // escalation code. A SECOND escalation
+                                    // definition on the same boundary is a
+                                    // last-wins overwrite of `escalation_ref`;
+                                    // flag it so `build` rejects the ambiguous
+                                    // multi-definition boundary (#1173).
+                                    if boundary.escalation {
+                                        boundary.escalation_dup = true;
+                                    }
                                     boundary.escalation = true;
                                     boundary.escalation_ref = escalation_ref.map(str::to_string);
                                     if let Some(escalation_ref) = escalation_ref {
@@ -2258,6 +2266,12 @@ struct PendingBoundary {
     /// The boundary's `escalationRef`, resolved to an `escalationCode` (empty =
     /// catch-all) at build. `None` when the escalation carrier declares no ref.
     escalation_ref: Option<String>,
+    /// True when a *second* `escalationEventDefinition` was seen on this same
+    /// boundary. A duplicate silently overwrites `escalation_ref` (last-wins),
+    /// so an exact code could be replaced by a catch-all (or vice-versa) with no
+    /// diagnostic. Rejected at build as an unsupported multi-definition boundary
+    /// (#1173).
+    escalation_dup: bool,
 }
 
 /// A definitions-level `<message>` declaration: its `name` and the instance
@@ -3061,7 +3075,53 @@ impl ProcessAcc {
             .iter()
             .filter_map(|n| n.parent.clone().map(|p| (n.id.clone(), p)))
             .collect();
+        // Node ids carrying a non-boundary `errorEventDefinition` (an error
+        // throw / end). Recorded separately from the node flags (in
+        // `error_refs_extra`), so surfaced here as a set for the competing
+        // event-definition guard below (#1173).
+        let error_def_node_ids: std::collections::HashSet<String> = self
+            .error_refs_extra
+            .iter()
+            .map(|(node_id, _)| node_id.clone())
+            .collect();
         for node in self.nodes {
+            // Reject an `endEvent` / `intermediateThrowEvent` that carries more
+            // than one throw/end event definition (#1173). Multiple definitions
+            // set multiple independent node flags, and the build dispatch below
+            // picks the FIRST it checks (escalation → compensation → terminate →
+            // link → …), silently discarding the others — e.g. an end event with
+            // both an escalation and a terminate definition would model as a bare
+            // escalation throw, dropping the terminate semantics. There is no
+            // combined-semantics element in the supported subset, so refuse the
+            // ambiguous model at deploy rather than pick one arm.
+            if matches!(node.kind, NodeKind::End | NodeKind::IntermediateThrow) {
+                let defs = node.is_escalation_throw as u32
+                    + node.is_compensation_throw as u32
+                    + node.is_terminate as u32
+                    + node.link_name.is_some() as u32
+                    + error_def_node_ids.contains(&node.id) as u32;
+                if defs > 1 {
+                    return Err(match node.kind {
+                        // The `endEvent` flavour has a reason-bearing error; an
+                        // `intermediateThrowEvent` reuses the throw-side
+                        // `UnsupportedElement` rejection (as the wrong-placement
+                        // escalation/compensation throws already do).
+                        NodeKind::End => ParseError::InvalidEndEvent {
+                            process_id: self.id.clone(),
+                            element_id: node.id.clone(),
+                            reason: "end event declares more than one event definition \
+                                     (escalation/compensation/terminate/link/error); a \
+                                     multi-definition end event is not supported (declare \
+                                     exactly one)"
+                                .to_string(),
+                        },
+                        _ => ParseError::UnsupportedElement {
+                            tag: "intermediateThrowEvent".to_string(),
+                            element_id: node.id.clone(),
+                        },
+                    });
+                }
+            }
             let node_id = node.id.clone();
             let io_id = node.id.clone();
             let node_io = node.io.clone();
@@ -3386,7 +3446,7 @@ impl ProcessAcc {
                     || boundary.signal_ref.is_some()
                     || boundary.condition.is_some()
                     || boundary.compensation;
-                if other_trigger {
+                if other_trigger || boundary.escalation_dup {
                     return Err(ParseError::InvalidBoundaryEvent {
                         process_id: self.id.clone(),
                         reason: format!(
@@ -4974,6 +5034,112 @@ mod tests {
             matches!(&err, ParseError::InvalidBoundaryEvent { reason, .. }
                 if reason.contains("Bnd") && reason.contains("ad-hoc tool")),
             "expected InvalidBoundaryEvent for the ad-hoc-tool Bnd, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_a_duplicate_escalation_definition_on_a_boundary() {
+        // Regression (#1173, suppressed advisory): a SECOND
+        // `escalationEventDefinition` on one boundary silently overwrites
+        // `escalation_ref` (last-wins), so an exact code could be swapped for a
+        // catch-all with no diagnostic. Reject the ambiguous multi-definition
+        // boundary at deploy.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:escalation id="EscA" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:escalation id="EscB" name="Any" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="ss" />
+      <bpmn:endEvent id="se" />
+      <bpmn:sequenceFlow id="if" sourceRef="ss" targetRef="se" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="Sub">
+      <bpmn:escalationEventDefinition escalationRef="EscA" />
+      <bpmn:escalationEventDefinition escalationRef="EscB" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Handler" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Sub" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="Bnd" targetRef="Handler" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err =
+            parse_bpmn(xml).expect_err("a boundary with two escalation definitions is rejected");
+        assert!(
+            matches!(&err, ParseError::InvalidBoundaryEvent { reason, .. }
+                if reason.contains("Bnd") && reason.contains("more than one event")),
+            "expected InvalidBoundaryEvent for the duplicate-escalation Bnd, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_an_end_event_with_escalation_and_terminate_definitions() {
+        // Regression (#1173): an `endEvent` carrying BOTH an escalation and a
+        // terminate definition sets both node flags, and the build dispatch picks
+        // escalation first — silently discarding the terminate semantics. There is
+        // no combined-semantics end event in the supported subset, so reject the
+        // ambiguous multi-definition end event at deploy.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="Bad">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+      <bpmn:terminateEventDefinition />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Bad" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err =
+            parse_bpmn(xml).expect_err("an end event with escalation + terminate is rejected");
+        assert!(
+            matches!(
+                &err,
+                ParseError::InvalidEndEvent { element_id, reason, .. }
+                    if element_id == "Bad" && reason.contains("more than one event definition")
+            ),
+            "expected InvalidEndEvent for the multi-definition Bad, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_an_intermediate_throw_with_competing_definitions() {
+        // Regression (#1173): the throw form of the same class — an
+        // `intermediateThrowEvent` carrying BOTH an escalation and a compensation
+        // definition. The build dispatch checks escalation first, discarding the
+        // compensation throw. Reject it (the throw-side `UnsupportedElement`
+        // rejection, matching how a wrong-placement throw is already refused).
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:intermediateThrowEvent id="Bad">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+      <bpmn:compensateEventDefinition />
+    </bpmn:intermediateThrowEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Bad" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Bad" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml)
+            .expect_err("an intermediate throw with escalation + compensation is rejected");
+        assert!(
+            matches!(
+                &err,
+                ParseError::UnsupportedElement { tag, element_id }
+                    if tag == "intermediateThrowEvent" && element_id == "Bad"
+            ),
+            "expected UnsupportedElement for the multi-definition throw Bad, got {err:?}"
         );
     }
 

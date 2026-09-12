@@ -335,6 +335,27 @@ fn attr_value_in(s: &str, attr: &str) -> Option<String> {
     None
 }
 
+/// Every value of a whitespace-preceded `id="…"` attribute in `s`, in document
+/// order. Used to reserve the ids inside a preserved `<bpmndi:BPMNDiagram>` block
+/// so a generated declaration id cannot collide with one (#1173).
+fn all_id_attrs_in(s: &str) -> Vec<String> {
+    let needle = "id=\"";
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(needle) {
+        let at = from + rel;
+        let preceded_by_ws = s[..at].chars().last().is_some_and(|c| c.is_whitespace());
+        let vstart = at + needle.len();
+        if preceded_by_ws {
+            if let Some(off) = s[vstart..].find('"') {
+                out.push(s[vstart..vstart + off].to_string());
+            }
+        }
+        from = vstart;
+    }
+    out
+}
+
 /// The raw `<process id="process_id">…</process>` block from a (multi-definition)
 /// document, or `None` if no such process exists.
 fn process_block(xml: &str, process_id: &str) -> Option<String> {
@@ -2663,6 +2684,17 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                 "intermediateThrowEvent"
             };
             out.push_str(&format!("    <bpmn:{tag} id=\"{eid}\"{na}>\n"));
+            // Round-trip any `zeebe:ioMapping` the model carries: the parser
+            // attaches io mappings on BOTH the `intermediateThrowEvent` and the
+            // `endEvent` form (same io_stack push as a plain/terminate end), so
+            // omitting them here would silently drop inputs/outputs on re-parse.
+            // Mirror the plain/terminate end branches — emit the block before the
+            // event definition. A no-op when there are no mappings.
+            if !el.io.inputs.is_empty() || !el.io.outputs.is_empty() {
+                out.push_str("      <bpmn:extensionElements>\n");
+                emit_io_mapping(el, out);
+                out.push_str("      </bpmn:extensionElements>\n");
+            }
             if escalation_code.is_empty() {
                 out.push_str("      <bpmn:escalationEventDefinition/>\n");
             } else {
@@ -2782,6 +2814,13 @@ struct PreservedDi {
     /// `(sourceRef, targetRef) -> original sequence-flow id`, so the reused body can adopt the same
     /// ids the preserved edges already reference.
     flow_ids: HashMap<(String, String), String>,
+    /// Every `id="…"` attribute declared INSIDE the verbatim diagram block — the
+    /// `<bpmndi:BPMNDiagram>`/`<bpmndi:BPMNPlane>`/`<bpmndi:BPMNShape>`/`<bpmndi:BPMNEdge>`
+    /// own ids (NOT their `bpmnElement` refs). The block is re-attached
+    /// byte-for-byte, so a generated declaration id (`Escalation_…`, `Signal_…`)
+    /// must be reserved against these too, or a legal DI id like
+    /// `Escalation_OVERLOAD` could duplicate a `<bpmn:escalation id>` (#1173).
+    di_ids: HashSet<String>,
 }
 
 impl PreservedDi {
@@ -2867,11 +2906,13 @@ fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
     if shape_ids.is_empty() {
         return None;
     }
+    let di_ids: HashSet<String> = all_id_attrs_in(&diagram_block).into_iter().collect();
     Some(PreservedDi {
         diagram_block,
         shape_ids,
         edge_keys,
         flow_ids,
+        di_ids,
     })
 }
 
@@ -3039,6 +3080,14 @@ fn serialize_definition(
     let mut reserved_ids: HashSet<String> = def.elements.keys().cloned().collect();
     reserved_ids.insert(def.id.clone());
     reserved_ids.extend(flow_ids.iter().cloned());
+    // Reserve every id declared inside a preserved `<bpmndi:BPMNDiagram>` block:
+    // it is re-attached verbatim by `definition_to_xml_preserving_di`, so a
+    // generated declaration id (`Escalation_…`, `Signal_…`, …) that duplicated a
+    // DI plane/shape/edge/diagram id would emit an invalid document with two
+    // elements sharing one XML id (#1173).
+    if let Some(d) = preserve {
+        reserved_ids.extend(d.di_ids.iter().cloned());
+    }
     let errors = collect_error_ids(def);
     let (messages, msg_lookup) = collect_messages(def);
     let signals = collect_signals(def);
@@ -5594,6 +5643,119 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         );
         let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
         assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_preserving_di_avoids_an_escalation_id_colliding_with_a_di_id() {
+        // Regression (#1173): a preserved `<bpmndi:BPMNDiagram>` is re-attached
+        // byte-for-byte by `definition_to_xml_preserving_di`, so its own
+        // plane/shape/edge/diagram ids must be reserved against a generated
+        // `<bpmn:escalation>` declaration id. A hand-authored file whose DI plane
+        // is literally named `Escalation_OVERLOAD` (a legal DI id) would otherwise
+        // duplicate the declaration minted for code `OVERLOAD`, emitting two
+        // elements that share one XML id.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Esc")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw", "OVERLOAD")
+            .contained_in("Throw", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .end_event("Done")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw")
+            .connect("Throw", "SubEnd")
+            .connect("Sub", "Done")
+            .build()
+            .unwrap();
+        // Auto-serialize once to obtain a DI sidecar that covers the topology,
+        // then rename its plane id to the value the escalation declaration wants.
+        let di_source =
+            definition_to_xml(&def).replace("id=\"BPMNPlane_1\"", "id=\"Escalation_OVERLOAD\"");
+        assert!(
+            di_source.contains("id=\"Escalation_OVERLOAD\""),
+            "the DI source carries the colliding plane id"
+        );
+        let xml = definition_to_xml_preserving_di(&def, &HashMap::new(), Some(&di_source));
+        assert!(
+            xml.contains("id=\"Escalation_OVERLOAD\""),
+            "the preserved DI plane id survives verbatim, got:\n{xml}"
+        );
+        assert!(
+            xml.contains("<bpmn:escalation id=\"Escalation_OVERLOAD_2\""),
+            "the escalation declaration must avoid the preserved DI id, got:\n{xml}"
+        );
+        assert_eq!(
+            xml.matches("\"Escalation_OVERLOAD\"").count(),
+            1,
+            "exactly one element (the DI plane) may carry id=\"Escalation_OVERLOAD\", got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_an_escalation_throw_with_io() {
+        // Regression (#1173): the escalation throw/end serializer must nest a
+        // `zeebe:ioMapping` the model carries. The parser attaches io on both the
+        // `intermediateThrowEvent` and `endEvent` forms (same io_stack push as a
+        // plain/terminate end), so a bare
+        // `<intermediateThrowEvent><escalationEventDefinition/></…>` would silently
+        // drop the mappings, mutating the model on re-parse.
+        use nanobpmn_engine_core::Mapping;
+        let mut def = nanobpmn_engine_core::ProcessBuilder::new("EscIo")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw", "OVERLOAD")
+            .contained_in("Throw", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .end_event("Done")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw")
+            .connect("Throw", "SubEnd")
+            .connect("Sub", "Done")
+            .build()
+            .unwrap();
+        {
+            let throw = def.elements.get_mut("Throw").unwrap();
+            throw.io.inputs.push(Mapping {
+                source: "= payload".to_string(),
+                target: "escPayload".to_string(),
+            });
+            throw.io.outputs.push(Mapping {
+                source: "= code".to_string(),
+                target: "escCode".to_string(),
+            });
+        }
+
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<zeebe:ioMapping>"),
+            "an escalation throw with io must emit ioMapping:\n{xml}"
+        );
+        assert!(
+            xml.contains("intermediateThrowEvent") && xml.contains("escalationEventDefinition"),
+            "the throw flavour and escalation definition must survive:\n{xml}"
+        );
+
+        let reparsed = parse_bpmn(&xml).expect("serialized escalation throw re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+        let throw = &reparsed[0].elements["Throw"];
+        assert_eq!(
+            throw.io.inputs.len(),
+            1,
+            "escalation-throw input mapping preserved on round-trip"
+        );
+        assert_eq!(
+            throw.io.outputs.len(),
+            1,
+            "escalation-throw output mapping preserved on round-trip"
+        );
     }
 
     #[test]

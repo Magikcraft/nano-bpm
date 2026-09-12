@@ -8227,6 +8227,110 @@ fn interrupting_escalation_boundary_on_a_multi_instance_subprocess_clears_the_bo
 }
 
 #[test]
+fn non_interrupting_escalation_boundary_on_a_multi_instance_subprocess_arms_at_the_parent_scope() {
+    // #1173 non-interrupting MI-scope guard. A NON-interrupting escalation
+    // boundary attached to a MULTI-INSTANCE sub-process must arm its parallel
+    // handler token at the boundary's OWN scope (the process root), not inside
+    // the multi-instance body scope of the child that threw. The caught element
+    // is the MI *child*, so `scope_of(caught_eik)` is the MI body — arming the
+    // handler there traps the handler token inside the loop body, so the body
+    // never completes (a #1170/#1173-class hang) or the handler routes its
+    // top-level `handler_end` in the wrong scope. The non-interrupting branch
+    // must mirror the interrupting branch's MI-child -> body redirection.
+    let def = ProcessBuilder::new("mi-esc-ni")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .escalation_throw_event("throw", "OVERLOAD")
+        .contained_in("throw", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .with_multi_instance(
+            "sub",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .non_interrupting_escalation_boundary_event("boundary", "sub", "OVERLOAD")
+        .service_task("handler", "handle")
+        .end_event("done")
+        .end_event("handler_end")
+        .connect("start", "sub")
+        .connect("sub_start", "throw")
+        .connect("throw", "sub_end")
+        .connect("sub", "done")
+        .connect("boundary", "handler")
+        .connect("handler", "handler_end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-esc-ni",
+            vars(&[("items", Value::List(vec![Value::Int(1)]))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The child throws OVERLOAD: the non-interrupting boundary spawns a parallel
+    // handler token while the child keeps running on to its own `sub_end`. No
+    // incident, and the boundary routed to the handler.
+    assert!(created
+        .iter()
+        .all(|e| !matches!(e, Event::IncidentRaised { .. })));
+    assert!(created.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "boundary" && to == "handler"
+    )));
+
+    // The handler token must be armed at the boundary's OWN (process-root) scope,
+    // not inside the multi-instance body scope of the child that threw. `scopes`
+    // maps each active element instance to its enclosing sub-process/MI-body
+    // scope; a root-scoped element is absent from it. With the pre-fix
+    // `scope_of(caught_eik)` (the MI body) the handler would be armed inside the
+    // loop body and appear here mapped to the body scope — the wrong level.
+    {
+        let inst = engine.instance(instance_key).unwrap();
+        let handler_eik = *inst
+            .active
+            .iter()
+            .find(|(_, id)| id.as_str() == "handler")
+            .map(|(k, _)| k)
+            .expect("the non-interrupting handler token must be active");
+        assert!(
+            !inst.scopes.contains_key(&handler_eik),
+            "the non-interrupting handler must arm at the parent (root) scope, \
+             not inside the multi-instance body scope"
+        );
+    }
+
+    // The multi-instance body completes normally (its child is not blocked by
+    // the parallel handler token): a handler armed inside the body scope would
+    // trap a token in the loop and hang it.
+    assert!(
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .multi_instances
+            .is_empty(),
+        "the multi-instance body must complete independently of the parallel handler"
+    );
+
+    // Draining the handler token completes the instance cleanly.
+    complete_one(&mut engine, "handle");
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+}
+
+#[test]
 fn should_ignore_an_uncaught_escalation() {
     // An escalation with no catching boundary is ignored (BPMN/Zeebe parity):
     // no incident, and the throw simply passes through to its outgoing flow.

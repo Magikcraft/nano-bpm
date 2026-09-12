@@ -9535,8 +9535,28 @@ impl Engine {
                 // Non-interrupting: the throw continues AND a parallel token is
                 // spawned by activating the boundary in the caught activity's
                 // own (enclosing) scope.
+                //
+                // If the caught activity is a multi-instance CHILD, the boundary
+                // is armed on the loop's BODY, not the individual child — so the
+                // parallel token must be spawned in the BODY's enclosing scope.
+                // `scope_of(caught_eik)` for an MI child is the MI body itself,
+                // which would activate the handler INSIDE the loop body (the
+                // wrong level). Mirror the interrupting branch's child→body
+                // redirection before taking `scope_of` so both branches arm the
+                // boundary at the same scope (#1173, the #1170 MI class).
                 take_throw_outgoing(&mut events, &mut followups);
-                let boundary_scope = self.scope_of(instance_key, caught_eik);
+                let child_scope = self.scope_of(instance_key, caught_eik);
+                let caught_is_mi_child = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .is_some_and(|i| i.multi_instances.contains_key(&child_scope));
+                let boundary_armed_eik = if caught_is_mi_child {
+                    child_scope
+                } else {
+                    caught_eik
+                };
+                let boundary_scope = self.scope_of(instance_key, boundary_armed_eik);
                 followups.push(Step::Activate {
                     instance_key,
                     element_id: boundary_id,

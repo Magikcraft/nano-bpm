@@ -673,9 +673,13 @@ pub enum ElementKind {
     },
     /// An escalation throw event: an `intermediateThrowEvent` or an `endEvent`
     /// carrying an `escalationEventDefinition`. On activation (completion) it
-    /// raises the named escalation — walking up the enclosing sub-process /
-    /// call-activity scopes for an [`EscalationBoundaryEvent`](ElementKind::EscalationBoundaryEvent)
-    /// whose `escalation_code` matches (an exact code beats a catch-all) — and
+    /// raises the named escalation — walking up the enclosing **embedded /
+    /// ad-hoc sub-process** scopes of the *current* process instance for an
+    /// [`EscalationBoundaryEvent`](ElementKind::EscalationBoundaryEvent)
+    /// whose `escalation_code` matches (an exact code beats a catch-all). A
+    /// boundary on a **call activity** is rejected at deploy and catching never
+    /// crosses into a called (separate) instance — cross-instance escalation
+    /// propagation is out of scope for #1173 — and
     /// then always continues: escalation is **non-critical**, so the throw's own
     /// token routes along its outgoing flow (an `intermediateThrowEvent`) or
     /// drains (an `endEvent`) whether or not the escalation was caught. A
