@@ -8008,11 +8008,23 @@ impl Engine {
                 propagate_all_parent_variables,
                 ..
             }) => {
+                // The actual first-pass child seed: the full activating view under
+                // `propagateAllParentVariables` (Zeebe
+                // `copyAllVariablesToProcessInstance`), or just the tool's
+                // input-mapping results when suppressed
+                // (`copyLocalVariablesToProcessInstance`).
                 let child_seed = if propagate_all_parent_variables {
                     child_vars.clone()
                 } else {
-                    applied_inputs
+                    applied_inputs.clone()
                 };
+                // The redrive-preserved projection is ALWAYS only the single-pass
+                // input-mapping results (#1176), never the frozen full view: on a
+                // spawn-incident respawn we overlay it onto a FRESH all-parent view
+                // (Zeebe re-reads the call activity's current scope in
+                // `finalizeActivation`), so container variables that became visible
+                // after the incident still propagate under
+                // `propagateAllParentVariables=true`.
                 let (spawn_events, spawn_followups) = self.spawn_call_activity_instance(
                     instance_key,
                     child_key,
@@ -8020,7 +8032,7 @@ impl Engine {
                     &called,
                     &child_vars,
                     child_seed,
-                    true,
+                    Some(applied_inputs),
                 );
                 events.extend(spawn_events);
                 followups.extend(spawn_followups);
@@ -11462,16 +11474,22 @@ impl Engine {
     /// would.
     ///
     /// `preserved_seed` (#1176) is the tool's single-pass input projection
-    /// captured on the failed first spawn: when present it is reused **verbatim**
-    /// as the child seed, because the tool child's local scope already carries the
-    /// first pass's applied input targets, so re-projecting the (single-pass,
-    /// possibly chained) input mappings here would read a mutated view and
-    /// silently alter the child seed (`x -> y`, `y -> z`: the retry would resolve
-    /// `z` non-null). The activating `view` is still re-read fresh so the
-    /// `=calledElement` expression re-evaluates against the operator's fix. It is
-    /// `None` only for a legacy incident predating #1176 (a plain
-    /// `CallActivitySpawn` redrive on an ad-hoc tool), which falls back to the
-    /// original re-projection.
+    /// captured on the failed first spawn: the tool child's local scope already
+    /// carries the first pass's applied input targets, so re-projecting the
+    /// (single-pass, possibly chained) input mappings here would read a mutated
+    /// view and silently alter them (`x -> y`, `y -> z`: the retry would resolve
+    /// `z` non-null). It seeds the child by Zeebe parity
+    /// (`CallActivityProcessor.finalizeActivation`): under
+    /// `propagateAllParentVariables=true` the preserved projection is overlaid
+    /// onto a FRESHLY re-read all-parent view (Zeebe's
+    /// `copyAllVariablesToProcessInstance` re-reads the call activity's current
+    /// scope on redrive), so container variables that became visible after the
+    /// incident still propagate into the child; with it off, only the preserved
+    /// projection crosses (`copyLocalVariablesToProcessInstance`). The activating
+    /// `view` is re-read fresh regardless so the `=calledElement` expression
+    /// re-evaluates against the operator's fix. `preserved_seed` is `None` only
+    /// for a legacy incident predating #1176 (a plain `CallActivitySpawn` redrive
+    /// on an ad-hoc tool), which re-projects the input mappings instead.
     fn respawn_adhoc_call_activity_tool(
         &mut self,
         instance_key: Key,
@@ -11513,40 +11531,46 @@ impl Engine {
         // from re-projecting inputs against this (already-mutated) view — see
         // `preserved_seed` below.
         let view = (*self.variables_for_element(instance_key, child_eik)).clone();
-        let child_seed = match preserved_seed {
-            // #1176: reuse the single-pass input projection captured on the failed
-            // first spawn, so a chained input mapping is not re-applied against the
-            // already-mutated child scope.
+        // The single-pass input-mapping projection: preserved verbatim from the
+        // failed first spawn (#1176) so a chained input mapping is not re-applied
+        // against the already-mutated child scope. For a legacy pre-#1176 incident
+        // (plain `CallActivitySpawn` redrive on an ad-hoc tool) it is re-projected
+        // — idempotent for non-chained inputs; the preservation path is what fixes
+        // the chained case.
+        let projection = match preserved_seed {
             Some(seed) => seed,
-            // Legacy pre-#1176 incident (plain `CallActivitySpawn` redrive on an
-            // ad-hoc tool): re-project as the original respawn did. Idempotent for
-            // non-chained inputs; the preservation path above is what fixes the
-            // chained case.
-            None => {
-                let applied_inputs = match self.adhoc_tool_input_updates(
-                    instance_key,
-                    &container_element_id,
-                    &element_id,
-                    &view,
-                ) {
-                    Ok(updates) => updates,
-                    Err(failure) => {
-                        let event = self.io_mapping_incident(
-                            instance_key,
-                            child_eik,
-                            element_id,
-                            failure,
-                            state::IoMappingRedrive::CallActivitySpawn,
-                        );
-                        return (vec![event], Vec::new());
-                    }
-                };
-                if propagate_all_parent {
-                    view.clone()
-                } else {
-                    applied_inputs
+            None => match self.adhoc_tool_input_updates(
+                instance_key,
+                &container_element_id,
+                &element_id,
+                &view,
+            ) {
+                Ok(updates) => updates,
+                Err(failure) => {
+                    let event = self.io_mapping_incident(
+                        instance_key,
+                        child_eik,
+                        element_id,
+                        failure,
+                        state::IoMappingRedrive::CallActivitySpawn,
+                    );
+                    return (vec![event], Vec::new());
                 }
-            }
+            },
+        };
+        // Zeebe parity (`CallActivityProcessor.finalizeActivation`): when the spawn
+        // incident resolves, `copyAllVariablesToProcessInstance` re-reads the call
+        // activity's CURRENT scope, so `propagateAllParentVariables=true` seeds the
+        // child from a FRESH all-parent view with the preserved input projection
+        // layered on top (child-local wins) — picking up container variables that
+        // became visible after the incident. With it off, only the preserved input
+        // projection crosses (`copyLocalVariablesToProcessInstance`).
+        let child_seed = if propagate_all_parent {
+            let mut merged = view.clone();
+            merged.extend(projection.clone());
+            merged
+        } else {
+            projection.clone()
         };
         self.spawn_call_activity_instance(
             instance_key,
@@ -11555,7 +11579,7 @@ impl Engine {
             &process_id,
             &view,
             child_seed,
-            true,
+            Some(projection),
         )
     }
 
@@ -11624,7 +11648,7 @@ impl Engine {
             called_process_id,
             element_vars,
             child_vars,
-            false,
+            None,
         )
     }
 
@@ -11650,32 +11674,29 @@ impl Engine {
         called_process_id: &str,
         eval_view: &HashMap<String, Value>,
         child_seed: HashMap<String, Value>,
-        // Whether this spawn is for a `callActivity` **ad-hoc tool** (issue #1159)
-        // rather than a mainstream sequence-flow call activity. An ad-hoc tool
-        // records its single-pass input projection (`child_seed`) on any
-        // recoverable spawn incident (#1176) so the post-resolve respawn reuses it
-        // verbatim instead of re-projecting chained input mappings against the
-        // already-mutated child scope; a mainstream call activity re-derives its
-        // seed idempotently from its still-stable element scope and so carries the
-        // plain [`state::IoMappingRedrive::CallActivitySpawn`].
-        is_adhoc_tool: bool,
+        // The ad-hoc tool's single-pass input projection to preserve on any
+        // recoverable spawn incident (issue #1159 / #1176), or `None` for a
+        // mainstream sequence-flow call activity. When `Some`, a spawn incident
+        // records this projection (`AdHocCallActivitySpawn.child_seed`) so the
+        // post-resolve respawn overlays it onto a FRESH all-parent view instead of
+        // re-projecting the tool's (possibly chained) input mappings against the
+        // already-mutated child scope; a mainstream call activity (`None`)
+        // re-derives its seed idempotently from its still-stable element scope and
+        // so carries the plain [`state::IoMappingRedrive::CallActivitySpawn`].
+        adhoc_input_projection: Option<HashMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         // The recoverable-spawn-incident redrive: for an ad-hoc tool it preserves
         // the single-pass input projection so the respawn does not re-evaluate the
         // tool's (possibly chained) input mappings; for a mainstream call activity
         // it is the plain spawn-retry marker. Built **lazily** — only an incident
-        // path needs it, and the ad-hoc variant deep-clones `child_seed` (up to the
-        // full visible variable set under `propagateAllParentVariables=true`), so
-        // the hot success path must not pay that copy: it moves the original
-        // `child_seed` straight into `ProcessInstanceCreated` instead.
-        let spawn_redrive = || {
-            if is_adhoc_tool {
-                state::IoMappingRedrive::AdHocCallActivitySpawn {
-                    child_seed: child_seed.clone(),
-                }
-            } else {
-                state::IoMappingRedrive::CallActivitySpawn
-            }
+        // path needs it, and the ad-hoc variant clones just the preserved input
+        // projection, so the hot success path must not pay that copy: it moves the
+        // original `child_seed` straight into `ProcessInstanceCreated` instead.
+        let spawn_redrive = || match &adhoc_input_projection {
+            Some(projection) => state::IoMappingRedrive::AdHocCallActivitySpawn {
+                child_seed: projection.clone(),
+            },
+            None => state::IoMappingRedrive::CallActivitySpawn,
         };
         // The callee id may be a literal or a FEEL `=` expression (C8
         // `zeebe:calledElement processId`), resolved against the activating view.

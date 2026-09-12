@@ -25399,6 +25399,146 @@ fn adhoc_call_activity_tool_spawn_incident_recovers_on_resolve() {
     assert!(!engine.is_completed(inst), "the parent waits for the child");
 }
 
+/// An ad-hoc `callActivity` tool with `propagateAllParentVariables="true"` whose
+/// callee is undeployed at activation, so its first spawn parks a recoverable
+/// `CALLED_ELEMENT_ERROR` incident. It carries an input mapping
+/// (`=askedAbout -> customerRequest`).
+fn adhoc_agent_tool_calls_undeployed_propagate_all() -> ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallSpecialist">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="specialist-proc"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="true" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=askedAbout" target="customerRequest" />
+                  <zeebe:output source="={status: status, summary: summary}" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap()
+}
+
+/// Zeebe parity for the #1176 spawn-incident redrive under
+/// `propagateAllParentVariables="true"`: when the incident resolves, Zeebe's
+/// `CallActivityProcessor.finalizeActivation` re-reads the call activity's
+/// CURRENT scope via `copyAllVariablesToProcessInstance`, so a container variable
+/// that became visible *after* the incident (here an operator `SetVariables`
+/// write, but equally another tool propagating its output) must cross into the
+/// child on redrive. The redrive must NOT freeze the first-pass view — it overlays
+/// only the preserved single-pass input projection onto a fresh all-parent view.
+#[test]
+fn adhoc_call_activity_tool_propagate_all_redrive_sees_post_incident_container_var() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_tool_calls_undeployed_propagate_all(),
+        ))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("askedAbout", Value::Str("a mortgage".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallSpecialist")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // First spawn parks a recoverable incident: the callee is undeployed.
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "the unknown callee parks one incident");
+    assert_eq!(active[0].kind, state::IncidentKind::CalledElementError);
+
+    // A container variable becomes visible only AFTER the incident is parked —
+    // e.g. an operator sets the variable that unblocks the redrive, or another
+    // ad-hoc tool propagates its output into the container.
+    engine
+        .apply_command(Command::SetVariables {
+            scope_key: inst,
+            variables: vars(&[("lateVar", Value::Str("added after incident".into()))]),
+            local: false,
+        })
+        .unwrap();
+
+    // Deploy the callee and resolve: the redrive re-attempts the spawn.
+    engine
+        .apply_command(Command::DeployProcess(specialist_proc()))
+        .unwrap();
+    let incident_key = engine.incidents()[0].key;
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(
+        engine.active_incidents().is_empty(),
+        "resolving the incident cleared it by spawning the child"
+    );
+
+    let child = engine
+        .activate_jobs("probe-child", "W", 10, 1_000, 0)
+        .into_iter()
+        .next()
+        .expect("child spawned on redrive")
+        .variables
+        .as_ref()
+        .clone();
+
+    // The preserved single-pass input projection still crosses (child-local wins).
+    assert_eq!(
+        child.get("customerRequest"),
+        Some(&Value::Str("a mortgage".into())),
+        "the redrive re-applied the preserved input projection",
+    );
+    // propagateAllParentVariables=true → the original parent variable crosses.
+    assert_eq!(
+        child.get("askedAbout"),
+        Some(&Value::Str("a mortgage".into())),
+        "propagateAllParentVariables=true crosses the original parent variable",
+    );
+    // The crux (#1176 propagate=true gap): the variable that became visible AFTER
+    // the incident must ALSO cross, because the redrive seeds from a fresh
+    // all-parent view — not a frozen first-pass snapshot. Before the fix this was
+    // absent (the seed was the frozen first-pass child_vars).
+    assert_eq!(
+        child.get("lateVar"),
+        Some(&Value::Str("added after incident".into())),
+        "propagateAllParentVariables=true redrive must see the container variable \
+         that became visible after the incident (Zeebe re-reads current scope; the \
+         seed is not frozen at first-pass time)",
+    );
+    assert!(!engine.is_completed(inst), "the parent waits for the child");
+}
+
 /// A `callActivity` ad-hoc tool with **chained input mappings**
 /// (`=x -> y`, `=y -> z`) and `propagateAllParentVariables=false`. On the first
 /// pass the tool's inputs are folded into the tool child's local scope, so a
