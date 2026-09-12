@@ -477,6 +477,12 @@ export function removeExternalAgentMarker(
 ): void {
   const def = agentDefinition(bo);
   if (def) removeExtChild(modeling, element, bo, def);
+  // The `--auto` opt-out is meaningless without the marker (the modeler hides
+  // its toggle once the marker is gone, see BpmnModeler's provider condition),
+  // so tear any opt-out down with the marker rather than stranding an orphaned
+  // `autoSubscribe="false"` in the saved BPMN with no visible control to clear
+  // it. Clearing is a no-op when no opt-out is present.
+  clearAutoSubscribeOptOut(modeling, element, bo);
 }
 
 // --- The `--auto` opt-out property (issue #1180) -----------------------------
@@ -515,7 +521,25 @@ export function writeAutoSubscribeOptOut(
   }
   // Clearing: drop the opt-out property; keep the container only if other
   // properties remain, else tear it (and any orphan wrapper) down.
+  clearAutoSubscribeOptOut(modeling, element, bo);
+}
+
+/** Clear the `io.nanobpm.agentTask.autoSubscribe="false"` opt-out: drop the
+ *  property, keep the `zeebe:Properties` container only if other properties
+ *  remain, else tear the container (and any orphan `bpmn:extensionElements`
+ *  wrapper) down. A no-op when no opt-out is present. Needs no `moddle` (it only
+ *  removes), so callers tearing an element down (e.g. `removeExternalAgentMarker`)
+ *  can reuse it without threading a `moddle` in. */
+export function clearAutoSubscribeOptOut(
+  modeling: AgentModeling,
+  element: unknown,
+  bo: AgentModdleElement,
+): void {
+  const container = zeebeProperties(bo);
   if (!container) return;
+  const kept = (container.properties ?? []).filter(
+    (p) => p.name !== AUTO_SUBSCRIBE_PROPERTY,
+  );
   if (kept.length) {
     for (const p of kept) p.$parent = container;
     modeling.updateModdleProperties(element, container, { properties: kept });

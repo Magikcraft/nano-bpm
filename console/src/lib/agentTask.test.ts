@@ -29,6 +29,7 @@ import {
   writeExternalAgentMarker,
   removeExternalAgentMarker,
   writeAutoSubscribeOptOut,
+  clearAutoSubscribeOptOut,
   type AgentModdle,
   type AgentModdleElement,
   type AgentModeling,
@@ -536,6 +537,57 @@ test("removeExternalAgentMarker strips the marker and tears down the empty wrapp
   assert.equal(agentDefinition(bo), undefined);
   // It was the only extension child, so the wrapper is gone.
   assert.equal(bo.extensionElements, undefined);
+});
+
+test("removeExternalAgentMarker also clears an orphaned --auto opt-out", () => {
+  // The moderate #1186 finding: the opt-out toggle is hidden once the marker is
+  // gone, so removing the marker must not strand `autoSubscribe="false"` in the
+  // saved BPMN with no visible control to clear it.
+  const bo = serviceTaskBo([agentMarker(), zeebeProps(optOutProperty())]);
+  removeExternalAgentMarker(applyingModeling(), {}, bo);
+  assert.equal(hasExternalAgentMarker(bo), false);
+  assert.equal(readAutoSubscribeOptOut(bo), false);
+  // Both children (and the empty wrapper) are gone — no orphan left behind.
+  assert.equal(bo.extensionElements, undefined);
+});
+
+test("removeExternalAgentMarker clears the opt-out but keeps unrelated siblings", () => {
+  const other: AgentModdleElement = {
+    $type: ZEEBE_PROPERTY_TYPE,
+    name: "some.other.prop",
+    value: "keep-me",
+  };
+  const bo = serviceTaskBo([
+    agentMarker(),
+    zeebeProps(optOutProperty(), other),
+  ]);
+  removeExternalAgentMarker(applyingModeling(), {}, bo);
+  assert.equal(hasExternalAgentMarker(bo), false);
+  assert.equal(readAutoSubscribeOptOut(bo), false);
+  // The unrelated property (and its container) survive.
+  const container = bo.extensionElements?.values?.find(
+    (v) => v.$type === ZEEBE_PROPERTIES_TYPE,
+  );
+  assert.deepEqual(
+    container?.properties?.map((p) => p.name),
+    ["some.other.prop"],
+  );
+});
+
+test("clearAutoSubscribeOptOut drops the opt-out and is a no-op when absent", () => {
+  const bo = serviceTaskBo([agentMarker(), zeebeProps(optOutProperty())]);
+  clearAutoSubscribeOptOut(applyingModeling(), {}, bo);
+  assert.equal(readAutoSubscribeOptOut(bo), false);
+  // Marker is untouched — clearing the opt-out is independent of the marker.
+  assert.equal(hasExternalAgentMarker(bo), true);
+  // Clearing again (now absent) does nothing and creates no empty container.
+  clearAutoSubscribeOptOut(applyingModeling(), {}, bo);
+  assert.equal(
+    bo.extensionElements?.values?.some(
+      (v) => v.$type === ZEEBE_PROPERTIES_TYPE,
+    ),
+    false,
+  );
 });
 
 test("the external marker leads the prompt link in extensionElements order", () => {
