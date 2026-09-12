@@ -25352,11 +25352,18 @@ fn adhoc_call_activity_tool_spawn_incident_recovers_on_resolve() {
     let active = engine.active_incidents();
     assert_eq!(active.len(), 1, "the unknown callee parks one incident");
     assert_eq!(active[0].kind, state::IncidentKind::CalledElementError);
-    assert_eq!(
-        active[0].redrive,
-        Some(state::IoMappingRedrive::CallActivitySpawn),
-        "the spawn incident carries a spawn-retry redrive, not None"
-    );
+    match &active[0].redrive {
+        Some(state::IoMappingRedrive::AdHocCallActivitySpawn { child_seed }) => {
+            // #1176: an ad-hoc call-activity tool preserves its single-pass input
+            // projection on the spawn redrive so the respawn reuses it verbatim.
+            assert_eq!(
+                child_seed.get("customerRequest"),
+                Some(&Value::Str("a mortgage".into())),
+                "the spawn incident carries the tool's preserved input projection",
+            );
+        }
+        other => panic!("expected AdHocCallActivitySpawn redrive, got {other:?}"),
+    }
     assert!(
         engine
             .activate_jobs("probe-child", "W", 10, 1_000, 0)
@@ -25390,4 +25397,327 @@ fn adhoc_call_activity_tool_spawn_incident_recovers_on_resolve() {
         "the retried spawn re-applied the tool's input mapping"
     );
     assert!(!engine.is_completed(inst), "the parent waits for the child");
+}
+
+/// A `callActivity` ad-hoc tool with **chained input mappings**
+/// (`=x -> y`, `=y -> z`) and `propagateAllParentVariables=false`. On the first
+/// pass the tool's inputs are folded into the tool child's local scope, so a
+/// respawn that re-projects them against that already-mutated view would resolve
+/// `z` non-null (`eval_io_mappings_in` is single-pass) — silently altering the
+/// child seed across a recoverable spawn-incident retry (#1176). The post-resolve
+/// respawn must produce the **same** child seed as a clean first spawn.
+fn adhoc_agent_tool_chained_inputs(callee: &str) -> ProcessDefinition {
+    let xml = format!(
+        r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="toolCallResults" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallChain">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="{callee}"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=x" target="y" />
+                  <zeebe:input source="=y" target="z" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#
+    );
+    crate::bpmn::parse_bpmn(&xml).unwrap().pop().unwrap()
+}
+
+/// Drives the chained-input ad-hoc call-activity tool to the point where its
+/// child process instance is spawned, returning the child's seed (the spawned
+/// `probe-child` job's variables). When `deploy_callee_first` is false the first
+/// spawn parks a recoverable `CALLED_ELEMENT_ERROR` incident; the callee is then
+/// deployed and the incident resolved, so the returned seed is the *respawn*
+/// seed.
+fn chained_input_child_seed(deploy_callee_first: bool) -> HashMap<String, Value> {
+    let mut engine = Engine::new();
+    if deploy_callee_first {
+        engine
+            .apply_command(Command::DeployProcess(specialist_proc()))
+            .unwrap();
+    }
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_tool_chained_inputs(
+            "specialist-proc",
+        )))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "parent",
+            vars(&[("x", Value::Str("seed".into()))]),
+        ))
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallChain")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    if !deploy_callee_first {
+        // The first spawn parked a recoverable incident; deploy the callee and
+        // resolve so the tool respawns.
+        let active = engine.active_incidents();
+        assert_eq!(active.len(), 1, "the unknown callee parks one incident");
+        assert_eq!(active[0].kind, state::IncidentKind::CalledElementError);
+        engine
+            .apply_command(Command::DeployProcess(specialist_proc()))
+            .unwrap();
+        let incident_key = engine.incidents()[0].key;
+        engine
+            .apply_command(Command::resolve_incident(incident_key))
+            .unwrap();
+        assert!(
+            engine.active_incidents().is_empty(),
+            "resolving the incident cleared it by spawning the child"
+        );
+    }
+
+    engine
+        .activate_jobs("probe-child", "W", 10, 1_000, 0)
+        .into_iter()
+        .next()
+        .expect("child spawned")
+        .variables
+        .as_ref()
+        .clone()
+}
+
+#[test]
+fn adhoc_call_activity_tool_preserves_chained_input_projection_across_spawn_retry() {
+    // The clean first spawn projects the chain single-pass: `y = <x>`, and
+    // `z = <y>` reads the ORIGINAL (empty) view, so `z` is null.
+    let clean = chained_input_child_seed(true);
+    assert_eq!(
+        clean.get("y"),
+        Some(&Value::Str("seed".into())),
+        "clean spawn: y = <x>",
+    );
+    assert_ne!(
+        clean.get("z"),
+        Some(&Value::Str("seed".into())),
+        "clean spawn: z reads the original (empty) view, so it is NOT <x>",
+    );
+
+    // The respawn after a recoverable spawn incident must reproduce the SAME seed
+    // — not re-project `z` against the mutated child scope (which now carries the
+    // first pass's applied `y`, making `z = <y>` non-null). This is the #1176
+    // defect: without preserving the single-pass projection, `z` would become
+    // `"seed"` on the retry.
+    let respawned = chained_input_child_seed(false);
+    assert_eq!(
+        respawned.get("z"),
+        clean.get("z"),
+        "the respawn seed's z must match the clean first-spawn seed \
+         (single-pass projection preserved, not re-evaluated against the mutated \
+         child scope)",
+    );
+    assert_eq!(
+        respawned.get("y"),
+        clean.get("y"),
+        "the respawn seed's y must match the clean first-spawn seed",
+    );
+}
+
+/// A `callActivity` ad-hoc tool with **chained output mappings**
+/// (`=status -> intermediate`, `=intermediate -> toolCallResult`) whose
+/// completion parks the output-collection *type* incident (the container
+/// `outputCollection` was overwritten with a scalar). Resolving it must reuse the
+/// tool's single-pass output projection — not re-evaluate the chained output
+/// mappings against the seeded child scope, which would make
+/// `toolCallResult = <intermediate>` non-null (#1176).
+fn adhoc_agent_tool_chained_outputs(overwrite_collection: bool) -> ProcessDefinition {
+    let container_input = if overwrite_collection {
+        r#"<zeebe:ioMapping><zeebe:input source="=5" target="results" /></zeebe:ioMapping>"#
+    } else {
+        ""
+    };
+    let xml = format!(
+        r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="parent">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=toolCallResult" />
+              {container_input}
+            </bpmn:extensionElements>
+            <bpmn:callActivity id="CallChain">
+              <bpmn:extensionElements>
+                <zeebe:calledElement processId="specialist2"
+                    propagateAllChildVariables="false"
+                    propagateAllParentVariables="false" />
+                <zeebe:ioMapping>
+                  <zeebe:output source="=status" target="intermediate" />
+                  <zeebe:output source="=intermediate" target="toolCallResult" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:callActivity>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#
+    );
+    crate::bpmn::parse_bpmn(&xml).unwrap().pop().unwrap()
+}
+
+fn specialist2_proc() -> ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="specialist2">
+          <bpmn:startEvent id="cs" />
+          <bpmn:serviceTask id="specialist">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-child2" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="ce" />
+          <bpmn:sequenceFlow id="cf1" sourceRef="cs" targetRef="specialist" />
+          <bpmn:sequenceFlow id="cf2" sourceRef="specialist" targetRef="ce" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap()
+}
+
+/// Runs the chained-output ad-hoc call-activity tool to completion of the tool,
+/// returning the tool's output projection as written into the container scope
+/// (`intermediate` and `toolCallResult`). With `overwrite_collection` the tool's
+/// completion parks the output-collection type incident, which is then fixed
+/// (`results = []`) and resolved, so the returned projection is the *redrive*
+/// projection.
+fn chained_output_container_projection(
+    overwrite_collection: bool,
+) -> (Option<Value>, Option<Value>) {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(specialist2_proc()))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_tool_chained_outputs(
+            overwrite_collection,
+        )))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "parent");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job");
+    let container = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("CallChain")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    // The tool spawned a child; complete its service task producing `status`.
+    let child = engine
+        .activate_jobs("probe-child2", "W", 10, 1_000, 0)
+        .into_iter()
+        .next()
+        .expect("child job");
+    engine
+        .apply_command(Command::complete_job_with(
+            child.key,
+            vars(&[("status", Value::Str("ok".into()))]),
+        ))
+        .unwrap();
+
+    if overwrite_collection {
+        // The tool's completion parked the output-collection type incident.
+        let active = engine.active_incidents();
+        assert_eq!(active.len(), 1, "the scalar outputCollection parks one incident");
+        assert_eq!(active[0].kind, state::IncidentKind::ExpressionEvaluation);
+        assert_eq!(active[0].element_id, "CallChain");
+        // Fix the outputCollection back to a list and resolve.
+        engine
+            .apply_command(Command::set_variables_scoped(
+                container,
+                vars(&[("results", Value::List(Vec::new()))]),
+                true,
+            ))
+            .unwrap();
+        let incident_key = engine.incidents()[0].key;
+        engine
+            .apply_command(Command::resolve_incident(incident_key))
+            .unwrap();
+        assert!(
+            engine.active_incidents().is_empty(),
+            "resolving the type incident cleared it by completing the tool",
+        );
+    }
+
+    (
+        engine.variables(inst).get("intermediate").cloned(),
+        engine.variables(inst).get("toolCallResult").cloned(),
+    )
+}
+
+#[test]
+fn adhoc_call_activity_tool_preserves_chained_output_projection_across_type_incident() {
+    // Clean completion projects the chain single-pass: `intermediate = <status>`,
+    // and `toolCallResult = <intermediate>` reads the child's ORIGINAL variables
+    // (no `intermediate`), so it is null.
+    let (clean_intermediate, clean_result) = chained_output_container_projection(false);
+    assert_eq!(
+        clean_intermediate,
+        Some(Value::Str("ok".into())),
+        "clean completion: intermediate = <status>",
+    );
+    assert_ne!(
+        clean_result,
+        Some(Value::Str("ok".into())),
+        "clean completion: toolCallResult reads the original child view, so NOT <status>",
+    );
+
+    // The redrive after the output-collection type incident must reproduce the
+    // SAME projection — not re-evaluate the chained output mappings against the
+    // seeded child scope (which now carries `intermediate`, making
+    // `toolCallResult = <intermediate>` = "ok"). This is the #1176 output-side
+    // defect.
+    let (retry_intermediate, retry_result) = chained_output_container_projection(true);
+    assert_eq!(
+        retry_result, clean_result,
+        "the redrive's toolCallResult must match the clean completion \
+         (single-pass output projection preserved, not re-evaluated against the \
+         mutated child scope)",
+    );
+    assert_eq!(
+        retry_intermediate, clean_intermediate,
+        "the redrive's intermediate must match the clean completion",
+    );
 }

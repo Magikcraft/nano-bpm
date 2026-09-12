@@ -739,6 +739,32 @@ pub enum IoMappingRedrive {
     /// process for the already-activated call activity (its boundary events were
     /// armed on the first pass and must not be re-armed).
     CallActivitySpawn,
+    /// An ad-hoc **call-activity tool** spawn failure (#1176): identical recovery
+    /// to [`Self::CallActivitySpawn`] (re-attempt the still-activated tool's
+    /// child-process spawn), but carries the tool's single-pass *input projection*
+    /// (`child_seed`) captured on the failed first pass so the post-resolve
+    /// respawn reuses it **verbatim** instead of re-evaluating the tool's
+    /// (possibly chained, non-idempotent) input mappings against the
+    /// already-mutated child scope. On the first pass the tool's input mappings
+    /// were already folded into the tool child's local scope (via
+    /// `AdHocToolActivated`'s `local_variables`), so re-projecting them at respawn
+    /// time reads a view that already contains the first pass's applied targets —
+    /// `eval_io_mappings_in` is single-pass, so a chained mapping (`x -> y`,
+    /// `y -> z`) is not idempotent across the retry. Mirrors the "project once,
+    /// reuse verbatim" pattern PR #1171 introduced for the output side. Additive
+    /// brand-new variant — old journals never carry it.
+    AdHocCallActivitySpawn { child_seed: HashMap<String, Value> },
+    /// An ad-hoc **call-activity tool** output-collection *type* incident (#1176):
+    /// the tool's completion parked because the container `outputCollection`
+    /// target is not a list (Zeebe `EXTRACT_VALUE_ERROR`). Carries the tool's
+    /// single-pass *output projection* (`precomputed_output`, already evaluated
+    /// once against the child process's produced variables by
+    /// `complete_adhoc_call_activity_tool`) so the post-resolve redrive reuses it
+    /// **verbatim** instead of re-evaluating the tool's (possibly chained) output
+    /// mappings against the seeded child scope — the double-eval PR #1171 fixed on
+    /// the clean path by threading `precomputed_output` through
+    /// `continue_adhoc_inner_flow`. Additive brand-new variant.
+    AdHocToolOutputCollection { precomputed_output: HashMap<String, Value> },
     /// A call-activity **output**-mapping failure: re-project the captured child
     /// result through the call activity's output mappings and complete it. The
     /// child variables are captured here because the completed child instance
