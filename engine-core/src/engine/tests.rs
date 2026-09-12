@@ -5157,6 +5157,351 @@ fn multi_instance_adhoc_child_completes_normally_and_seeds_its_output_collection
     );
 }
 
+/// Issue #1175 (gap 1) — a DECLARATIVE (BPMN_TASK / `activeElementsCollection`)
+/// ad-hoc container used as a multi-instance child must evaluate its
+/// active-elements collection and activate those inner elements — NOT mint a
+/// stray agent job. Because an ad-hoc sub-process flattens to
+/// `ElementKind::ServiceTask`, `run_mi_child_behaviour` used to unconditionally
+/// mint a job for every ad-hoc MI child, so a declarative container as an MI
+/// child minted a phantom container job and never ran its collection. Assert the
+/// branch activates the collection's inner tools directly (no container job) and
+/// the loop drains back through `complete_mi_child`.
+#[test]
+fn multi_instance_declarative_adhoc_child_activates_its_collection_without_a_job() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:adHoc activeElementsCollection="=tools" outputCollection="results" outputElement="=results" />
+            </bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics>
+              <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" />
+            </bpmn:multiInstanceLoopCharacteristics>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="f2" sourceRef="Host" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[
+                ("items", Value::List(vec![Value::Int(1), Value::Int(2)])),
+                ("tools", Value::List(vec![Value::Str("toolA".to_string())])),
+            ]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // A declarative container mints NO agent/container job. On `main`, each MI
+    // child would mint a phantom job (job type = the container element id "Host")
+    // and never activate its collection.
+    assert!(
+        engine.activate_jobs("Host", "W", 10, 1_000, 0).is_empty(),
+        "a declarative ad-hoc MI child mints no container job"
+    );
+    // Instead each of the two children activated its collection's `toolA`
+    // directly — two real tool jobs, one per MI child.
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(
+        tool_jobs.len(),
+        2,
+        "each declarative MI child activated its active-elements collection (gap 1)"
+    );
+    assert_eq!(engine.instance(inst).unwrap().multi_instances.len(), 1);
+
+    // Each tool completes with a `result`; the container aggregates it into its
+    // `results` outputCollection, the container drains, and its MI outputElement
+    // `=results` feeds the loop — draining the whole MI back through
+    // `complete_mi_child`.
+    for job in &tool_jobs {
+        engine
+            .apply_command(Command::complete_job_with(
+                job.key,
+                HashMap::from([("result".to_string(), Value::Str("x".to_string()))]),
+            ))
+            .unwrap();
+    }
+
+    assert!(
+        engine.is_completed(inst),
+        "every declarative MI ad-hoc child drains and the loop completes (gap 1)"
+    );
+    assert!(
+        engine.instance(inst).is_none()
+            || (engine.instance(inst).unwrap().multi_instances.is_empty()
+                && engine.instance(inst).unwrap().adhoc_instances.is_empty()),
+        "no stale multi-instance or ad-hoc runtime records remain"
+    );
+}
+
+/// Issue #1175 (gap 2) — a CALL-ACTIVITY multi-instance child's `zeebe:input`
+/// mappings must be evaluated exactly once, into the isolated child PROCESS
+/// scope, and the callee-id `=calledElement` expression must NOT see the callee's
+/// own input-mapped locals. `activate_mi_child` used to apply the mappings into
+/// the child scope and ALSO hand that mapped view to `spawn_call_activity_child`,
+/// which re-applied them (a second evaluation that compounds for a self-
+/// referencing mapping) and let the callee-id expression resolve against the
+/// contaminated view.
+#[test]
+fn multi_instance_call_activity_child_applies_inputs_once_and_keeps_callee_id_clean() {
+    // callee "target-proc": start -> cw("callee-work") -> end.
+    let callee = ProcessBuilder::new("target-proc")
+        .start_event("cs")
+        .service_task("cw", "callee-work")
+        .end_event("ce")
+        .connect("cs", "cw")
+        .connect("cw", "ce")
+        .build()
+        .unwrap();
+    // Parent: the callee id lives in `callee` = "target-proc". Two inputs:
+    //  - `callee` := "WRONG-proc"  (would derail the callee-id if it leaked)
+    //  - `n`      := n + 1         (self-referencing — doubles if applied twice)
+    let def = ProcessBuilder::new("mi-call")
+        .start_event("start")
+        .call_activity("each", "=callee")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![
+                    crate::model::Mapping {
+                        source: "=\"WRONG-proc\"".to_string(),
+                        target: "callee".to_string(),
+                    },
+                    crate::model::Mapping {
+                        source: "=n + 1".to_string(),
+                        target: "n".to_string(),
+                    },
+                ],
+                outputs: vec![],
+            },
+        )
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(callee))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-call",
+            vars(&[
+                ("items", Value::List(vec![Value::Int(1)])),
+                ("callee", Value::Str("target-proc".to_string())),
+                ("n", Value::Int(1)),
+            ]),
+        ))
+        .unwrap();
+
+    // The callee-id `=callee` resolved against the un-contaminated view
+    // ("target-proc"), so a real callee spawned and parked on its work job. On
+    // `main` the input-mapped `callee`="WRONG-proc" derailed the lookup into an
+    // unknown-callee incident and no child spawned.
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no unknown-callee incident — the callee-id ignored the input-mapped locals (gap 2)"
+    );
+    let jobs = engine.activate_jobs("callee-work", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 1, "the real callee (target-proc) was spawned");
+    // The self-referencing `n := n + 1` mapping was applied EXACTLY ONCE into the
+    // child seed (1 -> 2). Applied twice (the old double-eval) it would be 3.
+    assert_eq!(
+        jobs[0].variables.get("n"),
+        Some(&Value::Int(2)),
+        "call-activity input mappings applied exactly once into the child (gap 2)"
+    );
+    // And the input mapping did reach the child seed (it seeds the child process).
+    assert_eq!(
+        jobs[0].variables.get("callee"),
+        Some(&Value::Str("WRONG-proc".to_string())),
+        "the input mapping still seeds the isolated child process scope"
+    );
+}
+
+/// Issue #1175 (gap 3) — a failed CALL-ACTIVITY spawn on a multi-instance child
+/// must re-drive MI-aware on incident resolution: the retry must re-evaluate the
+/// callee id (and the input mappings) against the CHILD's scope, which carries
+/// the per-child `inputElement`/`loopCounter` bindings. The generic spawn retry
+/// used to evaluate against the enclosing MI-body scope, which does not carry
+/// those bindings, so a callee-id `=item` (or a mapping reading `loopCounter`)
+/// failed again on resolution and the loop never advanced.
+#[test]
+fn multi_instance_call_activity_spawn_retry_is_mi_aware() {
+    // callee "callee-1": start -> cw("callee-work") -> end.
+    let callee = ProcessBuilder::new("callee-1")
+        .start_event("cs")
+        .service_task("cw", "callee-work")
+        .end_event("ce")
+        .connect("cs", "cw")
+        .connect("cw", "ce")
+        .build()
+        .unwrap();
+    // The callee id is the per-child `inputElement` (`=item`). Its value only
+    // exists in the child scope, so a non-MI-aware retry cannot resolve it.
+    let def = ProcessBuilder::new("mi-call")
+        .start_event("start")
+        .call_activity("each", "=item")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    // Deploy ONLY the parent first: the callee is not yet deployed, so the child
+    // spawn parks a CalledElementError incident.
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-call",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Str("callee-1".to_string())]),
+            )]),
+        ))
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(
+        active.len(),
+        1,
+        "the undeployed callee parks one spawn incident"
+    );
+    assert_eq!(active[0].kind, state::IncidentKind::CalledElementError);
+    let incident_key = active[0].key;
+
+    // Deploy the callee, then resolve the incident. The MI-aware retry must
+    // re-evaluate `=item` against the child scope (item = "callee-1") and spawn.
+    engine
+        .apply_command(Command::DeployProcess(callee))
+        .unwrap();
+    engine
+        .apply_command(Command::ResolveIncident {
+            incident_key,
+            operation_reference: None,
+        })
+        .unwrap();
+
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the MI-aware spawn retry resolved the callee id from the child bindings (gap 3)"
+    );
+    let jobs = engine.activate_jobs("callee-work", "W", 10, 60_000, 0);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "the retry spawned the real callee for the MI child (gap 3)"
+    );
+}
+
+/// Issue #1175 (gap 4) — an ad-hoc MI child must seed its `outputCollection`
+/// BEFORE its per-child input mappings run, mirroring the normal activation
+/// path. The seed used to be emitted AFTER the mappings, so a (nonsensical but
+/// possible) per-child `zeebe:input` targeting the outputCollection variable was
+/// clobbered by the empty seed instead of surviving.
+#[test]
+fn multi_instance_adhoc_child_seeds_output_collection_before_input_mappings() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="r" outputElement="=result" />
+              <zeebe:ioMapping>
+                <zeebe:input source="=[item]" target="r" />
+              </zeebe:ioMapping>
+            </bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics>
+              <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" />
+            </bpmn:multiInstanceLoopCharacteristics>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="f2" sourceRef="Host" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("items", Value::List(vec![Value::Int(1)]))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // The container's agent job carries the child scope, in which the
+    // outputCollection `r` must reflect the per-child input mapping (`[item]` =
+    // `[1]`) rather than the empty seed — proving the seed ran BEFORE the mapping.
+    // On `main` the seed ran after the mapping and clobbered it to `[]`.
+    let agents = engine.activate_jobs("agent-worker", "W", 10, 1_000, 0);
+    assert_eq!(
+        agents.len(),
+        1,
+        "the single MI ad-hoc child minted its agent job"
+    );
+    assert_eq!(
+        agents[0].variables.get("r"),
+        Some(&Value::List(vec![Value::Int(1)])),
+        "the per-child input mapping to the outputCollection survived the seed (gap 4)"
+    );
+    let _ = inst;
+}
+
 /// Issue #1170 regression — a NORMAL multi-instance completion must disarm the
 /// boundary events armed on the body. This PR arms an interrupting boundary on
 /// the MI body (not per child); `complete_multi_instance_body` /
