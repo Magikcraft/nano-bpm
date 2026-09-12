@@ -472,6 +472,26 @@ export function writeExternalAgentMarker(
   attachExtChild(moddle, modeling, element, bo, def);
 }
 
+/** Clone a moddle element's scalar attributes into a fresh element of the same
+ *  `$type` (leaving the original — including its `$parent` link — untouched).
+ *  Used to rebuild a surviving `zeebe:Properties` container from copies of its
+ *  kept properties, so the ORIGINALS are never reparented. Only scalar
+ *  attributes are copied; nested `$`-internal fields (`$type`, `$parent`, …) and
+ *  child arrays are deliberately skipped — a `zeebe:Property` is a leaf, so its
+ *  `name`/`value` (and any future scalar attrs) carry over verbatim. */
+function cloneModdleElement(
+  moddle: AgentModdle,
+  el: AgentModdleElement,
+): AgentModdleElement {
+  const attrs: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(el)) {
+    if (key.startsWith("$")) continue;
+    if (val !== null && typeof val === "object") continue;
+    attrs[key] = val;
+  }
+  return moddle.create(el.$type ?? ZEEBE_PROPERTY_TYPE, attrs);
+}
+
 /** Remove the external-agent marker, and with it any `--auto` opt-out — which the
  *  modeler hides once the marker is gone (see BpmnModeler's provider condition),
  *  so it must not be stranded as an orphaned `autoSubscribe="false"` in the saved
@@ -481,8 +501,10 @@ export function writeExternalAgentMarker(
  *  revive `autoSubscribe="false"` while the marker — and the panel control that
  *  clears it — stays gone, recreating exactly the orphan this cleanup exists to
  *  prevent (issue #1186). A surviving container (one that still holds unrelated
- *  properties) is rebuilt as a fresh moddle object rather than mutated in place,
- *  so undo restores the original opt-out-bearing container intact. */
+ *  properties) is rebuilt as a fresh moddle object holding CLONES of the kept
+ *  properties — the originals are never reparented — so undo restores the
+ *  original opt-out-bearing container, with its children's `$parent` links
+ *  intact, rather than pointing at a rebuilt container undo has removed. */
 export function removeExternalAgentMarker(
   moddle: AgentModdle,
   modeling: AgentModeling,
@@ -508,10 +530,19 @@ export function removeExternalAgentMarker(
       // Drop the opt-out; keep the container only when it still holds unrelated
       // properties — rebuilt fresh so the in-place original survives an undo.
       if (keptProps.length === 0) continue;
+      // CLONE the surviving properties onto the fresh container; never reparent
+      // (mutate `$parent` on) the ORIGINALS. The single `updateModdleProperties`
+      // command only records `ext.values`, so any `$parent` mutation is invisible
+      // to undo and permanent. Reparenting the originals would leave them — which
+      // undo restores inside the original `container` — pointing at `rebuilt`, a
+      // container no longer in the model, so a later traversal walks a stale
+      // `$parent` (issue #1186). Cloning keeps the originals (and their parent
+      // links) untouched for a clean rollback.
+      const clones = keptProps.map((p) => cloneModdleElement(moddle, p));
       const rebuilt = moddle.create(ZEEBE_PROPERTIES_TYPE, {
-        properties: keptProps,
+        properties: clones,
       });
-      for (const p of keptProps) p.$parent = rebuilt;
+      for (const c of clones) c.$parent = rebuilt;
       rebuilt.$parent = ext;
       survivors.push(rebuilt);
       continue;

@@ -65,7 +65,45 @@ function applyingModeling(): AgentModeling & {
   };
 }
 
-// A service task business object with the given extension children.
+// A modeling stand-in that also mirrors bpmn-js's UpdateModdlePropertiesHandler
+// UNDO semantics: each call records the target's PRIOR value for every key it
+// sets, and `undo()` restores those keys (reverting the last command). This lets
+// a test exercise a real command-stack rollback — the only way to catch a stale
+// `$parent` that survives an undo (issue #1186).
+function undoableModeling(): AgentModeling & {
+  calls: Array<{
+    moddleElement: AgentModdleElement;
+    props: Record<string, unknown>;
+  }>;
+  undo(): void;
+} {
+  const calls: Array<{
+    moddleElement: AgentModdleElement;
+    props: Record<string, unknown>;
+  }> = [];
+  const history: Array<{
+    target: AgentModdleElement;
+    old: Record<string, unknown>;
+  }> = [];
+  return {
+    calls,
+    updateModdleProperties(_element, moddleElement, props) {
+      const target = moddleElement as AgentModdleElement;
+      const old: Record<string, unknown> = {};
+      for (const key of Object.keys(props)) {
+        old[key] = (target as Record<string, unknown>)[key];
+      }
+      history.push({ target, old });
+      calls.push({ moddleElement: target, props });
+      Object.assign(target, props);
+    },
+    undo() {
+      const entry = history.pop();
+      if (entry) Object.assign(entry.target, entry.old);
+    },
+  };
+}
+
 function serviceTaskBo(values: AgentModdleElement[] = []): AgentModdleElement {
   return {
     $type: "bpmn:ServiceTask",
@@ -586,6 +624,52 @@ test("removeExternalAgentMarker clears the opt-out but keeps unrelated siblings"
     originalContainer.properties?.map((p) => p.name),
     [AUTO_SUBSCRIBE_PROPERTY, "some.other.prop"],
   );
+});
+
+test("removeExternalAgentMarker's single command rolls back cleanly, restoring the original container and its children's parent links", () => {
+  // A real command-stack undo of the ONE removal command must fully restore the
+  // prior state — including every surviving property's `$parent`. The stale-
+  // `$parent` bug (#1186): rebuilding the container by REPARENTING the originals
+  // leaves them pointing at a `rebuilt` container that undo removes from the
+  // model, so a later traversal walks a dangling parent. Cloning avoids it.
+  const other: AgentModdleElement = {
+    $type: ZEEBE_PROPERTY_TYPE,
+    name: "some.other.prop",
+    value: "keep-me",
+  };
+  const optOut = optOutProperty();
+  const originalContainer = zeebeProps(optOut, other);
+  const bo = serviceTaskBo([agentMarker(), originalContainer]);
+  const ext = bo.extensionElements as AgentModdleElement;
+  // Wire the parent links the way bpmn-js keeps them, so a stale one is visible.
+  originalContainer.$parent = ext;
+  for (const p of originalContainer.properties ?? [])
+    p.$parent = originalContainer;
+
+  const modeling = undoableModeling();
+  removeExternalAgentMarker(moddle, modeling, {}, bo);
+  // New state: single command; marker + opt-out gone; sibling kept.
+  assert.equal(modeling.calls.length, 1);
+  assert.equal(hasExternalAgentMarker(bo), false);
+  assert.equal(readAutoSubscribeOptOut(bo), false);
+
+  // Undo the single removal command.
+  modeling.undo();
+
+  // The ORIGINAL container is back under the wrapper, both its properties intact.
+  assert.equal(ext.values?.includes(originalContainer), true);
+  assert.equal(hasExternalAgentMarker(bo), true);
+  assert.equal(readAutoSubscribeOptOut(bo), true);
+  assert.deepEqual(
+    originalContainer.properties?.map((p) => p.name),
+    [AUTO_SUBSCRIBE_PROPERTY, "some.other.prop"],
+  );
+  // Every restored child still points at the in-model original container — never
+  // a `rebuilt` container the undo removed (the stale-`$parent` bug #1186).
+  assert.equal(originalContainer.$parent, ext);
+  for (const p of originalContainer.properties ?? []) {
+    assert.equal(p.$parent, originalContainer);
+  }
 });
 
 test("clearAutoSubscribeOptOut drops the opt-out and is a no-op when absent", () => {
