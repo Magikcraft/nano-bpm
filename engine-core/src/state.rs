@@ -3550,3 +3550,85 @@ mod incident_kind_serde_compat_tests {
         }
     }
 }
+
+/// The ad-hoc call-activity redrive payloads (#1176) are **persisted** inside an
+/// `IncidentRaised` journal line / snapshot, not just resolved in-memory — an
+/// active ioMapping incident sits on the journal until the operator resolves it,
+/// and migration-by-replay (#1071) rebuilds the engine by replaying that journal
+/// under the current binary. So the single-pass input/output projections they
+/// carry (`AdHocCallActivitySpawn.child_seed` /
+/// `AdHocToolOutputCollection.precomputed_output`) must survive a serde
+/// round-trip **verbatim**, or a recovered incident would respawn the tool with a
+/// lost/garbled projection. These guard that replay-safety property directly.
+#[cfg(all(test, feature = "serde"))]
+mod adhoc_redrive_serde_tests {
+    use super::{IncidentKind, IoMappingRedrive, Value};
+    use crate::event::Event;
+    use std::collections::HashMap;
+
+    fn projection() -> HashMap<String, Value> {
+        // A mix of scalar + nested-container values so a structural
+        // serialization/recovery regression (not just a dropped key) is caught.
+        HashMap::from([
+            ("x".to_string(), Value::Int(1)),
+            (
+                "chained".to_string(),
+                Value::List(vec![Value::Str("z".to_string()), Value::Bool(true)]),
+            ),
+        ])
+    }
+
+    fn raised_with(redrive: IoMappingRedrive) -> Event {
+        Event::IncidentRaised {
+            incident_key: 7,
+            instance_key: 1,
+            element_instance_key: 2,
+            element_id: "tool".to_string(),
+            kind: IncidentKind::IoMapping,
+            redrive: Some(redrive),
+            reason: "boom".to_string(),
+            job_key: None,
+            created_at: 42,
+        }
+    }
+
+    /// An active `AdHocCallActivitySpawn` incident must replay with its input
+    /// projection (`child_seed`) preserved verbatim, so a post-recovery respawn
+    /// reuses it instead of re-evaluating chained input mappings.
+    #[test]
+    fn adhoc_call_activity_spawn_projection_survives_replay() {
+        let seed = projection();
+        let event = raised_with(IoMappingRedrive::AdHocCallActivitySpawn {
+            child_seed: seed.clone(),
+        });
+        let line = serde_json::to_string(&event).expect("serializes");
+        let back: Event = serde_json::from_str(&line).expect("replays");
+        match back {
+            Event::IncidentRaised {
+                redrive: Some(IoMappingRedrive::AdHocCallActivitySpawn { child_seed }),
+                ..
+            } => assert_eq!(child_seed, seed),
+            other => panic!("expected AdHocCallActivitySpawn redrive, got {other:?}"),
+        }
+    }
+
+    /// An active `AdHocToolOutputCollection` incident must replay with its output
+    /// projection (`precomputed_output`) preserved verbatim, so a post-recovery
+    /// redrive reuses it instead of re-projecting chained output mappings.
+    #[test]
+    fn adhoc_tool_output_collection_projection_survives_replay() {
+        let out = projection();
+        let event = raised_with(IoMappingRedrive::AdHocToolOutputCollection {
+            precomputed_output: out.clone(),
+        });
+        let line = serde_json::to_string(&event).expect("serializes");
+        let back: Event = serde_json::from_str(&line).expect("replays");
+        match back {
+            Event::IncidentRaised {
+                redrive: Some(IoMappingRedrive::AdHocToolOutputCollection { precomputed_output }),
+                ..
+            } => assert_eq!(precomputed_output, out),
+            other => panic!("expected AdHocToolOutputCollection redrive, got {other:?}"),
+        }
+    }
+}

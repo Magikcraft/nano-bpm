@@ -11663,13 +11663,19 @@ impl Engine {
         // The recoverable-spawn-incident redrive: for an ad-hoc tool it preserves
         // the single-pass input projection so the respawn does not re-evaluate the
         // tool's (possibly chained) input mappings; for a mainstream call activity
-        // it is the plain spawn-retry marker.
-        let spawn_redrive = if is_adhoc_tool {
-            state::IoMappingRedrive::AdHocCallActivitySpawn {
-                child_seed: child_seed.clone(),
+        // it is the plain spawn-retry marker. Built **lazily** — only an incident
+        // path needs it, and the ad-hoc variant deep-clones `child_seed` (up to the
+        // full visible variable set under `propagateAllParentVariables=true`), so
+        // the hot success path must not pay that copy: it moves the original
+        // `child_seed` straight into `ProcessInstanceCreated` instead.
+        let spawn_redrive = || {
+            if is_adhoc_tool {
+                state::IoMappingRedrive::AdHocCallActivitySpawn {
+                    child_seed: child_seed.clone(),
+                }
+            } else {
+                state::IoMappingRedrive::CallActivitySpawn
             }
-        } else {
-            state::IoMappingRedrive::CallActivitySpawn
         };
         // The callee id may be a literal or a FEEL `=` expression (C8
         // `zeebe:calledElement processId`), resolved against the activating view.
@@ -11697,7 +11703,7 @@ impl Engine {
                                 // the spawn (`RetryCallActivitySpawn`) rather than
                                 // completing the parked call activity / ad-hoc tool
                                 // with no child.
-                                redrive: Some(spawn_redrive.clone()),
+                                redrive: Some(spawn_redrive()),
                                 reason: format!(
                                     "call activity '{element_id}' could not evaluate \
                                      calledElement expression '{called_process_id}': {err}"
@@ -11723,7 +11729,7 @@ impl Engine {
                     element_instance_key: call_eik,
                     element_id: element_id.to_string(),
                     kind: state::IncidentKind::CalledElementError,
-                    redrive: Some(spawn_redrive.clone()),
+                    redrive: Some(spawn_redrive()),
                     reason: format!(
                         "call activity '{element_id}' exceeded the maximum child-instance depth \
                          of {MAX_CALL_ACTIVITY_DEPTH} calling '{called}' (possible unbounded \
@@ -11754,7 +11760,7 @@ impl Engine {
                     // Recoverable via a spawn retry (issue #1159): deploying the
                     // missing callee and resolving the incident re-attempts the
                     // spawn instead of completing the parent with no child.
-                    redrive: Some(spawn_redrive.clone()),
+                    redrive: Some(spawn_redrive()),
                     reason: format!(
                         "call activity '{element_id}' references unknown called process '{called}'"
                     ),
