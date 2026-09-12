@@ -57,6 +57,8 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
+        ElementKind::EscalationThrowEvent { .. } => "escalationThrowEvent",
+        ElementKind::EscalationBoundaryEvent { .. } => "escalationBoundaryEvent",
         ElementKind::LinkIntermediateThrowEvent { .. } => "linkIntermediateThrowEvent",
         ElementKind::LinkIntermediateCatchEvent { .. } => "linkIntermediateCatchEvent",
         ElementKind::Task => "task",
@@ -82,6 +84,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::SignalBoundaryEvent { attached_to, .. }
         | ElementKind::ConditionalBoundaryEvent { attached_to, .. }
         | ElementKind::CompensationBoundaryEvent { attached_to, .. }
+        | ElementKind::EscalationBoundaryEvent { attached_to, .. }
         | ElementKind::MessageBoundaryEvent { attached_to, .. } => Some(attached_to.as_str()),
         _ => None,
     }
@@ -174,6 +177,18 @@ fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
         }
         ElementKind::SubProcess { start_event } => {
             m.insert("innerStartEvent".into(), json!(start_event));
+        }
+        ElementKind::EscalationThrowEvent { escalation_code } => {
+            m.insert("escalationCode".into(), json!(escalation_code));
+        }
+        ElementKind::EscalationBoundaryEvent {
+            attached_to,
+            escalation_code,
+            interrupting,
+        } => {
+            m.insert("attachedTo".into(), json!(attached_to));
+            m.insert("escalationCode".into(), json!(escalation_code));
+            m.insert("interrupting".into(), json!(interrupting));
         }
         ElementKind::CallActivity {
             called_process_id,
@@ -318,6 +333,43 @@ fn attr_value_in(s: &str, attr: &str) -> Option<String> {
         from = at + needle.len();
     }
     None
+}
+
+/// Every value of an `id` attribute in `s`, in document order. Used to reserve the
+/// ids inside a preserved `<bpmndi:BPMNDiagram>` block so a generated declaration
+/// id cannot collide with one (#1173). Tolerant of the legal XML spellings the DI
+/// serializer (or a hand-edited model) may use — `id="…"`, `id = "…"` and
+/// `id='…'` — so a DI id in any of them is still reserved.
+fn all_id_attrs_in(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = s[from..].find("id") {
+        let at = from + rel;
+        from = at + 2;
+        // `id` must be a standalone attribute name: preceded by whitespace so it
+        // is not the tail of another name (`bpmndi`, `validId`, …) ...
+        if !s[..at].chars().last().is_some_and(|c| c.is_whitespace()) {
+            continue;
+        }
+        // ... and followed by optional whitespace, `=`, optional whitespace, then a
+        // single- or double-quote opening the value.
+        let after = s[from..].trim_start();
+        let Some(after_eq) = after.strip_prefix('=') else {
+            continue;
+        };
+        let val = after_eq.trim_start();
+        let Some(quote) = val.chars().next() else {
+            continue;
+        };
+        if quote != '"' && quote != '\'' {
+            continue;
+        }
+        let body = &val[quote.len_utf8()..];
+        if let Some(off) = body.find(quote) {
+            out.push(body[..off].to_string());
+        }
+    }
+    out
 }
 
 /// The raw `<process id="process_id">…</process>` block from a (multi-definition)
@@ -626,10 +678,14 @@ pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
     let adj = adjacency(&def);
     let is_task_id = |id: &str| def.element(id).map(|e| is_task(&e.kind)).unwrap_or(false);
     let is_end_id = |id: &str| {
-        matches!(
-            def.element(id).map(|e| &e.kind),
-            Some(ElementKind::EndEvent) | Some(ElementKind::TerminateEndEvent)
-        )
+        def.element(id).is_some_and(|e| match &e.kind {
+            ElementKind::EndEvent | ElementKind::TerminateEndEvent => true,
+            // An escalation throw with no outgoing flow is an escalation *end*
+            // event (terminal); one with outgoing is an intermediate throw and
+            // is not a closing node.
+            ElementKind::EscalationThrowEvent { .. } => e.outgoing.is_empty(),
+            _ => false,
+        })
     };
     let tasks: HashSet<String> = def
         .elements
@@ -812,14 +868,19 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
 
     let mut findings = Vec::new();
 
-    // No explicit end event.
+    // No explicit end event. An escalation throw with no outgoing flow is an
+    // escalation *end* event, so it counts as a terminal node here — otherwise a
+    // process whose only terminal is an escalation end would draw a false
+    // `no-end-event` warning (#1173).
     let end_events = ids
         .iter()
         .filter(|id| {
+            let el = &def.elements[**id];
             matches!(
-                def.elements[**id].kind,
+                el.kind,
                 ElementKind::EndEvent | ElementKind::TerminateEndEvent
-            )
+            ) || (matches!(el.kind, ElementKind::EscalationThrowEvent { .. })
+                && el.outgoing.is_empty())
         })
         .count();
     if end_events == 0 {
@@ -851,7 +912,11 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
         }
 
         // A non-end flow node with no outgoing flow silently drops its token.
-        let is_event_end = matches!(kind, ElementKind::EndEvent | ElementKind::TerminateEndEvent);
+        // An escalation throw with no outgoing flow is an escalation *end* event
+        // (terminal), so — like a plain end event — it must not be flagged as a
+        // dead end (#1173).
+        let is_event_end = matches!(kind, ElementKind::EndEvent | ElementKind::TerminateEndEvent)
+            || (matches!(kind, ElementKind::EscalationThrowEvent { .. }) && el.outgoing.is_empty());
         if !is_event_end && el.outgoing.is_empty() && !is_boundary(kind) {
             // Sub-process inner ends and the like aside, a task/gateway with no exit is a
             // dead end.
@@ -1932,7 +1997,66 @@ fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
     names
 }
 
-/// Emit an activity's `multiInstanceLoopCharacteristics` block (with its
+/// Collect the `<bpmn:escalation>` declarations a model needs, as a lookup from escalation code
+/// to a synthesized declaration id. Escalations correlate by code only, so one declaration per
+/// code. Empty codes (an unnamed throw or a catch-all boundary) carry no `escalationRef`, so they
+/// need no declaration and are skipped.
+///
+/// Generated ids are allocated **collision-free**: `id_fragment` is not injective (distinct legal
+/// codes such as `A/B` and `A_B` both fragment to `A_B`), and a generated `Escalation_…` id could
+/// also clash with any id the document already emits — a model element id, the `<bpmn:process>` id,
+/// or a (preserved or synthesized) sequence-flow id — either would emit duplicate BPMN ids and
+/// ambiguous `escalationRef`s. `reserved` carries that full set of already-emitted ids. Codes are
+/// assigned in sorted order (deterministic regardless of the element map's iteration order), each
+/// getting the base id or the first free `…_2`, `…_3`, … suffix not already taken by a reserved id
+/// or an earlier escalation id.
+fn collect_escalations(
+    def: &ProcessDefinition,
+    reserved: &HashSet<String>,
+) -> BTreeMap<String, String> {
+    let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for el in def.elements.values() {
+        match &el.kind {
+            ElementKind::EscalationThrowEvent { escalation_code }
+            | ElementKind::EscalationBoundaryEvent {
+                escalation_code, ..
+            } if !escalation_code.is_empty() => {
+                codes.insert(escalation_code.clone());
+            }
+            _ => {}
+        }
+    }
+    // Reserve every id this document will emit — model element ids, the
+    // `<bpmn:process>` id, and every (preserved or synthesized) sequence-flow id
+    // — so a generated `Escalation_…` declaration id can never shadow one of
+    // them (a process/flow literally named `Escalation_OVERLOAD` would otherwise
+    // duplicate a `<bpmn:escalation id>`; #1173).
+    let mut used: HashSet<String> = reserved.clone();
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for code in codes {
+        let id = alloc_unique_id(format!("Escalation_{}", id_fragment(&code)), &mut used);
+        out.insert(code, id);
+    }
+    out
+}
+
+/// Allocate `base` — or the first free `base_2`, `base_3`, … — as an id absent from `used`,
+/// inserting the chosen id into `used`. Keeps synthesized declaration ids collision-free against
+/// each other and against reserved (model element) ids, since the id-deriving `id_fragment` is not
+/// injective.
+fn alloc_unique_id(base: String, used: &mut HashSet<String>) -> String {
+    if used.insert(base.clone()) {
+        return base;
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}_{n}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
 /// `zeebe:loopCharacteristics` extension and optional `completionCondition`) as a
 /// child of the activity element. No-op when the element carries no MI. The
 /// output round-trips through the engine parser (`parse_bpmn`).
@@ -2010,6 +2134,7 @@ fn emit_element(
     errors: &BTreeMap<String, String>,
     messages: &HashMap<(String, Option<String>), String>,
     signals: &BTreeMap<String, String>,
+    escalations: &BTreeMap<String, String>,
     children_by_parent: &HashMap<String, Vec<String>>,
     labels: &HashMap<String, String>,
     default_flows: &HashMap<String, String>,
@@ -2292,6 +2417,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                         errors,
                         messages,
                         signals,
+                        escalations,
                         children_by_parent,
                         labels,
                         default_flows,
@@ -2576,6 +2702,70 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str("      </bpmn:conditionalEventDefinition>\n");
             out.push_str("    </bpmn:boundaryEvent>\n");
         }
+        ElementKind::EscalationThrowEvent { escalation_code } => {
+            // An escalation throw parsed from an `endEvent` carries no outgoing
+            // sequence flow; one parsed from an `intermediateThrowEvent` does.
+            // Preserve that flavour on round-trip (mirrors the compensation
+            // throw). An empty code emits no `escalationRef` (an unnamed throw).
+            let tag = if el.outgoing.is_empty() {
+                "endEvent"
+            } else {
+                "intermediateThrowEvent"
+            };
+            out.push_str(&format!("    <bpmn:{tag} id=\"{eid}\"{na}>\n"));
+            // Round-trip any `zeebe:ioMapping` the model carries: the parser
+            // attaches io mappings on BOTH the `intermediateThrowEvent` and the
+            // `endEvent` form (same io_stack push as a plain/terminate end), so
+            // omitting them here would silently drop inputs/outputs on re-parse.
+            // Mirror the plain/terminate end branches — emit the block before the
+            // event definition. A no-op when there are no mappings.
+            if !el.io.inputs.is_empty() || !el.io.outputs.is_empty() {
+                out.push_str("      <bpmn:extensionElements>\n");
+                emit_io_mapping(el, out);
+                out.push_str("      </bpmn:extensionElements>\n");
+            }
+            if escalation_code.is_empty() {
+                out.push_str("      <bpmn:escalationEventDefinition/>\n");
+            } else {
+                let eref = escalations
+                    .get(escalation_code)
+                    .cloned()
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "      <bpmn:escalationEventDefinition escalationRef=\"{}\"/>\n",
+                    xml_escape(&eref)
+                ));
+            }
+            out.push_str(&format!("    </bpmn:{tag}>\n"));
+        }
+        ElementKind::EscalationBoundaryEvent {
+            attached_to,
+            escalation_code,
+            interrupting,
+        } => {
+            let cancel = if *interrupting {
+                ""
+            } else {
+                " cancelActivity=\"false\""
+            };
+            out.push_str(&format!(
+                "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
+                xml_escape(attached_to)
+            ));
+            if escalation_code.is_empty() {
+                out.push_str("      <bpmn:escalationEventDefinition/>\n");
+            } else {
+                let eref = escalations
+                    .get(escalation_code)
+                    .cloned()
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "      <bpmn:escalationEventDefinition escalationRef=\"{}\"/>\n",
+                    xml_escape(&eref)
+                ));
+            }
+            out.push_str("    </bpmn:boundaryEvent>\n");
+        }
         ElementKind::CompensationThrowEvent => {
             // A compensation throw parsed from an `endEvent` carries no outgoing
             // sequence flow; one parsed from an `intermediateThrowEvent` does.
@@ -2625,6 +2815,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                         errors,
                         messages,
                         signals,
+                        escalations,
                         children_by_parent,
                         labels,
                         default_flows,
@@ -2652,6 +2843,13 @@ struct PreservedDi {
     /// `(sourceRef, targetRef) -> original sequence-flow id`, so the reused body can adopt the same
     /// ids the preserved edges already reference.
     flow_ids: HashMap<(String, String), String>,
+    /// Every `id="…"` attribute declared INSIDE the verbatim diagram block — the
+    /// `<bpmndi:BPMNDiagram>`/`<bpmndi:BPMNPlane>`/`<bpmndi:BPMNShape>`/`<bpmndi:BPMNEdge>`
+    /// own ids (NOT their `bpmnElement` refs). The block is re-attached
+    /// byte-for-byte, so a generated declaration id (`Escalation_…`, `Signal_…`)
+    /// must be reserved against these too, or a legal DI id like
+    /// `Escalation_OVERLOAD` could duplicate a `<bpmn:escalation id>` (#1173).
+    di_ids: HashSet<String>,
 }
 
 impl PreservedDi {
@@ -2737,11 +2935,13 @@ fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
     if shape_ids.is_empty() {
         return None;
     }
+    let di_ids: HashSet<String> = all_id_attrs_in(&diagram_block).into_iter().collect();
     Some(PreservedDi {
         diagram_block,
         shape_ids,
         edge_keys,
         flow_ids,
+        di_ids,
     })
 }
 
@@ -2853,6 +3053,38 @@ fn restore_adhoc_catalog_elements(def: &mut ProcessDefinition) {
     }
 }
 
+/// Resolve a stable id for every sequence flow once, in the canonical order the
+/// process body and the diagram-interchange both use (sorted sources, outgoing in
+/// declaration order), plus the per-source `default` flow map. When a preserved
+/// diagram covers the topology, the original flow ids are reused so its
+/// `<bpmndi:BPMNEdge>`s still reference live flows; otherwise a `Flow_{n}` id
+/// (n starting at 1) is synthesized. This is the single source of truth for flow
+/// ids: [`serialize_definition`] both reserves them against generated declaration
+/// ids and emits them, so the two can never drift.
+fn flow_id_resolution(
+    def: &ProcessDefinition,
+    preserve: Option<&PreservedDi>,
+) -> (Vec<String>, HashMap<String, String>) {
+    let mut flow_ids: Vec<String> = Vec::new();
+    let mut default_flows: HashMap<String, String> = HashMap::new();
+    let mut sources: Vec<&String> = def.elements.keys().collect();
+    sources.sort();
+    let mut k = 0usize;
+    for src in sources {
+        for flow in &def.elements[src].outgoing {
+            k += 1;
+            let id = preserve
+                .and_then(|d| d.flow_id(src, &flow.to))
+                .unwrap_or_else(|| format!("Flow_{k}"));
+            if flow.is_default {
+                default_flows.insert(src.clone(), id.clone());
+            }
+            flow_ids.push(id);
+        }
+    }
+    (flow_ids, default_flows)
+}
+
 fn serialize_definition(
     def: &ProcessDefinition,
     overrides: &HashMap<String, String>,
@@ -2863,9 +3095,32 @@ fn serialize_definition(
     normalized.normalize_legacy_agent_tasks();
     restore_adhoc_catalog_elements(&mut normalized);
     let def = &normalized;
+    // Resolve the preserved hand-layout (if it still covers the topology) and the
+    // canonical sequence-flow ids up front, so declaration-id allocation can
+    // reserve *every* id this document will emit. A generated declaration id
+    // (`Escalation_…`, `Signal_…`, …) must not collide with the `<bpmn:process>`
+    // id or a preserved/synthesized `<bpmn:sequenceFlow>` id — e.g. a process or
+    // preserved flow literally named `Escalation_OVERLOAD` would otherwise
+    // duplicate a `<bpmn:escalation id>` and emit an ambiguous `escalationRef`
+    // (#1173). `flow_id_resolution` is the single source of truth for flow ids,
+    // reused verbatim when the flows are emitted below.
+    let preserve = di.filter(|d| d.covers(def));
+    let (flow_ids, default_flows) = flow_id_resolution(def, preserve);
+    let mut reserved_ids: HashSet<String> = def.elements.keys().cloned().collect();
+    reserved_ids.insert(def.id.clone());
+    reserved_ids.extend(flow_ids.iter().cloned());
+    // Reserve every id declared inside a preserved `<bpmndi:BPMNDiagram>` block:
+    // it is re-attached verbatim by `definition_to_xml_preserving_di`, so a
+    // generated declaration id (`Escalation_…`, `Signal_…`, …) that duplicated a
+    // DI plane/shape/edge/diagram id would emit an invalid document with two
+    // elements sharing one XML id (#1173).
+    if let Some(d) = preserve {
+        reserved_ids.extend(d.di_ids.iter().cloned());
+    }
     let errors = collect_error_ids(def);
     let (messages, msg_lookup) = collect_messages(def);
     let signals = collect_signals(def);
+    let escalations = collect_escalations(def, &reserved_ids);
 
     // Resolve a human label for every element: an operator-set name wins, else a readable label
     // derived from the id (so an authored node like `FraudScreen` shows as "Fraud Screen").
@@ -2945,38 +3200,21 @@ fn serialize_definition(
             xml_escape(name)
         ));
     }
+    for (code, eid) in &escalations {
+        out.push_str(&format!(
+            "  <bpmn:escalation id=\"{}\" escalationCode=\"{}\"/>\n",
+            xml_escape(eid),
+            xml_escape(code)
+        ));
+    }
     out.push_str(&format!(
         "  <bpmn:process id=\"{}\" isExecutable=\"true\">\n",
         xml_escape(&def.id)
     ));
-    // Decide whether a preserved hand-layout can be re-attached verbatim: its shapes and edges must
-    // cover exactly the current node + flow topology (a pure attribute/condition/default edit).
-    let preserve = di.filter(|d| d.covers(def));
+    // `preserve`, `flow_ids` and `default_flows` were resolved once at the top of
+    // this function (so declaration-id allocation could reserve every emitted id);
+    // reuse them here for the flow body/DI emission.
 
-    // Assign a stable id to every sequence flow once, in the canonical order the body and DI both
-    // use (sorted sources, outgoing in declaration order). When a preserved diagram covers the
-    // topology, reuse the original flow ids so its `<bpmndi:BPMNEdge>`s still reference live flows;
-    // otherwise synthesize `Flow_{n}` (n starting at 1). A gateway emits `default="<id>"` referencing
-    // the same id, so the parser re-flags the branch as the default fallback on the round-trip.
-    let mut flow_ids: Vec<String> = Vec::new();
-    let mut default_flows: HashMap<String, String> = HashMap::new();
-    {
-        let mut sources: Vec<&String> = def.elements.keys().collect();
-        sources.sort();
-        let mut k = 0usize;
-        for src in sources {
-            for flow in &def.elements[src].outgoing {
-                k += 1;
-                let id = preserve
-                    .and_then(|d| d.flow_id(src, &flow.to))
-                    .unwrap_or_else(|| format!("Flow_{k}"));
-                if flow.is_default {
-                    default_flows.insert(src.clone(), id.clone());
-                }
-                flow_ids.push(id);
-            }
-        }
-    }
     // Emit top-level nodes (parent == None) in a stable order; sub-processes recurse.
     let mut top: Vec<&String> = def
         .elements
@@ -2992,6 +3230,7 @@ fn serialize_definition(
             &errors,
             &msg_lookup,
             &signals,
+            &escalations,
             &children_by_parent,
             &labels,
             &default_flows,
@@ -3755,16 +3994,14 @@ fn apply_edit_op(
                 el.outgoing = rewired;
             }
             // Drop any boundary events that were attached to the removed node (they would dangle).
+            // Derived from the shared `attached_to` helper so every boundary kind
+            // (error/timer/message/signal/conditional/compensation/escalation) is
+            // covered — enumerating a subset here silently leaks an orphan boundary
+            // of any omitted kind, emitting an invalid `attachedToRef` on the next serialize.
             let orphaned: Vec<String> = def
                 .elements
                 .iter()
-                .filter(|(_, e)| {
-                    matches!(&e.kind,
-                    ElementKind::ErrorBoundaryEvent { attached_to, .. }
-                    | ElementKind::TimerBoundaryEvent { attached_to, .. }
-                    | ElementKind::MessageBoundaryEvent { attached_to, .. }
-                    if attached_to == id)
-                })
+                .filter(|(_, e)| attached_to(&e.kind) == Some(id))
                 .map(|(bid, _)| bid.clone())
                 .collect();
             for bid in &orphaned {
@@ -5279,6 +5516,359 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
     }
 
     #[test]
+    fn definition_to_xml_round_trips_escalation_events() {
+        // An escalation throw inside a sub-process and both an interrupting and a
+        // non-interrupting escalation boundary must round-trip: the serializer
+        // synthesizes the <bpmn:escalation> declaration + escalationRef, and the
+        // re-parse reproduces the exact structure.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Esc")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw", "OVERLOAD")
+            .contained_in("Throw", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .escalation_boundary_event("Bnd", "Sub", "OVERLOAD")
+            .non_interrupting_escalation_boundary_event("Watch", "Sub", "")
+            .service_task("Handle", "handle")
+            .end_event("Done")
+            .end_event("Handled")
+            .end_event("Watched")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw")
+            .connect("Throw", "SubEnd")
+            .connect("Sub", "Done")
+            .connect("Bnd", "Handle")
+            .connect("Handle", "Handled")
+            .connect("Watch", "Watched")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<bpmn:escalation "),
+            "emits an escalation declaration"
+        );
+        assert!(
+            xml.contains("escalationEventDefinition"),
+            "emits escalationRef defs"
+        );
+        assert!(
+            xml.contains("cancelActivity=\"false\""),
+            "emits the non-interrupting boundary"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn collect_escalations_assigns_distinct_ids_to_colliding_codes() {
+        // `id_fragment` is not injective: distinct escalation codes can normalize
+        // to the same fragment (e.g. `A/B` and `A_B` both sanitize to `A_B`).
+        // `collect_escalations` must still mint a UNIQUE declaration id per code,
+        // or two `<bpmn:escalation>`s collide and one `escalationRef` dangles.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Collide")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw1", "A/B")
+            .contained_in("Throw1", "Sub")
+            .escalation_throw_event("Throw2", "A_B")
+            .contained_in("Throw2", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .end_event("Done")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw1")
+            .connect("Throw1", "Throw2")
+            .connect("Throw2", "SubEnd")
+            .connect("Sub", "Done")
+            .build()
+            .unwrap();
+        let reserved: std::collections::HashSet<String> = def.elements.keys().cloned().collect();
+        let escalations = collect_escalations(&def, &reserved);
+        assert_eq!(escalations.len(), 2, "both codes get a declaration");
+        let ids: std::collections::HashSet<&String> = escalations.values().collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "colliding codes must receive distinct escalation ids, got {:?}",
+            escalations
+        );
+        // And every code still round-trips through serialize -> parse.
+        let xml = definition_to_xml(&def);
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn collect_escalations_reserves_ids_emitted_outside_the_element_map() {
+        // Regression (#1173): a generated `Escalation_…` declaration id must not
+        // collide with an id the document emits that is NOT a model element id —
+        // the `<bpmn:process>` id or a preserved `<bpmn:sequenceFlow>` id. Here a
+        // reserved id (e.g. a preserved flow literally named `Escalation_OVERLOAD`)
+        // is passed alongside the element ids; the mint must skip it.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Collide")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw", "OVERLOAD")
+            .contained_in("Throw", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .end_event("Done")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw")
+            .connect("Throw", "SubEnd")
+            .connect("Sub", "Done")
+            .build()
+            .unwrap();
+        let mut reserved: std::collections::HashSet<String> =
+            def.elements.keys().cloned().collect();
+        // A preserved sequence-flow id (or the process id) that happens to equal
+        // the escalation base id.
+        reserved.insert("Escalation_OVERLOAD".to_string());
+        let escalations = collect_escalations(&def, &reserved);
+        assert_eq!(
+            escalations.get("OVERLOAD").map(String::as_str),
+            Some("Escalation_OVERLOAD_2"),
+            "the mint must skip the reserved id, got {escalations:?}"
+        );
+    }
+
+    #[test]
+    fn definition_to_xml_avoids_an_escalation_id_colliding_with_the_process_id() {
+        // End-to-end (#1173): a process literally named `Escalation_OVERLOAD` and
+        // an escalation code `OVERLOAD` (which fragments to the same base id) must
+        // not emit two elements with id `Escalation_OVERLOAD`. The escalation
+        // declaration is bumped to a free suffix and the document still re-parses.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Escalation_OVERLOAD")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw", "OVERLOAD")
+            .contained_in("Throw", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .end_event("Done")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw")
+            .connect("Throw", "SubEnd")
+            .connect("Sub", "Done")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<bpmn:process id=\"Escalation_OVERLOAD\""),
+            "the process keeps its id"
+        );
+        assert!(
+            xml.contains("<bpmn:escalation id=\"Escalation_OVERLOAD_2\""),
+            "the escalation declaration avoids the process id, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_preserving_di_avoids_an_escalation_id_colliding_with_a_di_id() {
+        // Regression (#1173): a preserved `<bpmndi:BPMNDiagram>` is re-attached
+        // byte-for-byte by `definition_to_xml_preserving_di`, so its own
+        // plane/shape/edge/diagram ids must be reserved against a generated
+        // `<bpmn:escalation>` declaration id. A hand-authored file whose DI plane
+        // is literally named `Escalation_OVERLOAD` (a legal DI id) would otherwise
+        // duplicate the declaration minted for code `OVERLOAD`, emitting two
+        // elements that share one XML id.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Esc")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw", "OVERLOAD")
+            .contained_in("Throw", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .end_event("Done")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw")
+            .connect("Throw", "SubEnd")
+            .connect("Sub", "Done")
+            .build()
+            .unwrap();
+        // Auto-serialize once to obtain a DI sidecar that covers the topology,
+        // then rename its plane id to the value the escalation declaration wants.
+        let di_source =
+            definition_to_xml(&def).replace("id=\"BPMNPlane_1\"", "id=\"Escalation_OVERLOAD\"");
+        assert!(
+            di_source.contains("id=\"Escalation_OVERLOAD\""),
+            "the DI source carries the colliding plane id"
+        );
+        let xml = definition_to_xml_preserving_di(&def, &HashMap::new(), Some(&di_source));
+        assert!(
+            xml.contains("id=\"Escalation_OVERLOAD\""),
+            "the preserved DI plane id survives verbatim, got:\n{xml}"
+        );
+        assert!(
+            xml.contains("<bpmn:escalation id=\"Escalation_OVERLOAD_2\""),
+            "the escalation declaration must avoid the preserved DI id, got:\n{xml}"
+        );
+        assert_eq!(
+            xml.matches("\"Escalation_OVERLOAD\"").count(),
+            1,
+            "exactly one element (the DI plane) may carry id=\"Escalation_OVERLOAD\", got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_an_escalation_throw_with_io() {
+        // Regression (#1173): the escalation throw/end serializer must nest a
+        // `zeebe:ioMapping` the model carries. The parser attaches io on both the
+        // `intermediateThrowEvent` and `endEvent` forms (same io_stack push as a
+        // plain/terminate end), so a bare
+        // `<intermediateThrowEvent><escalationEventDefinition/></…>` would silently
+        // drop the mappings, mutating the model on re-parse.
+        use nanobpmn_engine_core::Mapping;
+        let mut def = nanobpmn_engine_core::ProcessBuilder::new("EscIo")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw", "OVERLOAD")
+            .contained_in("Throw", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .end_event("Done")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw")
+            .connect("Throw", "SubEnd")
+            .connect("Sub", "Done")
+            .build()
+            .unwrap();
+        {
+            let throw = def.elements.get_mut("Throw").unwrap();
+            throw.io.inputs.push(Mapping {
+                source: "= payload".to_string(),
+                target: "escPayload".to_string(),
+            });
+            throw.io.outputs.push(Mapping {
+                source: "= code".to_string(),
+                target: "escCode".to_string(),
+            });
+        }
+
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<zeebe:ioMapping>"),
+            "an escalation throw with io must emit ioMapping:\n{xml}"
+        );
+        assert!(
+            xml.contains("intermediateThrowEvent") && xml.contains("escalationEventDefinition"),
+            "the throw flavour and escalation definition must survive:\n{xml}"
+        );
+
+        let reparsed = parse_bpmn(&xml).expect("serialized escalation throw re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+        let throw = &reparsed[0].elements["Throw"];
+        assert_eq!(
+            throw.io.inputs.len(),
+            1,
+            "escalation-throw input mapping preserved on round-trip"
+        );
+        assert_eq!(
+            throw.io.outputs.len(),
+            1,
+            "escalation-throw output mapping preserved on round-trip"
+        );
+    }
+
+    #[test]
+    fn definition_to_xml_preserving_di_reserves_a_di_id_in_an_alternate_spelling() {
+        // Regression (#1173, suppressed advisory): the DI-id reservation scanned
+        // for the literal `id="…"`, missing legal XML spellings like `id = "…"`
+        // and `id='…'`. A preserved DI element named `Escalation_OVERLOAD` in such
+        // a form was omitted from `reserved_ids`, so the escalation declaration
+        // minted for code `OVERLOAD` collided with it (two elements sharing one
+        // XML id). The scanner is now quote/whitespace tolerant.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Esc")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw", "OVERLOAD")
+            .contained_in("Throw", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .end_event("Done")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw")
+            .connect("Throw", "SubEnd")
+            .connect("Sub", "Done")
+            .build()
+            .unwrap();
+        // Rename the plane id using an alternate-but-legal spelling (`id = '…'`).
+        let di_source =
+            definition_to_xml(&def).replace("id=\"BPMNPlane_1\"", "id = 'Escalation_OVERLOAD'");
+        assert!(
+            di_source.contains("id = 'Escalation_OVERLOAD'"),
+            "the DI source carries the alternate-spelling colliding plane id"
+        );
+        let xml = definition_to_xml_preserving_di(&def, &HashMap::new(), Some(&di_source));
+        assert!(
+            xml.contains("id = 'Escalation_OVERLOAD'"),
+            "the preserved DI plane id survives verbatim, got:\n{xml}"
+        );
+        assert!(
+            xml.contains("<bpmn:escalation id=\"Escalation_OVERLOAD_2\""),
+            "the escalation declaration must avoid the alternate-spelling DI id, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn analyze_model_treats_an_escalation_end_event_as_terminal() {
+        // Regression (#1173, suppressed advisory): a task → escalation *end* event
+        // (an `EscalationThrowEvent` with no outgoing flow) is a legitimate
+        // terminal. The end-event and dead-end checks only recognised
+        // `EndEvent`/`TerminateEndEvent`, so such a model drew a false
+        // `no-end-event` warning and a false `dead-end` on the escalation end.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("EscTerminal")
+            .start_event("Start")
+            .service_task("Work", "worker")
+            .escalation_throw_event("EscEnd", "OVERLOAD")
+            .connect("Start", "Work")
+            .connect("Work", "EscEnd")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        let v = analyze_model(&xml).expect("analyze");
+        let findings = v["findings"].as_array().unwrap();
+        assert!(
+            !findings.iter().any(|f| f["code"] == "no-end-event"),
+            "an escalation end event is a terminal, so no `no-end-event` warning is due:\n{findings:#?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f["code"] == "dead-end" && f["element"] == "EscEnd"),
+            "an escalation end event must not be flagged as a dead end:\n{findings:#?}"
+        );
+        // The observable-task projection must also see it as a closing task.
+        let graph = model_task_graph(&xml).expect("task graph");
+        assert!(
+            graph.end_tasks.contains("Work"),
+            "the task reaching the escalation end event is a legal closing task, got {:?}",
+            graph.end_tasks
+        );
+    }
+
+    #[test]
     fn definition_to_xml_round_trips_an_inline_script_task() {
         // An inline-FEEL script task must round-trip: the serializer emits a
         // <bpmn:scriptTask> with a <zeebe:script expression=.. resultVariable=..>,
@@ -5513,6 +6103,51 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         let cc = &def.elements["CreditCheck"];
         assert!(cc.outgoing.iter().any(|f| f.to == "Approve"));
         assert!(cc.outgoing.iter().any(|f| f.to == "Reject"));
+    }
+
+    #[test]
+    fn edit_model_removes_a_boundary_orphan_beyond_the_error_timer_message_trio() {
+        // Regression (#1173): removing an activity must drop EVERY boundary event
+        // attached to it, not just the error/timer/message trio the orphan filter
+        // used to enumerate. Signal/conditional/compensation/escalation boundaries
+        // were silently leaked, emitting an invalid `attachedToRef` on the next
+        // serialize. The filter now derives from the shared `attached_to` helper,
+        // so this uses a SIGNAL boundary (previously missed) on a plain task to
+        // pin the whole defect class; the same code path covers escalation.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:signal id="Sig" name="Cancelled" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="task">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="task">
+      <bpmn:signalEventDefinition signalRef="Sig" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Handler" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="task" />
+    <bpmn:sequenceFlow id="f2" sourceRef="task" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="Bnd" targetRef="Handler" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let ops = vec![json!({"op":"remove_node","id":"task"})];
+        let v = edit_model(xml, &ops).expect("edit");
+        let out = v["model"].as_str().unwrap();
+        let def = first_def(out).unwrap().0;
+        assert!(
+            !def.elements.contains_key("task"),
+            "the removed task is gone"
+        );
+        assert!(
+            !def.elements.contains_key("Bnd"),
+            "the signal boundary orphaned by removing its host must be dropped, got {:?}",
+            def.elements.get("Bnd").map(|e| &e.kind)
+        );
     }
 
     #[test]

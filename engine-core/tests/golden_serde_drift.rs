@@ -214,6 +214,44 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("deploy review"),
     );
 
+    // An escalation witness process. Deployed but never instantiated: its only
+    // purpose is to embed `ElementKind::EscalationThrowEvent` and BOTH flavours
+    // of `ElementKind::EscalationBoundaryEvent` — interrupting (`true`) and the
+    // non-interrupting default (`false`) — in the snapshot's persisted process
+    // definitions, so the checked-in golden pins their serialized tags/fields,
+    // including the `interrupting` bool. Without a witness here the #1069 drift
+    // guard would stay green if a field were added to (or the tag of) either
+    // escalation variant changed — exactly the variant-exhaustiveness blind spot
+    // `snapshot_forward_compat.rs` documents (#1173).
+    let escalation: ProcessDefinition = ProcessBuilder::new("escalate")
+        .start_event("s")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .escalation_throw_event("throw", "OVERLOAD")
+        .contained_in("throw", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .escalation_boundary_event("b_int", "sub", "OVERLOAD")
+        .non_interrupting_escalation_boundary_event("b_non", "sub", "")
+        .end_event("e")
+        .end_event("h_int")
+        .end_event("h_non")
+        .connect("s", "sub")
+        .connect("sub_start", "throw")
+        .connect("throw", "sub_end")
+        .connect("sub", "e")
+        .connect("b_int", "h_int")
+        .connect("b_non", "h_non")
+        .build()
+        .expect("build escalation process");
+
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(escalation), T0)
+            .expect("deploy escalation"),
+    );
+
     // Instance A: created with variables, its one job activated + completed, so
     // it walks the full lifecycle to a retained-terminal instance. Leaves the
     // `Activated` set empty again (the job completed).

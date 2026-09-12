@@ -42,8 +42,10 @@
 //! * Telemetry-source overrides for time / variance defaults (slice 2 in
 //!   ADR 0002 mentions this, but the [`SemanticAnnotations`] schema doesn't
 //!   yet carry cost / time — that's slice 4's `nano:*` extension work).
-//! * Escalation and compensation flow classes — Nano's engine surface
-//!   doesn't yet model dedicated escalation / compensation boundary events.
+//! * Compensation flow classes — Nano's engine surface doesn't yet model
+//!   dedicated compensation boundary events as a distinct flow class.
+//!   (Escalation boundaries (#1173) *are* now classified — see
+//!   [`escalation_flows`], which emits [`FlowKind::Escalation`].)
 //! * Provenance / confidence per annotation — slice 5/6 workbench feature.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -96,6 +98,7 @@ pub fn infer(def: &ProcessDefinition) -> SemanticAnnotations {
         }
     }
     ann.flows.extend(exception_flows(def));
+    ann.flows.extend(escalation_flows(def));
     ann.roles = infer_roles(def);
     ann
 }
@@ -184,7 +187,41 @@ fn exception_flows(def: &ProcessDefinition) -> Vec<AnnotatedFlow> {
     flows
 }
 
-/// Breadth-first walk of every node reachable from `from` via sequence flows,
+/// Discover every escalation boundary event and return one escalation flow per
+/// boundary — starting at the boundary itself, then everything reachable
+/// downstream via sequence flows. Escalation handler paths get their own band
+/// ([`FlowKind::Escalation`], rising above the centerline) rather than the
+/// exception band, matching the "escalation to a supervisor / out-of-band
+/// notification" reading. Both interrupting and non-interrupting escalation
+/// boundaries are annotated: the handler path is out-of-band regardless of
+/// whether the caught activity is torn down (the usual escalation idiom is in
+/// fact non-interrupting). Without this the boundary and its handler nodes fall
+/// through to the primary/default band and render on the main spine (#1173).
+fn escalation_flows(def: &ProcessDefinition) -> Vec<AnnotatedFlow> {
+    let mut flows: Vec<AnnotatedFlow> = Vec::new();
+    let mut boundaries: Vec<&str> = def
+        .elements
+        .values()
+        .filter_map(|el| match &el.kind {
+            ElementKind::EscalationBoundaryEvent { .. } => Some(el.id.as_str()),
+            _ => None,
+        })
+        .collect();
+    // Stable, id-sorted ordering so repeat runs produce identical annotations.
+    boundaries.sort_unstable();
+    for boundary_id in boundaries {
+        let nodes = reachable_from(def, boundary_id);
+        if nodes.is_empty() {
+            continue;
+        }
+        flows.push(AnnotatedFlow {
+            id: format!("escalation.{boundary_id}"),
+            kind: FlowKind::Escalation,
+            nodes,
+        });
+    }
+    flows
+}
 /// returning them in visitation order and including `from` itself.
 fn reachable_from(def: &ProcessDefinition, from: &str) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();
@@ -450,6 +487,71 @@ mod tests {
         assert!(
             !exc.nodes.is_empty(),
             "exception flow has at least the boundary event itself"
+        );
+    }
+
+    #[test]
+    fn escalation_flow_captures_the_boundary_handler_path() {
+        // An escalation boundary (#1173) must produce a `FlowKind::Escalation`
+        // band starting at the boundary and covering its downstream handler
+        // nodes, and that path must NOT be folded onto the primary spine —
+        // otherwise the escalation handler renders on the main flow line. Built
+        // via `ProcessBuilder` (no fixture needed) so the assertion is exact.
+        use nanobpmn_engine_core::ProcessBuilder;
+        let def = ProcessBuilder::new("esc")
+            .start_event("start")
+            .sub_process("sub", "sub_start")
+            .start_event("sub_start")
+            .contained_in("sub_start", "sub")
+            .escalation_throw_event("throw", "OVERLOAD")
+            .contained_in("throw", "sub")
+            .end_event("sub_end")
+            .contained_in("sub_end", "sub")
+            .escalation_boundary_event("boundary", "sub", "OVERLOAD")
+            .service_task("notify", "notify")
+            .end_event("done")
+            .end_event("handled")
+            .connect("start", "sub")
+            .connect("sub_start", "throw")
+            .connect("throw", "sub_end")
+            .connect("sub", "done")
+            .connect("boundary", "notify")
+            .connect("notify", "handled")
+            .build()
+            .expect("valid escalation model");
+        let ann = infer(&def);
+        let esc = ann
+            .flows
+            .iter()
+            .find(|f| f.kind == FlowKind::Escalation)
+            .expect("escalation flow inferred for the escalation boundary");
+        assert_eq!(esc.id, "escalation.boundary");
+        assert_eq!(
+            esc.nodes.first().map(String::as_str),
+            Some("boundary"),
+            "escalation flow starts at the boundary, got {:?}",
+            esc.nodes
+        );
+        assert!(
+            esc.nodes.iter().any(|n| n == "notify"),
+            "escalation flow includes the downstream handler, got {:?}",
+            esc.nodes
+        );
+        assert!(
+            esc.nodes.iter().any(|n| n == "handled"),
+            "escalation flow reaches the handler end, got {:?}",
+            esc.nodes
+        );
+        // The handler path is out-of-band: it must not appear on the primary spine.
+        let primary = ann
+            .flows
+            .iter()
+            .find(|f| f.kind == FlowKind::Primary)
+            .expect("primary flow inferred");
+        assert!(
+            !primary.nodes.iter().any(|n| n == "notify"),
+            "escalation handler must not be folded onto the primary spine, got {:?}",
+            primary.nodes
         );
     }
 

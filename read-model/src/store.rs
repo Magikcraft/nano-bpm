@@ -3366,16 +3366,17 @@ pub fn dmn_decision_type_name(kind: &nanobpmn_engine_core::dmn::DecisionType) ->
 /// model, derived from the deployed element as the single source of truth.
 ///
 /// This wraps [`ElementKind::type_name`](nanobpmn_engine_core::ElementKind::type_name)
-/// and overrides the one case the kind alone cannot disambiguate:
-/// `CompensationThrowEvent` covers both the `<intermediateThrowEvent>` and
-/// `<endEvent>` compensation-throw flavours (the engine infers the end-event
-/// flavour purely from having no outgoing flow — runtime routing is unaffected).
-/// `type_name()` hard-codes it to `INTERMEDIATE_THROW_EVENT`; a terminal
-/// (no-outgoing-flow) compensation throw is an end event, so classify it as
-/// `END_EVENT` here (#917). Every other kind passes through unchanged.
+/// and overrides the cases the kind alone cannot disambiguate:
+/// `CompensationThrowEvent` and `EscalationThrowEvent` each cover both the
+/// `<intermediateThrowEvent>` and `<endEvent>` throw flavours (the engine infers
+/// the end-event flavour purely from having no outgoing flow — runtime routing is
+/// unaffected). `type_name()` hard-codes both to `INTERMEDIATE_THROW_EVENT`; a
+/// terminal (no-outgoing-flow) throw is an end event, so classify it as
+/// `END_EVENT` here (#917, #1173). Every other kind passes through unchanged.
 fn element_type_name(element: &nanobpmn_engine_core::Element) -> &'static str {
     match element.kind {
         nanobpmn_engine_core::ElementKind::CompensationThrowEvent
+        | nanobpmn_engine_core::ElementKind::EscalationThrowEvent { .. }
             if element.outgoing.is_empty() =>
         {
             "END_EVENT"
@@ -8119,6 +8120,72 @@ mod element_instance_tests {
         );
         assert_eq!(
             store.element_instance(3002).unwrap().element_type,
+            "END_EVENT"
+        );
+    }
+
+    /// #1173: `ElementKind::EscalationThrowEvent` likewise covers both the
+    /// `<intermediateThrowEvent>` and `<endEvent>` escalation-throw flavours,
+    /// disambiguated purely by outgoing-flow emptiness. The read model must
+    /// expose a terminal (no-outgoing-flow) escalation throw as `END_EVENT` and
+    /// one with an outgoing flow as `INTERMEDIATE_THROW_EVENT`, rather than
+    /// hard-coding both to `INTERMEDIATE_THROW_EVENT`.
+    #[test]
+    fn escalation_throw_end_event_flavour_classifies_as_end_event() {
+        const ESC_DEF_KEY: u64 = 601;
+        const ESC_INST: u64 = 1101;
+        let def = ProcessBuilder::new("esc")
+            .start_event("s")
+            .escalation_throw_event("mid", "OVERLOAD")
+            .escalation_throw_event("term", "OVERLOAD")
+            .connect("s", "mid")
+            .connect("mid", "term")
+            .build()
+            .unwrap();
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[
+                &Event::ProcessDeployed {
+                    deployment_key: 3,
+                    process_definition_key: ESC_DEF_KEY,
+                    version: 1,
+                    process: def,
+                },
+                &Event::ProcessInstanceCreated {
+                    instance_key: ESC_INST,
+                    process_id: "esc".to_string(),
+                    variables: HashMap::new(),
+                    created_at: 1,
+                    tags: Vec::new(),
+                    business_id: None,
+                    process_definition_key: ESC_DEF_KEY,
+                    version: 1,
+                    parent_process_instance_key: None,
+                    parent_element_instance_key: None,
+                },
+                // Intermediate flavour: has an outgoing flow.
+                &Event::ElementActivated {
+                    instance_key: ESC_INST,
+                    element_instance_key: 3101,
+                    element_id: "mid".to_string(),
+                    scope: 0,
+                },
+                // Terminal flavour: no outgoing flow.
+                &Event::ElementActivated {
+                    instance_key: ESC_INST,
+                    element_instance_key: 3102,
+                    element_id: "term".to_string(),
+                    scope: 0,
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(
+            store.element_instance(3101).unwrap().element_type,
+            "INTERMEDIATE_THROW_EVENT"
+        );
+        assert_eq!(
+            store.element_instance(3102).unwrap().element_type,
             "END_EVENT"
         );
     }

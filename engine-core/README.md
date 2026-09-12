@@ -342,7 +342,14 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > sub-process — an interrupting one terminates the whole inner scope and routes to
 > its handler), and **terminate end events** (an `endEvent` with a
 > `terminateEventDefinition` that kills the remaining tokens in its enclosing
-> scope, then completes that scope). Instances carry JSON-like variables (`null`, booleans, numbers,
+> scope, then completes that scope), and **escalation events** (an
+> `escalationEventDefinition` on an intermediate throw event or an escalation
+> **end event** raises an escalation that propagates up the scope hierarchy; an
+> **escalation boundary event** on a sub-process whose `escalationCode` matches —
+> or a catch-all with no code — catches it, interrupting the sub-process when
+> `cancelActivity="true"` or spawning a parallel token when `false`; an uncaught
+> escalation is ignored, per BPMN/Zeebe semantics, and the thrower continues).
+> Instances carry JSON-like variables (`null`, booleans, numbers,
 > strings, lists and contexts) evaluated by an in-house FEEL engine ([`feel`])
 > for gateway conditions, job types and message correlation. It also supports
 > **persisted AgentInstance state** (Camunda stable/8.10 parity): agent markers
@@ -380,14 +387,14 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > placement is rejected at deploy. Processes can be
 > built programmatically with [`ProcessBuilder`] or parsed from BPMN 2.0 XML for
 > that same subset (including `subProcess`, `boundaryEvent`/`errorEventDefinition`,
+> `boundaryEvent`/`escalationEventDefinition`, `intermediateThrowEvent`/`escalationEventDefinition`,
 > `intermediateCatchEvent`/`timerEventDefinition`, `messageEventDefinition`/
 > `zeebe:subscription` and `startEvent` message/timer definitions) via the
 > [`bpmn`] module (`bpmn::parse_bpmn`), a tiny dependency-free scanner.
 > Deployments assign a per-id **version** and a unique process-definition key.
 > A `sendTask` is parsed as a job-backed **service task** (Zeebe models
-> send tasks as ordinary job workers). Constructs the engine does not execute —
-> notably `escalationEventDefinition` (escalation throw, end and boundary
-> events) — are **rejected at deploy** with an `UnsupportedElement` error that
+> send tasks as ordinary job workers). Constructs the engine does not execute
+> are **rejected at deploy** with an `UnsupportedElement` error that
 > names the construct, rather than being silently dropped.
 > Deeper sub-process nesting is an intended extension point — new element kinds
 > plug into `process_step` without touching the

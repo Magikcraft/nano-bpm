@@ -20,7 +20,7 @@ const inclusive = readFileSync(new URL(
   "../../../engine-core/tests/fixtures/inclusive-gateway.bpmn", import.meta.url,
 ), "utf8");
 const escalation = readFileSync(new URL(
-  "../../../engine-core/tests/fixtures/escalation-throw.bpmn", import.meta.url,
+  "../../../engine-core/tests/fixtures/escalation-boundary.bpmn", import.meta.url,
 ), "utf8");
 
 for (const variant of ["lean", "readmodel"]) {
@@ -68,24 +68,31 @@ for (const variant of ["lean", "readmodel"]) {
 
   console.log(`[${variant}] sendTask + inclusiveGateway deploy/createInstance OK`);
 
-  // escalation: the committed wasm must *reject* an escalation carrier at
-  // deploy (#1168) — escalation is not modelled for execution, so `deploy()`
-  // has to throw a clean error naming `escalationEventDefinition` rather than
-  // silently demoting the throw to a none pass-through. This mirrors the native
-  // `should_reject_an_escalation_throw_event_naming_the_construct` test; a
-  // stale/broken committed wasm could regress the parser/error conversion while
-  // the two success probes above still pass, so assert the rejection surfaces
-  // through both shipped variants.
+  // escalation: the committed wasm must now *execute* escalation events (#1173),
+  // not reject them. Deploy an embedded sub-process whose escalation throw is
+  // caught by an interrupting escalation boundary routing to a `handle` service
+  // task; creating an instance raises + catches the escalation, tears the
+  // sub-process down, and arms the boundary handler job. Drive that job to
+  // completion and assert the instance reaches `Completed` — a stale/broken
+  // committed wasm that still rejected the carrier (or demoted the throw to a
+  // none pass-through) would fail here through both shipped variants. Mirrors
+  // the native `should_interrupt_a_subprocess_via_an_interrupting_escalation_boundary`.
   {
     const engine = new TestEngine();
-    assert.throws(
-      () => engine.deploy(escalation),
-      /escalationEventDefinition/,
-      `${variant}: deploying an escalation carrier must throw naming the construct`,
-    );
+    engine.deploy(escalation);
+    engine.createInstance("escalate", "{}");
+    const jobs = JSON.parse(engine.activateJobs("handle", 1, 1000, "W", true));
+    assert.equal(jobs.length, 1,
+      `${variant}: the interrupting escalation boundary must arm one 'handle' handler job`);
+    assert.equal(jobs[0].elementId, "handle",
+      `${variant}: the escalation handler job carries its element id`);
+    const snap = JSON.parse(engine.completeJob(jobs[0].key, "{}", jobs[0].leaseToken ?? null));
+    const inst = snap.instances.find((i) => i.processId === "escalate");
+    assert.equal(inst?.state, "Completed",
+      `${variant}: completing the escalation handler job must drive the instance to Completed`);
   }
 
-  console.log(`[${variant}] escalation carrier cleanly rejected OK`);
+  console.log(`[${variant}] escalation boundary deploy/execute OK`);
 }
 
 console.log("element-support: all variants OK");

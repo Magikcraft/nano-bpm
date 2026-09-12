@@ -9480,6 +9480,24 @@ impl Engine {
             return (events, followups);
         }
 
+        // An escalation throw event (`escalationEventDefinition` on an
+        // intermediate throw or end event, #1173): raise the named escalation
+        // and continue. Mirrors the deferred `finalize_completion` handoff for
+        // the end-listener path — escalation is non-critical, so the throw's own
+        // token always routes onward / drains regardless of whether it is caught.
+        if let Some(ElementKind::EscalationThrowEvent { escalation_code }) =
+            self.element_kind(instance_key, &element_id)
+        {
+            return self.raise_escalation_from_throw(
+                instance_key,
+                element_instance_key,
+                element_id,
+                scope,
+                escalation_code,
+                events,
+            );
+        }
+
         let mut followups = Vec::new();
         for flow in self.outgoing(instance_key, &element_id) {
             events.push(Event::SequenceFlowTaken {
@@ -9642,9 +9660,22 @@ impl Engine {
             }
             return (events, followups);
         }
-        // A completing activity that carries a compensation boundary event
-        // becomes compensable: record it so a later compensation throw event in
-        // the same scope can run its handler.
+        // An escalation throw event (`escalationEventDefinition` on an
+        // intermediate throw or end event, #1173): raise the named escalation,
+        // then continue. Escalation is non-critical, so the throw's own token
+        // always routes onward / drains regardless of whether it was caught.
+        if let Some(ElementKind::EscalationThrowEvent { escalation_code }) =
+            self.element_kind(instance_key, &element_id)
+        {
+            return self.raise_escalation_from_throw(
+                instance_key,
+                element_instance_key,
+                element_id,
+                scope,
+                escalation_code,
+                events,
+            );
+        }
         for handler in self.compensation_handlers_for(instance_key, &element_id) {
             events.push(Event::CompensationSubscriptionCreated {
                 instance_key,
@@ -9665,6 +9696,178 @@ impl Engine {
                 element_id: flow.to,
                 scope,
             });
+        }
+        (events, followups)
+    }
+
+    /// Raises the escalation of a just-completed
+    /// [`EscalationThrowEvent`](ElementKind::EscalationThrowEvent). `events`
+    /// already carries the throw's own `ElementCompleted`. Escalation is
+    /// non-critical, so:
+    ///
+    /// * **uncaught** — the throw simply routes onward / drains (as a plain
+    ///   pass-through), no incident;
+    /// * **caught by a non-interrupting boundary** — the throw still routes
+    ///   onward, and a parallel token is spawned by activating the boundary in
+    ///   its own scope (the enclosing activity keeps running);
+    /// * **caught by an interrupting boundary** — the caught activity's whole
+    ///   inner scope is torn down (mirroring the error-boundary path) and the
+    ///   token continues out the boundary instead of along the throw's flow.
+    ///
+    /// The catch is resolved by propagating up the enclosing sub-process scopes
+    /// from the throw's `scope`, preferring an exact escalation-code match over a
+    /// catch-all (see [`find_catching_escalation_boundary`](Self::find_catching_escalation_boundary)).
+    fn raise_escalation_from_throw(
+        &mut self,
+        instance_key: Key,
+        throw_eik: Key,
+        throw_element_id: String,
+        scope: Key,
+        escalation_code: String,
+        mut events: Vec<Event>,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let mut followups = Vec::new();
+        let caught = self.find_catching_escalation_boundary(instance_key, scope, &escalation_code);
+        // Collect the throw's outgoing targets up front (owned) so routing does
+        // not hold an immutable borrow of `self` across the teardown mutation.
+        let outgoing_targets: Vec<String> = self
+            .outgoing(instance_key, &throw_element_id)
+            .into_iter()
+            .map(|flow| flow.to)
+            .collect();
+        let take_throw_outgoing = |events: &mut Vec<Event>, followups: &mut Vec<Step>| {
+            for to in &outgoing_targets {
+                events.push(Event::SequenceFlowTaken {
+                    instance_key,
+                    from: throw_element_id.clone(),
+                    to: to.clone(),
+                });
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: to.clone(),
+                    scope,
+                });
+            }
+        };
+        match caught {
+            // Uncaught: ignore the escalation (no incident) and pass through.
+            None => {
+                take_throw_outgoing(&mut events, &mut followups);
+            }
+            Some((boundary_id, caught_eik, caught_element_id, false)) => {
+                // Non-interrupting: the throw continues AND a parallel token is
+                // spawned by activating the boundary in the caught activity's
+                // own (enclosing) scope.
+                //
+                // If the caught activity is a multi-instance CHILD, the boundary
+                // is armed on the loop's BODY, not the individual child — so the
+                // parallel token must be spawned in the BODY's enclosing scope.
+                // `scope_of(caught_eik)` for an MI child is the MI body itself,
+                // which would activate the handler INSIDE the loop body (the
+                // wrong level). Mirror the interrupting branch's child→body
+                // redirection before taking `scope_of` so both branches arm the
+                // boundary at the same scope (#1173, the #1170 MI class).
+                take_throw_outgoing(&mut events, &mut followups);
+                let child_scope = self.scope_of(instance_key, caught_eik);
+                let caught_is_mi_child = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .is_some_and(|i| i.multi_instances.contains_key(&child_scope));
+                let boundary_armed_eik = if caught_is_mi_child {
+                    child_scope
+                } else {
+                    caught_eik
+                };
+                let boundary_scope = self.scope_of(instance_key, boundary_armed_eik);
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: boundary_id,
+                    scope: boundary_scope,
+                });
+                let _ = caught_element_id;
+            }
+            Some((boundary_id, caught_eik, caught_element_id, true)) => {
+                // Interrupting: tear the caught sub-process scope down (its
+                // descendants, but not the throw itself — its `ElementCompleted`
+                // is already in `events`), complete the caught activity, and run
+                // the token out the boundary instead of along the throw's flow.
+                //
+                // If the caught activity is a multi-instance CHILD, the boundary
+                // is armed on the loop's BODY, so interrupting it must tear down
+                // the WHOLE loop — every sibling child and the body's runtime
+                // record — not the single child the throw happened to fire from.
+                // Redirect the teardown to the MI body (its element id equals the
+                // child's, since each child is an instance of the same activity);
+                // otherwise sibling children and the body's `MultiInstanceState`
+                // survive and hang the instance (#1173, the #1170 MI class).
+                let child_scope = self.scope_of(instance_key, caught_eik);
+                let caught_is_mi_child = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .is_some_and(|i| i.multi_instances.contains_key(&child_scope));
+                let (torn_eik, torn_element_id) = if caught_is_mi_child {
+                    let body_element_id = self
+                        .element_id_of_instance(instance_key, child_scope)
+                        .unwrap_or_else(|| caught_element_id.clone());
+                    (child_scope, body_element_id)
+                } else {
+                    (caught_eik, caught_element_id)
+                };
+                let boundary_scope = self.scope_of(instance_key, torn_eik);
+                for event in self.scope_teardown_events(instance_key, torn_eik) {
+                    if matches!(
+                        &event,
+                        Event::ElementCompleting { element_instance_key: eik, .. }
+                            | Event::ElementCompleted { element_instance_key: eik, .. }
+                            if *eik == throw_eik
+                    ) {
+                        continue;
+                    }
+                    events.push(event);
+                }
+                // `scope_teardown_events` only sweeps the torn activity's
+                // DESCENDANTS. If the torn activity is itself a multi-instance
+                // body or an ad-hoc container, its own active-child runtime
+                // record (cleared only by `MultiInstanceCompleted` /
+                // `AdHocCompleted`, never by `ElementCompleted`) — plus any job
+                // or incident parked on the root — would otherwise leak, hanging
+                // the instance or letting a queued child activation resurrect
+                // work after the handler. Mirror `interrupt_activity_via_boundary`'s
+                // root-record cleanup (#1173, matching the #1170 MI-teardown fix).
+                for event in self.boundary_root_teardown_events(instance_key, torn_eik) {
+                    events.push(event);
+                }
+                self.torn_down_scopes.insert(torn_eik);
+                events.push(Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key: torn_eik,
+                    element_id: torn_element_id.clone(),
+                });
+                events.push(Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key: torn_eik,
+                    element_id: torn_element_id,
+                });
+                for event in self.cancel_boundary_timers_on(torn_eik) {
+                    events.push(event);
+                }
+                for event in self.cancel_boundary_message_subscriptions_on(torn_eik) {
+                    events.push(event);
+                }
+                for event in self.cancel_boundary_signal_subscriptions_on(torn_eik) {
+                    events.push(event);
+                }
+                for event in self.cancel_boundary_conditional_subscriptions_on(torn_eik) {
+                    events.push(event);
+                }
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: boundary_id,
+                    scope: boundary_scope,
+                });
+            }
         }
         (events, followups)
     }
@@ -11049,6 +11252,7 @@ impl Engine {
                 | ElementKind::TimerBoundaryEvent { attached_to, .. }
                 | ElementKind::MessageBoundaryEvent { attached_to, .. }
                 | ElementKind::SignalBoundaryEvent { attached_to, .. }
+                | ElementKind::EscalationBoundaryEvent { attached_to, .. }
                 | ElementKind::ConditionalBoundaryEvent { attached_to, .. } => Some(attached_to),
                 _ => None,
             };
@@ -13096,7 +13300,8 @@ fn unsupported_migration_reason(kind: &crate::model::ElementKind) -> Option<&'st
         | ElementKind::TimerBoundaryEvent { .. }
         | ElementKind::MessageBoundaryEvent { .. }
         | ElementKind::SignalBoundaryEvent { .. }
-        | ElementKind::ConditionalBoundaryEvent { .. } => {
+        | ElementKind::ConditionalBoundaryEvent { .. }
+        | ElementKind::EscalationBoundaryEvent { .. } => {
             Some("boundary events are not migratable yet")
         }
         ElementKind::CallActivity { .. } => Some("call activities are not migratable yet"),
