@@ -6125,7 +6125,24 @@ impl Engine {
         // a multi-instance activity nested in a sub-process can read that
         // sub-process's locals.
         let enclosing_vars = self.variables_for_element(instance_key, scope);
-        let inputs = self.io_inputs(instance_key, &element_id);
+        // A CALL ACTIVITY's `zeebe:input` mappings seed only its isolated child
+        // PROCESS scope — they are applied once in `spawn_call_activity_child` per
+        // child, never local to the MI body scope. Applying them here would leak
+        // the callee's own input-mapped locals into the body scope (which every
+        // child inherits), so the callee-id `=calledElement` expression and the
+        // per-child spawn would see them and a self-referencing mapping would
+        // compound across the body → child re-evaluation (#1175). Mirrors the
+        // normal activation path (`activate_body`), which likewise skips a call
+        // activity's inputs. The input collection is evaluated without them.
+        let is_call_activity = matches!(
+            self.element_kind(instance_key, &element_id),
+            Some(ElementKind::CallActivity { .. })
+        );
+        let inputs = if is_call_activity {
+            Vec::new()
+        } else {
+            self.io_inputs(instance_key, &element_id)
+        };
         let input_updates = if inputs.is_empty() {
             HashMap::new()
         } else {
@@ -6333,6 +6350,26 @@ impl Engine {
         }
         locals.insert("loopCounter".to_string(), Value::Int((index as i64) + 1));
 
+        // Seed the ad-hoc container's `outputCollection` as an empty local list
+        // BEFORE the per-child input mappings are applied below — mirroring the
+        // normal activation path (`activate_body`), which seeds the collection
+        // before running the container's inputs — so a (nonsensical but possible)
+        // per-child `zeebe:input` targeting the outputCollection variable
+        // overrides the seed instead of being clobbered by a seed applied
+        // afterwards (#1175). Seeded into the child's `locals` (carried in
+        // `MultiInstanceChildActivated.local_variables`, which replaces the child
+        // scope wholesale on apply) rather than a discrete post-activation
+        // `ScopedVariablesUpdated`: that establishes it with the child scope, so
+        // the mappings that follow can still override it and `run_mi_child_behaviour`
+        // need not re-seed it. Applies to both the JOB_WORKER and declarative
+        // (BPMN_TASK) ad-hoc variants.
+        if let Some(name) = self
+            .adhoc_def_of(instance_key, &element_id)
+            .and_then(|d| d.output_collection.clone())
+        {
+            locals.insert(name, Value::List(Vec::new()));
+        }
+
         // The scoped view this child evaluates its own FEEL attributes (job type,
         // retries, priority) against: the multi-instance body's scope (already
         // applied) overlaid with the child's own `inputElement`/`loopCounter`
@@ -6351,7 +6388,25 @@ impl Engine {
         // normally-activated element these mappings must be applied here; they are
         // then visible both to the child's job-type/retry FEEL resolution below
         // and, for a sub-process child, to its inner flow.
-        let inputs = self.io_inputs(instance_key, &element_id);
+        //
+        // A call-activity MI child's input mappings seed only its isolated child
+        // PROCESS scope — never the child element's own MI scope — so they are NOT
+        // applied here: `spawn_call_activity_child` (invoked by
+        // `run_mi_child_behaviour`) evaluates them exactly once into the child
+        // seed. Applying them here as well would evaluate them twice (a second
+        // application that compounds for a mapping referencing an earlier mapped
+        // target) and would let the callee-id `=calledElement` expression see the
+        // callee's own input-mapped locals (#1175). Mirrors the normal activation
+        // path, which likewise routes a call activity's inputs through the spawn.
+        let is_call_activity = matches!(
+            self.element_kind(instance_key, &element_id),
+            Some(ElementKind::CallActivity { .. })
+        );
+        let inputs = if is_call_activity {
+            Vec::new()
+        } else {
+            self.io_inputs(instance_key, &element_id)
+        };
         if !inputs.is_empty() {
             match self.eval_io_mappings_in(&child_vars, &inputs) {
                 Ok(mut mapped) => {
@@ -6465,6 +6520,62 @@ impl Engine {
             Some(ElementKind::ServiceTask {
                 job_type, priority, ..
             }) => {
+                let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
+                // A DECLARATIVE ad-hoc container (Camunda BPMN_TASK /
+                // `activeElementsCollection`) used as an MI child is NOT a job
+                // worker: because an ad-hoc sub-process flattens to
+                // `ElementKind::ServiceTask`, minting a job here would spawn a
+                // stray agent job and never evaluate its active-elements
+                // collection. Mirror the normal activation path
+                // (`run_activation_body`): on activation evaluate the FEEL
+                // collection to inner element ids and activate them directly — no
+                // job — and let them drain back through `complete_adhoc_container`'s
+                // MI-child route into `complete_mi_child` (#1175). The container's
+                // `outputCollection` is seeded ahead of the per-child input
+                // mappings in `activate_mi_child`, so it is not re-seeded here.
+                let declarative_adhoc = adhoc_def
+                    .as_ref()
+                    .map(|d| d.impl_type == crate::model::AdHocImplementationType::BpmnTask)
+                    .unwrap_or(false);
+                if declarative_adhoc {
+                    let def = adhoc_def
+                        .as_ref()
+                        .expect("declarative_adhoc implies adhoc_def is Some");
+                    events.push(Event::AdHocActivated {
+                        instance_key,
+                        container_key: child_key,
+                        element_id: element_id.clone(),
+                        output_collection: def.output_collection.clone(),
+                        output_element: def.output_element.clone(),
+                    });
+                    // Evaluate the active-elements collection against the child's
+                    // resolved scope view (`inputElement`/`loopCounter` bound) and
+                    // activate each named tool into THIS child's container scope.
+                    let ids = def
+                        .active_elements_collection
+                        .as_deref()
+                        .map(|expr| self.eval_adhoc_active_elements(expr, child_vars, def))
+                        .unwrap_or_default();
+                    for id in &ids {
+                        followups.push(Step::ActivateAdHocTool {
+                            instance_key,
+                            container_key: child_key,
+                            element_id: id.clone(),
+                            variables: HashMap::new(),
+                        });
+                    }
+                    // An empty collection has nothing to run: the container
+                    // completes at once, routing straight into the loop via
+                    // `complete_adhoc_container`'s MI-child branch.
+                    if ids.is_empty() {
+                        followups.push(Step::CompleteAdHoc {
+                            instance_key,
+                            container_key: child_key,
+                            cancel: false,
+                        });
+                    }
+                    return (events, followups);
+                }
                 let job_key = self.mint_key();
                 let job_type = self.resolve_job_type(child_vars, &job_type);
                 let priority = self.resolve_priority(child_vars, priority.as_deref());
@@ -6489,8 +6600,11 @@ impl Engine {
                 // the agent can activate tools into THIS child's scope and an
                 // interrupting boundary on the loop can tear that scope down
                 // (#1170). The container element instance is the ad-hoc scope
-                // (`child_key`); its tool catalog is advertised local to it.
-                if let Some(def) = self.adhoc_def_of(instance_key, &element_id) {
+                // (`child_key`); its tool catalog is advertised local to it. The
+                // container's `outputCollection` is seeded ahead of the per-child
+                // input mappings in `activate_mi_child` (#1175), so it is not
+                // re-seeded here.
+                if let Some(def) = &adhoc_def {
                     events.push(Event::AdHocActivated {
                         instance_key,
                         container_key: child_key,
@@ -6498,25 +6612,10 @@ impl Engine {
                         output_collection: def.output_collection.clone(),
                         output_element: def.output_element.clone(),
                     });
-                    // Seed the container's `outputCollection` to an empty array as
-                    // a local variable the moment it activates (Zeebe
-                    // `AdHocSubProcessProcessor.onActivate`), exactly like the
-                    // normally-activated container path (`activate`). This local
-                    // list is the single source of truth `complete_adhoc_tool`
-                    // appends each tool result to; without it, an MI ad-hoc child
-                    // with `outputCollection="r"` silently loses every tool result
-                    // and container completion falls back to an empty array.
-                    if let Some(name) = def.output_collection.clone() {
-                        events.push(Event::ScopedVariablesUpdated {
-                            instance_key,
-                            scope_key: child_key,
-                            variables: HashMap::from([(name, Value::List(Vec::new()))]),
-                        });
-                    }
                     let mut catalog_var = HashMap::new();
                     catalog_var.insert(
                         "adHocSubProcessElements".to_string(),
-                        Value::List(Self::advertised_adhoc_catalog(&def)),
+                        Value::List(Self::advertised_adhoc_catalog(def)),
                     );
                     events.push(Event::ScopedVariablesUpdated {
                         instance_key,
@@ -11321,7 +11420,34 @@ impl Engine {
             _ => return (Vec::new(), Vec::new()),
         };
         let scope = self.scope_of(instance_key, element_instance_key);
-        let element_vars = (*self.variables_for_element(instance_key, scope)).clone();
+        // A call activity that is a MULTI-INSTANCE child parks its token directly
+        // on the child element instance (minted by `activate_mi_child`, bypassing
+        // `activate`), whose own scope carries the per-child `inputElement` /
+        // `loopCounter` bindings written by `MultiInstanceChildActivated`. The
+        // ordinary retry above evaluates against the *enclosing* scope
+        // (`scope_of` = the MI body), which does NOT carry those bindings, so a
+        // callee-id `=calledElement` expression or an input mapping that reads
+        // `loopCounter` / `inputElement` would fail (or resolve wrongly) on the
+        // retry. Evaluate against the child element instance's own scope instead,
+        // so the spawn re-drive is MI-aware — re-evaluating both the callee id and
+        // the (once-applied) input mappings with the child bindings in view, and
+        // seeding them into the child process exactly as the first pass did
+        // (#1175). Its completion still routes back through `complete_mi_child`
+        // (via `complete_call_activity`'s MI-child detection).
+        let is_mi_child = scope != 0
+            && self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.multi_instances.get(&scope))
+                .map(|mi| mi.element_id == element_id)
+                .unwrap_or(false);
+        let eval_scope = if is_mi_child {
+            element_instance_key
+        } else {
+            scope
+        };
+        let element_vars = (*self.variables_for_element(instance_key, eval_scope)).clone();
         self.spawn_call_activity_child(
             instance_key,
             element_instance_key,
