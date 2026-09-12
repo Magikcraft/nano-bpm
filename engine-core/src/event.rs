@@ -611,10 +611,15 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
         kind: IncidentKind,
-        /// For an `IncidentKind::IoMapping` incident, the lifecycle phase to
-        /// replay on resolution (phase-driven recovery). `None` for every other
-        /// kind. `serde(default)` so events journaled before phase-driven
-        /// ioMapping recovery replay as `None`.
+        /// The lifecycle phase / projection to replay on resolution
+        /// (phase-driven recovery). Present for every `IncidentKind::IoMapping`
+        /// incident, and also for the ad-hoc call-activity tool recovery paths
+        /// (#1176) that park on an `IncidentKind::ExpressionEvaluation`
+        /// (output-collection type) or `IncidentKind::CalledElementError`
+        /// (child-spawn) incident while carrying a preserved single-pass
+        /// projection to reuse verbatim on redrive. `None` for every other
+        /// incident, whose recovery is derived from the kind. `serde(default)`
+        /// so events journaled before phase-driven recovery replay as `None`.
         #[cfg_attr(feature = "serde", serde(default))]
         redrive: Option<IoMappingRedrive>,
         reason: String,
