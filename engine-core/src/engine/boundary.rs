@@ -149,8 +149,84 @@ impl Engine {
         }
     }
 
-    /// Every element instance transitively contained in the sub-process scope
-    /// `scope_eik`, sorted by key for deterministic processing.
+    /// The escalation boundary attached to `activity_id` that catches
+    /// `escalation_code`, or `None`. An **exact** code match wins over a
+    /// **catch-all** (a boundary with an empty `escalation_code`) at the same
+    /// activity (Zeebe: a specific code beats a catch-all). Among equally
+    /// specific matches the lexicographically smallest boundary id is chosen for
+    /// determinism. Returns the boundary id and whether it is interrupting.
+    pub(crate) fn find_escalation_boundary(
+        &self,
+        instance_key: Key,
+        activity_id: &str,
+        escalation_code: &str,
+    ) -> Option<(ElementId, bool)> {
+        let process = self.process_of_instance(instance_key)?;
+        let pick = |exact: bool| {
+            process
+                .elements
+                .values()
+                .filter(|e| match &e.kind {
+                    ElementKind::EscalationBoundaryEvent {
+                        attached_to,
+                        escalation_code: ec,
+                        ..
+                    } => {
+                        attached_to == activity_id
+                            && if exact {
+                                ec == escalation_code
+                            } else {
+                                ec.is_empty()
+                            }
+                    }
+                    _ => false,
+                })
+                .min_by(|a, b| a.id.cmp(&b.id))
+        };
+        // An exact match (which, when `escalation_code` is itself empty, already
+        // covers the catch-all boundaries) beats a separate catch-all fallback.
+        let chosen = pick(true).or_else(|| {
+            if escalation_code.is_empty() {
+                None
+            } else {
+                pick(false)
+            }
+        })?;
+        match &chosen.kind {
+            ElementKind::EscalationBoundaryEvent { interrupting, .. } => {
+                Some((chosen.id.clone(), *interrupting))
+            }
+            _ => None,
+        }
+    }
+
+    /// Finds the escalation boundary that catches `escalation_code` raised from
+    /// the scope `from_scope_eik` (the enclosing sub-process element instance the
+    /// throw lives in, or `0` for the process root), propagating up the enclosing
+    /// scopes until one is found. Returns `(boundary_id, caught_element_instance_key,
+    /// caught_element_id, interrupting)` — the boundary event and the activity it
+    /// is attached to (the enclosing sub-process). `None` when uncaught (an
+    /// uncaught escalation is ignored, no incident).
+    pub(crate) fn find_catching_escalation_boundary(
+        &self,
+        instance_key: Key,
+        from_scope_eik: Key,
+        escalation_code: &str,
+    ) -> Option<(ElementId, Key, ElementId, bool)> {
+        let mut eik = from_scope_eik;
+        while eik != 0 {
+            let element_id = self.element_id_of_instance(instance_key, eik)?;
+            if let Some((boundary_id, interrupting)) =
+                self.find_escalation_boundary(instance_key, &element_id, escalation_code)
+            {
+                return Some((boundary_id, eik, element_id, interrupting));
+            }
+            eik = self.scope_of(instance_key, eik);
+        }
+        None
+    }
+
+
     pub(crate) fn scope_descendants(&self, instance_key: Key, scope_eik: Key) -> Vec<Key> {
         let Some(instance) = self.state.instances.get(&instance_key) else {
             return Vec::new();

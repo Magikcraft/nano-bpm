@@ -671,6 +671,46 @@ pub enum ElementKind {
         /// scope begins.
         start_event: ElementId,
     },
+    /// An escalation throw event: an `intermediateThrowEvent` or an `endEvent`
+    /// carrying an `escalationEventDefinition`. On activation (completion) it
+    /// raises the named escalation — walking up the enclosing sub-process /
+    /// call-activity scopes for an [`EscalationBoundaryEvent`](ElementKind::EscalationBoundaryEvent)
+    /// whose `escalation_code` matches (an exact code beats a catch-all) — and
+    /// then always continues: escalation is **non-critical**, so the throw's own
+    /// token routes along its outgoing flow (an `intermediateThrowEvent`) or
+    /// drains (an `endEvent`) whether or not the escalation was caught. A
+    /// non-interrupting catch spawns a parallel token beside the still-running
+    /// activity; an interrupting catch tears the caught activity's scope down.
+    /// An uncaught escalation is simply ignored (no incident), matching Zeebe.
+    EscalationThrowEvent {
+        /// The BPMN escalation code this event raises (resolved from the
+        /// `escalationRef`'s `<escalation … escalationCode="…">`). Empty when the
+        /// referenced escalation declares no code.
+        escalation_code: String,
+    },
+    /// An escalation boundary event attached to an activity (a sub-process or
+    /// call activity). It has no incoming sequence flow; instead it fires when an
+    /// [`EscalationThrowEvent`](ElementKind::EscalationThrowEvent) inside the
+    /// attached activity's scope raises an escalation whose code matches
+    /// `escalation_code` (an empty `escalation_code` is a **catch-all** that
+    /// matches any escalation not claimed by a more specific code at the same
+    /// scope). A non-interrupting boundary (`interrupting == false` — the usual
+    /// escalation idiom) leaves the activity running and spawns a new parallel
+    /// token along its outgoing flow; an interrupting one tears the activity's
+    /// scope down and routes the token along its outgoing flow instead.
+    EscalationBoundaryEvent {
+        /// Id of the activity this boundary event is attached to.
+        attached_to: ElementId,
+        /// The BPMN escalation code this boundary event catches; empty is a
+        /// catch-all.
+        escalation_code: String,
+        /// Whether firing interrupts the activity (`true`) or spawns a parallel
+        /// token and leaves it running (`false`, the escalation default). New
+        /// variant, so a persisted snapshot never lacks it; `serde(default)`
+        /// (`false`) keeps decoding forward-safe regardless.
+        #[cfg_attr(feature = "serde", serde(default))]
+        interrupting: bool,
+    },
     /// A none intermediate throw event. A pure pass-through: on activation it
     /// completes immediately and routes the token along its outgoing flow,
     /// exactly like a gateway with a single unconditional outgoing flow. Used
@@ -915,12 +955,14 @@ impl ElementKind {
             | ElementKind::SignalIntermediateCatchEvent { .. }
             | ElementKind::ConditionalIntermediateCatchEvent { .. }
             | ElementKind::ErrorBoundaryEvent { .. }
+            | ElementKind::EscalationBoundaryEvent { .. }
             | ElementKind::TimerBoundaryEvent { .. }
             | ElementKind::MessageBoundaryEvent { .. }
             | ElementKind::SignalBoundaryEvent { .. }
             | ElementKind::ConditionalBoundaryEvent { .. }
             | ElementKind::CompensationBoundaryEvent { .. }
             | ElementKind::CompensationThrowEvent
+            | ElementKind::EscalationThrowEvent { .. }
             | ElementKind::ExclusiveGateway
             | ElementKind::ParallelGateway
             | ElementKind::InclusiveGateway
@@ -944,6 +986,7 @@ impl ElementKind {
             ElementKind::IntermediateThrowEvent => "INTERMEDIATE_THROW_EVENT",
             ElementKind::LinkIntermediateThrowEvent { .. } => "INTERMEDIATE_THROW_EVENT",
             ElementKind::CompensationThrowEvent => "INTERMEDIATE_THROW_EVENT",
+            ElementKind::EscalationThrowEvent { .. } => "INTERMEDIATE_THROW_EVENT",
             ElementKind::Task => "TASK",
             ElementKind::TimerIntermediateCatchEvent { .. }
             | ElementKind::MessageIntermediateCatchEvent { .. }
@@ -955,6 +998,7 @@ impl ElementKind {
             | ElementKind::MessageBoundaryEvent { .. }
             | ElementKind::SignalBoundaryEvent { .. }
             | ElementKind::ConditionalBoundaryEvent { .. } => "BOUNDARY_EVENT",
+            ElementKind::EscalationBoundaryEvent { .. } => "BOUNDARY_EVENT",
             ElementKind::CompensationBoundaryEvent { .. } => "BOUNDARY_EVENT",
             ElementKind::ServiceTask { .. } => "SERVICE_TASK",
             ElementKind::AgentTask { .. } => "SERVICE_TASK",
@@ -1606,6 +1650,15 @@ fn remap_kind_ids(kind: &ElementKind, pfx: &impl Fn(&str) -> String) -> ElementK
             attached_to: pfx(attached_to),
             handler: pfx(handler),
         },
+        ElementKind::EscalationBoundaryEvent {
+            attached_to,
+            escalation_code,
+            interrupting,
+        } => ElementKind::EscalationBoundaryEvent {
+            attached_to: pfx(attached_to),
+            escalation_code: escalation_code.clone(),
+            interrupting: *interrupting,
+        },
         other => other.clone(),
     }
 }
@@ -2128,6 +2181,62 @@ impl ProcessBuilder {
             ElementKind::ErrorBoundaryEvent {
                 attached_to: attached_to.into(),
                 error_code: error_code.into(),
+            },
+        )
+    }
+
+    /// Adds an escalation throw event (an `intermediateThrowEvent` or `endEvent`
+    /// carrying an `escalationEventDefinition`) that raises `escalation_code`.
+    /// See [`ElementKind::EscalationThrowEvent`].
+    pub fn escalation_throw_event(
+        self,
+        id: impl Into<String>,
+        escalation_code: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::EscalationThrowEvent {
+                escalation_code: escalation_code.into(),
+            },
+        )
+    }
+
+    /// Adds an **interrupting** escalation boundary event attached to
+    /// `attached_to`, catching `escalation_code` (empty is a catch-all). Connect
+    /// its outgoing flow(s) with [`connect`](ProcessBuilder::connect) to route
+    /// the escalation-handling path. See [`ElementKind::EscalationBoundaryEvent`].
+    pub fn escalation_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        escalation_code: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::EscalationBoundaryEvent {
+                attached_to: attached_to.into(),
+                escalation_code: escalation_code.into(),
+                interrupting: true,
+            },
+        )
+    }
+
+    /// Adds a **non-interrupting** escalation boundary event attached to
+    /// `attached_to`, catching `escalation_code` (empty is a catch-all). The
+    /// attached activity keeps running and a parallel token is spawned on each
+    /// catch. See [`ElementKind::EscalationBoundaryEvent`].
+    pub fn non_interrupting_escalation_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        escalation_code: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::EscalationBoundaryEvent {
+                attached_to: attached_to.into(),
+                escalation_code: escalation_code.into(),
+                interrupting: false,
             },
         )
     }

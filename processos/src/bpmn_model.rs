@@ -57,6 +57,8 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
+        ElementKind::EscalationThrowEvent { .. } => "escalationThrowEvent",
+        ElementKind::EscalationBoundaryEvent { .. } => "escalationBoundaryEvent",
         ElementKind::LinkIntermediateThrowEvent { .. } => "linkIntermediateThrowEvent",
         ElementKind::LinkIntermediateCatchEvent { .. } => "linkIntermediateCatchEvent",
         ElementKind::Task => "task",
@@ -82,6 +84,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::SignalBoundaryEvent { attached_to, .. }
         | ElementKind::ConditionalBoundaryEvent { attached_to, .. }
         | ElementKind::CompensationBoundaryEvent { attached_to, .. }
+        | ElementKind::EscalationBoundaryEvent { attached_to, .. }
         | ElementKind::MessageBoundaryEvent { attached_to, .. } => Some(attached_to.as_str()),
         _ => None,
     }
@@ -174,6 +177,18 @@ fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
         }
         ElementKind::SubProcess { start_event } => {
             m.insert("innerStartEvent".into(), json!(start_event));
+        }
+        ElementKind::EscalationThrowEvent { escalation_code } => {
+            m.insert("escalationCode".into(), json!(escalation_code));
+        }
+        ElementKind::EscalationBoundaryEvent {
+            attached_to,
+            escalation_code,
+            interrupting,
+        } => {
+            m.insert("attachedTo".into(), json!(attached_to));
+            m.insert("escalationCode".into(), json!(escalation_code));
+            m.insert("interrupting".into(), json!(interrupting));
         }
         ElementKind::CallActivity {
             called_process_id,
@@ -1932,7 +1947,30 @@ fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
     names
 }
 
-/// Emit an activity's `multiInstanceLoopCharacteristics` block (with its
+/// Collect the `<bpmn:escalation>` declarations a model needs, as a lookup from escalation code
+/// to a synthesized declaration id. Escalations correlate by code only, so one declaration per
+/// code. Empty codes (an unnamed throw or a catch-all boundary) carry no `escalationRef`, so they
+/// need no declaration and are skipped.
+fn collect_escalations(def: &ProcessDefinition) -> BTreeMap<String, String> {
+    let mut codes: BTreeMap<String, String> = BTreeMap::new();
+    for el in def.elements.values() {
+        let code = match &el.kind {
+            ElementKind::EscalationThrowEvent { escalation_code }
+            | ElementKind::EscalationBoundaryEvent {
+                escalation_code, ..
+            } => Some(escalation_code),
+            _ => None,
+        };
+        if let Some(code) = code {
+            if !code.is_empty() {
+                codes
+                    .entry(code.clone())
+                    .or_insert_with(|| format!("Escalation_{}", id_fragment(code)));
+            }
+        }
+    }
+    codes
+}
 /// `zeebe:loopCharacteristics` extension and optional `completionCondition`) as a
 /// child of the activity element. No-op when the element carries no MI. The
 /// output round-trips through the engine parser (`parse_bpmn`).
@@ -2010,6 +2048,7 @@ fn emit_element(
     errors: &BTreeMap<String, String>,
     messages: &HashMap<(String, Option<String>), String>,
     signals: &BTreeMap<String, String>,
+    escalations: &BTreeMap<String, String>,
     children_by_parent: &HashMap<String, Vec<String>>,
     labels: &HashMap<String, String>,
     default_flows: &HashMap<String, String>,
@@ -2292,6 +2331,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                         errors,
                         messages,
                         signals,
+                        escalations,
                         children_by_parent,
                         labels,
                         default_flows,
@@ -2576,6 +2616,53 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             out.push_str("      </bpmn:conditionalEventDefinition>\n");
             out.push_str("    </bpmn:boundaryEvent>\n");
         }
+        ElementKind::EscalationThrowEvent { escalation_code } => {
+            // An escalation throw parsed from an `endEvent` carries no outgoing
+            // sequence flow; one parsed from an `intermediateThrowEvent` does.
+            // Preserve that flavour on round-trip (mirrors the compensation
+            // throw). An empty code emits no `escalationRef` (an unnamed throw).
+            let tag = if el.outgoing.is_empty() {
+                "endEvent"
+            } else {
+                "intermediateThrowEvent"
+            };
+            out.push_str(&format!("    <bpmn:{tag} id=\"{eid}\"{na}>\n"));
+            if escalation_code.is_empty() {
+                out.push_str("      <bpmn:escalationEventDefinition/>\n");
+            } else {
+                let eref = escalations.get(escalation_code).cloned().unwrap_or_default();
+                out.push_str(&format!(
+                    "      <bpmn:escalationEventDefinition escalationRef=\"{}\"/>\n",
+                    xml_escape(&eref)
+                ));
+            }
+            out.push_str(&format!("    </bpmn:{tag}>\n"));
+        }
+        ElementKind::EscalationBoundaryEvent {
+            attached_to,
+            escalation_code,
+            interrupting,
+        } => {
+            let cancel = if *interrupting {
+                ""
+            } else {
+                " cancelActivity=\"false\""
+            };
+            out.push_str(&format!(
+                "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
+                xml_escape(attached_to)
+            ));
+            if escalation_code.is_empty() {
+                out.push_str("      <bpmn:escalationEventDefinition/>\n");
+            } else {
+                let eref = escalations.get(escalation_code).cloned().unwrap_or_default();
+                out.push_str(&format!(
+                    "      <bpmn:escalationEventDefinition escalationRef=\"{}\"/>\n",
+                    xml_escape(&eref)
+                ));
+            }
+            out.push_str("    </bpmn:boundaryEvent>\n");
+        }
         ElementKind::CompensationThrowEvent => {
             // A compensation throw parsed from an `endEvent` carries no outgoing
             // sequence flow; one parsed from an `intermediateThrowEvent` does.
@@ -2625,6 +2712,7 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                         errors,
                         messages,
                         signals,
+                        escalations,
                         children_by_parent,
                         labels,
                         default_flows,
@@ -2866,6 +2954,7 @@ fn serialize_definition(
     let errors = collect_error_ids(def);
     let (messages, msg_lookup) = collect_messages(def);
     let signals = collect_signals(def);
+    let escalations = collect_escalations(def);
 
     // Resolve a human label for every element: an operator-set name wins, else a readable label
     // derived from the id (so an authored node like `FraudScreen` shows as "Fraud Screen").
@@ -2945,6 +3034,13 @@ fn serialize_definition(
             xml_escape(name)
         ));
     }
+    for (code, eid) in &escalations {
+        out.push_str(&format!(
+            "  <bpmn:escalation id=\"{}\" escalationCode=\"{}\"/>\n",
+            xml_escape(eid),
+            xml_escape(code)
+        ));
+    }
     out.push_str(&format!(
         "  <bpmn:process id=\"{}\" isExecutable=\"true\">\n",
         xml_escape(&def.id)
@@ -2992,6 +3088,7 @@ fn serialize_definition(
             &errors,
             &msg_lookup,
             &signals,
+            &escalations,
             &children_by_parent,
             &labels,
             &default_flows,
@@ -5273,6 +5370,53 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         assert!(
             xml.contains("signalEventDefinition"),
             "emits signalRef defs"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_escalation_events() {
+        // An escalation throw inside a sub-process and both an interrupting and a
+        // non-interrupting escalation boundary must round-trip: the serializer
+        // synthesizes the <bpmn:escalation> declaration + escalationRef, and the
+        // re-parse reproduces the exact structure.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Esc")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw", "OVERLOAD")
+            .contained_in("Throw", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .escalation_boundary_event("Bnd", "Sub", "OVERLOAD")
+            .non_interrupting_escalation_boundary_event("Watch", "Sub", "")
+            .service_task("Handle", "handle")
+            .end_event("Done")
+            .end_event("Handled")
+            .end_event("Watched")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw")
+            .connect("Throw", "SubEnd")
+            .connect("Sub", "Done")
+            .connect("Bnd", "Handle")
+            .connect("Handle", "Handled")
+            .connect("Watch", "Watched")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<bpmn:escalation "),
+            "emits an escalation declaration"
+        );
+        assert!(
+            xml.contains("escalationEventDefinition"),
+            "emits escalationRef defs"
+        );
+        assert!(
+            xml.contains("cancelActivity=\"false\""),
+            "emits the non-interrupting boundary"
         );
         let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
         assert_same_structure(&def, &reparsed[0]);

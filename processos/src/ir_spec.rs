@@ -357,6 +357,43 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
         }],
     },
     KindSpec {
+        keyword: "escalationThrowEvent",
+        doc: "Escalation throw (intermediate throw or end event). Raises `escalationCode` \
+              up the enclosing scopes; non-critical, so the token always continues / drains \
+              (an uncaught escalation is ignored).",
+        attrs: &[AttrSpec {
+            key: "escalationCode",
+            required: false,
+            ty: AttrType::Str,
+            doc: "The BPMN escalation code raised (empty raises an unnamed escalation).",
+        }],
+    },
+    KindSpec {
+        keyword: "escalationBoundaryEvent",
+        doc: "Escalation boundary on an activity. Catches an escalation raised inside it \
+              (exact `escalationCode`, or empty for catch-all); interrupting or non-interrupting.",
+        attrs: &[
+            AttrSpec {
+                key: "attachedTo",
+                required: true,
+                ty: AttrType::Id,
+                doc: "Id of the activity this boundary is attached to.",
+            },
+            AttrSpec {
+                key: "escalationCode",
+                required: false,
+                ty: AttrType::Str,
+                doc: "The BPMN escalation code caught (empty is a catch-all).",
+            },
+            AttrSpec {
+                key: "interrupting",
+                required: true,
+                ty: AttrType::Bool,
+                doc: "`true` cancels the activity on fire; `false` spawns a parallel token.",
+            },
+        ],
+    },
+    KindSpec {
         keyword: "intermediateThrowEvent",
         doc: "None intermediate throw. Pure pass-through.",
         attrs: &[],
@@ -895,6 +932,8 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         TimerStartEvent { .. } => "timerStartEvent",
         SubProcess { .. } => "subProcess",
         IntermediateThrowEvent => "intermediateThrowEvent",
+        EscalationThrowEvent { .. } => "escalationThrowEvent",
+        EscalationBoundaryEvent { .. } => "escalationBoundaryEvent",
         LinkIntermediateThrowEvent { .. } => "linkIntermediateThrowEvent",
         LinkIntermediateCatchEvent { .. } => "linkIntermediateCatchEvent",
         Task => "task",
@@ -1014,6 +1053,20 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
         (
             "intermediateThrowEvent",
             ElementKind::IntermediateThrowEvent,
+        ),
+        (
+            "escalationThrowEvent",
+            ElementKind::EscalationThrowEvent {
+                escalation_code: "OVERLOAD".into(),
+            },
+        ),
+        (
+            "escalationBoundaryEvent",
+            ElementKind::EscalationBoundaryEvent {
+                attached_to: "sub_1".into(),
+                escalation_code: "OVERLOAD".into(),
+                interrupting: true,
+            },
         ),
         (
             "linkIntermediateThrowEvent",

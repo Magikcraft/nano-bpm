@@ -407,6 +407,8 @@ fn callactivity_variant_witness_is_exhaustive() {
             TimerStartEvent { .. } => "timerStartEvent",
             SubProcess { .. } => "subProcess",
             IntermediateThrowEvent => "intermediateThrowEvent",
+            EscalationThrowEvent { .. } => "escalationThrowEvent",
+            EscalationBoundaryEvent { .. } => "escalationBoundaryEvent",
             LinkIntermediateThrowEvent { .. } => "linkIntermediateThrowEvent",
             LinkIntermediateCatchEvent { .. } => "linkIntermediateCatchEvent",
             Task => "task",

@@ -162,6 +162,8 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
+        ElementKind::EscalationThrowEvent { .. } => "escalationThrowEvent",
+        ElementKind::EscalationBoundaryEvent { .. } => "escalationBoundaryEvent",
         ElementKind::LinkIntermediateThrowEvent { .. } => "linkIntermediateThrowEvent",
         ElementKind::LinkIntermediateCatchEvent { .. } => "linkIntermediateCatchEvent",
         ElementKind::Task => "task",
@@ -356,6 +358,22 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         } => {
             attrs.push(format!("attachedTo {attached_to}"));
             attrs.push(format!("handler {handler}"));
+        }
+        ElementKind::EscalationThrowEvent { escalation_code } => {
+            if !escalation_code.is_empty() {
+                attrs.push(format!("escalationCode {}", quote(escalation_code)));
+            }
+        }
+        ElementKind::EscalationBoundaryEvent {
+            attached_to,
+            escalation_code,
+            interrupting,
+        } => {
+            attrs.push(format!("attachedTo {attached_to}"));
+            if !escalation_code.is_empty() {
+                attrs.push(format!("escalationCode {}", quote(escalation_code)));
+            }
+            attrs.push(format!("interrupting {interrupting}"));
         }
     }
 }
@@ -1258,6 +1276,14 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
             handler: attrs.require("handler", id)?,
         },
         "compensationThrowEvent" => ElementKind::CompensationThrowEvent,
+        "escalationThrowEvent" => ElementKind::EscalationThrowEvent {
+            escalation_code: attrs.take("escalationCode").unwrap_or_default(),
+        },
+        "escalationBoundaryEvent" => ElementKind::EscalationBoundaryEvent {
+            attached_to: attrs.require("attachedTo", id)?,
+            escalation_code: attrs.take("escalationCode").unwrap_or_default(),
+            interrupting: attrs.bool_or("interrupting", true)?,
+        },
         other => return Err(format!("unknown element kind '{other}'")),
     };
     Ok(kind)
@@ -1272,6 +1298,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::MessageBoundaryEvent { attached_to, .. }
         | ElementKind::SignalBoundaryEvent { attached_to, .. }
         | ElementKind::ConditionalBoundaryEvent { attached_to, .. }
+        | ElementKind::EscalationBoundaryEvent { attached_to, .. }
         | ElementKind::CompensationBoundaryEvent { attached_to, .. } => Some(attached_to),
         ElementKind::StartEvent
         | ElementKind::EndEvent
@@ -1289,6 +1316,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::TimerStartEvent { .. }
         | ElementKind::SubProcess { .. }
         | ElementKind::IntermediateThrowEvent
+        | ElementKind::EscalationThrowEvent { .. }
         | ElementKind::CompensationThrowEvent
         | ElementKind::Task
         | ElementKind::ScriptTask { .. }
