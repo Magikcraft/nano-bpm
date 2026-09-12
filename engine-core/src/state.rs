@@ -767,7 +767,9 @@ pub enum IoMappingRedrive {
     /// mappings against the seeded child scope — the double-eval PR #1171 fixed on
     /// the clean path by threading `precomputed_output` through
     /// `continue_adhoc_inner_flow`. Additive brand-new variant.
-    AdHocToolOutputCollection { precomputed_output: HashMap<String, Value> },
+    AdHocToolOutputCollection {
+        precomputed_output: HashMap<String, Value>,
+    },
     /// A call-activity **output**-mapping failure: re-project the captured child
     /// result through the call activity's output mappings and complete it. The
     /// child variables are captured here because the completed child instance

@@ -25802,7 +25802,11 @@ fn chained_output_container_projection(
     if overwrite_collection {
         // The tool's completion parked the output-collection type incident.
         let active = engine.active_incidents();
-        assert_eq!(active.len(), 1, "the scalar outputCollection parks one incident");
+        assert_eq!(
+            active.len(),
+            1,
+            "the scalar outputCollection parks one incident"
+        );
         assert_eq!(active[0].kind, state::IncidentKind::ExpressionEvaluation);
         assert_eq!(active[0].element_id, "CallChain");
         // Fix the outputCollection back to a list and resolve.

@@ -2987,11 +2987,9 @@ impl Engine {
                                 element_id,
                                 preserved_seed,
                             });
-                        } else if let Some(
-                            state::IoMappingRedrive::AdHocToolOutputCollection {
-                                precomputed_output,
-                            },
-                        ) = &redrive
+                        } else if let Some(state::IoMappingRedrive::AdHocToolOutputCollection {
+                            precomputed_output,
+                        }) = &redrive
                         {
                             // An ad-hoc call-activity tool whose completion parked
                             // the output-collection *type* incident (#1176). Re-drive
@@ -3003,9 +3001,7 @@ impl Engine {
                             // instances the leaf needs (the incident sits on the tool
                             // child); fall back to `Step::Complete` if the tool is no
                             // longer a live ad-hoc tool child.
-                            match self
-                                .adhoc_tool_container_of(instance_key, element_instance_key)
-                            {
+                            match self.adhoc_tool_container_of(instance_key, element_instance_key) {
                                 Some((container_key, inner_key)) => {
                                     queue.push_back(Step::CompleteAdHocCallActivityTool {
                                         instance_key,
