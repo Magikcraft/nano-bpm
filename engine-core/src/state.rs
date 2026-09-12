@@ -697,8 +697,11 @@ pub enum IncidentKind {
     IoMapping,
 }
 
-/// The lifecycle re-drive an [`IncidentKind::IoMapping`] incident replays when it
-/// is resolved. Recovery is **phase-driven** — the re-drive is chosen from the
+/// The lifecycle re-drive an incident replays when it is resolved. Carried by
+/// every [`IncidentKind::IoMapping`] incident, and also by the ad-hoc
+/// call-activity tool recovery paths (#1176) that park on an
+/// [`IncidentKind::ExpressionEvaluation`] or [`IncidentKind::CalledElementError`]
+/// incident. Recovery is **phase-driven** — the re-drive is chosen from the
 /// element's lifecycle phase (activation vs completion) recorded here, not from
 /// the incident *kind* — so a single `IoMapping` taxonomy can cover every
 /// ioMapping failure (uniform `IO_MAPPING_ERROR`) while each specialized path
@@ -799,9 +802,14 @@ pub struct Incident {
     pub element_id: ElementId,
     /// What went wrong.
     pub kind: IncidentKind,
-    /// For an [`IncidentKind::IoMapping`] incident, the lifecycle phase to replay
-    /// on resolution (phase-driven recovery — see [`IoMappingRedrive`]). `None`
-    /// for every other incident kind (whose recovery is derived from the kind).
+    /// The lifecycle phase / projection to replay on resolution (phase-driven
+    /// recovery — see [`IoMappingRedrive`]). Present for every
+    /// [`IncidentKind::IoMapping`] incident, and also for the ad-hoc
+    /// call-activity tool recovery paths (#1176) that park on an
+    /// [`IncidentKind::ExpressionEvaluation`] (output-collection type) or
+    /// [`IncidentKind::CalledElementError`] (child-spawn) incident while carrying
+    /// a preserved single-pass projection to reuse verbatim on redrive. `None`
+    /// for every other incident (whose recovery is derived from the kind).
     #[cfg_attr(feature = "serde", serde(default))]
     pub redrive: Option<IoMappingRedrive>,
     /// Human-readable explanation of why the incident was raised.
