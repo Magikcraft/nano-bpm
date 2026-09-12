@@ -66,6 +66,10 @@ export const AUTO_SUBSCRIBE_OPT_OUT_VALUE = "false";
 export const ZEEBE_PROPERTIES_TYPE = "zeebe:Properties";
 /** The moddle `$type` of a single `zeebe:property`. */
 export const ZEEBE_PROPERTY_TYPE = "zeebe:Property";
+/** The moddle `$type` of the `zeebe:linkedResources` container. */
+export const LINKED_RESOURCES_TYPE = "zeebe:LinkedResources";
+/** The moddle `$type` of the `zeebe:ioMapping` container. */
+export const IO_MAPPING_TYPE = "zeebe:IoMapping";
 
 // The Camunda binding types the modeler offers for the prompt resource — how the
 // engine resolves the resource version at deploy time. `bindingType` is a free
@@ -145,7 +149,7 @@ function findExt(
 export function promptLinkedResource(
   bo: AgentModdleElement | undefined,
 ): AgentModdleElement | undefined {
-  const container = findExt(bo, "zeebe:LinkedResources");
+  const container = findExt(bo, LINKED_RESOURCES_TYPE);
   return (container?.values ?? []).find((v) => v.linkName === PROMPT_LINK_NAME);
 }
 
@@ -153,7 +157,7 @@ export function promptLinkedResource(
 function appendPromptInput(
   bo: AgentModdleElement | undefined,
 ): AgentModdleElement | undefined {
-  const io = findExt(bo, "zeebe:IoMapping");
+  const io = findExt(bo, IO_MAPPING_TYPE);
   return (io?.inputParameters ?? []).find(
     (p) => p.target === APPEND_PROMPT_TARGET,
   );
@@ -251,10 +255,10 @@ export function isAgentTask(
 // external-agent marker leads (a bare marker), and the zeebe:Properties container
 // (the `--auto` opt-out lives here) trails.
 const EXT_CHILD_ORDER = [
-  "zeebe:AgentDefinition",
-  "zeebe:LinkedResources",
-  "zeebe:IoMapping",
-  "zeebe:Properties",
+  AGENT_DEFINITION_TYPE,
+  LINKED_RESOURCES_TYPE,
+  IO_MAPPING_TYPE,
+  ZEEBE_PROPERTIES_TYPE,
 ];
 
 function extRank(type: string | undefined): number {
@@ -337,7 +341,7 @@ export function writePromptLink(
   resourceId: string,
   bindingType: string,
 ): void {
-  const container = findExt(bo, "zeebe:LinkedResources");
+  const container = findExt(bo, LINKED_RESOURCES_TYPE);
   const kept = (container?.values ?? []).filter(
     (v) => v.linkName !== PROMPT_LINK_NAME,
   );
@@ -363,7 +367,7 @@ export function writePromptLink(
     modeling.updateModdleProperties(element, container, { values });
     return;
   }
-  const newContainer = moddle.create("zeebe:LinkedResources", { values });
+  const newContainer = moddle.create(LINKED_RESOURCES_TYPE, { values });
   for (const v of values) v.$parent = newContainer;
   attachExtChild(moddle, modeling, element, bo, newContainer);
 }
@@ -375,7 +379,7 @@ export function removePromptLink(
   element: unknown,
   bo: AgentModdleElement,
 ): void {
-  const container = findExt(bo, "zeebe:LinkedResources");
+  const container = findExt(bo, LINKED_RESOURCES_TYPE);
   if (!container) return;
   const kept = (container.values ?? []).filter(
     (v) => v.linkName !== PROMPT_LINK_NAME,
@@ -399,7 +403,7 @@ export function writeAppendPrompt(
   bo: AgentModdleElement,
   value: string,
 ): void {
-  const io = findExt(bo, "zeebe:IoMapping");
+  const io = findExt(bo, IO_MAPPING_TYPE);
   const keptInputs = (io?.inputParameters ?? []).filter(
     (p) => p.target !== APPEND_PROMPT_TARGET,
   );
@@ -424,7 +428,7 @@ export function writeAppendPrompt(
   }
   // No ioMapping yet: clearing is a no-op; setting creates the container.
   if (!value) return;
-  const newIo = moddle.create("zeebe:IoMapping", { inputParameters: inputs });
+  const newIo = moddle.create(IO_MAPPING_TYPE, { inputParameters: inputs });
   for (const p of inputs) p.$parent = newIo;
   attachExtChild(moddle, modeling, element, bo, newIo);
 }
