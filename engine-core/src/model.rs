@@ -699,11 +699,12 @@ pub enum ElementKind {
     /// token along its outgoing flow; an interrupting one tears the activity's
     /// scope down and routes the token along its outgoing flow instead.
     ///
-    /// Only embedded sub-processes are supported: catching resolves by walking
-    /// the scope tree of the *current* process instance (see
-    /// `find_catching_escalation_boundary`), so a boundary on a **call activity**
-    /// can never catch a throw raised in the called (separate) instance.
-    /// Cross-instance escalation propagation is out of scope for #1173.
+    /// Only container activities that open an inner token scope are supported:
+    /// an **embedded sub-process** or an **ad-hoc sub-process** container.
+    /// Catching resolves by walking the scope tree of the *current* process
+    /// instance (see `find_catching_escalation_boundary`), so a boundary on a
+    /// **call activity** can never catch a throw raised in the called (separate)
+    /// instance. Cross-instance escalation propagation is out of scope for #1173.
     EscalationBoundaryEvent {
         /// Id of the activity this boundary event is attached to.
         attached_to: ElementId,

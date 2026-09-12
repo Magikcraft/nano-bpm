@@ -42,8 +42,10 @@
 //! * Telemetry-source overrides for time / variance defaults (slice 2 in
 //!   ADR 0002 mentions this, but the [`SemanticAnnotations`] schema doesn't
 //!   yet carry cost / time — that's slice 4's `nano:*` extension work).
-//! * Escalation and compensation flow classes — Nano's engine surface
-//!   doesn't yet model dedicated escalation / compensation boundary events.
+//! * Compensation flow classes — Nano's engine surface doesn't yet model
+//!   dedicated compensation boundary events as a distinct flow class.
+//!   (Escalation boundaries (#1173) *are* now classified — see
+//!   [`escalation_flows`], which emits [`FlowKind::Escalation`].)
 //! * Provenance / confidence per annotation — slice 5/6 workbench feature.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};

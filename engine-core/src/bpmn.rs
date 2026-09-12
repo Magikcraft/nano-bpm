@@ -923,8 +923,7 @@ fn parse_with_captures(
                                     // event, built in `build` from the resolved
                                     // escalation code.
                                     boundary.escalation = true;
-                                    boundary.escalation_ref =
-                                        escalation_ref.map(str::to_string);
+                                    boundary.escalation_ref = escalation_ref.map(str::to_string);
                                     if let Some(escalation_ref) = escalation_ref {
                                         acc.escalation_refs.push((
                                             boundary.id.clone(),
@@ -3027,11 +3026,8 @@ impl ProcessAcc {
         // outgoing flow), so a malformed `<endEvent>…<escalationEventDefinition/>`
         // with an outgoing flow would otherwise silently deploy as a routing
         // intermediate throw (#1173).
-        let flow_source_ids: std::collections::HashSet<String> = self
-            .flows
-            .iter()
-            .filter_map(|f| f.source.clone())
-            .collect();
+        let flow_source_ids: std::collections::HashSet<String> =
+            self.flows.iter().filter_map(|f| f.source.clone()).collect();
         // Ids of every node an escalation boundary event may legally attach to.
         // An escalation propagates *out* of the inner token scope it is raised
         // in, so only a container that opens such a scope — an embedded
@@ -3044,6 +3040,26 @@ impl ProcessAcc {
             .iter()
             .filter(|n| matches!(n.kind, NodeKind::SubProcess) || n.is_adhoc)
             .map(|n| n.id.clone())
+            .collect();
+        // Ids of ad-hoc sub-process containers, and the parent of every node.
+        // Used to reject an escalation boundary attached to an activity that is
+        // itself a *tool* of an ad-hoc sub-process (its parent is an ad-hoc
+        // container). The runtime arms boundary events on an embedded-subProcess
+        // ad-hoc tool, but an interrupting boundary firing on such a tool cannot
+        // release it back to its parent container's active set (the tool →
+        // agent-re-drive completion path is not wired for boundary interruption),
+        // so the container would hang `Active` forever. Refuse the model at deploy
+        // rather than mis-execute it (#1173); full runtime support is a follow-up.
+        let adhoc_container_ids: std::collections::HashSet<String> = self
+            .nodes
+            .iter()
+            .filter(|n| n.is_adhoc)
+            .map(|n| n.id.clone())
+            .collect();
+        let node_parent: HashMap<String, String> = self
+            .nodes
+            .iter()
+            .filter_map(|n| n.parent.clone().map(|p| (n.id.clone(), p)))
             .collect();
         for node in self.nodes {
             let node_id = node.id.clone();
@@ -3325,6 +3341,23 @@ impl ProcessAcc {
             .filter(|b| b.compensation)
             .map(|b| b.id.clone())
             .collect();
+        // Ids of every REACTIVE boundary event (error/timer/message/signal/
+        // conditional/escalation — i.e. every boundary except the compensation
+        // marker handled separately above). A reactive boundary is armed by its
+        // own trigger and reached ONLY when that trigger fires; it legitimately
+        // has an OUTGOING flow to its handler but must NEVER be the TARGET of a
+        // sequenceFlow. If a model wires a token into one, `run_activation_body`
+        // would treat it as an ordinary pass-through and complete it (routing its
+        // handler) without any event ever being raised or matched — most acutely
+        // the new escalation boundary (#1173), whose handler would fire with no
+        // escalation. Reject such models at deploy (see the flow validation below)
+        // rather than mis-executing them.
+        let reactive_boundary_ids: std::collections::HashSet<String> = self
+            .boundaries
+            .iter()
+            .filter(|b| !b.compensation)
+            .map(|b| b.id.clone())
+            .collect();
         for boundary in self.boundaries {
             let attached_to =
                 boundary
@@ -3338,6 +3371,33 @@ impl ProcessAcc {
             // interrupting per `cancelActivity`. Built before the flavour cascade
             // below since it carries no error/timer/message/signal ref.
             if boundary.escalation {
+                // Reject an AMBIGUOUS multi-definition boundary (#1173): a
+                // `boundaryEvent` carrying an `escalationEventDefinition` *plus*
+                // another trigger (error/timer/message/signal/conditional/
+                // compensation) would be silently modelled as escalation here (the
+                // escalation branch wins and `continue`s), discarding the declared
+                // second trigger and changing the model's behaviour. There is no
+                // OR-trigger boundary in the supported subset, so refuse the model
+                // at deploy rather than drop a declared event.
+                let other_trigger = boundary.error_ref.is_some()
+                    || boundary.timer_duration_millis.is_some()
+                    || boundary.timer_expr.is_some()
+                    || boundary.message_ref.is_some()
+                    || boundary.signal_ref.is_some()
+                    || boundary.condition.is_some()
+                    || boundary.compensation;
+                if other_trigger {
+                    return Err(ParseError::InvalidBoundaryEvent {
+                        process_id: self.id.clone(),
+                        reason: format!(
+                            "escalation boundary event {} declares more than one event \
+                             definition; a multi-trigger boundary is not supported (declare \
+                             exactly one of escalation/error/timer/message/signal/conditional/\
+                             compensation)",
+                            boundary.id
+                        ),
+                    });
+                }
                 // An escalation boundary can only catch an escalation raised in
                 // the inner scope of the container it is attached to. Reject an
                 // attachment to anything that opens no such scope (plain task,
@@ -3349,6 +3409,28 @@ impl ProcessAcc {
                             "escalation boundary event {} must be attached to an embedded \
                              sub-process or ad-hoc sub-process (attachedToRef '{attached_to}' \
                              is not a container that can raise an escalation)",
+                            boundary.id
+                        ),
+                    });
+                }
+                // Reject an escalation boundary attached to a *tool* of an ad-hoc
+                // sub-process (its parent is an ad-hoc container). The runtime arms
+                // boundary events on an embedded-subProcess ad-hoc tool, but an
+                // interrupting boundary firing on such a tool has no wired path to
+                // release the tool back to its parent container's active set, so
+                // the container would remain `Active` forever after the handler
+                // completes. Refuse it at deploy rather than mis-execute (#1173).
+                if node_parent
+                    .get(&attached_to)
+                    .is_some_and(|p| adhoc_container_ids.contains(p))
+                {
+                    return Err(ParseError::InvalidBoundaryEvent {
+                        process_id: self.id.clone(),
+                        reason: format!(
+                            "escalation boundary event {} is attached to '{attached_to}', a tool \
+                             of an ad-hoc sub-process; an escalation boundary on an ad-hoc tool \
+                             is not supported (attach it to a top-level embedded or ad-hoc \
+                             sub-process instead)",
                             boundary.id
                         ),
                     });
@@ -3552,6 +3634,20 @@ impl ProcessAcc {
                         process_id: self.id.clone(),
                         reason: format!(
                             "compensation handler activity {endpoint} (isForCompensation) must not be the source or target of a sequenceFlow"
+                        ),
+                    });
+                }
+            }
+            // A reactive boundary event has an outgoing flow to its handler but is
+            // itself only reached when its trigger fires — so it may be a flow
+            // SOURCE but never a flow TARGET. Reject an incoming sequenceFlow so a
+            // token can never drive the handler without the event being raised.
+            if let Some(target) = flow.target.as_deref() {
+                if reactive_boundary_ids.contains(target) {
+                    return Err(ParseError::InvalidProcess {
+                        process_id: self.id.clone(),
+                        reason: format!(
+                            "boundary event {target} must not be the target of a sequenceFlow (a boundary event is reached only when its trigger fires)"
                         ),
                     });
                 }
@@ -4707,8 +4803,7 @@ mod tests {
   </bpmn:process>
 </bpmn:definitions>"#;
 
-        let err =
-            parse_bpmn(xml).expect_err("escalation boundary on a service task is rejected");
+        let err = parse_bpmn(xml).expect_err("escalation boundary on a service task is rejected");
         assert!(
             matches!(&err, ParseError::InvalidBoundaryEvent { reason, .. } if reason.contains("Bnd")),
             "expected InvalidBoundaryEvent for Bnd, got {err:?}"
@@ -4748,7 +4843,8 @@ mod tests {
   </bpmn:process>
 </bpmn:definitions>"#;
 
-        let def = &parse_bpmn(xml).expect("escalation boundary on an ad-hoc sub-process is valid")[0];
+        let def =
+            &parse_bpmn(xml).expect("escalation boundary on an ad-hoc sub-process is valid")[0];
         assert_eq!(
             def.element("Bnd").unwrap().kind,
             ElementKind::EscalationBoundaryEvent {
@@ -4756,6 +4852,128 @@ mod tests {
                 escalation_code: "OVERLOAD".to_string(),
                 interrupting: true,
             }
+        );
+    }
+
+    #[test]
+    fn should_reject_a_sequence_flow_targeting_an_escalation_boundary() {
+        // Regression (#1173): a reactive boundary event has an outgoing flow to
+        // its handler but is itself reached ONLY when its trigger fires — it must
+        // never be the TARGET of a sequenceFlow. Otherwise the generic
+        // pass-through would complete the boundary and route its handler with no
+        // escalation ever raised or matched. Reject an incoming flow at deploy.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="ss" />
+      <bpmn:endEvent id="se" />
+      <bpmn:sequenceFlow id="if" sourceRef="ss" targetRef="se" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="Sub">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Handler" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Sub" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="Bnd" targetRef="Handler" />
+    <bpmn:sequenceFlow id="f4" sourceRef="s" targetRef="Bnd" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml)
+            .expect_err("a sequenceFlow targeting an escalation boundary is rejected");
+        assert!(
+            matches!(&err, ParseError::InvalidProcess { reason, .. }
+                if reason.contains("Bnd") && reason.contains("must not be the target")),
+            "expected InvalidProcess for the incoming flow to Bnd, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_a_multi_definition_escalation_boundary() {
+        // Regression (#1173): a `boundaryEvent` carrying an
+        // `escalationEventDefinition` PLUS another trigger (here a timer) would be
+        // silently modelled as escalation, discarding the declared timer. There is
+        // no OR-trigger boundary in the supported subset, so reject the ambiguous
+        // multi-definition boundary at deploy rather than drop a declared event.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:subProcess id="Sub">
+      <bpmn:startEvent id="ss" />
+      <bpmn:endEvent id="se" />
+      <bpmn:sequenceFlow id="if" sourceRef="ss" targetRef="se" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="Sub">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>PT5M</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Handler" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Sub" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="Bnd" targetRef="Handler" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml).expect_err("a multi-definition escalation boundary is rejected");
+        assert!(
+            matches!(&err, ParseError::InvalidBoundaryEvent { reason, .. }
+                if reason.contains("Bnd") && reason.contains("more than one event")),
+            "expected InvalidBoundaryEvent for the multi-definition Bnd, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_an_escalation_boundary_on_an_adhoc_tool() {
+        // Regression (#1173): an embedded-subProcess ad-hoc TOOL opens an inner
+        // scope (so the container check passes), and the runtime arms boundary
+        // events on it — but an interrupting boundary firing on such a tool cannot
+        // release it back to its parent container's active set, hanging the
+        // instance. Reject the attachment at deploy rather than mis-execute.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:adHocSubProcess id="Agent">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="agent" />
+      </bpmn:extensionElements>
+      <bpmn:subProcess id="tool">
+        <bpmn:startEvent id="ts" />
+        <bpmn:endEvent id="te" />
+        <bpmn:sequenceFlow id="tf" sourceRef="ts" targetRef="te" />
+      </bpmn:subProcess>
+    </bpmn:adHocSubProcess>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="tool">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Handler" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Agent" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Agent" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="Bnd" targetRef="Handler" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err =
+            parse_bpmn(xml).expect_err("an escalation boundary on an ad-hoc tool is rejected");
+        assert!(
+            matches!(&err, ParseError::InvalidBoundaryEvent { reason, .. }
+                if reason.contains("Bnd") && reason.contains("ad-hoc tool")),
+            "expected InvalidBoundaryEvent for the ad-hoc-tool Bnd, got {err:?}"
         );
     }
 

@@ -8008,10 +8008,7 @@ fn should_raise_an_incident_when_a_subprocess_error_is_unhandled() {
 /// start -> sub[ sub_start -> throw(esc CODE) -> work(work) -> sub_end ] -> done
 ///          sub --(escalation boundary CODE, interrupting?)--> handler(handle)
 ///                                                              -> handler_end
-fn process_with_escalation_boundary(
-    interrupting: bool,
-    boundary_code: &str,
-) -> ProcessDefinition {
+fn process_with_escalation_boundary(interrupting: bool, boundary_code: &str) -> ProcessDefinition {
     let builder = ProcessBuilder::new("esc-sub")
         .start_event("start")
         .sub_process("sub", "sub_start")
@@ -8067,10 +8064,9 @@ fn should_spawn_a_parallel_token_via_a_non_interrupting_escalation_boundary() {
         e,
         Event::SequenceFlowTaken { from, to, .. } if from == "boundary" && to == "handler"
     )));
-    assert!(created.iter().all(|e| !matches!(
-        e,
-        Event::IncidentRaised { .. }
-    )));
+    assert!(created
+        .iter()
+        .all(|e| !matches!(e, Event::IncidentRaised { .. })));
 
     // Both tokens are live: the inner "work" job and the boundary "handle" job.
     let mut job_types: Vec<_> = engine
@@ -8256,10 +8252,9 @@ fn should_ignore_an_uncaught_escalation() {
         e,
         Event::SequenceFlowTaken { from, to, .. } if from == "throw" && to == "after"
     )));
-    assert!(created.iter().all(|e| !matches!(
-        e,
-        Event::IncidentRaised { .. }
-    )));
+    assert!(created
+        .iter()
+        .all(|e| !matches!(e, Event::IncidentRaised { .. })));
     assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
     assert_eq!(engine.pending_jobs()[0].job_type, "after");
 
@@ -8369,7 +8364,10 @@ fn should_raise_an_escalation_only_after_a_throws_end_listener_drains() {
         "escalation must not be raised until the throw's end listener drains"
     );
     assert!(
-        engine.pending_jobs().iter().any(|j| j.job_type == "esc-audit"),
+        engine
+            .pending_jobs()
+            .iter()
+            .any(|j| j.job_type == "esc-audit"),
         "the throw's end execution listener job is pending"
     );
 
@@ -8436,7 +8434,10 @@ fn should_raise_an_escalation_end_event_only_after_its_end_listener_drains() {
         "escalation must not be raised until the end event's listener drains"
     );
     assert!(
-        engine.pending_jobs().iter().any(|j| j.job_type == "esc-audit"),
+        engine
+            .pending_jobs()
+            .iter()
+            .any(|j| j.job_type == "esc-audit"),
         "the escalation end event's end listener job is pending"
     );
 

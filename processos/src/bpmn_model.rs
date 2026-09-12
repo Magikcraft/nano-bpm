@@ -1960,7 +1960,10 @@ fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
 /// assigned in sorted order (deterministic regardless of the element map's iteration order), each
 /// getting the base id or the first free `…_2`, `…_3`, … suffix not already taken by a reserved id
 /// or an earlier escalation id.
-fn collect_escalations(def: &ProcessDefinition, reserved: &HashSet<String>) -> BTreeMap<String, String> {
+fn collect_escalations(
+    def: &ProcessDefinition,
+    reserved: &HashSet<String>,
+) -> BTreeMap<String, String> {
     let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for el in def.elements.values() {
         match &el.kind {
@@ -2663,7 +2666,10 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             if escalation_code.is_empty() {
                 out.push_str("      <bpmn:escalationEventDefinition/>\n");
             } else {
-                let eref = escalations.get(escalation_code).cloned().unwrap_or_default();
+                let eref = escalations
+                    .get(escalation_code)
+                    .cloned()
+                    .unwrap_or_default();
                 out.push_str(&format!(
                     "      <bpmn:escalationEventDefinition escalationRef=\"{}\"/>\n",
                     xml_escape(&eref)
@@ -2688,7 +2694,10 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
             if escalation_code.is_empty() {
                 out.push_str("      <bpmn:escalationEventDefinition/>\n");
             } else {
-                let eref = escalations.get(escalation_code).cloned().unwrap_or_default();
+                let eref = escalations
+                    .get(escalation_code)
+                    .cloned()
+                    .unwrap_or_default();
                 out.push_str(&format!(
                     "      <bpmn:escalationEventDefinition escalationRef=\"{}\"/>\n",
                     xml_escape(&eref)
@@ -3907,16 +3916,14 @@ fn apply_edit_op(
                 el.outgoing = rewired;
             }
             // Drop any boundary events that were attached to the removed node (they would dangle).
+            // Derived from the shared `attached_to` helper so every boundary kind
+            // (error/timer/message/signal/conditional/compensation/escalation) is
+            // covered — enumerating a subset here silently leaks an orphan boundary
+            // of any omitted kind, emitting an invalid `attachedToRef` on the next serialize.
             let orphaned: Vec<String> = def
                 .elements
                 .iter()
-                .filter(|(_, e)| {
-                    matches!(&e.kind,
-                    ElementKind::ErrorBoundaryEvent { attached_to, .. }
-                    | ElementKind::TimerBoundaryEvent { attached_to, .. }
-                    | ElementKind::MessageBoundaryEvent { attached_to, .. }
-                    if attached_to == id)
-                })
+                .filter(|(_, e)| attached_to(&e.kind) == Some(id))
                 .map(|(bid, _)| bid.clone())
                 .collect();
             for bid in &orphaned {
@@ -5541,7 +5548,8 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             .connect("Sub", "Done")
             .build()
             .unwrap();
-        let mut reserved: std::collections::HashSet<String> = def.elements.keys().cloned().collect();
+        let mut reserved: std::collections::HashSet<String> =
+            def.elements.keys().cloned().collect();
         // A preserved sequence-flow id (or the process id) that happens to equal
         // the escalation base id.
         reserved.insert("Escalation_OVERLOAD".to_string());
@@ -5823,6 +5831,51 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         let cc = &def.elements["CreditCheck"];
         assert!(cc.outgoing.iter().any(|f| f.to == "Approve"));
         assert!(cc.outgoing.iter().any(|f| f.to == "Reject"));
+    }
+
+    #[test]
+    fn edit_model_removes_a_boundary_orphan_beyond_the_error_timer_message_trio() {
+        // Regression (#1173): removing an activity must drop EVERY boundary event
+        // attached to it, not just the error/timer/message trio the orphan filter
+        // used to enumerate. Signal/conditional/compensation/escalation boundaries
+        // were silently leaked, emitting an invalid `attachedToRef` on the next
+        // serialize. The filter now derives from the shared `attached_to` helper,
+        // so this uses a SIGNAL boundary (previously missed) on a plain task to
+        // pin the whole defect class; the same code path covers escalation.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:signal id="Sig" name="Cancelled" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="task">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="task">
+      <bpmn:signalEventDefinition signalRef="Sig" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Handler" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="task" />
+    <bpmn:sequenceFlow id="f2" sourceRef="task" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="Bnd" targetRef="Handler" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let ops = vec![json!({"op":"remove_node","id":"task"})];
+        let v = edit_model(xml, &ops).expect("edit");
+        let out = v["model"].as_str().unwrap();
+        let def = first_def(out).unwrap().0;
+        assert!(
+            !def.elements.contains_key("task"),
+            "the removed task is gone"
+        );
+        assert!(
+            !def.elements.contains_key("Bnd"),
+            "the signal boundary orphaned by removing its host must be dropped, got {:?}",
+            def.elements.get("Bnd").map(|e| &e.kind)
+        );
     }
 
     #[test]
@@ -6348,4 +6401,3 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         );
     }
 }
-

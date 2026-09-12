@@ -9504,8 +9504,7 @@ impl Engine {
         mut events: Vec<Event>,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut followups = Vec::new();
-        let caught =
-            self.find_catching_escalation_boundary(instance_key, scope, &escalation_code);
+        let caught = self.find_catching_escalation_boundary(instance_key, scope, &escalation_code);
         // Collect the throw's outgoing targets up front (owned) so routing does
         // not hold an immutable borrow of `self` across the teardown mutation.
         let outgoing_targets: Vec<String> = self

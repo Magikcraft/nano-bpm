@@ -226,7 +226,6 @@ impl Engine {
         None
     }
 
-
     pub(crate) fn scope_descendants(&self, instance_key: Key, scope_eik: Key) -> Vec<Key> {
         let Some(instance) = self.state.instances.get(&instance_key) else {
             return Vec::new();
