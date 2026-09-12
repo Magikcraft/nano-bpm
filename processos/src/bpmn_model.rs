@@ -1951,25 +1951,53 @@ fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
 /// to a synthesized declaration id. Escalations correlate by code only, so one declaration per
 /// code. Empty codes (an unnamed throw or a catch-all boundary) carry no `escalationRef`, so they
 /// need no declaration and are skipped.
+///
+/// Generated ids are allocated **collision-free**: `id_fragment` is not injective (distinct legal
+/// codes such as `A/B` and `A_B` both fragment to `A_B`), and a generated `Escalation_…` id could
+/// also clash with an existing element id — either would emit duplicate BPMN ids and ambiguous
+/// `escalationRef`s. Codes are assigned in sorted order (deterministic regardless of the element
+/// map's iteration order), each getting the base id or the first free `…_2`, `…_3`, … suffix that
+/// is not already taken by a model element id or an earlier escalation id.
 fn collect_escalations(def: &ProcessDefinition) -> BTreeMap<String, String> {
-    let mut codes: BTreeMap<String, String> = BTreeMap::new();
+    let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for el in def.elements.values() {
-        let code = match &el.kind {
+        match &el.kind {
             ElementKind::EscalationThrowEvent { escalation_code }
             | ElementKind::EscalationBoundaryEvent {
                 escalation_code, ..
-            } => Some(escalation_code),
-            _ => None,
-        };
-        if let Some(code) = code {
-            if !code.is_empty() {
-                codes
-                    .entry(code.clone())
-                    .or_insert_with(|| format!("Escalation_{}", id_fragment(code)));
+            } if !escalation_code.is_empty() => {
+                codes.insert(escalation_code.clone());
             }
+            _ => {}
         }
     }
-    codes
+    // Reserve every model element id so a generated declaration id can never
+    // shadow an existing node.
+    let mut used: HashSet<String> = def.elements.keys().cloned().collect();
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for code in codes {
+        let id = alloc_unique_id(format!("Escalation_{}", id_fragment(&code)), &mut used);
+        out.insert(code, id);
+    }
+    out
+}
+
+/// Allocate `base` — or the first free `base_2`, `base_3`, … — as an id absent from `used`,
+/// inserting the chosen id into `used`. Keeps synthesized declaration ids collision-free against
+/// each other and against reserved (model element) ids, since the id-deriving `id_fragment` is not
+/// injective.
+fn alloc_unique_id(base: String, used: &mut HashSet<String>) -> String {
+    if used.insert(base.clone()) {
+        return base;
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}_{n}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 /// `zeebe:loopCharacteristics` extension and optional `completionCondition`) as a
 /// child of the activity element. No-op when the element carries no MI. The
@@ -5423,6 +5451,46 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
     }
 
     #[test]
+    fn collect_escalations_assigns_distinct_ids_to_colliding_codes() {
+        // `id_fragment` is not injective: distinct escalation codes can normalize
+        // to the same fragment (e.g. `A/B` and `A_B` both sanitize to `A_B`).
+        // `collect_escalations` must still mint a UNIQUE declaration id per code,
+        // or two `<bpmn:escalation>`s collide and one `escalationRef` dangles.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Collide")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw1", "A/B")
+            .contained_in("Throw1", "Sub")
+            .escalation_throw_event("Throw2", "A_B")
+            .contained_in("Throw2", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .end_event("Done")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw1")
+            .connect("Throw1", "Throw2")
+            .connect("Throw2", "SubEnd")
+            .connect("Sub", "Done")
+            .build()
+            .unwrap();
+        let escalations = collect_escalations(&def);
+        assert_eq!(escalations.len(), 2, "both codes get a declaration");
+        let ids: std::collections::HashSet<&String> = escalations.values().collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "colliding codes must receive distinct escalation ids, got {:?}",
+            escalations
+        );
+        // And every code still round-trips through serialize -> parse.
+        let xml = definition_to_xml(&def);
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
     fn definition_to_xml_round_trips_an_inline_script_task() {
         // An inline-FEEL script task must round-trip: the serializer emits a
         // <bpmn:scriptTask> with a <zeebe:script expression=.. resultVariable=..>,
@@ -6182,3 +6250,4 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
         );
     }
 }
+

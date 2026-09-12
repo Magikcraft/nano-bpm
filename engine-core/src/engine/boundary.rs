@@ -405,7 +405,54 @@ impl Engine {
         events
     }
 
-    /// The `UserTaskCanceled` events for every resting (`Created`) user task on
+    /// Root-record teardown events for an activity interrupted at its boundary —
+    /// the bookkeeping [`scope_teardown_events`](Self::scope_teardown_events)
+    /// never touches for the scope *root* itself (it only sweeps descendants):
+    /// the activity's own in-play job, any incident parked on it, and a
+    /// multi-instance body's / ad-hoc container's active-child runtime record.
+    /// That record is cleared only by `MultiInstanceCompleted` / `AdHocCompleted`
+    /// (never the root's `ElementCompleted`), so without this an interrupting
+    /// escalation boundary on a multi-instance or ad-hoc sub-process would leave
+    /// a stale active-child set — hanging the instance or letting a still-queued
+    /// child activation resurrect work after the handler.
+    ///
+    /// The caller still emits the root's own `ElementCompleting`/`ElementCompleted`
+    /// and sweeps its descendants; this only fills the root-record gap. It is the
+    /// returns-events sibling of the emit-driven root cleanup inlined in
+    /// [`interrupt_activity_via_boundary`](Self::interrupt_activity_via_boundary)
+    /// (#1173). A call activity is deliberately not handled: a boundary on a call
+    /// activity can never catch a same-instance escalation (the callee is a
+    /// separate instance), so `caught_eik` is never a call-activity host here.
+    pub(crate) fn boundary_root_teardown_events(
+        &self,
+        instance_key: Key,
+        root_eik: Key,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        if let Some(job_key) = self.active_job_on(root_eik) {
+            events.push(Event::JobCanceled {
+                job_key,
+                instance_key,
+            });
+        }
+        events.extend(self.resolve_incidents_on(instance_key, root_eik));
+        if let Some(instance) = self.state.instances.get(&instance_key) {
+            if instance.multi_instances.contains_key(&root_eik) {
+                events.push(Event::MultiInstanceCompleted {
+                    instance_key,
+                    body_key: root_eik,
+                });
+            }
+            if instance.adhoc_instances.contains_key(&root_eik) {
+                events.push(Event::AdHocCompleted {
+                    instance_key,
+                    container_key: root_eik,
+                    cancelled: true,
+                });
+            }
+        }
+        events
+    }
     /// `element_instance_key`, sorted by key. `ElementCompleted` alone leaves a
     /// user task queryable as `Created` (and completable), so scope teardown must
     /// cancel it explicitly — mirroring the whole-instance

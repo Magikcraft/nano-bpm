@@ -688,8 +688,8 @@ pub enum ElementKind {
         /// referenced escalation declares no code.
         escalation_code: String,
     },
-    /// An escalation boundary event attached to an activity (a sub-process or
-    /// call activity). It has no incoming sequence flow; instead it fires when an
+    /// An escalation boundary event attached to an embedded sub-process. It has
+    /// no incoming sequence flow; instead it fires when an
     /// [`EscalationThrowEvent`](ElementKind::EscalationThrowEvent) inside the
     /// attached activity's scope raises an escalation whose code matches
     /// `escalation_code` (an empty `escalation_code` is a **catch-all** that
@@ -698,6 +698,12 @@ pub enum ElementKind {
     /// escalation idiom) leaves the activity running and spawns a new parallel
     /// token along its outgoing flow; an interrupting one tears the activity's
     /// scope down and routes the token along its outgoing flow instead.
+    ///
+    /// Only embedded sub-processes are supported: catching resolves by walking
+    /// the scope tree of the *current* process instance (see
+    /// `find_catching_escalation_boundary`), so a boundary on a **call activity**
+    /// can never catch a throw raised in the called (separate) instance.
+    /// Cross-instance escalation propagation is out of scope for #1173.
     EscalationBoundaryEvent {
         /// Id of the activity this boundary event is attached to.
         attached_to: ElementId,
@@ -705,10 +711,13 @@ pub enum ElementKind {
         /// catch-all.
         escalation_code: String,
         /// Whether firing interrupts the activity (`true`) or spawns a parallel
-        /// token and leaves it running (`false`, the escalation default). New
-        /// variant, so a persisted snapshot never lacks it; `serde(default)`
-        /// (`false`) keeps decoding forward-safe regardless.
-        #[cfg_attr(feature = "serde", serde(default))]
+        /// token and leaves it running (`false`, the escalation default). BPMN's
+        /// `cancelActivity` defaults to interrupting (`true`), and the
+        /// parser/builders encode an omitted value as `true`, so decode must
+        /// default to `true` as well — a serialized record that omits the field
+        /// (e.g. a future `skip_serializing_if`) must restore as interrupting,
+        /// not silently flip the control flow to non-interrupting.
+        #[cfg_attr(feature = "serde", serde(default = "default_true"))]
         interrupting: bool,
     },
     /// A none intermediate throw event. A pure pass-through: on activation it

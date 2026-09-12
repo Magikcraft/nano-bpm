@@ -50,8 +50,8 @@
 //!   until they finish before routing onward (single-activity path).
 //! * Escalation (#1173): an `escalationEventDefinition` on an
 //!   `intermediateThrowEvent`/`endEvent` raises the referenced escalation code;
-//!   an `escalationEventDefinition` on a `boundaryEvent` (attached to a
-//!   sub-process or call activity) catches a matching code raised inside that
+//!   an `escalationEventDefinition` on a `boundaryEvent` (attached to an
+//!   embedded sub-process) catches a matching code raised inside that
 //!   activity's scope, propagating up the enclosing scopes (an exact code beats
 //!   a catch-all with no `escalationRef`). `cancelActivity="false"` (the
 //!   escalation default idiom) makes the boundary non-interrupting — the

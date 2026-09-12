@@ -9550,8 +9550,31 @@ impl Engine {
                 // descendants, but not the throw itself — its `ElementCompleted`
                 // is already in `events`), complete the caught activity, and run
                 // the token out the boundary instead of along the throw's flow.
-                let boundary_scope = self.scope_of(instance_key, caught_eik);
-                for event in self.scope_teardown_events(instance_key, caught_eik) {
+                //
+                // If the caught activity is a multi-instance CHILD, the boundary
+                // is armed on the loop's BODY, so interrupting it must tear down
+                // the WHOLE loop — every sibling child and the body's runtime
+                // record — not the single child the throw happened to fire from.
+                // Redirect the teardown to the MI body (its element id equals the
+                // child's, since each child is an instance of the same activity);
+                // otherwise sibling children and the body's `MultiInstanceState`
+                // survive and hang the instance (#1173, the #1170 MI class).
+                let child_scope = self.scope_of(instance_key, caught_eik);
+                let caught_is_mi_child = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .is_some_and(|i| i.multi_instances.contains_key(&child_scope));
+                let (torn_eik, torn_element_id) = if caught_is_mi_child {
+                    let body_element_id = self
+                        .element_id_of_instance(instance_key, child_scope)
+                        .unwrap_or_else(|| caught_element_id.clone());
+                    (child_scope, body_element_id)
+                } else {
+                    (caught_eik, caught_element_id)
+                };
+                let boundary_scope = self.scope_of(instance_key, torn_eik);
+                for event in self.scope_teardown_events(instance_key, torn_eik) {
                     if matches!(
                         &event,
                         Event::ElementCompleting { element_instance_key: eik, .. }
@@ -9562,27 +9585,39 @@ impl Engine {
                     }
                     events.push(event);
                 }
-                self.torn_down_scopes.insert(caught_eik);
+                // `scope_teardown_events` only sweeps the torn activity's
+                // DESCENDANTS. If the torn activity is itself a multi-instance
+                // body or an ad-hoc container, its own active-child runtime
+                // record (cleared only by `MultiInstanceCompleted` /
+                // `AdHocCompleted`, never by `ElementCompleted`) — plus any job
+                // or incident parked on the root — would otherwise leak, hanging
+                // the instance or letting a queued child activation resurrect
+                // work after the handler. Mirror `interrupt_activity_via_boundary`'s
+                // root-record cleanup (#1173, matching the #1170 MI-teardown fix).
+                for event in self.boundary_root_teardown_events(instance_key, torn_eik) {
+                    events.push(event);
+                }
+                self.torn_down_scopes.insert(torn_eik);
                 events.push(Event::ElementCompleting {
                     instance_key,
-                    element_instance_key: caught_eik,
-                    element_id: caught_element_id.clone(),
+                    element_instance_key: torn_eik,
+                    element_id: torn_element_id.clone(),
                 });
                 events.push(Event::ElementCompleted {
                     instance_key,
-                    element_instance_key: caught_eik,
-                    element_id: caught_element_id,
+                    element_instance_key: torn_eik,
+                    element_id: torn_element_id,
                 });
-                for event in self.cancel_boundary_timers_on(caught_eik) {
+                for event in self.cancel_boundary_timers_on(torn_eik) {
                     events.push(event);
                 }
-                for event in self.cancel_boundary_message_subscriptions_on(caught_eik) {
+                for event in self.cancel_boundary_message_subscriptions_on(torn_eik) {
                     events.push(event);
                 }
-                for event in self.cancel_boundary_signal_subscriptions_on(caught_eik) {
+                for event in self.cancel_boundary_signal_subscriptions_on(torn_eik) {
                     events.push(event);
                 }
-                for event in self.cancel_boundary_conditional_subscriptions_on(caught_eik) {
+                for event in self.cancel_boundary_conditional_subscriptions_on(torn_eik) {
                     events.push(event);
                 }
                 followups.push(Step::Activate {
@@ -10975,6 +11010,7 @@ impl Engine {
                 | ElementKind::TimerBoundaryEvent { attached_to, .. }
                 | ElementKind::MessageBoundaryEvent { attached_to, .. }
                 | ElementKind::SignalBoundaryEvent { attached_to, .. }
+                | ElementKind::EscalationBoundaryEvent { attached_to, .. }
                 | ElementKind::ConditionalBoundaryEvent { attached_to, .. } => Some(attached_to),
                 _ => None,
             };

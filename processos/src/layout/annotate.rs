@@ -96,6 +96,7 @@ pub fn infer(def: &ProcessDefinition) -> SemanticAnnotations {
         }
     }
     ann.flows.extend(exception_flows(def));
+    ann.flows.extend(escalation_flows(def));
     ann.roles = infer_roles(def);
     ann
 }
@@ -184,7 +185,41 @@ fn exception_flows(def: &ProcessDefinition) -> Vec<AnnotatedFlow> {
     flows
 }
 
-/// Breadth-first walk of every node reachable from `from` via sequence flows,
+/// Discover every escalation boundary event and return one escalation flow per
+/// boundary — starting at the boundary itself, then everything reachable
+/// downstream via sequence flows. Escalation handler paths get their own band
+/// ([`FlowKind::Escalation`], rising above the centerline) rather than the
+/// exception band, matching the "escalation to a supervisor / out-of-band
+/// notification" reading. Both interrupting and non-interrupting escalation
+/// boundaries are annotated: the handler path is out-of-band regardless of
+/// whether the caught activity is torn down (the usual escalation idiom is in
+/// fact non-interrupting). Without this the boundary and its handler nodes fall
+/// through to the primary/default band and render on the main spine (#1173).
+fn escalation_flows(def: &ProcessDefinition) -> Vec<AnnotatedFlow> {
+    let mut flows: Vec<AnnotatedFlow> = Vec::new();
+    let mut boundaries: Vec<&str> = def
+        .elements
+        .values()
+        .filter_map(|el| match &el.kind {
+            ElementKind::EscalationBoundaryEvent { .. } => Some(el.id.as_str()),
+            _ => None,
+        })
+        .collect();
+    // Stable, id-sorted ordering so repeat runs produce identical annotations.
+    boundaries.sort_unstable();
+    for boundary_id in boundaries {
+        let nodes = reachable_from(def, boundary_id);
+        if nodes.is_empty() {
+            continue;
+        }
+        flows.push(AnnotatedFlow {
+            id: format!("escalation.{boundary_id}"),
+            kind: FlowKind::Escalation,
+            nodes,
+        });
+    }
+    flows
+}
 /// returning them in visitation order and including `from` itself.
 fn reachable_from(def: &ProcessDefinition, from: &str) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();

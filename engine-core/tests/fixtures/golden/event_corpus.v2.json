@@ -267,10 +267,258 @@
     }
   },
   {
+    "DeploymentCreated": {
+      "deployment_key": 5
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 5,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "b_int": {
+            "end_listeners": [],
+            "id": "b_int",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "EscalationBoundaryEvent": {
+                "attached_to": "sub",
+                "escalation_code": "OVERLOAD",
+                "interrupting": true
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "h_int"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "b_non": {
+            "end_listeners": [],
+            "id": "b_non",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "EscalationBoundaryEvent": {
+                "attached_to": "sub",
+                "escalation_code": "",
+                "interrupting": false
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "h_non"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "e": {
+            "end_listeners": [],
+            "id": "e",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "h_int": {
+            "end_listeners": [],
+            "id": "h_int",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "h_non": {
+            "end_listeners": [],
+            "id": "h_non",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "sub"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub": {
+            "end_listeners": [],
+            "id": "sub",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "SubProcess": {
+                "start_event": "sub_start"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "e"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub_end": {
+            "end_listeners": [],
+            "id": "sub_end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub_start": {
+            "end_listeners": [],
+            "id": "sub_start",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "throw"
+              }
+            ],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "throw": {
+            "end_listeners": [],
+            "id": "throw",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "EscalationThrowEvent": {
+                "escalation_code": "OVERLOAD"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "sub_end"
+              }
+            ],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "escalate",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 6,
+      "version": 1
+    }
+  },
+  {
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000001,
-      "instance_key": 5,
+      "instance_key": 7,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
       "process_definition_key": 2,
@@ -290,51 +538,51 @@
   {
     "ElementActivating": {
       "element_id": "start",
-      "element_instance_key": 6,
-      "instance_key": 5
+      "element_instance_key": 8,
+      "instance_key": 7
     }
   },
   {
     "ElementActivated": {
       "element_id": "start",
-      "element_instance_key": 6,
-      "instance_key": 5,
+      "element_instance_key": 8,
+      "instance_key": 7,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "start",
-      "element_instance_key": 6,
-      "instance_key": 5
+      "element_instance_key": 8,
+      "instance_key": 7
     }
   },
   {
     "ElementCompleted": {
       "element_id": "start",
-      "element_instance_key": 6,
-      "instance_key": 5
+      "element_instance_key": 8,
+      "instance_key": 7
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "start",
-      "instance_key": 5,
+      "instance_key": 7,
       "to": "charge"
     }
   },
   {
     "ElementActivating": {
       "element_id": "charge",
-      "element_instance_key": 7,
-      "instance_key": 5
+      "element_instance_key": 9,
+      "instance_key": 7
     }
   },
   {
     "ElementActivated": {
       "element_id": "charge",
-      "element_instance_key": 7,
-      "instance_key": 5,
+      "element_instance_key": 9,
+      "instance_key": 7,
       "scope": 0
     }
   },
@@ -342,9 +590,9 @@
     "JobCreated": {
       "created_at": 1700000000001,
       "element_id": "charge",
-      "element_instance_key": 7,
-      "instance_key": 5,
-      "job_key": 8,
+      "element_instance_key": 9,
+      "instance_key": 7,
+      "job_key": 10,
       "job_type": "payment",
       "priority": 50,
       "retries": 3
@@ -355,22 +603,22 @@
       "activated_at": 1700000000002,
       "deadline": 1700000030002,
       "durable": true,
-      "instance_key": 5,
-      "job_key": 8,
+      "instance_key": 7,
+      "job_key": 10,
       "worker": "worker-1"
     }
   },
   {
     "JobCompleted": {
       "created_at": 1700000000001,
-      "instance_key": 5,
-      "job_key": 8,
+      "instance_key": 7,
+      "job_key": 10,
       "job_type": "payment"
     }
   },
   {
     "VariablesUpdated": {
-      "instance_key": 5,
+      "instance_key": 7,
       "variables": {
         "approved": {
           "Bool": true
@@ -381,63 +629,63 @@
   {
     "ElementCompleting": {
       "element_id": "charge",
-      "element_instance_key": 7,
-      "instance_key": 5
+      "element_instance_key": 9,
+      "instance_key": 7
     }
   },
   {
     "ElementCompleted": {
       "element_id": "charge",
-      "element_instance_key": 7,
-      "instance_key": 5
+      "element_instance_key": 9,
+      "instance_key": 7
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "charge",
-      "instance_key": 5,
+      "instance_key": 7,
       "to": "end"
     }
   },
   {
     "ElementActivating": {
       "element_id": "end",
-      "element_instance_key": 9,
-      "instance_key": 5
+      "element_instance_key": 11,
+      "instance_key": 7
     }
   },
   {
     "ElementActivated": {
       "element_id": "end",
-      "element_instance_key": 9,
-      "instance_key": 5,
+      "element_instance_key": 11,
+      "instance_key": 7,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "end",
-      "element_instance_key": 9,
-      "instance_key": 5
+      "element_instance_key": 11,
+      "instance_key": 7
     }
   },
   {
     "ElementCompleted": {
       "element_id": "end",
-      "element_instance_key": 9,
-      "instance_key": 5
+      "element_instance_key": 11,
+      "instance_key": 7
     }
   },
   {
     "ProcessInstanceCompleted": {
-      "instance_key": 5
+      "instance_key": 7
     }
   },
   {
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000004,
-      "instance_key": 10,
+      "instance_key": 12,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
       "process_definition_key": 2,
@@ -454,51 +702,51 @@
   {
     "ElementActivating": {
       "element_id": "start",
-      "element_instance_key": 11,
-      "instance_key": 10
+      "element_instance_key": 13,
+      "instance_key": 12
     }
   },
   {
     "ElementActivated": {
       "element_id": "start",
-      "element_instance_key": 11,
-      "instance_key": 10,
+      "element_instance_key": 13,
+      "instance_key": 12,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "start",
-      "element_instance_key": 11,
-      "instance_key": 10
+      "element_instance_key": 13,
+      "instance_key": 12
     }
   },
   {
     "ElementCompleted": {
       "element_id": "start",
-      "element_instance_key": 11,
-      "instance_key": 10
+      "element_instance_key": 13,
+      "instance_key": 12
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "start",
-      "instance_key": 10,
+      "instance_key": 12,
       "to": "charge"
     }
   },
   {
     "ElementActivating": {
       "element_id": "charge",
-      "element_instance_key": 12,
-      "instance_key": 10
+      "element_instance_key": 14,
+      "instance_key": 12
     }
   },
   {
     "ElementActivated": {
       "element_id": "charge",
-      "element_instance_key": 12,
-      "instance_key": 10,
+      "element_instance_key": 14,
+      "instance_key": 12,
       "scope": 0
     }
   },
@@ -506,9 +754,9 @@
     "JobCreated": {
       "created_at": 1700000000004,
       "element_id": "charge",
-      "element_instance_key": 12,
-      "instance_key": 10,
-      "job_key": 13,
+      "element_instance_key": 14,
+      "instance_key": 12,
+      "job_key": 15,
       "job_type": "payment",
       "priority": 50,
       "retries": 3
@@ -517,18 +765,18 @@
   {
     "ProcessInstanceSuspended": {
       "at": 1700000000005,
-      "instance_key": 10
+      "instance_key": 12
     }
   },
   {
     "ProcessInstanceResumed": {
-      "instance_key": 10
+      "instance_key": 12
     }
   },
   {
     "ProcessInstanceSuspended": {
       "at": 1700000000007,
-      "instance_key": 10
+      "instance_key": 12
     }
   }
 ]

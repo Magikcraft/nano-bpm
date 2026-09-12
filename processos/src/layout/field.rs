@@ -919,6 +919,8 @@ fn node_shape(el: &Element) -> NodeShape {
         | SignalBoundaryEvent { .. }
         | ConditionalBoundaryEvent { .. }
         | CompensationBoundaryEvent { .. }
+        | EscalationThrowEvent { .. }
+        | EscalationBoundaryEvent { .. }
         | CompensationThrowEvent => NodeShape::Circle,
         _ => NodeShape::Rect,
     }
