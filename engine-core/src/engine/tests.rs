@@ -25518,10 +25518,12 @@ fn adhoc_call_activity_tool_preserves_chained_input_projection_across_spawn_retr
         Some(&Value::Str("seed".into())),
         "clean spawn: y = <x>",
     );
-    assert_ne!(
+    assert_eq!(
         clean.get("z"),
-        Some(&Value::Str("seed".into())),
-        "clean spawn: z reads the original (empty) view, so it is NOT <x>",
+        Some(&Value::Null),
+        "clean spawn: z reads the original (empty) view, so it is exactly null \
+         (asserted explicitly so a stray non-null value can't become a \
+         non-diagnostic baseline for the retry comparison below)",
     );
 
     // The respawn after a recoverable spawn incident must reproduce the SAME seed
@@ -25698,10 +25700,12 @@ fn adhoc_call_activity_tool_preserves_chained_output_projection_across_type_inci
         Some(Value::Str("ok".into())),
         "clean completion: intermediate = <status>",
     );
-    assert_ne!(
+    assert_eq!(
         clean_result,
-        Some(Value::Str("ok".into())),
-        "clean completion: toolCallResult reads the original child view, so NOT <status>",
+        Some(Value::Null),
+        "clean completion: toolCallResult reads the original child view, so it is \
+         exactly null (asserted explicitly so a stray non-null value can't become \
+         a non-diagnostic baseline for the redrive comparison below)",
     );
 
     // The redrive after the output-collection type incident must reproduce the
