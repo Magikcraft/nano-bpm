@@ -30,7 +30,7 @@ import {
   isTextAreaEntryEdited,
   isToggleSwitchEntryEdited,
 } from "@bpmn-io/properties-panel";
-import ZeebeModdle from "zeebe-bpmn-moddle/resources/zeebe.json";
+import { zeebeModdleWithAgent } from "../moddle/zeebeAgent";
 import { nanoShapesModdle } from "../moddle/nanoShapes";
 import {
   CloudElementTemplatesCoreModule,
@@ -70,11 +70,19 @@ import {
   PROMPT_LINK_NAME,
   PROMPT_RESOURCE_TYPE,
   AGENT_TASK_ELEMENT_TYPE,
+  AGENT_TYPE_EXTERNAL,
+  AUTO_SUBSCRIBE_PROPERTY,
   isAgentTask,
+  hasPromptBinding,
+  hasExternalAgentMarker,
+  readAutoSubscribeOptOut,
   readPromptBinding,
   writePromptLink,
   writeAppendPrompt,
   removePromptBinding,
+  writeExternalAgentMarker,
+  removeExternalAgentMarker,
+  writeAutoSubscribeOptOut,
   type AgentModdle,
   type AgentModdleElement,
   type AgentModeling,
@@ -211,6 +219,9 @@ function collectComponentOutputs(registry: ElementRegistry): ComponentOutput[] {
 // DI (the model already has it; the renderer only augments the shape graphics).
 const AGENT_BADGE_FILL = "#6d28d9";
 const AGENT_CAPTION_FILL = "#6d28d9";
+// A distinct amber for the opt-out badge so a "manual subscription only" task
+// reads differently from a plain agent task at a glance.
+const AGENT_OPTOUT_FILL = "#b45309";
 
 interface BpmnShapeRenderer {
   drawShape(parentNode: SVGElement, element: DiagramElement): SVGElement;
@@ -279,8 +290,43 @@ class AgentTaskRenderer extends BaseRenderer {
     badgeText.textContent = "AGENT";
     svgAppend(parentNode, badgeText);
 
-    // Caption below the shape: the bound prompt resource + binding type, so the
-    // binding is inspectable at a glance without opening the properties panel.
+    // Second badge (below the AGENT badge) when the task opts OUT of the
+    // harness `--auto` subscription set (`autoSubscribe="false"`) — so a
+    // manual-subscription-only agent task is distinguishable on the canvas.
+    if (readAutoSubscribeOptOut(element.businessObject)) {
+      const optW = 56;
+      const optH = 15;
+      const optX = width - optW - 4;
+      const optY = 4 + badgeH + 3;
+      const optBadge = svgCreate("rect");
+      svgAttr(optBadge, {
+        x: optX,
+        y: optY,
+        width: optW,
+        height: optH,
+        rx: 3,
+        ry: 3,
+        fill: AGENT_OPTOUT_FILL,
+      });
+      svgAppend(parentNode, optBadge);
+      const optText = svgCreate("text");
+      svgAttr(optText, {
+        x: optX + optW / 2,
+        y: optY + optH / 2,
+        "text-anchor": "middle",
+        "dominant-baseline": "central",
+        "font-size": "9px",
+        "font-family": "Arial, sans-serif",
+        "font-weight": "bold",
+        fill: "#ffffff",
+      });
+      optText.textContent = "NO --auto";
+      svgAppend(parentNode, optText);
+    }
+
+    // Caption below the shape: the bound prompt resource + binding type (or the
+    // external-agent marker when there is no prompt link), so the agentic shape
+    // is inspectable at a glance without opening the properties panel.
     const caption = svgCreate("text");
     svgAttr(caption, {
       x: width / 2,
@@ -290,10 +336,15 @@ class AgentTaskRenderer extends BaseRenderer {
       "font-family": "Arial, sans-serif",
       fill: AGENT_CAPTION_FILL,
     });
-    const resource = binding?.resourceId ? binding.resourceId : "(no prompt)";
-    caption.textContent = `${PROMPT_LINK_NAME}: ${resource} · ${
-      binding?.bindingType ?? PROMPT_DEFAULT_BINDING_TYPE
-    }`;
+    if (binding) {
+      const resource = binding.resourceId ? binding.resourceId : "(no prompt)";
+      caption.textContent = `${PROMPT_LINK_NAME}: ${resource} · ${
+        binding.bindingType ?? PROMPT_DEFAULT_BINDING_TYPE
+      }`;
+    } else {
+      // Marker-only agent task (external marker, no prompt link).
+      caption.textContent = `agent: ${AGENT_TYPE_EXTERNAL}`;
+    }
     svgAppend(parentNode, caption);
 
     return shape;
@@ -833,14 +884,56 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
         type?: string;
         businessObject?: AgentModdleElement;
       };
+      const AgentExternalToggleEntry = (props: { element: AgentElement }) => {
+        const { element } = props;
+        return ToggleSwitchEntry({
+          element,
+          id: "nano-agent-external-toggle",
+          label: "Agent task",
+          switcherLabel: "External agent worker",
+          getValue: () => hasExternalAgentMarker(element.businessObject),
+          setValue: (value: boolean) => {
+            const svc = agentServices();
+            const bo = element.businessObject;
+            if (!svc || !bo) return;
+            if (value)
+              writeExternalAgentMarker(svc.moddle, svc.modeling, element, bo);
+            else removeExternalAgentMarker(svc.modeling, element, bo);
+          },
+          description: `Mark this task agentic with the canonical <zeebe:agentDefinition agentType="${AGENT_TYPE_EXTERNAL}"/> marker (the harness --auto scan keys on it).`,
+        });
+      };
+      const AgentOptOutEntry = (props: { element: AgentElement }) => {
+        const { element } = props;
+        return ToggleSwitchEntry({
+          element,
+          id: "nano-agent-optout",
+          label: "Exclude from --auto",
+          switcherLabel: "Manual subscription only",
+          getValue: () => readAutoSubscribeOptOut(element.businessObject),
+          setValue: (value: boolean) => {
+            const svc = agentServices();
+            const bo = element.businessObject;
+            if (!svc || !bo) return;
+            writeAutoSubscribeOptOut(
+              svc.moddle,
+              svc.modeling,
+              element,
+              bo,
+              value,
+            );
+          },
+          description: `Set ${AUTO_SUBSCRIBE_PROPERTY}="false" so the harness --auto scan skips this task; explicit --job-type/profile targeting still serves it.`,
+        });
+      };
       const AgentToggleEntry = (props: { element: AgentElement }) => {
         const { element } = props;
         return ToggleSwitchEntry({
           element,
           id: "nano-agent-toggle",
-          label: "Agent task",
+          label: "Prompt binding",
           switcherLabel: "Prompt-bound worker",
-          getValue: () => isAgentTask(element),
+          getValue: () => hasPromptBinding(element.businessObject),
           setValue: (value: boolean) => {
             const svc = agentServices();
             const bo = element.businessObject;
@@ -983,14 +1076,30 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
         getGroups(element: AgentElement) {
           return (groups: unknown[]): unknown[] => {
             if (element.type !== AGENT_TASK_ELEMENT_TYPE) return groups;
+            // The external-agent marker toggle leads — it is the canonical
+            // single-convention agentic signal (#1180).
             const entries: unknown[] = [
               {
-                id: "nano-agent-toggle",
-                component: AgentToggleEntry,
+                id: "nano-agent-external-toggle",
+                component: AgentExternalToggleEntry,
                 isEdited: isToggleSwitchEntryEdited,
               },
             ];
-            if (isAgentTask(element)) {
+            // The `--auto` opt-out only makes sense for a marked agent task.
+            if (hasExternalAgentMarker(element.businessObject)) {
+              entries.push({
+                id: "nano-agent-optout",
+                component: AgentOptOutEntry,
+                isEdited: isToggleSwitchEntryEdited,
+              });
+            }
+            // The prompt binding remains authorable alongside the marker.
+            entries.push({
+              id: "nano-agent-toggle",
+              component: AgentToggleEntry,
+              isEdited: isToggleSwitchEntryEdited,
+            });
+            if (hasPromptBinding(element.businessObject)) {
               entries.push(
                 {
                   id: "nano-agent-resourceId",
@@ -1051,7 +1160,10 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           agentTaskPropertiesModule,
           domainVariableResolverModule,
         ],
-        moddleExtensions: { zeebe: ZeebeModdle, nano: nanoShapesModdle },
+        moddleExtensions: {
+          zeebe: zeebeModdleWithAgent,
+          nano: nanoShapesModdle,
+        },
       });
       modelerRef.current = modeler;
       // Install the project's components so the palette + template chooser

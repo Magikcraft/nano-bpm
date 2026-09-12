@@ -9,13 +9,26 @@ import {
   PROMPT_DEFAULT_BINDING_TYPE,
   APPEND_PROMPT_TARGET,
   AGENT_TASK_ELEMENT_TYPE,
+  AGENT_DEFINITION_TYPE,
+  AGENT_TYPE_EXTERNAL,
+  AUTO_SUBSCRIBE_PROPERTY,
+  AUTO_SUBSCRIBE_OPT_OUT_VALUE,
+  ZEEBE_PROPERTIES_TYPE,
+  ZEEBE_PROPERTY_TYPE,
   promptLinkedResource,
   readPromptBinding,
   isAgentTask,
+  hasPromptBinding,
+  hasExternalAgentMarker,
+  agentDefinition,
+  readAutoSubscribeOptOut,
   writePromptLink,
   removePromptLink,
   writeAppendPrompt,
   removePromptBinding,
+  writeExternalAgentMarker,
+  removeExternalAgentMarker,
+  writeAutoSubscribeOptOut,
   type AgentModdle,
   type AgentModdleElement,
   type AgentModeling,
@@ -430,4 +443,211 @@ test("removePromptBinding strips both the link and the append addendum", () => {
   );
   // Both children gone, so the wrapper is torn down entirely — no orphan.
   assert.equal(bo.extensionElements, undefined);
+});
+
+// --- External-agent marker + --auto opt-out (issue #1180) -------------------
+
+function agentMarker(agentType = AGENT_TYPE_EXTERNAL): AgentModdleElement {
+  return { $type: AGENT_DEFINITION_TYPE, agentType };
+}
+
+function zeebeProps(...properties: AgentModdleElement[]): AgentModdleElement {
+  return { $type: ZEEBE_PROPERTIES_TYPE, properties };
+}
+
+function optOutProperty(
+  value = AUTO_SUBSCRIBE_OPT_OUT_VALUE,
+): AgentModdleElement {
+  return { $type: ZEEBE_PROPERTY_TYPE, name: AUTO_SUBSCRIBE_PROPERTY, value };
+}
+
+test("hasExternalAgentMarker is true only for agentType=external", () => {
+  assert.equal(hasExternalAgentMarker(serviceTaskBo()), false);
+  assert.equal(hasExternalAgentMarker(serviceTaskBo([agentMarker()])), true);
+  // A different agentType (e.g. Camunda's aiAgentTask) is not the fleet marker.
+  assert.equal(
+    hasExternalAgentMarker(serviceTaskBo([agentMarker("aiAgentTask")])),
+    false,
+  );
+});
+
+test("isAgentTask recognizes the external marker as well as the prompt link", () => {
+  const markerOnly = {
+    type: AGENT_TASK_ELEMENT_TYPE,
+    businessObject: serviceTaskBo([agentMarker()]),
+  };
+  const promptOnly = {
+    type: AGENT_TASK_ELEMENT_TYPE,
+    businessObject: serviceTaskBo([linkedResources(promptLink())]),
+  };
+  const plain = {
+    type: AGENT_TASK_ELEMENT_TYPE,
+    businessObject: serviceTaskBo(),
+  };
+  assert.equal(isAgentTask(markerOnly), true);
+  assert.equal(isAgentTask(promptOnly), true);
+  assert.equal(isAgentTask(plain), false);
+  // hasPromptBinding stays narrow — it never reports the marker as a prompt.
+  assert.equal(hasPromptBinding(markerOnly.businessObject), false);
+  assert.equal(hasPromptBinding(promptOnly.businessObject), true);
+});
+
+test("writeExternalAgentMarker adds the canonical marker to a plain task", () => {
+  const bo = serviceTaskBo();
+  writeExternalAgentMarker(moddle, applyingModeling(), {}, bo);
+  const def = agentDefinition(bo);
+  assert.equal(def?.$type, AGENT_DEFINITION_TYPE);
+  assert.equal(def?.agentType, AGENT_TYPE_EXTERNAL);
+  assert.equal(hasExternalAgentMarker(bo), true);
+});
+
+test("writeExternalAgentMarker creates extensionElements when the task has none", () => {
+  const bo: AgentModdleElement = { $type: "bpmn:ServiceTask" };
+  writeExternalAgentMarker(moddle, applyingModeling(), {}, bo);
+  assert.equal(bo.extensionElements?.$type, "bpmn:ExtensionElements");
+  assert.equal(hasExternalAgentMarker(bo), true);
+});
+
+test("writeExternalAgentMarker is idempotent and corrects a stale agentType", () => {
+  // Already external → no duplicate marker, single command-free no-op result.
+  const bo = serviceTaskBo([agentMarker()]);
+  writeExternalAgentMarker(moddle, applyingModeling(), {}, bo);
+  assert.equal(
+    bo.extensionElements?.values?.filter(
+      (v) => v.$type === AGENT_DEFINITION_TYPE,
+    ).length,
+    1,
+  );
+  // Stale agentType is corrected in place, not duplicated.
+  const stale = serviceTaskBo([agentMarker("aiAgentTask")]);
+  writeExternalAgentMarker(moddle, applyingModeling(), {}, stale);
+  assert.equal(
+    stale.extensionElements?.values?.filter(
+      (v) => v.$type === AGENT_DEFINITION_TYPE,
+    ).length,
+    1,
+  );
+  assert.equal(hasExternalAgentMarker(stale), true);
+});
+
+test("removeExternalAgentMarker strips the marker and tears down the empty wrapper", () => {
+  const bo = serviceTaskBo([agentMarker()]);
+  removeExternalAgentMarker(applyingModeling(), {}, bo);
+  assert.equal(agentDefinition(bo), undefined);
+  // It was the only extension child, so the wrapper is gone.
+  assert.equal(bo.extensionElements, undefined);
+});
+
+test("the external marker leads the prompt link in extensionElements order", () => {
+  // A task that already carries a prompt link. Adding the marker must slot it
+  // BEFORE LinkedResources (canonical order), never after.
+  const bo = serviceTaskBo([linkedResources(promptLink())]);
+  writeExternalAgentMarker(moddle, applyingModeling(), {}, bo);
+  assert.deepEqual(
+    bo.extensionElements?.values?.map((v) => v.$type),
+    [AGENT_DEFINITION_TYPE, "zeebe:LinkedResources"],
+  );
+});
+
+test("marker and prompt binding coexist independently", () => {
+  const bo = serviceTaskBo();
+  const modeling = applyingModeling();
+  writeExternalAgentMarker(moddle, modeling, {}, bo);
+  writePromptLink(moddle, modeling, {}, bo, "feature.md", "latest");
+  assert.equal(hasExternalAgentMarker(bo), true);
+  assert.equal(hasPromptBinding(bo), true);
+  // Removing the prompt binding leaves the marker (still an agent task).
+  removePromptBinding(moddle, modeling, {}, bo);
+  assert.equal(hasPromptBinding(bo), false);
+  assert.equal(hasExternalAgentMarker(bo), true);
+  assert.equal(
+    isAgentTask({ type: AGENT_TASK_ELEMENT_TYPE, businessObject: bo }),
+    true,
+  );
+});
+
+test('readAutoSubscribeOptOut is true only for the exact value "false" (fail-safe)', () => {
+  assert.equal(readAutoSubscribeOptOut(serviceTaskBo()), false);
+  assert.equal(
+    readAutoSubscribeOptOut(serviceTaskBo([zeebeProps(optOutProperty())])),
+    true,
+  );
+  // Any other value means auto-subscribed (fail-safe).
+  for (const v of ["true", "0", "no", ""]) {
+    assert.equal(
+      readAutoSubscribeOptOut(serviceTaskBo([zeebeProps(optOutProperty(v))])),
+      false,
+      `value ${JSON.stringify(v)} must not opt out`,
+    );
+  }
+});
+
+test("writeAutoSubscribeOptOut sets and clears the opt-out property", () => {
+  const bo = serviceTaskBo([agentMarker()]);
+  const modeling = applyingModeling();
+  // set
+  writeAutoSubscribeOptOut(moddle, modeling, {}, bo, true);
+  assert.equal(readAutoSubscribeOptOut(bo), true);
+  const container = bo.extensionElements?.values?.find(
+    (v) => v.$type === ZEEBE_PROPERTIES_TYPE,
+  );
+  const prop = container?.properties?.find(
+    (p) => p.name === AUTO_SUBSCRIBE_PROPERTY,
+  );
+  assert.equal(prop?.value, AUTO_SUBSCRIBE_OPT_OUT_VALUE);
+  // setting again does not duplicate the property
+  writeAutoSubscribeOptOut(moddle, modeling, {}, bo, true);
+  assert.equal(
+    container?.properties?.filter((p) => p.name === AUTO_SUBSCRIBE_PROPERTY)
+      .length,
+    1,
+  );
+  // clear removes the property and its now-empty container
+  writeAutoSubscribeOptOut(moddle, modeling, {}, bo, false);
+  assert.equal(readAutoSubscribeOptOut(bo), false);
+  assert.equal(
+    bo.extensionElements?.values?.some(
+      (v) => v.$type === ZEEBE_PROPERTIES_TYPE,
+    ),
+    false,
+  );
+  // marker survives the opt-out lifecycle.
+  assert.equal(hasExternalAgentMarker(bo), true);
+});
+
+test("writeAutoSubscribeOptOut preserves unrelated zeebe:property siblings", () => {
+  const other: AgentModdleElement = {
+    $type: ZEEBE_PROPERTY_TYPE,
+    name: "some.other.prop",
+    value: "keep-me",
+  };
+  const bo = serviceTaskBo([zeebeProps(other)]);
+  const modeling = applyingModeling();
+  writeAutoSubscribeOptOut(moddle, modeling, {}, bo, true);
+  const container = bo.extensionElements?.values?.find(
+    (v) => v.$type === ZEEBE_PROPERTIES_TYPE,
+  );
+  assert.equal(container?.properties?.length, 2);
+  // Clearing the opt-out keeps the unrelated property and its container.
+  writeAutoSubscribeOptOut(moddle, modeling, {}, bo, false);
+  assert.deepEqual(
+    container?.properties?.map((p) => p.name),
+    ["some.other.prop"],
+  );
+  assert.ok(
+    bo.extensionElements?.values?.some(
+      (v) => v.$type === ZEEBE_PROPERTIES_TYPE,
+    ),
+  );
+});
+
+test("clearing an absent opt-out is a no-op (no empty container created)", () => {
+  const bo = serviceTaskBo([agentMarker()]);
+  writeAutoSubscribeOptOut(moddle, applyingModeling(), {}, bo, false);
+  assert.equal(
+    bo.extensionElements?.values?.some(
+      (v) => v.$type === ZEEBE_PROPERTIES_TYPE,
+    ),
+    false,
+  );
 });

@@ -39,6 +39,34 @@ export const APPEND_PROMPT_TARGET = "appendPrompt";
  *  service task carrying the prompt link). */
 export const AGENT_TASK_ELEMENT_TYPE = "bpmn:ServiceTask";
 
+// --- The external-agent marker (issue #1180) ---------------------------------
+// The fleet is converging on ONE canonical agentic-task signal: a
+// `<zeebe:agentDefinition agentType="external"/>` marker inside a service task's
+// `extensionElements` (the harness `--auto` scan keys on it —
+// jwulf/c8ctl-plugin-nano#235; the engine parser recognises it —
+// `engine-core/src/bpmn.rs`). It is a bare marker (no children), sibling to the
+// prompt link. `zeebe-bpmn-moddle` has no descriptor for it, so the modeler
+// registers the augmented descriptor in `moddle/zeebeAgent.ts` — this module owns
+// the shape it reads/writes.
+/** The moddle `$type` of the external-agent marker element. */
+export const AGENT_DEFINITION_TYPE = "zeebe:AgentDefinition";
+/** The `agentType` value that marks a fleet external-agent task. */
+export const AGENT_TYPE_EXTERNAL = "external";
+
+// --- The `--auto` opt-out property (issue #1180) -----------------------------
+// A namespaced `zeebe:property` an author sets to exclude an agent task from the
+// harness's `--auto` subscription set (specific `--job-type`/profile targeting
+// still serves it — jwulf/c8ctl-plugin-nano#235). Fail-safe: ONLY the exact value
+// `"false"` opts out; any other value (or absence) means auto-subscribed.
+/** The opt-out property `name`. */
+export const AUTO_SUBSCRIBE_PROPERTY = "io.nanobpm.agentTask.autoSubscribe";
+/** The one `value` that opts a task out of `--auto` (fail-safe). */
+export const AUTO_SUBSCRIBE_OPT_OUT_VALUE = "false";
+/** The moddle `$type` of the `zeebe:properties` container. */
+export const ZEEBE_PROPERTIES_TYPE = "zeebe:Properties";
+/** The moddle `$type` of a single `zeebe:property`. */
+export const ZEEBE_PROPERTY_TYPE = "zeebe:Property";
+
 // The Camunda binding types the modeler offers for the prompt resource — how the
 // engine resolves the resource version at deploy time. `bindingType` is a free
 // string to the engine; these are the standard values a maker picks between.
@@ -60,7 +88,15 @@ export interface AgentModdleElement {
   bindingType?: string;
   source?: string;
   target?: string;
+  /** `zeebe:agentDefinition`'s marker attribute. */
+  agentType?: string;
+  /** A `zeebe:property`'s `name`/`value` attributes. */
+  name?: string;
+  value?: string;
   values?: AgentModdleElement[];
+  /** The `zeebe:Properties` container's child list (moddle property `properties`,
+   *  distinct from the generic `values`). */
+  properties?: AgentModdleElement[];
   inputParameters?: AgentModdleElement[];
   outputParameters?: AgentModdleElement[];
   extensionElements?: AgentModdleElement;
@@ -141,13 +177,65 @@ export function readPromptBinding(
   return binding;
 }
 
-/** Whether `element` is an agent service task — a service task carrying the
- *  `linkName="prompt"` side-car (the `@nanobpm/agentic` `agentic` signal). */
+/** Whether `bo` carries the prompt side-car (the `@nanobpm/agentic` prompt
+ *  signal). Kept distinct from {@link isAgentTask} so the prompt-binding UI
+ *  reflects only the prompt link, not the newer external marker. */
+export function hasPromptBinding(bo: AgentModdleElement | undefined): boolean {
+  return promptLinkedResource(bo) !== undefined;
+}
+
+/** The `zeebe:agentDefinition` external-agent marker element, if present. */
+export function agentDefinition(
+  bo: AgentModdleElement | undefined,
+): AgentModdleElement | undefined {
+  return findExt(bo, AGENT_DEFINITION_TYPE);
+}
+
+/** Whether `bo` carries the canonical external-agent marker
+ *  (`<zeebe:agentDefinition agentType="external"/>`). */
+export function hasExternalAgentMarker(
+  bo: AgentModdleElement | undefined,
+): boolean {
+  return agentDefinition(bo)?.agentType === AGENT_TYPE_EXTERNAL;
+}
+
+/** The `zeebe:Properties` container, if present. */
+function zeebeProperties(
+  bo: AgentModdleElement | undefined,
+): AgentModdleElement | undefined {
+  return findExt(bo, ZEEBE_PROPERTIES_TYPE);
+}
+
+/** The `io.nanobpm.agentTask.autoSubscribe` property element, if present. */
+function autoSubscribeProperty(
+  bo: AgentModdleElement | undefined,
+): AgentModdleElement | undefined {
+  return (zeebeProperties(bo)?.properties ?? []).find(
+    (p) => p.name === AUTO_SUBSCRIBE_PROPERTY,
+  );
+}
+
+/** Whether the task opts OUT of the harness `--auto` subscription set —
+ *  `io.nanobpm.agentTask.autoSubscribe="false"` (fail-safe: only the exact value
+ *  `"false"` opts out; any other value, or absence, is auto-subscribed). */
+export function readAutoSubscribeOptOut(
+  bo: AgentModdleElement | undefined,
+): boolean {
+  return autoSubscribeProperty(bo)?.value === AUTO_SUBSCRIBE_OPT_OUT_VALUE;
+}
+
+/** Whether `element` is an agent service task — a service task carrying EITHER
+ *  the prompt side-car (the `@nanobpm/agentic` prompt signal) OR the canonical
+ *  `<zeebe:agentDefinition agentType="external"/>` marker (the fleet's
+ *  single-convention agentic signal, issue #1180). */
 export function isAgentTask(
   element: { type?: string; businessObject?: AgentModdleElement } | undefined,
 ): boolean {
   if (element?.type !== AGENT_TASK_ELEMENT_TYPE) return false;
-  return promptLinkedResource(element.businessObject) !== undefined;
+  return (
+    hasPromptBinding(element.businessObject) ||
+    hasExternalAgentMarker(element.businessObject)
+  );
 }
 
 // --- Writing -----------------------------------------------------------------
@@ -159,8 +247,15 @@ export function isAgentTask(
 
 // The canonical order of the extension-element children the toolchain emits, so
 // a newly attached child slots into its stable position (e.g. LinkedResources
-// before IoMapping) and the serialized XML never drifts on insertion order.
-const EXT_CHILD_ORDER = ["zeebe:LinkedResources", "zeebe:IoMapping"];
+// before IoMapping) and the serialized XML never drifts on insertion order. The
+// external-agent marker leads (a bare marker), and the zeebe:Properties container
+// (the `--auto` opt-out lives here) trails.
+const EXT_CHILD_ORDER = [
+  "zeebe:AgentDefinition",
+  "zeebe:LinkedResources",
+  "zeebe:IoMapping",
+  "zeebe:Properties",
+];
 
 function extRank(type: string | undefined): number {
   const i = EXT_CHILD_ORDER.indexOf(type ?? "");
@@ -345,4 +440,86 @@ export function removePromptBinding(
 ): void {
   removePromptLink(modeling, element, bo);
   writeAppendPrompt(moddle, modeling, element, bo, "");
+}
+
+// --- The external-agent marker (issue #1180) ---------------------------------
+
+/** Add the canonical `<zeebe:agentDefinition agentType="external"/>` marker to a
+ *  service task (idempotent — a stale `agentType` is corrected in place, and a
+ *  marker already set to `external` is left untouched). This is the single
+ *  convention that makes a task agentic (aligns with the harness `--auto` scan). */
+export function writeExternalAgentMarker(
+  moddle: AgentModdle,
+  modeling: AgentModeling,
+  element: unknown,
+  bo: AgentModdleElement,
+): void {
+  const existing = agentDefinition(bo);
+  if (existing) {
+    if (existing.agentType !== AGENT_TYPE_EXTERNAL)
+      modeling.updateModdleProperties(element, existing, {
+        agentType: AGENT_TYPE_EXTERNAL,
+      });
+    return;
+  }
+  const def = moddle.create(AGENT_DEFINITION_TYPE, {
+    agentType: AGENT_TYPE_EXTERNAL,
+  });
+  attachExtChild(moddle, modeling, element, bo, def);
+}
+
+/** Remove the external-agent marker, tearing down the `bpmn:extensionElements`
+ *  wrapper when it was the last child. */
+export function removeExternalAgentMarker(
+  modeling: AgentModeling,
+  element: unknown,
+  bo: AgentModdleElement,
+): void {
+  const def = agentDefinition(bo);
+  if (def) removeExtChild(modeling, element, bo, def);
+}
+
+// --- The `--auto` opt-out property (issue #1180) -----------------------------
+
+/** Set (`true`) or clear (`false`) the `io.nanobpm.agentTask.autoSubscribe="false"`
+ *  opt-out property. Setting creates the `zeebe:Properties` container on demand;
+ *  clearing removes the property and tears the container (and empty wrapper) down
+ *  when nothing else remains. Any non-opt-out `zeebe:property` siblings are
+ *  preserved. */
+export function writeAutoSubscribeOptOut(
+  moddle: AgentModdle,
+  modeling: AgentModeling,
+  element: unknown,
+  bo: AgentModdleElement,
+  optOut: boolean,
+): void {
+  const container = zeebeProperties(bo);
+  const kept = (container?.properties ?? []).filter(
+    (p) => p.name !== AUTO_SUBSCRIBE_PROPERTY,
+  );
+  if (optOut) {
+    const prop = moddle.create(ZEEBE_PROPERTY_TYPE, {
+      name: AUTO_SUBSCRIBE_PROPERTY,
+      value: AUTO_SUBSCRIBE_OPT_OUT_VALUE,
+    });
+    const properties = [...kept, prop];
+    if (container) {
+      for (const p of properties) p.$parent = container;
+      modeling.updateModdleProperties(element, container, { properties });
+      return;
+    }
+    const newContainer = moddle.create(ZEEBE_PROPERTIES_TYPE, { properties });
+    for (const p of properties) p.$parent = newContainer;
+    attachExtChild(moddle, modeling, element, bo, newContainer);
+    return;
+  }
+  // Clearing: drop the opt-out property; keep the container only if other
+  // properties remain, else tear it (and any orphan wrapper) down.
+  if (!container) return;
+  if (kept.length) {
+    for (const p of kept) p.$parent = container;
+    modeling.updateModdleProperties(element, container, { properties: kept });
+    return;
+  }
+  removeExtChild(modeling, element, bo, container);
 }
