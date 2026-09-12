@@ -3572,9 +3572,10 @@ mod incident_kind_serde_compat_tests {
 /// lost/garbled projection. These guard that replay-safety property directly.
 #[cfg(all(test, feature = "serde"))]
 mod adhoc_redrive_serde_tests {
+    use std::collections::HashMap;
+
     use super::{IncidentKind, IoMappingRedrive, Value};
     use crate::event::Event;
-    use std::collections::HashMap;
 
     fn projection() -> HashMap<String, Value> {
         // A mix of scalar + nested-container values so a structural
