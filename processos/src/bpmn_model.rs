@@ -335,23 +335,39 @@ fn attr_value_in(s: &str, attr: &str) -> Option<String> {
     None
 }
 
-/// Every value of a whitespace-preceded `id="…"` attribute in `s`, in document
-/// order. Used to reserve the ids inside a preserved `<bpmndi:BPMNDiagram>` block
-/// so a generated declaration id cannot collide with one (#1173).
+/// Every value of an `id` attribute in `s`, in document order. Used to reserve the
+/// ids inside a preserved `<bpmndi:BPMNDiagram>` block so a generated declaration
+/// id cannot collide with one (#1173). Tolerant of the legal XML spellings the DI
+/// serializer (or a hand-edited model) may use — `id="…"`, `id = "…"` and
+/// `id='…'` — so a DI id in any of them is still reserved.
 fn all_id_attrs_in(s: &str) -> Vec<String> {
-    let needle = "id=\"";
     let mut out = Vec::new();
     let mut from = 0;
-    while let Some(rel) = s[from..].find(needle) {
+    while let Some(rel) = s[from..].find("id") {
         let at = from + rel;
-        let preceded_by_ws = s[..at].chars().last().is_some_and(|c| c.is_whitespace());
-        let vstart = at + needle.len();
-        if preceded_by_ws {
-            if let Some(off) = s[vstart..].find('"') {
-                out.push(s[vstart..vstart + off].to_string());
-            }
+        from = at + 2;
+        // `id` must be a standalone attribute name: preceded by whitespace so it
+        // is not the tail of another name (`bpmndi`, `validId`, …) ...
+        if !s[..at].chars().last().is_some_and(|c| c.is_whitespace()) {
+            continue;
         }
-        from = vstart;
+        // ... and followed by optional whitespace, `=`, optional whitespace, then a
+        // single- or double-quote opening the value.
+        let after = s[from..].trim_start();
+        let Some(after_eq) = after.strip_prefix('=') else {
+            continue;
+        };
+        let val = after_eq.trim_start();
+        let Some(quote) = val.chars().next() else {
+            continue;
+        };
+        if quote != '"' && quote != '\'' {
+            continue;
+        }
+        let body = &val[quote.len_utf8()..];
+        if let Some(off) = body.find(quote) {
+            out.push(body[..off].to_string());
+        }
     }
     out
 }
@@ -662,10 +678,14 @@ pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
     let adj = adjacency(&def);
     let is_task_id = |id: &str| def.element(id).map(|e| is_task(&e.kind)).unwrap_or(false);
     let is_end_id = |id: &str| {
-        matches!(
-            def.element(id).map(|e| &e.kind),
-            Some(ElementKind::EndEvent) | Some(ElementKind::TerminateEndEvent)
-        )
+        def.element(id).is_some_and(|e| match &e.kind {
+            ElementKind::EndEvent | ElementKind::TerminateEndEvent => true,
+            // An escalation throw with no outgoing flow is an escalation *end*
+            // event (terminal); one with outgoing is an intermediate throw and
+            // is not a closing node.
+            ElementKind::EscalationThrowEvent { .. } => e.outgoing.is_empty(),
+            _ => false,
+        })
     };
     let tasks: HashSet<String> = def
         .elements
@@ -848,14 +868,19 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
 
     let mut findings = Vec::new();
 
-    // No explicit end event.
+    // No explicit end event. An escalation throw with no outgoing flow is an
+    // escalation *end* event, so it counts as a terminal node here — otherwise a
+    // process whose only terminal is an escalation end would draw a false
+    // `no-end-event` warning (#1173).
     let end_events = ids
         .iter()
         .filter(|id| {
+            let el = &def.elements[**id];
             matches!(
-                def.elements[**id].kind,
+                el.kind,
                 ElementKind::EndEvent | ElementKind::TerminateEndEvent
-            )
+            ) || (matches!(el.kind, ElementKind::EscalationThrowEvent { .. })
+                && el.outgoing.is_empty())
         })
         .count();
     if end_events == 0 {
@@ -887,7 +912,11 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
         }
 
         // A non-end flow node with no outgoing flow silently drops its token.
-        let is_event_end = matches!(kind, ElementKind::EndEvent | ElementKind::TerminateEndEvent);
+        // An escalation throw with no outgoing flow is an escalation *end* event
+        // (terminal), so — like a plain end event — it must not be flagged as a
+        // dead end (#1173).
+        let is_event_end = matches!(kind, ElementKind::EndEvent | ElementKind::TerminateEndEvent)
+            || (matches!(kind, ElementKind::EscalationThrowEvent { .. }) && el.outgoing.is_empty());
         if !is_event_end && el.outgoing.is_empty() && !is_boundary(kind) {
             // Sub-process inner ends and the like aside, a task/gateway with no exit is a
             // dead end.
@@ -5755,6 +5784,87 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             throw.io.outputs.len(),
             1,
             "escalation-throw output mapping preserved on round-trip"
+        );
+    }
+
+    #[test]
+    fn definition_to_xml_preserving_di_reserves_a_di_id_in_an_alternate_spelling() {
+        // Regression (#1173, suppressed advisory): the DI-id reservation scanned
+        // for the literal `id="…"`, missing legal XML spellings like `id = "…"`
+        // and `id='…'`. A preserved DI element named `Escalation_OVERLOAD` in such
+        // a form was omitted from `reserved_ids`, so the escalation declaration
+        // minted for code `OVERLOAD` collided with it (two elements sharing one
+        // XML id). The scanner is now quote/whitespace tolerant.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Esc")
+            .start_event("Start")
+            .sub_process("Sub", "SubStart")
+            .start_event("SubStart")
+            .contained_in("SubStart", "Sub")
+            .escalation_throw_event("Throw", "OVERLOAD")
+            .contained_in("Throw", "Sub")
+            .end_event("SubEnd")
+            .contained_in("SubEnd", "Sub")
+            .end_event("Done")
+            .connect("Start", "Sub")
+            .connect("SubStart", "Throw")
+            .connect("Throw", "SubEnd")
+            .connect("Sub", "Done")
+            .build()
+            .unwrap();
+        // Rename the plane id using an alternate-but-legal spelling (`id = '…'`).
+        let di_source =
+            definition_to_xml(&def).replace("id=\"BPMNPlane_1\"", "id = 'Escalation_OVERLOAD'");
+        assert!(
+            di_source.contains("id = 'Escalation_OVERLOAD'"),
+            "the DI source carries the alternate-spelling colliding plane id"
+        );
+        let xml = definition_to_xml_preserving_di(&def, &HashMap::new(), Some(&di_source));
+        assert!(
+            xml.contains("id = 'Escalation_OVERLOAD'"),
+            "the preserved DI plane id survives verbatim, got:\n{xml}"
+        );
+        assert!(
+            xml.contains("<bpmn:escalation id=\"Escalation_OVERLOAD_2\""),
+            "the escalation declaration must avoid the alternate-spelling DI id, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn analyze_model_treats_an_escalation_end_event_as_terminal() {
+        // Regression (#1173, suppressed advisory): a task → escalation *end* event
+        // (an `EscalationThrowEvent` with no outgoing flow) is a legitimate
+        // terminal. The end-event and dead-end checks only recognised
+        // `EndEvent`/`TerminateEndEvent`, so such a model drew a false
+        // `no-end-event` warning and a false `dead-end` on the escalation end.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("EscTerminal")
+            .start_event("Start")
+            .service_task("Work", "worker")
+            .escalation_throw_event("EscEnd", "OVERLOAD")
+            .connect("Start", "Work")
+            .connect("Work", "EscEnd")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        let v = analyze_model(&xml).expect("analyze");
+        let findings = v["findings"].as_array().unwrap();
+        assert!(
+            !findings.iter().any(|f| f["code"] == "no-end-event"),
+            "an escalation end event is a terminal, so no `no-end-event` warning is due:\n{findings:#?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f["code"] == "dead-end" && f["element"] == "EscEnd"),
+            "an escalation end event must not be flagged as a dead end:\n{findings:#?}"
+        );
+        // The observable-task projection must also see it as a closing task.
+        let graph = model_task_graph(&xml).expect("task graph");
+        assert!(
+            graph.end_tasks.contains("Work"),
+            "the task reaching the escalation end event is a legal closing task, got {:?}",
+            graph.end_tasks
         );
     }
 

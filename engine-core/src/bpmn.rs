@@ -954,6 +954,14 @@ fn parse_with_captures(
                                         acc.nodes[idx].kind,
                                         NodeKind::IntermediateThrow | NodeKind::End
                                     ) {
+                                        // A SECOND escalation definition on the
+                                        // same throw/end is a last-wins overwrite
+                                        // of `escalation_ref`; flag it so `build`
+                                        // rejects the ambiguous multi-definition
+                                        // throw (#1173).
+                                        if acc.nodes[idx].is_escalation_throw {
+                                            acc.nodes[idx].escalation_throw_dup = true;
+                                        }
                                         acc.nodes[idx].is_escalation_throw = true;
                                         acc.nodes[idx].escalation_ref =
                                             escalation_ref.map(str::to_string);
@@ -2158,6 +2166,12 @@ struct NodeAcc {
     /// [`EscalationThrowEvent`](crate::model::ElementKind::EscalationThrowEvent).
     /// Its raised escalation code is resolved from `escalation_ref` at build.
     is_escalation_throw: bool,
+    /// True when a SECOND `escalationEventDefinition` was seen on this
+    /// throw/end event. `escalation_ref`/`is_escalation_throw` are last-wins, so
+    /// a second definition would silently drop the first; `build` rejects the
+    /// ambiguous multi-definition throw instead (#1173), mirroring the boundary
+    /// `escalation_dup` guard.
+    escalation_throw_dup: bool,
     /// The `escalationRef` on this escalation throw/end (or boundary-less) event,
     /// resolved to an `escalationCode` at build. `None` when absent.
     escalation_ref: Option<String>,
@@ -2396,6 +2410,7 @@ impl ProcessAcc {
             start_form_id: None,
             is_compensation_throw: false,
             is_escalation_throw: false,
+            escalation_throw_dup: false,
             escalation_ref: None,
             link_name: None,
             is_terminate: false,
@@ -2656,6 +2671,38 @@ impl ProcessAcc {
                 .filter(|n| inside_adhoc(&n.id) && !in_subprocess_tool(&n.id))
                 .map(|n| n.id.clone())
                 .collect();
+
+            // A pruned inner element is flattened into an `AdHocTool` whose
+            // `AdHocToolKind` is `Other` for any node kind the catalog doesn't
+            // model as an executable tool (only Service/User/Call/SubProcess are).
+            // Activating an `Other` tool completes it directly, which is harmless
+            // for a plain none-throw but SILENTLY DROPS the runtime side-effect of
+            // an escalation/compensation *throw*: the escalation is never raised
+            // (its boundary handler never fires) and the compensation is never
+            // triggered. Executing these as ad-hoc tools is a larger runtime
+            // feature nano does not yet support, so — rather than let the model
+            // misbehave at runtime — reject the placement at deploy naming the
+            // construct (mirrors the start/end-event rejections below and the
+            // "reject, don't silently drop" contract). Iterate `self.nodes` in
+            // document order so the error is deterministic.
+            if let Some(bad) = self.nodes.iter().find(|n| {
+                pruned.contains(&n.id) && (n.is_escalation_throw || n.is_compensation_throw)
+            }) {
+                let construct = if bad.is_escalation_throw {
+                    "escalation throw event"
+                } else {
+                    "compensation throw event"
+                };
+                return Err(ParseError::InvalidProcess {
+                    process_id: self.id.clone(),
+                    reason: format!(
+                        "ad-hoc sub-process must not contain a {construct} ({}); \
+                         nano cannot execute a throw event as an ad-hoc tool, so its \
+                         escalation/compensation would be silently dropped",
+                        bad.id
+                    ),
+                });
+            }
 
             // Deploy-time ad-hoc validation (Zeebe `AdHocSubProcessValidator`):
             // reject structurally invalid containers before they can run, so a bad
@@ -3100,12 +3147,26 @@ impl ProcessAcc {
                     + node.is_terminate as u32
                     + node.link_name.is_some() as u32
                     + error_def_node_ids.contains(&node.id) as u32;
-                if defs > 1 {
+                // `defs > 1`: competing definitions of different kinds.
+                // `escalation_throw_dup`: two `escalationEventDefinition`s on the
+                // SAME throw/end — a last-wins overwrite of `escalation_ref` that
+                // would silently drop the first (#1173), the throw/end analogue of
+                // the boundary `escalation_dup` guard.
+                if defs > 1 || node.escalation_throw_dup {
                     return Err(match node.kind {
                         // The `endEvent` flavour has a reason-bearing error; an
                         // `intermediateThrowEvent` reuses the throw-side
                         // `UnsupportedElement` rejection (as the wrong-placement
                         // escalation/compensation throws already do).
+                        NodeKind::End if node.escalation_throw_dup => ParseError::InvalidEndEvent {
+                            process_id: self.id.clone(),
+                            element_id: node.id.clone(),
+                            reason: "end event declares more than one \
+                                         escalationEventDefinition; a multi-definition \
+                                         escalation end event is not supported (declare \
+                                         exactly one)"
+                                .to_string(),
+                        },
                         NodeKind::End => ParseError::InvalidEndEvent {
                             process_id: self.id.clone(),
                             element_id: node.id.clone(),
@@ -5140,6 +5201,87 @@ mod tests {
                     if tag == "intermediateThrowEvent" && element_id == "Bad"
             ),
             "expected UnsupportedElement for the multi-definition throw Bad, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_an_escalation_throw_inside_an_adhoc_container() {
+        // Regression (#1173, critical): an escalation *throw* placed directly in
+        // an ad-hoc container is pruned to `AdHocToolKind::Other`; activating that
+        // tool completes it directly, so the runtime escalation hook (which only
+        // runs for `ElementKind::EscalationThrowEvent`) never fires and the
+        // container's escalation boundary handler is silently skipped. nano cannot
+        // execute a throw event as an ad-hoc tool, so reject the placement at
+        // deploy naming the construct rather than let the model misbehave.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:escalation id="Esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:adHocSubProcess id="Agent">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="agent" />
+      </bpmn:extensionElements>
+      <bpmn:serviceTask id="tool">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="tool" />
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:intermediateThrowEvent id="ThrowEsc">
+        <bpmn:escalationEventDefinition escalationRef="Esc" />
+      </bpmn:intermediateThrowEvent>
+    </bpmn:adHocSubProcess>
+    <bpmn:boundaryEvent id="Bnd" attachedToRef="Agent">
+      <bpmn:escalationEventDefinition escalationRef="Esc" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="Handler" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Agent" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Agent" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="Bnd" targetRef="Handler" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err = parse_bpmn(xml)
+            .expect_err("an escalation throw inside an ad-hoc container is rejected");
+        assert!(
+            matches!(&err, ParseError::InvalidProcess { reason, .. }
+                if reason.contains("ThrowEsc") && reason.contains("escalation throw event")),
+            "expected InvalidProcess naming the escalation throw ThrowEsc, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn should_reject_a_duplicate_escalation_definition_on_a_throw() {
+        // Regression (#1173, suppressed advisory): a SECOND
+        // `escalationEventDefinition` on one intermediate throw / end event
+        // silently overwrites `escalation_ref` (last-wins), swapping the raised
+        // code with no diagnostic — the throw/end analogue of the boundary
+        // duplicate guard. Reject the ambiguous multi-definition throw at deploy.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:escalation id="EscA" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:escalation id="EscB" name="Any" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="Bad">
+      <bpmn:escalationEventDefinition escalationRef="EscA" />
+      <bpmn:escalationEventDefinition escalationRef="EscB" />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Bad" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let err =
+            parse_bpmn(xml).expect_err("an end event with two escalation definitions is rejected");
+        assert!(
+            matches!(
+                &err,
+                ParseError::InvalidEndEvent { element_id, reason, .. }
+                    if element_id == "Bad" && reason.contains("more than one escalationEventDefinition")
+            ),
+            "expected InvalidEndEvent for the duplicate-escalation end event Bad, got {err:?}"
         );
     }
 
