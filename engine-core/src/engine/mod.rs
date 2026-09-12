@@ -425,11 +425,18 @@ enum Step {
     /// Re-drive a call activity's child-process **spawn** after its input-mapping
     /// incident is resolved (#946): re-attempt seeding and creating the child
     /// process for the already-activated call activity (its boundary events were
-    /// armed on the first pass and are not re-armed).
+    /// armed on the first pass and are not re-armed). `preserved_seed` carries the
+    /// ad-hoc call-activity *tool*'s single-pass input projection captured on the
+    /// failed first spawn (#1176) so the respawn reuses it verbatim rather than
+    /// re-projecting the tool's (possibly chained) input mappings against the
+    /// already-mutated child scope; `None` for a mainstream call activity (whose
+    /// seed re-derives idempotently from its still-stable element scope) and for
+    /// legacy journals predating #1176.
     RetryCallActivitySpawn {
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
+        preserved_seed: Option<HashMap<String, Value>>,
     },
 }
 
@@ -2953,6 +2960,7 @@ impl Engine {
                         } else if matches!(
                             redrive,
                             Some(state::IoMappingRedrive::CallActivitySpawn)
+                                | Some(state::IoMappingRedrive::AdHocCallActivitySpawn { .. })
                         ) {
                             // A failed call-activity spawn (bad `=calledElement`
                             // expression, unknown callee, or depth overflow — issue
@@ -2963,11 +2971,55 @@ impl Engine {
                             // result) without ever instantiating the callee. Re-attempt
                             // the spawn instead, so resolving the incident (after the
                             // operator fixes the callee) actually creates the child.
+                            // An ad-hoc call-activity tool carries its single-pass
+                            // input projection on the redrive (#1176) so the respawn
+                            // reuses it verbatim instead of re-projecting chained
+                            // input mappings against the already-mutated child scope.
+                            let preserved_seed = match &redrive {
+                                Some(state::IoMappingRedrive::AdHocCallActivitySpawn {
+                                    child_seed,
+                                }) => Some(child_seed.clone()),
+                                _ => None,
+                            };
                             queue.push_back(Step::RetryCallActivitySpawn {
                                 instance_key,
                                 element_instance_key,
                                 element_id,
+                                preserved_seed,
                             });
+                        } else if let Some(state::IoMappingRedrive::AdHocToolOutputCollection {
+                            precomputed_output,
+                        }) = &redrive
+                        {
+                            // An ad-hoc call-activity tool whose completion parked
+                            // the output-collection *type* incident (#1176). Re-drive
+                            // the tool's completion reusing the single-pass output
+                            // projection captured on the redrive, rather than a plain
+                            // `Step::Complete` that would re-evaluate the tool's
+                            // (possibly chained) output mappings against the mutated
+                            // child scope. Recover the container/inner element
+                            // instances the leaf needs (the incident sits on the tool
+                            // child); fall back to `Step::Complete` if the tool is no
+                            // longer a live ad-hoc tool child.
+                            match self.adhoc_tool_container_of(instance_key, element_instance_key) {
+                                Some((container_key, inner_key)) => {
+                                    queue.push_back(Step::CompleteAdHocCallActivityTool {
+                                        instance_key,
+                                        element_instance_key,
+                                        element_id,
+                                        container_key,
+                                        inner_key,
+                                        output_updates: precomputed_output.clone(),
+                                    });
+                                }
+                                None => {
+                                    queue.push_back(Step::Complete {
+                                        instance_key,
+                                        element_instance_key,
+                                        element_id,
+                                    });
+                                }
+                            }
                         } else {
                             queue.push_back(Step::Complete {
                                 instance_key,
@@ -3093,8 +3145,46 @@ impl Engine {
                                     instance_key,
                                     element_instance_key,
                                     element_id,
+                                    preserved_seed: None,
                                 })
                             }
+                            // Ad-hoc call-activity tool spawn (#1176): re-attempt the
+                            // spawn reusing the tool's preserved single-pass input
+                            // projection. (Spawn incidents surface as
+                            // `ExpressionEvaluation`/`CalledElementError`, handled
+                            // above; this arm keeps the `IoMapping` match exhaustive.)
+                            Some(state::IoMappingRedrive::AdHocCallActivitySpawn {
+                                child_seed,
+                            }) => Some(Step::RetryCallActivitySpawn {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                preserved_seed: Some(child_seed),
+                            }),
+                            // Ad-hoc tool output-collection type incident (#1176):
+                            // re-drive the tool completion reusing the preserved
+                            // single-pass output projection. (Surfaces as
+                            // `ExpressionEvaluation`, handled above; this arm keeps
+                            // the `IoMapping` match exhaustive.)
+                            Some(state::IoMappingRedrive::AdHocToolOutputCollection {
+                                precomputed_output,
+                            }) => self
+                                .adhoc_tool_container_of(instance_key, element_instance_key)
+                                .map(|(container_key, inner_key)| {
+                                    Step::CompleteAdHocCallActivityTool {
+                                        instance_key,
+                                        element_instance_key,
+                                        element_id: element_id.clone(),
+                                        container_key,
+                                        inner_key,
+                                        output_updates: precomputed_output.clone(),
+                                    }
+                                })
+                                .or(Some(Step::Complete {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                })),
                             // Call-activity output: re-project the captured child
                             // result through the output mappings and complete.
                             Some(state::IoMappingRedrive::CallActivityCompletion {
@@ -5258,7 +5348,13 @@ impl Engine {
                 instance_key,
                 element_instance_key,
                 element_id,
-            } => self.retry_call_activity_spawn(instance_key, element_instance_key, element_id),
+                preserved_seed,
+            } => self.retry_call_activity_spawn(
+                instance_key,
+                element_instance_key,
+                element_id,
+                preserved_seed,
+            ),
         }
     }
 
@@ -8007,11 +8103,23 @@ impl Engine {
                 propagate_all_parent_variables,
                 ..
             }) => {
+                // The actual first-pass child seed: the full activating view under
+                // `propagateAllParentVariables` (Zeebe
+                // `copyAllVariablesToProcessInstance`), or just the tool's
+                // input-mapping results when suppressed
+                // (`copyLocalVariablesToProcessInstance`).
                 let child_seed = if propagate_all_parent_variables {
                     child_vars.clone()
                 } else {
-                    applied_inputs
+                    applied_inputs.clone()
                 };
+                // The redrive-preserved projection is ALWAYS only the single-pass
+                // input-mapping results (#1176), never the frozen full view: on a
+                // spawn-incident respawn we overlay it onto a FRESH all-parent view
+                // (Zeebe re-reads the call activity's current scope in
+                // `finalizeActivation`), so container variables that became visible
+                // after the incident still propagate under
+                // `propagateAllParentVariables=true`.
                 let (spawn_events, spawn_followups) = self.spawn_call_activity_instance(
                     instance_key,
                     child_key,
@@ -8019,6 +8127,7 @@ impl Engine {
                     &called,
                     &child_vars,
                     child_seed,
+                    Some(applied_inputs),
                 );
                 events.extend(spawn_events);
                 followups.extend(spawn_followups);
@@ -8215,6 +8324,21 @@ impl Engine {
                         "the output collection '{name}' of ad-hoc sub-process \
                          '{container_element_id}' has the wrong type: expected an array"
                     );
+                    // Preserve the tool's single-pass output projection on the
+                    // redrive when it is a call-activity tool (#1176): the projection
+                    // was already evaluated once by `complete_adhoc_call_activity_tool`
+                    // against the child process's produced variables. A plain
+                    // `Step::Complete` redrive would re-enter `complete_adhoc_tool`
+                    // with `precomputed_output = None` and re-evaluate the tool's
+                    // (possibly chained) output mappings against the seeded child
+                    // scope — the double-eval PR #1171 fixed on the clean path.
+                    // Carrying the projection lets the resolve reuse it verbatim. An
+                    // ordinary (single-activity) tool has `None` here: its output
+                    // re-evaluates idempotently against its own unmutated child scope,
+                    // so it keeps the plain `redrive: None` → `Step::Complete` path.
+                    let redrive = precomputed_output.clone().map(|precomputed_output| {
+                        state::IoMappingRedrive::AdHocToolOutputCollection { precomputed_output }
+                    });
                     return (
                         vec![Event::IncidentRaised {
                             incident_key,
@@ -8222,7 +8346,7 @@ impl Engine {
                             element_instance_key: child_eik,
                             element_id: tool_element_id,
                             kind: state::IncidentKind::ExpressionEvaluation,
-                            redrive: None,
+                            redrive,
                             reason,
                             job_key: None,
                             created_at: self.now,
@@ -11395,6 +11519,7 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
+        preserved_seed: Option<HashMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         // Ad-hoc call-activity tool (issue #1159): the tool element is pruned from
         // the flat element graph, so `element_kind` returns `None` for it and the
@@ -11409,6 +11534,7 @@ impl Engine {
                 element_instance_key,
                 container_key,
                 element_id,
+                preserved_seed,
             );
         }
         let (called, propagate_all_parent) = match self.element_kind(instance_key, &element_id) {
@@ -11464,18 +11590,35 @@ impl Engine {
     /// child element instance is still ACTIVATED in the container's active set and
     /// its local scope already carries the agent seed + the tool's applied input
     /// mappings from the first pass, so this re-derives the callee id and
-    /// `propagateAllParentVariables` from the container catalog, re-evaluates the
-    /// tool's inputs against that scope (idempotent — the same
-    /// `adhoc_tool_input_updates` the activation used), and re-runs the shared
-    /// spawn with the same seed decision. Creating the child on success routes its
-    /// completion back through `complete_adhoc_call_activity_tool` exactly as a
-    /// first-pass spawn would.
+    /// `propagateAllParentVariables` from the container catalog and re-runs the
+    /// shared spawn. Creating the child on success routes its completion back
+    /// through `complete_adhoc_call_activity_tool` exactly as a first-pass spawn
+    /// would.
+    ///
+    /// `preserved_seed` (#1176) is the tool's single-pass input projection
+    /// captured on the failed first spawn: the tool child's local scope already
+    /// carries the first pass's applied input targets, so re-projecting the
+    /// (single-pass, possibly chained) input mappings here would read a mutated
+    /// view and silently alter them (`x -> y`, `y -> z`: the retry would resolve
+    /// `z` non-null). It seeds the child by Zeebe parity
+    /// (`CallActivityProcessor.finalizeActivation`): under
+    /// `propagateAllParentVariables=true` the preserved projection is overlaid
+    /// onto a FRESHLY re-read all-parent view (Zeebe's
+    /// `copyAllVariablesToProcessInstance` re-reads the call activity's current
+    /// scope on redrive), so container variables that became visible after the
+    /// incident still propagate into the child; with it off, only the preserved
+    /// projection crosses (`copyLocalVariablesToProcessInstance`). The activating
+    /// `view` is re-read fresh regardless so the `=calledElement` expression
+    /// re-evaluates against the operator's fix. `preserved_seed` is `None` only
+    /// for a legacy incident predating #1176 (a plain `CallActivitySpawn` redrive
+    /// on an ad-hoc tool), which re-projects the input mappings instead.
     fn respawn_adhoc_call_activity_tool(
         &mut self,
         instance_key: Key,
         child_eik: Key,
         container_key: Key,
         element_id: String,
+        preserved_seed: Option<HashMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
         let container_element_id = match self
             .state
@@ -11505,29 +11648,51 @@ impl Engine {
             // spawn with an empty callee.
             _ => return (Vec::new(), Vec::new()),
         };
+        // Re-read the activating view fresh so the `=calledElement` expression
+        // re-evaluates against the operator's fix. The child *seed* does NOT come
+        // from re-projecting inputs against this (already-mutated) view — see
+        // `preserved_seed` below.
         let view = (*self.variables_for_element(instance_key, child_eik)).clone();
-        let applied_inputs = match self.adhoc_tool_input_updates(
-            instance_key,
-            &container_element_id,
-            &element_id,
-            &view,
-        ) {
-            Ok(updates) => updates,
-            Err(failure) => {
-                let event = self.io_mapping_incident(
-                    instance_key,
-                    child_eik,
-                    element_id,
-                    failure,
-                    state::IoMappingRedrive::CallActivitySpawn,
-                );
-                return (vec![event], Vec::new());
-            }
+        // The single-pass input-mapping projection: preserved verbatim from the
+        // failed first spawn (#1176) so a chained input mapping is not re-applied
+        // against the already-mutated child scope. For a legacy pre-#1176 incident
+        // (plain `CallActivitySpawn` redrive on an ad-hoc tool) it is re-projected
+        // — idempotent for non-chained inputs; the preservation path is what fixes
+        // the chained case.
+        let projection = match preserved_seed {
+            Some(seed) => seed,
+            None => match self.adhoc_tool_input_updates(
+                instance_key,
+                &container_element_id,
+                &element_id,
+                &view,
+            ) {
+                Ok(updates) => updates,
+                Err(failure) => {
+                    let event = self.io_mapping_incident(
+                        instance_key,
+                        child_eik,
+                        element_id,
+                        failure,
+                        state::IoMappingRedrive::CallActivitySpawn,
+                    );
+                    return (vec![event], Vec::new());
+                }
+            },
         };
+        // Zeebe parity (`CallActivityProcessor.finalizeActivation`): when the spawn
+        // incident resolves, `copyAllVariablesToProcessInstance` re-reads the call
+        // activity's CURRENT scope, so `propagateAllParentVariables=true` seeds the
+        // child from a FRESH all-parent view with the preserved input projection
+        // layered on top (child-local wins) — picking up container variables that
+        // became visible after the incident. With it off, only the preserved input
+        // projection crosses (`copyLocalVariablesToProcessInstance`).
         let child_seed = if propagate_all_parent {
-            view.clone()
+            let mut merged = view.clone();
+            merged.extend(projection.clone());
+            merged
         } else {
-            applied_inputs
+            projection.clone()
         };
         self.spawn_call_activity_instance(
             instance_key,
@@ -11536,6 +11701,7 @@ impl Engine {
             &process_id,
             &view,
             child_seed,
+            Some(projection),
         )
     }
 
@@ -11604,6 +11770,7 @@ impl Engine {
             called_process_id,
             element_vars,
             child_vars,
+            None,
         )
     }
 
@@ -11620,6 +11787,7 @@ impl Engine {
     /// on a recoverable incident instead (no child is created). The caller owns
     /// the input mappings and the `propagateAllParentVariables` seed decision, so
     /// this single site owns only the callee-resolution + spawn machinery.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_call_activity_instance(
         &mut self,
         parent_instance: Key,
@@ -11628,7 +11796,30 @@ impl Engine {
         called_process_id: &str,
         eval_view: &HashMap<String, Value>,
         child_seed: HashMap<String, Value>,
+        // The ad-hoc tool's single-pass input projection to preserve on any
+        // recoverable spawn incident (issue #1159 / #1176), or `None` for a
+        // mainstream sequence-flow call activity. When `Some`, a spawn incident
+        // records this projection (`AdHocCallActivitySpawn.child_seed`) so the
+        // post-resolve respawn overlays it onto a FRESH all-parent view instead of
+        // re-projecting the tool's (possibly chained) input mappings against the
+        // already-mutated child scope; a mainstream call activity (`None`)
+        // re-derives its seed idempotently from its still-stable element scope and
+        // so carries the plain [`state::IoMappingRedrive::CallActivitySpawn`].
+        adhoc_input_projection: Option<HashMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
+        // The recoverable-spawn-incident redrive: for an ad-hoc tool it preserves
+        // the single-pass input projection so the respawn does not re-evaluate the
+        // tool's (possibly chained) input mappings; for a mainstream call activity
+        // it is the plain spawn-retry marker. Built **lazily** — only an incident
+        // path needs it, and the ad-hoc variant clones just the preserved input
+        // projection, so the hot success path must not pay that copy: it moves the
+        // original `child_seed` straight into `ProcessInstanceCreated` instead.
+        let spawn_redrive = || match &adhoc_input_projection {
+            Some(projection) => state::IoMappingRedrive::AdHocCallActivitySpawn {
+                child_seed: projection.clone(),
+            },
+            None => state::IoMappingRedrive::CallActivitySpawn,
+        };
         // The callee id may be a literal or a FEEL `=` expression (C8
         // `zeebe:calledElement processId`), resolved against the activating view.
         // A failing expression must surface as an expression-evaluation incident
@@ -11655,7 +11846,7 @@ impl Engine {
                                 // the spawn (`RetryCallActivitySpawn`) rather than
                                 // completing the parked call activity / ad-hoc tool
                                 // with no child.
-                                redrive: Some(state::IoMappingRedrive::CallActivitySpawn),
+                                redrive: Some(spawn_redrive()),
                                 reason: format!(
                                     "call activity '{element_id}' could not evaluate \
                                      calledElement expression '{called_process_id}': {err}"
@@ -11681,7 +11872,7 @@ impl Engine {
                     element_instance_key: call_eik,
                     element_id: element_id.to_string(),
                     kind: state::IncidentKind::CalledElementError,
-                    redrive: Some(state::IoMappingRedrive::CallActivitySpawn),
+                    redrive: Some(spawn_redrive()),
                     reason: format!(
                         "call activity '{element_id}' exceeded the maximum child-instance depth \
                          of {MAX_CALL_ACTIVITY_DEPTH} calling '{called}' (possible unbounded \
@@ -11712,7 +11903,7 @@ impl Engine {
                     // Recoverable via a spawn retry (issue #1159): deploying the
                     // missing callee and resolving the incident re-attempts the
                     // spawn instead of completing the parent with no child.
-                    redrive: Some(state::IoMappingRedrive::CallActivitySpawn),
+                    redrive: Some(spawn_redrive()),
                     reason: format!(
                         "call activity '{element_id}' references unknown called process '{called}'"
                     ),

@@ -697,8 +697,11 @@ pub enum IncidentKind {
     IoMapping,
 }
 
-/// The lifecycle re-drive an [`IncidentKind::IoMapping`] incident replays when it
-/// is resolved. Recovery is **phase-driven** — the re-drive is chosen from the
+/// The lifecycle re-drive an incident replays when it is resolved. Carried by
+/// every [`IncidentKind::IoMapping`] incident, and also by the ad-hoc
+/// call-activity tool recovery paths (#1176) that park on an
+/// [`IncidentKind::ExpressionEvaluation`] or [`IncidentKind::CalledElementError`]
+/// incident. Recovery is **phase-driven** — the re-drive is chosen from the
 /// element's lifecycle phase (activation vs completion) recorded here, not from
 /// the incident *kind* — so a single `IoMapping` taxonomy can cover every
 /// ioMapping failure (uniform `IO_MAPPING_ERROR`) while each specialized path
@@ -739,6 +742,34 @@ pub enum IoMappingRedrive {
     /// process for the already-activated call activity (its boundary events were
     /// armed on the first pass and must not be re-armed).
     CallActivitySpawn,
+    /// An ad-hoc **call-activity tool** spawn failure (#1176): identical recovery
+    /// to [`Self::CallActivitySpawn`] (re-attempt the still-activated tool's
+    /// child-process spawn), but carries the tool's single-pass *input projection*
+    /// (`child_seed`) captured on the failed first pass so the post-resolve
+    /// respawn reuses it **verbatim** instead of re-evaluating the tool's
+    /// (possibly chained, non-idempotent) input mappings against the
+    /// already-mutated child scope. On the first pass the tool's input mappings
+    /// were already folded into the tool child's local scope (via
+    /// `AdHocToolActivated`'s `local_variables`), so re-projecting them at respawn
+    /// time reads a view that already contains the first pass's applied targets —
+    /// `eval_io_mappings_in` is single-pass, so a chained mapping (`x -> y`,
+    /// `y -> z`) is not idempotent across the retry. Mirrors the "project once,
+    /// reuse verbatim" pattern PR #1171 introduced for the output side. Additive
+    /// brand-new variant — old journals never carry it.
+    AdHocCallActivitySpawn { child_seed: HashMap<String, Value> },
+    /// An ad-hoc **call-activity tool** output-collection *type* incident (#1176):
+    /// the tool's completion parked because the container `outputCollection`
+    /// target is not a list (Zeebe `EXTRACT_VALUE_ERROR`). Carries the tool's
+    /// single-pass *output projection* (`precomputed_output`, already evaluated
+    /// once against the child process's produced variables by
+    /// `complete_adhoc_call_activity_tool`) so the post-resolve redrive reuses it
+    /// **verbatim** instead of re-evaluating the tool's (possibly chained) output
+    /// mappings against the seeded child scope — the double-eval PR #1171 fixed on
+    /// the clean path by threading `precomputed_output` through
+    /// `continue_adhoc_inner_flow`. Additive brand-new variant.
+    AdHocToolOutputCollection {
+        precomputed_output: HashMap<String, Value>,
+    },
     /// A call-activity **output**-mapping failure: re-project the captured child
     /// result through the call activity's output mappings and complete it. The
     /// child variables are captured here because the completed child instance
@@ -773,9 +804,14 @@ pub struct Incident {
     pub element_id: ElementId,
     /// What went wrong.
     pub kind: IncidentKind,
-    /// For an [`IncidentKind::IoMapping`] incident, the lifecycle phase to replay
-    /// on resolution (phase-driven recovery — see [`IoMappingRedrive`]). `None`
-    /// for every other incident kind (whose recovery is derived from the kind).
+    /// The lifecycle phase / projection to replay on resolution (phase-driven
+    /// recovery — see [`IoMappingRedrive`]). Present for every
+    /// [`IncidentKind::IoMapping`] incident, and also for the ad-hoc
+    /// call-activity tool recovery paths (#1176) that park on an
+    /// [`IncidentKind::ExpressionEvaluation`] (output-collection type) or
+    /// [`IncidentKind::CalledElementError`] (child-spawn) incident while carrying
+    /// a preserved single-pass projection to reuse verbatim on redrive. `None`
+    /// for every other incident (whose recovery is derived from the kind).
     #[cfg_attr(feature = "serde", serde(default))]
     pub redrive: Option<IoMappingRedrive>,
     /// Human-readable explanation of why the incident was raised.
@@ -3521,6 +3557,89 @@ mod incident_kind_serde_compat_tests {
                 assert!(redrive.is_none());
             }
             other => panic!("expected IncidentRaised, got {other:?}"),
+        }
+    }
+}
+
+/// The ad-hoc call-activity redrive payloads (#1176) are **persisted** inside an
+/// `IncidentRaised` journal line / snapshot, not just resolved in-memory — an
+/// active ioMapping incident sits on the journal until the operator resolves it,
+/// and migration-by-replay (#1071) rebuilds the engine by replaying that journal
+/// under the current binary. So the single-pass input/output projections they
+/// carry (`AdHocCallActivitySpawn.child_seed` /
+/// `AdHocToolOutputCollection.precomputed_output`) must survive a serde
+/// round-trip **verbatim**, or a recovered incident would respawn the tool with a
+/// lost/garbled projection. These guard that replay-safety property directly.
+#[cfg(all(test, feature = "serde"))]
+mod adhoc_redrive_serde_tests {
+    use std::collections::HashMap;
+
+    use super::{IncidentKind, IoMappingRedrive, Value};
+    use crate::event::Event;
+
+    fn projection() -> HashMap<String, Value> {
+        // A mix of scalar + nested-container values so a structural
+        // serialization/recovery regression (not just a dropped key) is caught.
+        HashMap::from([
+            ("x".to_string(), Value::Int(1)),
+            (
+                "chained".to_string(),
+                Value::List(vec![Value::Str("z".to_string()), Value::Bool(true)]),
+            ),
+        ])
+    }
+
+    fn raised_with(redrive: IoMappingRedrive) -> Event {
+        Event::IncidentRaised {
+            incident_key: 7,
+            instance_key: 1,
+            element_instance_key: 2,
+            element_id: "tool".to_string(),
+            kind: IncidentKind::IoMapping,
+            redrive: Some(redrive),
+            reason: "boom".to_string(),
+            job_key: None,
+            created_at: 42,
+        }
+    }
+
+    /// An active `AdHocCallActivitySpawn` incident must replay with its input
+    /// projection (`child_seed`) preserved verbatim, so a post-recovery respawn
+    /// reuses it instead of re-evaluating chained input mappings.
+    #[test]
+    fn adhoc_call_activity_spawn_projection_survives_replay() {
+        let seed = projection();
+        let event = raised_with(IoMappingRedrive::AdHocCallActivitySpawn {
+            child_seed: seed.clone(),
+        });
+        let line = serde_json::to_string(&event).expect("serializes");
+        let back: Event = serde_json::from_str(&line).expect("replays");
+        match back {
+            Event::IncidentRaised {
+                redrive: Some(IoMappingRedrive::AdHocCallActivitySpawn { child_seed }),
+                ..
+            } => assert_eq!(child_seed, seed),
+            other => panic!("expected AdHocCallActivitySpawn redrive, got {other:?}"),
+        }
+    }
+
+    /// An active `AdHocToolOutputCollection` incident must replay with its output
+    /// projection (`precomputed_output`) preserved verbatim, so a post-recovery
+    /// redrive reuses it instead of re-projecting chained output mappings.
+    #[test]
+    fn adhoc_tool_output_collection_projection_survives_replay() {
+        let out = projection();
+        let event = raised_with(IoMappingRedrive::AdHocToolOutputCollection {
+            precomputed_output: out.clone(),
+        });
+        let line = serde_json::to_string(&event).expect("serializes");
+        let back: Event = serde_json::from_str(&line).expect("replays");
+        match back {
+            Event::IncidentRaised {
+                redrive: Some(IoMappingRedrive::AdHocToolOutputCollection { precomputed_output }),
+                ..
+            } => assert_eq!(precomputed_output, out),
+            other => panic!("expected AdHocToolOutputCollection redrive, got {other:?}"),
         }
     }
 }
