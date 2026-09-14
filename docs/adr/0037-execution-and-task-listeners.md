@@ -270,7 +270,10 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
   listener IS supported**, since the quiescence sweep defers the join behind the
   end-listener chain, so an inclusive-join `end` listener is *not* rejected), a
   **compensation boundary event** (a passive structural marker never entered by
-  token flow), and a **sequence-flow ("take") listener** (a sequence flow is
+  token flow), a **tool of an ad-hoc sub-process** (a leaf tool is pruned into the
+  non-executable catalog and a retained embedded tool is activated/completed with
+  direct lifecycle events, both bypassing the listener gate), and a
+  **sequence-flow ("take") listener** (a sequence flow is
   modelled as an edge, not an `Element`, so it has no lifecycle to run a listener
   on). **Sequence-flow ("take") listeners
   remain deferred:** firing a take listener between source completion and target

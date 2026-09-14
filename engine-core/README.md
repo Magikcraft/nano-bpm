@@ -391,7 +391,9 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > `intermediateCatchEvent`/`timerEventDefinition`, `messageEventDefinition`/
 > `zeebe:subscription` and `startEvent` message/timer definitions) via the
 > [`bpmn`] module (`bpmn::parse_bpmn`), a tiny dependency-free scanner.
-> `zeebe:executionListeners` (`start`/`end`, ADR 0037) are parsed on tasks,
+> `zeebe:executionListeners` (`start`/`end`, ADR 0037) are parsed on tasks
+> (including `receiveTask`, which pushes onto the io_stack so its listener lands
+> on the receive task itself rather than hoisting onto the enclosing scope),
 > sub-processes, ad-hoc/call containers **and** on gateways
 > (exclusive/parallel/inclusive/event-based), **start events**, and **boundary
 > events** (#1197) — each attaches to its own element and fires through the shared
@@ -400,8 +402,10 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > parallel gateway (a *join* — both phases; a single-incoming split is
 > supported), a multi-incoming inclusive gateway's `start` listener (its `end`
 > listener IS supported — the join defers behind the end-listener chain at
-> quiescence), a compensation boundary event, and a sequence-flow ("take")
-> listener. Sequence-flow ("take") listeners are not yet modelled (sequence flows
+> quiescence), a compensation boundary event, a **tool of an ad-hoc sub-process**
+> (a leaf tool is pruned and a retained embedded tool is activated/completed with
+> direct lifecycle events, both bypassing the listener gate), and a sequence-flow
+> ("take") listener. Sequence-flow ("take") listeners are not yet modelled (sequence flows
 > are edges, not elements), so a listener nested in a `<sequenceFlow>` is rejected
 > at deploy rather than silently dropped — tracked in #1198.
 > Deployments assign a per-id **version** and a unique process-definition key.

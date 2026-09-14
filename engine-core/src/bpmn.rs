@@ -95,14 +95,19 @@
 //!   and `aiAgentSubProcess` only on an `adHocSubProcess`; the wrong placement
 //!   (or an unknown `agentType`) is rejected at parse time.
 //! * `zeebe:executionListeners` / nested `zeebe:executionListener`
-//!   (`eventType` `start`/`end`, ADR 0037): parsed on activities, sub-processes,
-//!   ad-hoc/call containers, **gateways** (exclusive/parallel/inclusive/
-//!   event-based), **start events**, and **boundary events** (#1197). Each
+//!   (`eventType` `start`/`end`, ADR 0037): parsed on activities (including
+//!   `receiveTask`, which rides the `io_stack` like the other plain tasks),
+//!   sub-processes, ad-hoc/call containers, **gateways** (exclusive/parallel/
+//!   inclusive/event-based), **start events**, and **boundary events** (#1197).
+//!   Each
 //!   listener attaches to its own element (activities/gateways/start & end events
 //!   ride the `io_stack`; a boundary event carries its listeners on the buffered
 //!   boundary and re-attaches them by id at build) and fires through the shared
-//!   activation/completion listener gate. Sequence-flow ("take") listeners are
-//!   **not** modelled — sequence flows are edges, not elements.
+//!   activation/completion listener gate. A listener that could never fire is
+//!   rejected at deploy rather than dropped: sequence-flow ("take") listeners
+//!   (edges, not elements) and listeners on a **tool of an ad-hoc sub-process**
+//!   (pruned leaf tools and directly-activated embedded tools both bypass the
+//!   listener gate).
 
 use std::collections::HashMap;
 
@@ -202,6 +207,14 @@ pub enum ParseError {
     /// * a **compensation boundary event**: a passive structural marker, armed
     ///   implicitly and never entered by token flow, so it has no lifecycle to
     ///   hang a listener on.
+    /// * a **sequence flow**: an edge, not an `Element`, so it has no lifecycle
+    ///   to run a "take" listener on. Sequence-flow ("take") listeners are a
+    ///   deferred subset (#1198); until then a declared one is rejected rather
+    ///   than dropped or hoisted onto the enclosing sub-process.
+    /// * a **tool of an ad-hoc sub-process**: a leaf tool is pruned and a
+    ///   retained embedded-sub-process tool is activated/completed with direct
+    ///   lifecycle events, both bypassing the shared listener gate, so a listener
+    ///   on it could never create a job. Rejected rather than accepted dead.
     UnsupportedExecutionListener {
         process_id: String,
         element_id: String,
@@ -1483,9 +1496,22 @@ fn parse_with_captures(
                             // A receive task waits for a message. Nano's trace
                             // generator has no inbound correlation, so model it as
                             // a pass-through (the awaited event is assumed to
-                            // arrive) rather than a perpetual block.
+                            // arrive) rather than a perpetual block. Push it onto
+                            // the io_stack like the other plain tasks so a
+                            // `zeebe:ioMapping` or `zeebe:executionListeners`
+                            // declared on it attaches to the receive task itself
+                            // and fires through the shared pass-through listener
+                            // gate — otherwise its listeners would fall through to
+                            // `io_stack.last()` and be dropped at process root or
+                            // hoisted onto the enclosing sub-process (#1197).
                             "receiveTask" => {
-                                acc.add_node(attrs, NodeKind::IntermediateThrow);
+                                let idx = acc.add_node(attrs, NodeKind::IntermediateThrow);
+                                if !self_closing {
+                                    cur_plain_task = idx;
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
+                                }
                             }
                             "timeDuration"
                                 if cur_intermediate.is_some()
@@ -1984,7 +2010,7 @@ fn parse_with_captures(
                     }
                     cur_user_task = None;
                 }
-                "task" | "manualTask" => {
+                "task" | "manualTask" | "receiveTask" => {
                     if cur_plain_task.is_some() {
                         io_stack.pop();
                     }
@@ -2913,6 +2939,33 @@ impl ProcessAcc {
             .filter(|n| n.is_adhoc)
             .map(|n| n.id.clone())
             .collect();
+        // Reject an execution listener declared on a *tool* of an ad-hoc
+        // sub-process — a node whose direct parent is an ad-hoc container (#1197).
+        // A leaf tool is pruned below (flattened into the non-executable
+        // `AdHocTool` catalog and never activated through the lifecycle) and a
+        // retained embedded-sub-process tool is activated/completed with direct
+        // lifecycle events, both bypassing `advance_listener`, so a `start`/`end`
+        // listener on the tool could never create a job. Refuse the model at
+        // deploy rather than accept a dead listener that silently disappears —
+        // the same reject-don't-drop contract applied to sequence flows and
+        // joins. Checked pre-pruning (leaf tools are removed just below) and only
+        // for the tool ITSELF: listeners on deeper elements inside a retained
+        // sub-process tool's body run by ordinary token flow and DO fire, so they
+        // are left alone. Document order keeps the error deterministic.
+        if let Some(bad) = self.nodes.iter().find(|n| {
+            (!n.start_listeners.is_empty() || !n.end_listeners.is_empty())
+                && n.parent.as_deref().is_some_and(|p| adhoc_ids.contains(p))
+        }) {
+            return Err(ParseError::UnsupportedExecutionListener {
+                process_id: self.id.clone(),
+                element_id: bad.id.clone(),
+                reason: "an execution listener on a tool of an ad-hoc sub-process is not \
+                         supported: a leaf tool is pruned and a retained embedded tool is \
+                         activated/completed with direct lifecycle events, both bypassing the \
+                         listener gate, so the listener could never fire"
+                    .to_string(),
+            });
+        }
         if !adhoc_ids.is_empty() {
             let parent_of: HashMap<&str, &str> = self
                 .nodes
@@ -8484,6 +8537,102 @@ mod io_mapping_tests {
             "the sibling task must own its own listener"
         );
         assert_eq!(next.start_listeners[0].job_type, "next-start");
+    }
+
+    #[test]
+    fn receive_task_execution_listener_attaches_to_itself() {
+        // #1197 regression: a `receiveTask` is modelled as a pass-through, but it
+        // must push onto the io_stack like the other plain tasks so a
+        // `zeebe:executionListener` declared on it lands on the RECEIVE TASK —
+        // not fall through to `io_stack.last()` and get dropped at process root
+        // or hoisted onto the enclosing sub-process (the silent mis-attachment
+        // class this PR closes). Here the listener is declared inside a receive
+        // task nested in a sub-process: it must own its listener, and the
+        // enclosing sub-process must NOT.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:subProcess id="sub">
+      <bpmn:startEvent id="ss" />
+      <bpmn:receiveTask id="rt">
+        <bpmn:extensionElements>
+          <zeebe:executionListeners>
+            <zeebe:executionListener eventType="start" type="rt-start" />
+            <zeebe:executionListener eventType="end" type="rt-end" />
+          </zeebe:executionListeners>
+        </bpmn:extensionElements>
+      </bpmn:receiveTask>
+      <bpmn:endEvent id="se" />
+      <bpmn:sequenceFlow id="a" sourceRef="ss" targetRef="rt" />
+      <bpmn:sequenceFlow id="b" sourceRef="rt" targetRef="se" />
+    </bpmn:subProcess>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).expect("receive-task listener must parse")[0];
+        let rt = def.element("rt").expect("receive task present");
+        assert_eq!(
+            rt.start_listeners.len(),
+            1,
+            "start listener on the receive task"
+        );
+        assert_eq!(rt.start_listeners[0].job_type, "rt-start");
+        assert_eq!(
+            rt.end_listeners.len(),
+            1,
+            "end listener on the receive task"
+        );
+        assert_eq!(rt.end_listeners[0].job_type, "rt-end");
+        let sub = def.element("sub").expect("sub-process present");
+        assert!(
+            sub.start_listeners.is_empty() && sub.end_listeners.is_empty(),
+            "the receive task's listeners must NOT hoist onto the enclosing sub-process"
+        );
+    }
+
+    #[test]
+    fn execution_listener_on_adhoc_tool_is_rejected() {
+        // #1197 reject-don't-drop: an execution listener on a *tool* of an ad-hoc
+        // sub-process cannot fire — a leaf tool is pruned into the non-executable
+        // catalog and a retained embedded tool is activated/completed with direct
+        // lifecycle events, both bypassing the listener gate. Accepting one would
+        // deploy a dead listener, so the deploy is rejected instead.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:adHocSubProcess id="agent">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="agent-worker" />
+        <zeebe:adHoc outputCollection="results" outputElement="=result" />
+      </bpmn:extensionElements>
+      <bpmn:serviceTask id="toolA">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="tool" />
+          <zeebe:executionListeners>
+            <zeebe:executionListener eventType="start" type="toolA-start" />
+          </zeebe:executionListeners>
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+    </bpmn:adHocSubProcess>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+    <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        match parse_bpmn(xml) {
+            Err(ParseError::UnsupportedExecutionListener { element_id, .. }) => {
+                assert_eq!(element_id, "toolA");
+            }
+            other => {
+                panic!("expected UnsupportedExecutionListener for an ad-hoc tool, got {other:?}")
+            }
+        }
     }
 
     #[test]
