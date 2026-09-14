@@ -7470,6 +7470,43 @@ fn should_stamp_the_activating_worker_on_a_successful_job_completion() {
 }
 
 #[test]
+fn should_normalize_an_empty_activation_worker_to_no_attribution() {
+    // #1191 — an *empty* activation worker string (e.g. an explicitly-supplied
+    // `""` forwarded by the REST activation handler) is NOT an attribution: it
+    // must be normalized to `None` at the single source (the `JobActivated`
+    // reducer) rather than stamped as `Some("")`. Otherwise it flows into the
+    // terminal `JobCompleted`/`JobFailed`/`JobErrorThrown` events and the
+    // read-model `COALESCE(?, worker)` bindings treat `""` as a non-NULL value,
+    // storing an empty attribution instead of leaving the row NULL.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+
+    // when a job is activated with an empty worker string
+    let job_key = engine.activate_jobs("payment", "", 10, 60_000, 0)[0].key;
+
+    // then the live job carries no attribution (not `Some("")`)
+    assert_eq!(engine.job(job_key).unwrap().worker, None);
+
+    // and a successful completion emits no empty attribution
+    let events = engine
+        .apply_command(Command::complete_job(job_key))
+        .unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::JobCompleted { job_key: k, worker: None, .. } if *k == job_key
+    )));
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        Event::JobCompleted { worker: Some(w), .. } if w.is_empty()
+    )));
+}
+
+#[test]
 fn should_drop_the_worker_when_a_failed_job_returns_to_the_activatable_pool() {
     // #959 — with retries remaining the job is genuinely no longer held (it goes
     // back to the activatable pool), so the activating `worker` must be cleared.

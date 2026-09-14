@@ -2236,7 +2236,14 @@ pub fn apply(state: &mut State, event: &Event) {
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.state = JobState::Activated;
-                job.worker = Some(worker.clone());
+                // An *empty* activation worker string is not an attribution:
+                // normalize it to `None` here, at the single source, so an
+                // explicitly-supplied `""` never becomes `Some("")`. This keeps
+                // `Job.worker` canonical for every downstream derivation — the
+                // terminal `JobCompleted`/`JobFailed`/`JobErrorThrown` events and
+                // the read-model attribution bindings — so no empty attribution
+                // can be stamped or `COALESCE`d into a row that should stay NULL.
+                job.worker = Some(worker.clone()).filter(|w| !w.is_empty());
                 job.deadline = Some(*deadline);
                 job.activated_at = *activated_at;
                 // Freeze the requested lock duration at activation, from the two

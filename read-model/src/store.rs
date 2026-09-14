@@ -3917,6 +3917,18 @@ fn project_engine_state(
 /// `search*`/`get*` projection are materialized; the rest (element lifecycle,
 /// sequence flows, timers, message subscriptions, start subscriptions) carry no
 /// queryable read-model state and are ignored.
+/// An *empty* worker string is not an attribution: a job activated with an
+/// explicitly-supplied `""` (e.g. forwarded verbatim by the REST activation
+/// handler) carries no worker, so a terminal row must project it to SQL `NULL`
+/// — leaving any pre-existing attribution untouched under `COALESCE(?, worker)`
+/// — rather than overwriting the row with an empty attribution. The engine's
+/// `JobActivated` reducer normalizes this at the source for freshly-emitted
+/// events; this guard keeps the projection correct when *replaying* any event
+/// persisted before that normalization existed.
+fn worker_attribution(worker: Option<&str>) -> Option<&str> {
+    worker.filter(|w| !w.is_empty())
+}
+
 /// Applies `event` to the read model and returns its exact contribution to the
 /// in-flight instance gauge: `+1` when it genuinely creates a new active
 /// instance, `-1` when it genuinely transitions an active instance to terminal,
@@ -4471,7 +4483,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                         *job_key as i64,
                         job_state_code(JobState::Failed),
                         retries,
-                        worker.as_deref()
+                        worker_attribution(worker.as_deref())
                     ],
                 )?;
             }
@@ -4489,7 +4501,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 params![
                     *job_key as i64,
                     job_state_code(JobState::Errored),
-                    worker.as_deref()
+                    worker_attribution(worker.as_deref())
                 ],
             )?;
         }
@@ -4512,7 +4524,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 params![
                     *job_key as i64,
                     job_state_code(JobState::Completed),
-                    worker.as_deref()
+                    worker_attribution(worker.as_deref())
                 ],
             )?;
         }
@@ -8781,6 +8793,88 @@ mod element_instance_tests {
         let no_worker = &jobs[&9102];
         assert_eq!(no_worker.state, JobState::Completed);
         assert_eq!(no_worker.worker, None);
+    }
+
+    #[test]
+    fn an_empty_worker_on_a_terminal_event_projects_to_null_not_an_empty_attribution() {
+        // #1191 — an *empty* worker string on a persisted terminal event
+        // (`Some("")`, e.g. replayed from before the engine reducer normalized it
+        // at the source) must NOT be stored as an attribution: under
+        // `COALESCE(?, worker)` a non-NULL `""` would overwrite / pin the row to
+        // an empty worker instead of leaving it NULL. The projection normalizes
+        // `Some("")` to `None` so the row stays NULL across all three terminal
+        // paths (completed / failed / errored).
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &Event::JobCreated {
+                    job_key: 9201,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "review-round".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobCompleted {
+                    job_key: 9201,
+                    instance_key: INST,
+                    created_at: 1,
+                    job_type: "review-round".to_string(),
+                    worker: Some(String::new()),
+                },
+                &Event::JobCreated {
+                    job_key: 9202,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobFailed {
+                    job_key: 9202,
+                    instance_key: INST,
+                    retries: 0,
+                    worker: Some(String::new()),
+                },
+                &Event::JobCreated {
+                    job_key: 9203,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobErrorThrown {
+                    job_key: 9203,
+                    instance_key: INST,
+                    error_code: "BOOM".to_string(),
+                    worker: Some(String::new()),
+                },
+            ])
+            .unwrap();
+
+        let jobs: HashMap<Key, super::JobRow> =
+            store.jobs().into_iter().map(|j| (j.key, j)).collect();
+
+        let completed = &jobs[&9201];
+        assert_eq!(completed.state, JobState::Completed);
+        assert_eq!(completed.worker, None);
+
+        let failed = &jobs[&9202];
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.worker, None);
+
+        let errored = &jobs[&9203];
+        assert_eq!(errored.state, JobState::Errored);
+        assert_eq!(errored.worker, None);
     }
 
     #[test]
