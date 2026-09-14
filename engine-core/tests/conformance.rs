@@ -48,9 +48,14 @@ struct Mapping {
 }
 
 /// The Nano↔Zeebe reject-category mapping table — the single source of truth,
-/// mirrored in `tests/conformance/README.md`. It MUST cover every [`ParseError`]
-/// variant (enforced by [`nano_category`]'s exhaustive match plus
-/// [`mapping_covers_every_parse_error_category`]).
+/// mirrored in `tests/conformance/README.md`. It covers every [`ParseError`]
+/// variant that is a genuine Zeebe-parity rejection. Together with
+/// [`NANO_ONLY_DIVERGENCES`] (the intentional Nano-only rejections Zeebe accepts)
+/// the two tables **partition** the full [`ParseError`] surface — every category
+/// is in exactly one of them (enforced by [`nano_category`]'s exhaustive match
+/// plus [`mapping_covers_every_parse_error_category`]). A new Zeebe-parity
+/// variant belongs here; a new Nano-only divergence belongs in
+/// [`NANO_ONLY_DIVERGENCES`].
 const NANO_ZEEBE_MAPPING: &[Mapping] = &[
     Mapping {
         nano: "MalformedXml",
@@ -136,8 +141,10 @@ const NANO_ZEEBE_MAPPING: &[Mapping] = &[
 
 /// Maps a [`ParseError`] to its stable category key. The match is **exhaustive
 /// with no wildcard**: adding a new `ParseError` variant to the shared enum
-/// forces a new arm here, which in turn forces a [`NANO_ZEEBE_MAPPING`] row and
-/// (via the coverage ratchet) a corpus entry — closing the drift surface.
+/// forces a new arm here, which in turn forces a row in **exactly one** of
+/// [`NANO_ZEEBE_MAPPING`] (a Zeebe-parity rejection) or [`NANO_ONLY_DIVERGENCES`]
+/// (an intentional Nano-only divergence) and (via the coverage ratchets) a
+/// corpus entry — closing the drift surface.
 fn nano_category(err: &ParseError) -> &'static str {
     match err {
         ParseError::MalformedXml(_) => "MalformedXml",

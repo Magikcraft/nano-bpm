@@ -126,13 +126,15 @@ pub enum ParseError {
     /// deployment (`INVALID_ARGUMENT` → HTTP 400) rather than silently dropping
     /// the link, so Nano surfaces it as a hard parse error for parity.
     InvalidLinkedResource { task_id: String, attribute: String },
-    /// A user task's `zeebe:formDefinition` declared a `formId` with a
-    /// non-`latest` `bindingType` (`deployment` or `versionTag`). The engine
-    /// only implements the `latest` binding — it resolves a `formId` to the
-    /// latest deployed form version at user-task creation. Rather than silently
-    /// degrading a `deployment`/`versionTag` binding to `latest` (a latent
-    /// mis-binding, #1190), Nano rejects the deploy loudly. `binding_type`
-    /// carries the offending attribute value.
+    /// A user task's `zeebe:formDefinition` declared a non-`latest`
+    /// `bindingType` (`deployment` or `versionTag`) on the form definition. The
+    /// engine only implements the `latest` binding — it resolves a `formId` to
+    /// the latest deployed form version at user-task creation. This is raised
+    /// for any non-`latest` binding on the form definition, whether it carries a
+    /// `formId` or not (an explicit empty `bindingType` is likewise rejected).
+    /// Rather than silently degrading a `deployment`/`versionTag` binding to
+    /// `latest` (a latent mis-binding, #1190), Nano rejects the deploy loudly.
+    /// `binding_type` carries the offending attribute value.
     UnsupportedUserTaskFormBinding {
         task_id: String,
         binding_type: String,
