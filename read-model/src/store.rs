@@ -9002,7 +9002,10 @@ mod element_instance_tests {
         // The seed itself must have normalized the empty worker to NULL.
         let seeded: HashMap<Key, super::JobRow> =
             store.jobs().into_iter().map(|j| (j.key, j)).collect();
-        assert_eq!(seeded[&9401].worker, None, "seeded empty worker must be NULL");
+        assert_eq!(
+            seeded[&9401].worker, None,
+            "seeded empty worker must be NULL"
+        );
 
         // A completion carrying no attribution must not resurrect the empty string.
         store
