@@ -1742,7 +1742,17 @@ fn parse_with_captures(
                             // zeebe:executionListener entries (ADR 0037). Each
                             // listener attaches to the innermost open activity.
                             "executionListeners" => {
-                                in_execution_listeners = true;
+                                // A self-closing `<zeebe:executionListeners />` has
+                                // no nested listeners and emits no matching end tag,
+                                // so only enter the container state for a real open
+                                // element — otherwise the flag would stay stuck
+                                // `true` and wrongly capture a later stray
+                                // `zeebe:executionListener` onto whatever element is
+                                // open on the io_stack (mirrors the `taskHeaders`
+                                // gate).
+                                if !self_closing {
+                                    in_execution_listeners = true;
+                                }
                             }
                             "executionListener" if in_execution_listeners => {
                                 if let Some(job_type) = attr(attrs, "type") {
@@ -2917,6 +2927,28 @@ impl ProcessAcc {
                         reason: "a compensation boundary event is a passive structural \
                                  marker that is never activated by token flow, so its \
                                  execution listeners would never fire"
+                            .to_string(),
+                    });
+                }
+            }
+            // A **terminate end event** completes off the normal end-event path:
+            // `complete_terminate_end` drives a scope-wide teardown and emits
+            // `ElementCompleting`/`ElementCompleted` directly, never running the
+            // end-listener chain — so an `end` listener on it could never create a
+            // job. Reject `end` alone (reject-don't-drop, #1197). Its `start`
+            // listener IS supported: it fires through the generic activation
+            // start-listener gate before the terminate behaviour runs, exactly like
+            // the inclusive-join case where only the dead phase is rejected.
+            for node in &self.nodes {
+                if node.is_terminate && !node.end_listeners.is_empty() {
+                    return Err(ParseError::UnsupportedExecutionListener {
+                        process_id: self.id.clone(),
+                        element_id: node.id.clone(),
+                        reason: "an `end` execution listener on a terminate end event would \
+                                 never fire: completing a terminate end drives a scope-wide \
+                                 teardown that emits completion directly, bypassing the \
+                                 end-listener chain (its `start` listener IS supported — it \
+                                 fires through the activation start-listener gate)"
                             .to_string(),
                     });
                 }
@@ -6798,6 +6830,55 @@ mod tests {
     }
 
     #[test]
+    fn self_closing_execution_listeners_do_not_leak_into_later_listeners() {
+        // given: a first service task with a self-closing (empty)
+        // `<zeebe:executionListeners />`, then a second service task whose own
+        // stray `zeebe:executionListener` sits *outside* any executionListeners
+        // container. A self-closing start tag emits no matching end tag, so the
+        // `in_execution_listeners` gate must not stay stuck open across elements
+        // (mirrors the `zeebe:taskHeaders` gate) — otherwise the stray listener is
+        // wrongly captured onto whatever element is open on the io_stack.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="first">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="a" />
+                  <zeebe:executionListeners />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:serviceTask id="second">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="b" />
+                  <zeebe:executionListener eventType="start" type="stray" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="first" />
+              <bpmn:sequenceFlow id="f2" sourceRef="first" targetRef="second" />
+              <bpmn:sequenceFlow id="f3" sourceRef="second" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the empty container yields no listeners, and the stray listener
+        // that follows is *not* captured onto the second task.
+        for id in ["first", "second"] {
+            let el = def.element(id).unwrap();
+            assert!(
+                el.start_listeners.is_empty() && el.end_listeners.is_empty(),
+                "{id} unexpectedly captured listeners: start={:?} end={:?}",
+                el.start_listeners,
+                el.end_listeners
+            );
+        }
+    }
+
+    #[test]
     fn stray_linked_resource_outside_a_container_is_not_captured() {
         // given: a first service task with a self-closing (empty)
         // `<zeebe:linkedResources />`, then a second service task whose own
@@ -7052,6 +7133,55 @@ mod tests {
             def.element("plain").unwrap().kind,
             crate::model::ElementKind::EndEvent
         );
+    }
+
+    #[test]
+    fn end_execution_listener_on_terminate_end_is_rejected() {
+        // Completing a terminate end drives a scope-wide teardown
+        // (`complete_terminate_end`) that emits `ElementCompleting`/`ElementCompleted`
+        // directly, off the normal end-event completion path — so it never runs the
+        // end-listener chain and an `end` listener on it could never create a job.
+        // Reject it at deploy rather than silently accept a dead listener — the
+        // reject-don't-drop contract (#1197). A `start` listener on the same element
+        // IS supported (it fires through the generic activation start-listener gate),
+        // so it must NOT be rejected.
+        let base = |listener: &str| {
+            format!(
+                r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+              <bpmn:endEvent id="stop">
+                <bpmn:extensionElements>
+                  <zeebe:executionListeners>
+                    <zeebe:executionListener eventType="{listener}" type="ping" />
+                  </zeebe:executionListeners>
+                </bpmn:extensionElements>
+                <bpmn:incoming>f1</bpmn:incoming>
+                <bpmn:terminateEventDefinition />
+              </bpmn:endEvent>
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+            </bpmn:process>
+          </bpmn:definitions>"#
+            )
+        };
+
+        // an `end` listener is rejected — it can never fire
+        match parse_bpmn(&base("end")) {
+            Err(ParseError::UnsupportedExecutionListener { element_id, .. }) => {
+                assert_eq!(element_id, "stop");
+            }
+            other => panic!(
+                "expected UnsupportedExecutionListener for an `end` listener on a terminate end, got {other:?}"
+            ),
+        }
+
+        // a `start` listener is accepted — it fires through the activation gate
+        let def = &parse_bpmn(&base("start")).unwrap()[0];
+        let stop = def.element("stop").unwrap();
+        assert_eq!(stop.kind, crate::model::ElementKind::TerminateEndEvent);
+        assert_eq!(stop.start_listeners.len(), 1);
+        assert!(stop.end_listeners.is_empty());
     }
 
     #[test]
