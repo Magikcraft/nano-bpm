@@ -1835,6 +1835,23 @@ mod terminal_worker_serde_compat_tests {
             other => panic!("expected JobErrorThrown, got {other:?}"),
         }
     }
+
+    /// `JobCompleted.worker` (#1191) is the newest of the three terminal
+    /// attributions and, unlike `JobFailed`/`JobErrorThrown`, its `serde(default)`
+    /// contract lost its dedicated corpus witness when `event_corpus.v2.json` was
+    /// refreshed to *include* the field. Guard the same defect class directly: a
+    /// legacy `JobCompleted` line — written before the field existed — has no
+    /// `worker` key and must still deserialize, defaulting `worker` to `None`,
+    /// so a journal recorded before this PR still replays under the new binary.
+    #[test]
+    fn legacy_job_completed_without_worker_defaults_to_none() {
+        let line = r#"{"JobCompleted":{"job_key":7,"instance_key":1}}"#;
+        let event: Event = serde_json::from_str(line).expect("legacy event deserializes");
+        match event {
+            Event::JobCompleted { worker, .. } => assert!(worker.is_none()),
+            other => panic!("expected JobCompleted, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(all(test, feature = "serde"))]

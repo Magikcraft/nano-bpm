@@ -258,6 +258,24 @@ pub struct Job {
     pub kind: JobKind,
 }
 
+impl Job {
+    /// The activating worker as a durable **attribution**, or `None` when there
+    /// is none. An *empty* worker string (`Some("")`) is not an attribution: it
+    /// normalizes to `None` here so a terminal event captured from this job
+    /// (`JobCompleted` / `JobFailed` / `JobErrorThrown`) never carries `Some("")`.
+    ///
+    /// The `JobActivated` reducer already normalizes an empty worker at the
+    /// source, so a *freshly-activated* job can never hold `Some("")`. This guard
+    /// closes the remaining path: a job **restored from a snapshot written before
+    /// that normalization existed** can still carry `Some("")`, which would
+    /// otherwise be captured verbatim into a terminal event and stamped as an
+    /// empty attribution downstream (#1191). Single source for the three terminal
+    /// capture sites in the engine, so the invariant cannot drift between them.
+    pub fn attribution_worker(&self) -> Option<String> {
+        self.worker.clone().filter(|w| !w.is_empty())
+    }
+}
+
 /// Default job-activation priority when no `zeebe:priorityDefinition` is declared.
 pub const DEFAULT_JOB_PRIORITY: i32 = 50;
 
@@ -3397,6 +3415,50 @@ pub fn apply(state: &mut State, event: &Event) {
         // the target partition (driven by the host's DispatchStartInstance), so
         // there is no local state to mutate here.
         Event::StartInstanceDispatched { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod job_attribution_worker_tests {
+    use super::{Job, JobKind, JobState};
+
+    fn job_with_worker(worker: Option<&str>) -> Job {
+        Job {
+            key: 1,
+            instance_key: 2,
+            element_instance_key: 3,
+            element_id: "t".to_string(),
+            job_type: "review-round".to_string(),
+            state: JobState::Activated,
+            worker: worker.map(str::to_string),
+            deadline: Some(60_000),
+            activated_at: Some(1),
+            activation_timeout: Some(60_000),
+            lease_token: None,
+            durable_activation: false,
+            activated: true,
+            retries: 3,
+            priority: 0,
+            created_at: 1,
+            kind: JobKind::BpmnElement,
+        }
+    }
+
+    /// #1191 — the single-source capture helper the three terminal sites use must
+    /// treat an *empty* worker as no attribution. The `JobActivated` reducer
+    /// normalizes a fresh activation, but a job **restored from a snapshot written
+    /// before that normalization** can still hold `Some("")`; capturing it
+    /// verbatim would stamp an empty attribution onto the terminal event. The
+    /// helper closes that gap: `Some("")` → `None`, while a genuine worker and a
+    /// truly-absent worker pass through unchanged.
+    #[test]
+    fn empty_worker_normalizes_to_none_but_real_and_absent_pass_through() {
+        assert_eq!(job_with_worker(Some("")).attribution_worker(), None);
+        assert_eq!(
+            job_with_worker(Some("w1")).attribution_worker(),
+            Some("w1".to_string())
+        );
+        assert_eq!(job_with_worker(None).attribution_worker(), None);
     }
 }
 

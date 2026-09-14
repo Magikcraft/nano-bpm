@@ -4415,13 +4415,21 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // overwritten when this activation declared a set, so a subsequent
             // fetch-all re-activation of the same job does not erase the last
             // declared provenance.
+            //
+            // The `worker` binding is normalized through `worker_attribution`: an
+            // *empty* activation worker (`""`, e.g. an explicitly-supplied empty
+            // string, or replayed from a `JobActivated` written before the engine
+            // reducer normalized it) is not an attribution and must land as SQL
+            // NULL, not `""`. Otherwise the terminal `COALESCE(?, worker)` on a
+            // completion that carries no attribution would preserve that `""`,
+            // pinning the completed row to an empty worker (#1191).
             if fetch_variables.is_empty() {
                 tx.cexecute(
                     "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, lease_token = ?5 WHERE key = ?1",
                     params![
                         *job_key as i64,
                         job_state_code(JobState::Activated),
-                        worker,
+                        worker_attribution(Some(worker.as_str())),
                         *deadline as i64,
                         lease_token,
                     ],
@@ -4435,7 +4443,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     params![
                         *job_key as i64,
                         job_state_code(JobState::Activated),
-                        worker,
+                        worker_attribution(Some(worker.as_str())),
                         *deadline as i64,
                         read_set,
                         lease_token,
@@ -8875,6 +8883,63 @@ mod element_instance_tests {
         let errored = &jobs[&9203];
         assert_eq!(errored.state, JobState::Errored);
         assert_eq!(errored.worker, None);
+    }
+
+    #[test]
+    fn an_empty_durable_activation_worker_is_not_pinned_onto_the_completed_row() {
+        // #1191 — the terminal `COALESCE(?, worker)` only leaves the completed row
+        // NULL if the *activation* projection did not already write an empty
+        // string. A durable activation carrying `worker: ""` (an explicitly
+        // supplied empty worker, or replay of a `JobActivated` written before the
+        // engine reducer normalized it) must project to SQL NULL, not `""` —
+        // otherwise the completion, which now normalizes its own capture to
+        // `worker: None`, would `COALESCE(NULL, "")` and pin the completed row to
+        // an empty attribution. Guard the activation → completion path end to end.
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &Event::JobCreated {
+                    job_key: 9301,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "review-round".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                // Durable activation with an explicitly-empty worker: the
+                // projection must land NULL, not `""`.
+                &Event::JobActivated {
+                    job_key: 9301,
+                    instance_key: INST,
+                    worker: String::new(),
+                    deadline: 60_000,
+                    activated_at: Some(1),
+                    lease_token: None,
+                    durable: true,
+                    fetch_variables: Vec::new(),
+                },
+                // Completion carries no attribution (the engine normalized its
+                // capture to `None`); `COALESCE(NULL, worker)` must not resurrect
+                // an empty activation string.
+                &Event::JobCompleted {
+                    job_key: 9301,
+                    instance_key: INST,
+                    created_at: 1,
+                    job_type: "review-round".to_string(),
+                    worker: None,
+                },
+            ])
+            .unwrap();
+
+        let jobs: HashMap<Key, super::JobRow> =
+            store.jobs().into_iter().map(|j| (j.key, j)).collect();
+        let completed = &jobs[&9301];
+        assert_eq!(completed.state, JobState::Completed);
+        assert_eq!(completed.worker, None);
     }
 
     #[test]
