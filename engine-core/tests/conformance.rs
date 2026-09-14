@@ -212,12 +212,16 @@ const NANO_ONLY_DIVERGENCES: &[Divergence] = &[
         nano: "UnsupportedExecutionListener",
         rationale: "Zeebe ACCEPTS `zeebe:executionListener`s on multi-incoming \
                     parallel/inclusive joins, on compensation boundary events, and \
-                    on sequence flows; Nano's join lifecycle short-circuits the \
-                    listener-aware activation body, a compensation boundary is a \
-                    passive marker never entered by token flow, and a sequence flow \
-                    is an edge with no lifecycle, so such a listener could never \
-                    fire. Nano rejects the deploy loudly rather than silently store \
-                    (or drop) a dead listener (#1197).",
+                    on sequence flows; Nano rejects those it cannot enact: a parallel \
+                    join completes without running the activation body or the \
+                    end-listener chain (both phases dead), an inclusive join's \
+                    `start` listener never fires (the join short-circuits the \
+                    activation body — but its `end` listener IS supported and is \
+                    accepted, since the quiescence sweep defers the join behind the \
+                    end-listener chain), a compensation boundary is a passive marker \
+                    never entered by token flow, and a sequence flow is an edge with \
+                    no lifecycle. Nano rejects the unsupported deploy loudly rather \
+                    than silently store (or drop) a dead listener (#1197).",
         origin: "#1197",
     },
 ];

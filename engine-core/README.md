@@ -397,11 +397,13 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > events** (#1197) — each attaches to its own element and fires through the shared
 > activation/completion listener gate. A listener that could never fire is
 > rejected at deploy (`UnsupportedExecutionListener`): a multi-incoming
-> parallel/inclusive gateway (a *join* — a single-incoming split is supported), a
-> compensation boundary event, and a sequence-flow ("take") listener. Sequence-flow
-> ("take") listeners are not yet modelled (sequence flows are edges, not elements),
-> so a listener nested in a `<sequenceFlow>` is rejected at deploy rather than
-> silently dropped — tracked in #1198.
+> parallel gateway (a *join* — both phases; a single-incoming split is
+> supported), a multi-incoming inclusive gateway's `start` listener (its `end`
+> listener IS supported — the join defers behind the end-listener chain at
+> quiescence), a compensation boundary event, and a sequence-flow ("take")
+> listener. Sequence-flow ("take") listeners are not yet modelled (sequence flows
+> are edges, not elements), so a listener nested in a `<sequenceFlow>` is rejected
+> at deploy rather than silently dropped — tracked in #1198.
 > Deployments assign a per-id **version** and a unique process-definition key.
 > A `sendTask` is parsed as a job-backed **service task** (Zeebe models
 > send tasks as ordinary job workers). Constructs the engine does not execute

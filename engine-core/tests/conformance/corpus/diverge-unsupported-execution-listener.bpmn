@@ -1,9 +1,13 @@
 <!-- verdict: diverge | category: UnsupportedExecutionListener -->
 <!-- oracle: INTENTIONAL Nano/Zeebe divergence, not parity. Zeebe ACCEPTS a
-     `zeebe:executionListener` on a multi-incoming parallel/inclusive join (and on
-     a compensation boundary); Nano's join lifecycle short-circuits the
-     listener-aware activation body, so such a listener could never fire, and Nano
-     rejects the deploy loudly rather than silently store a dead listener (#1197).
+     `zeebe:executionListener` on a multi-incoming parallel join (and on a
+     compensation boundary); Nano's parallel join completes without running the
+     activation body or the end-listener chain, so such a listener could never
+     fire, and Nano rejects the deploy loudly rather than silently store a dead
+     listener (#1197). (An inclusive join's `end` listener IS supported and is not
+     a divergence — the quiescence sweep defers the join behind its end-listener
+     chain; only the inclusive-join `start` listener and both parallel-join phases
+     are rejected. This fixture exercises a parallel-join `start` listener.)
      Tagged `diverge` (not `reject`) so the conformance oracle never falsely claims
      Zeebe rejected a model it accepts. -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"

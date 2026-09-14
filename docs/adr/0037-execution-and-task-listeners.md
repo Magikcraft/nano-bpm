@@ -260,14 +260,19 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
   the `io_stack`; a boundary event, buffered rather than live on the stack, carries
   its listeners on the pending boundary and re-attaches them by id at build) and
   fire through the shared activation/completion listener gate — closing the silent
-  drop / mis-attachment gap. Three placements where a listener could never fire
-  are **rejected at deploy** rather than silently stored
-  (`UnsupportedExecutionListener`): a **multi-incoming parallel/inclusive gateway**
-  (a *join* synchronises tokens and short-circuits the listener-aware activation
-  body — a single-incoming split is supported), a **compensation boundary event**
-  (a passive structural marker never entered by token flow), and a **sequence-flow
-  ("take") listener** (a sequence flow is modelled as an edge, not an `Element`, so
-  it has no lifecycle to run a listener on). **Sequence-flow ("take") listeners
+  drop / mis-attachment gap. Placements where a listener could never fire are
+  **rejected at deploy** rather than silently stored
+  (`UnsupportedExecutionListener`): a **multi-incoming parallel gateway** (a *join*
+  that synchronises tokens and completes without running the activation body or the
+  end-listener chain — so *neither* phase fires; a single-incoming split is
+  supported), the **`start` listener of a multi-incoming inclusive gateway** (the
+  join fires at quiescence and short-circuits the activation body — but its **`end`
+  listener IS supported**, since the quiescence sweep defers the join behind the
+  end-listener chain, so an inclusive-join `end` listener is *not* rejected), a
+  **compensation boundary event** (a passive structural marker never entered by
+  token flow), and a **sequence-flow ("take") listener** (a sequence flow is
+  modelled as an edge, not an `Element`, so it has no lifecycle to run a listener
+  on). **Sequence-flow ("take") listeners
   remain deferred:** firing a take listener between source completion and target
   activation needs a model + runtime design and is tracked separately in #1198 —
   until then a listener nested in a `<sequenceFlow>` is rejected at deploy (naming

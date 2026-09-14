@@ -146,7 +146,7 @@ exercised by at least one DIVERGE corpus entry
 | Nano `ParseError` category | Zeebe behaviour | Nano behaviour | Origin |
 |----------------------------|-----------------|----------------|--------|
 | `UnsupportedUserTaskFormBinding` | **accepts** `deployment`/`versionTag` user-task form bindings | rejects the deploy (only `latest` implemented) rather than silently degrading | #1190 |
-| `UnsupportedExecutionListener` | **accepts** `zeebe:executionListener`s on multi-incoming parallel/inclusive joins, compensation boundary events, and sequence flows | rejects the deploy (the join lifecycle short-circuits the listener-aware activation body, a compensation boundary is a passive marker never entered by token flow, and a sequence flow is an edge with no lifecycle — such a listener could never fire) rather than silently storing or dropping a dead listener | #1197 |
+| `UnsupportedExecutionListener` | **accepts** `zeebe:executionListener`s on multi-incoming parallel/inclusive joins, compensation boundary events, and sequence flows | rejects those it cannot enact (a parallel join runs neither the activation body nor the end-listener chain, so both phases are dead; an inclusive join's `start` listener never fires — but its `end` listener IS supported and accepted, since the quiescence sweep defers the join behind the end-listener chain; a compensation boundary is a passive marker never entered by token flow; a sequence flow is an edge with no lifecycle) rather than silently storing or dropping a dead listener | #1197 |
 
 ### Notes on a few Nano-specific categorisations
 
