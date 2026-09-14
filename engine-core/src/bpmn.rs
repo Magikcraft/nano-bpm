@@ -104,10 +104,17 @@
 //!   ride the `io_stack`; a boundary event carries its listeners on the buffered
 //!   boundary and re-attaches them by id at build) and fires through the shared
 //!   activation/completion listener gate. A listener that could never fire is
-//!   rejected at deploy rather than dropped: sequence-flow ("take") listeners
-//!   (edges, not elements) and listeners on a **tool of an ad-hoc sub-process**
-//!   (pruned leaf tools and directly-activated embedded tools both bypass the
-//!   listener gate).
+//!   rejected at deploy rather than dropped (`UnsupportedExecutionListener`):
+//!   a multi-incoming parallel gateway (a *join* — both phases), the `start`
+//!   listener of a multi-incoming inclusive gateway (its `end` listener IS
+//!   supported), a compensation boundary event, the `end` listener of a
+//!   terminate end event (its `start` listener IS supported), a listener on a
+//!   surplus signal start event (demoted to an inert throw), a **tool of an
+//!   ad-hoc sub-process** (pruned leaf tools and directly-activated embedded
+//!   tools both bypass the listener gate), and a sequence-flow ("take") listener
+//!   (edges, not elements — deferred, #1198). A `zeebe:taskListener` declared on
+//!   a non-user-task element is likewise rejected (`UnsupportedTaskListener`),
+//!   since task-listener jobs only run on the user-task path.
 
 use std::collections::HashMap;
 
@@ -215,7 +222,27 @@ pub enum ParseError {
     ///   retained embedded-sub-process tool is activated/completed with direct
     ///   lifecycle events, both bypassing the shared listener gate, so a listener
     ///   on it could never create a job. Rejected rather than accepted dead.
+    /// * the **`end` listener of a terminate end event**: completing a terminate
+    ///   end drives a scope-wide teardown that emits completion directly,
+    ///   bypassing the end-listener chain. Its **`start`** listener IS supported
+    ///   (it fires through the activation start-listener gate), so only the dead
+    ///   `end` phase is rejected.
+    /// * a listener on a **surplus signal start event**: Nano has no dedicated
+    ///   signal-start kind, so a second signal start is demoted to an inert throw
+    ///   event with no incoming flow that is never activated or completed — a
+    ///   listener captured on it could never fire.
     UnsupportedExecutionListener {
+        process_id: String,
+        element_id: String,
+        reason: String,
+    },
+    /// A `zeebe:taskListener` was declared on an element that is not a user task
+    /// (#1197). Task-listener jobs are created only on the user-task runtime
+    /// path, so a task listener on any other element (e.g. a `receiveTask`, which
+    /// now rides the `io_stack` for its *execution* listeners) is accepted by the
+    /// lenient parser yet could never create a job. Rather than store a dead task
+    /// listener, Nano rejects the deploy and names the offending element.
+    UnsupportedTaskListener {
         process_id: String,
         element_id: String,
         reason: String,
@@ -329,6 +356,14 @@ deployed form version at user-task creation)"
             } => write!(
                 f,
                 "process {process_id}: execution listener on '{element_id}' is not supported: {reason}"
+            ),
+            ParseError::UnsupportedTaskListener {
+                process_id,
+                element_id,
+                reason,
+            } => write!(
+                f,
+                "process {process_id}: task listener on '{element_id}' is not supported: {reason}"
             ),
             ParseError::InvalidStartEvents { process_id, reason } => {
                 write!(f, "process {process_id}: {reason}")
@@ -1740,7 +1775,9 @@ fn parse_with_captures(
                             }
                             // zeebe:executionListeners and its nested
                             // zeebe:executionListener entries (ADR 0037). Each
-                            // listener attaches to the innermost open activity.
+                            // listener attaches to the innermost open flow node
+                            // (an activity, gateway, start or end event) on the
+                            // io_stack — not just activities.
                             "executionListeners" => {
                                 // A self-closing `<zeebe:executionListeners />` has
                                 // no nested listeners and emits no matching end tag,
@@ -1832,8 +1869,11 @@ fn parse_with_captures(
                             }
                             // zeebe:taskListeners and its nested
                             // zeebe:taskListener entries (ADR 0037 §6). Task
-                            // listeners exist only on user tasks; each attaches
-                            // to the innermost open activity (the user task).
+                            // listeners run only on user tasks; the entry is
+                            // attached to the innermost open element here, and a
+                            // declaration on a non-user-task element is rejected
+                            // at build (`UnsupportedTaskListener`, #1197) rather
+                            // than stored dead.
                             "taskListeners" => {
                                 in_task_listeners = true;
                             }
@@ -2854,7 +2894,16 @@ impl ProcessAcc {
         escalations: &HashMap<String, String>,
     ) -> Result<ProcessDefinition, ParseError> {
         // Reject `zeebe:executionListener`s declared where they can never fire
-        // (#1197), rather than silently storing a listener that creates no job:
+        // (#1197), rather than silently storing a listener that creates no job.
+        //
+        // Scope: this is the **parsed-XML deploy path** contract. All real
+        // deployments arrive as BPMN XML (`parse_bpmn` → `NodeAcc::build` →
+        // `ProcessDefinition` → `Engine::deploy`), so this scan gates every
+        // listener a user can actually deploy. The lower-level programmatic
+        // `ProcessBuilder::with_listeners` is an internal construction API (used
+        // by tests and callers that assemble a `ProcessDefinition` by hand) that
+        // deliberately trusts its caller and does not re-run this semantic check;
+        // it is not a user-facing deploy surface.
         //
         // * A **multi-incoming parallel gateway** is a *join*:
         //   `arrive_at_parallel_join` synchronises tokens and, once the threshold
@@ -2949,6 +2998,25 @@ impl ProcessAcc {
                                  teardown that emits completion directly, bypassing the \
                                  end-listener chain (its `start` listener IS supported — it \
                                  fires through the activation start-listener gate)"
+                            .to_string(),
+                    });
+                }
+            }
+            // A **`zeebe:taskListener`** (ADR 0037 §6) only runs on a user task —
+            // task-listener jobs are created solely on the user-task runtime path.
+            // The lenient parser attaches a `zeebe:taskListeners` declaration to
+            // whatever element is innermost on the `io_stack`, so now that a
+            // `receiveTask` (a pass-through) rides the io_stack for its *execution*
+            // listeners, a task listener declared on it (or any non-user-task) is
+            // stored yet could never create a job. Reject-don't-drop it (#1197).
+            for node in &self.nodes {
+                if !node.task_listeners.is_empty() && !matches!(node.kind, NodeKind::User) {
+                    return Err(ParseError::UnsupportedTaskListener {
+                        process_id: self.id.clone(),
+                        element_id: node.id.clone(),
+                        reason: "a `zeebe:taskListener` only runs on a user task — task-listener \
+                                 jobs are created only on the user-task runtime path, so a task \
+                                 listener declared on any other element could never fire"
                             .to_string(),
                     });
                 }
@@ -8814,6 +8882,71 @@ mod io_mapping_tests {
             sub.start_listeners.is_empty() && sub.end_listeners.is_empty(),
             "the receive task's listeners must NOT hoist onto the enclosing sub-process"
         );
+    }
+
+    #[test]
+    fn task_listener_on_non_user_task_is_rejected() {
+        // #1197 reject-don't-drop: a `zeebe:taskListeners` declaration only runs
+        // on a **user task** — task-listener jobs are created solely on the
+        // user-task runtime path. Since a `receiveTask` now rides the `io_stack`
+        // (so its *execution* listeners attach to itself), a `zeebe:taskListeners`
+        // declared on it would attach to the pass-through receive task and could
+        // never create a job. Accepting one would deploy a dead task listener, so
+        // the deploy is rejected instead — naming the offending element.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:receiveTask id="rt">
+      <bpmn:extensionElements>
+        <zeebe:taskListeners>
+          <zeebe:taskListener eventType="creating" type="rt-creating" />
+        </zeebe:taskListeners>
+      </bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="rt" />
+    <bpmn:sequenceFlow id="f2" sourceRef="rt" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        match parse_bpmn(xml) {
+            Err(ParseError::UnsupportedTaskListener { element_id, .. }) => {
+                assert_eq!(element_id, "rt");
+            }
+            other => {
+                panic!("expected UnsupportedTaskListener for a receive task, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn task_listener_on_user_task_is_accepted() {
+        // Companion to `task_listener_on_non_user_task_is_rejected`: the supported
+        // placement (a `zeebe:taskListeners` on a real `userTask`) must still be
+        // accepted and attach to that user task.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:userTask id="ut">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:taskListeners>
+          <zeebe:taskListener eventType="creating" type="ut-creating" />
+        </zeebe:taskListeners>
+      </bpmn:extensionElements>
+    </bpmn:userTask>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ut" />
+    <bpmn:sequenceFlow id="f2" sourceRef="ut" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).expect("user-task task listener must parse")[0];
+        let ut = def.element("ut").expect("user task present");
+        assert_eq!(ut.task_listeners.len(), 1, "task listener on the user task");
+        assert_eq!(ut.task_listeners[0].job_type, "ut-creating");
     }
 
     #[test]

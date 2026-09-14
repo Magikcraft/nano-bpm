@@ -291,6 +291,12 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
   activation needs a model + runtime design and is tracked separately in #1198 —
   until then a listener nested in a `<sequenceFlow>` is rejected at deploy (naming
   the offending flow), never silently dropped or hoisted onto the enclosing node.
+  A **`zeebe:taskListener` on a non-user-task element** is likewise rejected at
+  deploy (`UnsupportedTaskListener`, naming the element): task-listener jobs are
+  created only on the user-task runtime path, so a task listener attached to any
+  other element (e.g. a `receiveTask`, which rides the `io_stack` for its
+  *execution* listeners) could never fire — reject-don't-drop rather than store a
+  dead task listener.
 
 ## Phased plan
 

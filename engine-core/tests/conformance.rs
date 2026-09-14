@@ -165,6 +165,7 @@ fn nano_category(err: &ParseError) -> &'static str {
         ParseError::InvalidTaskDefinition { .. } => "InvalidTaskDefinition",
         ParseError::InvalidAgentDefinition { .. } => "InvalidAgentDefinition",
         ParseError::UnsupportedExecutionListener { .. } => "UnsupportedExecutionListener",
+        ParseError::UnsupportedTaskListener { .. } => "UnsupportedTaskListener",
     }
 }
 
@@ -212,6 +213,7 @@ const NANO_ONLY_DIVERGENCES: &[Divergence] = &[
         nano: "UnsupportedExecutionListener",
         rationale: "Zeebe ACCEPTS `zeebe:executionListener`s on multi-incoming \
                     parallel/inclusive joins, on compensation boundary events, on \
+                    terminate end events, on surplus signal start events, on \
                     ad-hoc sub-process tools, and \
                     on sequence flows; Nano rejects those it cannot enact: a parallel \
                     join completes without running the activation body or the \
@@ -220,11 +222,28 @@ const NANO_ONLY_DIVERGENCES: &[Divergence] = &[
                     activation body — but its `end` listener IS supported and is \
                     accepted, since the quiescence sweep defers the join behind the \
                     end-listener chain), a compensation boundary is a passive marker \
-                    never entered by token flow, an ad-hoc tool is pruned or \
+                    never entered by token flow, a terminate end event's `end` \
+                    listener never fires (its scope-wide teardown emits completion \
+                    directly, bypassing the end-listener chain — its `start` \
+                    listener IS supported and accepted), a surplus signal start is \
+                    demoted to an inert throw event that is never activated, an \
+                    ad-hoc tool is pruned or \
                     activated/completed with direct lifecycle events (bypassing the \
                     listener gate), and a sequence flow is an edge with \
                     no lifecycle. Nano rejects the unsupported deploy loudly rather \
                     than silently store (or drop) a dead listener (#1197).",
+        origin: "#1197",
+    },
+    Divergence {
+        nano: "UnsupportedTaskListener",
+        rationale: "Zeebe ACCEPTS a `zeebe:taskListener` only on a user task, but \
+                    its lenient parser does not reject one misplaced on another \
+                    element; Nano rejects a task listener on any non-user-task \
+                    element (e.g. a `receiveTask`, which rides the `io_stack` for \
+                    its execution listeners): task-listener jobs are created only on \
+                    the user-task runtime path, so such a listener could never fire. \
+                    Nano rejects it loudly rather than store a dead task listener \
+                    (#1197).",
         origin: "#1197",
     },
 ];
@@ -645,6 +664,11 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             element_id: String::new(),
             reason: String::new(),
         },
+        ParseError::UnsupportedTaskListener {
+            process_id: String::new(),
+            element_id: String::new(),
+            reason: String::new(),
+        },
     ];
     // Compile-time completeness ratchet: this exhaustive, wildcard-free match
     // will not compile if a `ParseError` variant is added without a witness
@@ -670,6 +694,7 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             | ParseError::InvalidTaskDefinition { .. } => {}
             ParseError::InvalidAgentDefinition { .. } => {}
             ParseError::UnsupportedExecutionListener { .. } => {}
+            ParseError::UnsupportedTaskListener { .. } => {}
         }
     }
     witnesses
