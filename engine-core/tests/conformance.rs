@@ -93,12 +93,6 @@ const NANO_ZEEBE_MAPPING: &[Mapping] = &[
         origin: "baseline",
     },
     Mapping {
-        nano: "UnsupportedUserTaskFormBinding",
-        zeebe:
-            "INVALID_ARGUMENT (user-task zeebe:formDefinition non-latest bindingType unsupported)",
-        origin: "#1190",
-    },
-    Mapping {
         nano: "UnresolvedReference",
         zeebe: "INVALID_ARGUMENT (camunda-xml-model eager QName resolution failure)",
         origin: "#849/#851",
@@ -170,6 +164,46 @@ fn mapping_for(nano: &str) -> Option<&'static Mapping> {
     NANO_ZEEBE_MAPPING.iter().find(|m| m.nano == nano)
 }
 
+// ───────────────────────── Nano-only divergences ──────────────────────────
+
+/// One row describing an **intentional Nano/Zeebe divergence**: a model Zeebe
+/// *accepts* but Nano deliberately *rejects*, because Nano does not implement the
+/// feature and refuses to silently degrade it.
+///
+/// This is categorically distinct from [`NANO_ZEEBE_MAPPING`], whose invariant is
+/// genuine parity — Nano rejects **iff** Zeebe rejects. A divergence must **not**
+/// be shoehorned into that table: doing so would fabricate a Zeebe rejection
+/// class for a model Zeebe actually accepts, making the conformance oracle assert
+/// a falsehood and blinding it to the very divergence it is meant to record. A
+/// divergence carries no Zeebe rejection class — only the rationale for why Nano
+/// intentionally differs.
+struct Divergence {
+    /// Stable Nano category key — the [`ParseError`] variant name, as returned by
+    /// [`nano_category`]. This is what a `diverge` fixture tags itself with.
+    nano: &'static str,
+    /// Why Nano rejects a model Zeebe accepts (the deliberate non-implementation).
+    rationale: &'static str,
+    /// The slice that established this divergence (for traceability).
+    origin: &'static str,
+}
+
+/// The Nano-only divergence registry — models Zeebe **accepts** but Nano
+/// intentionally **rejects**. Together with [`NANO_ZEEBE_MAPPING`] it partitions
+/// the full [`ParseError`] surface (every category is in exactly one of the two,
+/// enforced by [`mapping_covers_every_parse_error_category`]).
+const NANO_ONLY_DIVERGENCES: &[Divergence] = &[Divergence {
+    nano: "UnsupportedUserTaskFormBinding",
+    rationale: "Zeebe implements the `deployment` and `versionTag` user-task form \
+                bindings and ACCEPTS such a model; Nano implements only `latest` and \
+                rejects the deploy loudly rather than silently degrading the binding \
+                to `latest` (#1190).",
+    origin: "#1190",
+}];
+
+fn divergence_for(nano: &str) -> Option<&'static Divergence> {
+    NANO_ONLY_DIVERGENCES.iter().find(|d| d.nano == nano)
+}
+
 // ─────────────────────────── corpus loading ───────────────────────────────
 
 /// A parsed corpus entry: the fixture path, its declarative expectation, and
@@ -187,6 +221,12 @@ enum Expectation {
     /// Zeebe rejects this model; Nano's `parse_bpmn` must return `Err` whose
     /// [`nano_category`] equals this category.
     Reject { category: String },
+    /// An **intentional Nano/Zeebe divergence**: Zeebe *accepts* this model but
+    /// Nano deliberately *rejects* it (it does not implement the feature). Nano's
+    /// `parse_bpmn` must return `Err` whose [`nano_category`] equals this category
+    /// and which is registered in [`NANO_ONLY_DIVERGENCES`]. Recorded so the
+    /// oracle never falsely claims Zeebe rejected a model it accepts.
+    NanoReject { category: String },
 }
 
 fn corpus_dir() -> PathBuf {
@@ -206,6 +246,8 @@ fn corpus_dir() -> PathBuf {
 /// Grammar (case-insensitive on the keywords):
 ///   * `<!-- verdict: accept -->`
 ///   * `<!-- verdict: reject | category: <NanoCategory> -->`
+///   * `<!-- verdict: diverge | category: <NanoCategory> -->`
+///     (an intentional Nano-only rejection of a model Zeebe accepts)
 fn parse_directive(name: &str, xml: &str) -> Expectation {
     let mut in_comment = false;
     let comment = xml
@@ -221,18 +263,25 @@ fn parse_directive(name: &str, xml: &str) -> Expectation {
         .find(|t| !t.is_empty())
         .unwrap_or("")
         .to_ascii_lowercase();
+    // Both `reject` and `diverge` carry a `category:` naming the Nano ParseError;
+    // extract it once so the two arms cannot drift.
+    let category = |kind: &str| -> String {
+        after_keyword(comment, "category:")
+            .unwrap_or_else(|| panic!("{name}: {kind} directive missing `category:`"))
+            .split(|c: char| c.is_whitespace() || c == '|' || c == '-' || c == '>')
+            .find(|t| !t.is_empty())
+            .unwrap_or_else(|| panic!("{name}: empty {kind} category"))
+            .to_string()
+    };
     match verdict.as_str() {
         "accept" => Expectation::Accept,
-        "reject" => {
-            let category = after_keyword(comment, "category:")
-                .unwrap_or_else(|| panic!("{name}: reject directive missing `category:`"))
-                .split(|c: char| c.is_whitespace() || c == '|' || c == '-' || c == '>')
-                .find(|t| !t.is_empty())
-                .unwrap_or_else(|| panic!("{name}: empty reject category"))
-                .to_string();
-            Expectation::Reject { category }
-        }
-        other => panic!("{name}: unknown verdict `{other}` (expected accept|reject)"),
+        "reject" => Expectation::Reject {
+            category: category("reject"),
+        },
+        "diverge" => Expectation::NanoReject {
+            category: category("diverge"),
+        },
+        other => panic!("{name}: unknown verdict `{other}` (expected accept|reject|diverge)"),
     }
 }
 
@@ -348,6 +397,25 @@ fn parse_bpmn_matches_zeebe_verdict_for_every_corpus_entry() {
                     ));
                 }
             }
+            (Expectation::NanoReject { category }, Ok(_)) => failures.push(format!(
+                "{}: expected DIVERGE ({category}: Zeebe accepts, Nano intentionally rejects) \
+                 but Nano ACCEPTED — the intentional divergence has regressed",
+                entry.name
+            )),
+            (Expectation::NanoReject { category }, Err(e)) => {
+                let actual = nano_category(e);
+                if actual != category {
+                    failures.push(format!(
+                        "{}: expected DIVERGE category `{category}` but Nano rejected with `{actual}` ({e:?})",
+                        entry.name
+                    ));
+                } else if divergence_for(actual).is_none() {
+                    failures.push(format!(
+                        "{}: category `{actual}` is not in the Nano-only divergence table",
+                        entry.name
+                    ));
+                }
+            }
         }
     }
     assert!(
@@ -358,17 +426,25 @@ fn parse_bpmn_matches_zeebe_verdict_for_every_corpus_entry() {
     );
 }
 
-/// Every fixture's declared reject category must be a real Nano category that
-/// exists in the mapping table (guards against a typo'd tag silently passing).
+/// Every fixture's declared category must be a real Nano category that exists in
+/// the appropriate registry: a `reject` fixture maps to the Zeebe-parity table,
+/// a `diverge` fixture to the Nano-only divergence table (guards against a typo'd
+/// tag silently passing, and against a divergence masquerading as parity).
 #[test]
 fn every_reject_fixture_tags_a_mapped_category() {
     for entry in load_corpus() {
-        if let Expectation::Reject { category } = &entry.expected {
-            assert!(
+        match &entry.expected {
+            Expectation::Reject { category } => assert!(
                 mapping_for(category).is_some(),
                 "{}: reject category `{category}` is not a known Nano↔Zeebe mapping key",
                 entry.name
-            );
+            ),
+            Expectation::NanoReject { category } => assert!(
+                divergence_for(category).is_some(),
+                "{}: diverge category `{category}` is not a known Nano-only divergence key",
+                entry.name
+            ),
+            Expectation::Accept => {}
         }
     }
 }
@@ -384,7 +460,7 @@ fn every_mapped_category_has_a_reject_corpus_entry() {
         .into_iter()
         .filter_map(|e| match e.expected {
             Expectation::Reject { category } => Some(category),
-            Expectation::Accept => None,
+            Expectation::NanoReject { .. } | Expectation::Accept => None,
         })
         .collect();
 
@@ -413,6 +489,47 @@ fn every_mapped_category_has_a_reject_corpus_entry() {
     assert!(
         missing.is_empty(),
         "these mapped ParseError categories have no REJECT corpus entry (add one — see README): {missing:?}"
+    );
+}
+
+/// Coverage ratchet #1b — every Nano-only divergence category is exercised by at
+/// least one DIVERGE corpus entry, mirroring the reject-category ratchet for the
+/// [`NANO_ONLY_DIVERGENCES`] registry so an intentional divergence cannot lose
+/// its regression fixture unnoticed.
+#[test]
+fn every_divergence_category_has_a_diverge_corpus_entry() {
+    let covered: BTreeSet<String> = load_corpus()
+        .into_iter()
+        .filter_map(|e| match e.expected {
+            Expectation::NanoReject { category } => Some(category),
+            Expectation::Reject { .. } | Expectation::Accept => None,
+        })
+        .collect();
+
+    let missing: Vec<&str> = NANO_ONLY_DIVERGENCES
+        .iter()
+        .map(|d| d.nano)
+        .filter(|n| !covered.contains(*n))
+        .collect();
+
+    // Report the registered divergences for visibility in `-- --nocapture`.
+    eprintln!(
+        "[conformance] intentional Nano-only divergences ({}):",
+        NANO_ONLY_DIVERGENCES.len()
+    );
+    for d in NANO_ONLY_DIVERGENCES {
+        eprintln!(
+            "  [{}] {} — {} ({})",
+            if covered.contains(d.nano) { "x" } else { " " },
+            d.nano,
+            d.rationale,
+            d.origin
+        );
+    }
+
+    assert!(
+        missing.is_empty(),
+        "these Nano-only divergence categories have no DIVERGE corpus entry (add one — see README): {missing:?}"
     );
 }
 
@@ -523,27 +640,43 @@ fn parse_error_witnesses() -> Vec<ParseError> {
     witnesses
 }
 
-/// The mapping table must cover every [`ParseError`] category. The category set
-/// is derived from [`parse_error_witnesses`] (one witness per enum variant, kept
-/// complete by a compile-time exhaustiveness ratchet) rather than a
-/// hand-maintained string list, so a new `ParseError` variant forces both a
-/// witness and a [`NANO_ZEEBE_MAPPING`] row.
+/// The two registries together must cover every [`ParseError`] category, and be
+/// **disjoint**. The category set is derived from [`parse_error_witnesses`] (one
+/// witness per enum variant, kept complete by a compile-time exhaustiveness
+/// ratchet) rather than a hand-maintained string list, so a new `ParseError`
+/// variant forces both a witness and a row in exactly one of the two registries
+/// ([`NANO_ZEEBE_MAPPING`] for a genuine Zeebe-parity rejection, or
+/// [`NANO_ONLY_DIVERGENCES`] for an intentional Nano-only divergence).
 #[test]
 fn mapping_covers_every_parse_error_category() {
     let all_categories: BTreeSet<&'static str> =
         parse_error_witnesses().iter().map(nano_category).collect();
     for cat in &all_categories {
         assert!(
-            mapping_for(cat).is_some(),
-            "ParseError category `{cat}` has no Nano↔Zeebe mapping row"
+            mapping_for(cat).is_some() || divergence_for(cat).is_some(),
+            "ParseError category `{cat}` is in neither the Nano↔Zeebe mapping nor the \
+             Nano-only divergence table"
+        );
+        assert!(
+            !(mapping_for(cat).is_some() && divergence_for(cat).is_some()),
+            "ParseError category `{cat}` is in BOTH the Nano↔Zeebe mapping and the \
+             Nano-only divergence table — a category is either genuine parity or a \
+             divergence, never both"
         );
     }
-    // And no stale mapping rows for categories that no longer exist.
+    // And no stale rows in either table for categories that no longer exist.
     for m in NANO_ZEEBE_MAPPING {
         assert!(
             all_categories.contains(&m.nano),
             "mapping row `{}` names an unknown ParseError category",
             m.nano
+        );
+    }
+    for d in NANO_ONLY_DIVERGENCES {
+        assert!(
+            all_categories.contains(&d.nano),
+            "divergence row `{}` names an unknown ParseError category",
+            d.nano
         );
     }
 }
