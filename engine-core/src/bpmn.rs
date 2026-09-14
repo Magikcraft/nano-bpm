@@ -238,10 +238,20 @@ pub enum ParseError {
     },
     /// A `zeebe:taskListener` was declared on an element that is not a user task
     /// (#1197). Task-listener jobs are created only on the user-task runtime
-    /// path, so a task listener on any other element (e.g. a `receiveTask`, which
-    /// now rides the `io_stack` for its *execution* listeners) is accepted by the
-    /// lenient parser yet could never create a job. Rather than store a dead task
-    /// listener, Nano rejects the deploy and names the offending element.
+    /// path, so a task listener anywhere else is accepted by the lenient parser
+    /// yet could never create a job. Rather than store (or silently drop) a dead
+    /// task listener, Nano rejects the deploy and names the offending element.
+    /// Rejected placements include:
+    /// * a non-user-task flow node (e.g. a `receiveTask`, which now rides the
+    ///   `io_stack` for its *execution* listeners) — caught by the build-time
+    ///   node scan;
+    /// * a **boundary event** or a **sequence flow** — neither enters the
+    ///   `io_stack`, so the listener is rejected at parse with the real owner
+    ///   named, rather than dropped (top-level) or hoisted onto the enclosing
+    ///   sub-process (nested);
+    /// * a **user-task tool of an ad-hoc sub-process** — the tool is flattened
+    ///   into the non-executable ad-hoc catalog and activated through a direct
+    ///   path that never runs task listeners.
     UnsupportedTaskListener {
         process_id: String,
         element_id: String,
@@ -1875,12 +1885,19 @@ fn parse_with_captures(
                             // at build (`UnsupportedTaskListener`, #1197) rather
                             // than stored dead.
                             "taskListeners" => {
-                                in_task_listeners = true;
+                                // Mirror the `executionListeners` self-closing
+                                // guard: a self-closing `<zeebe:taskListeners />`
+                                // has no nested listeners and emits no matching end
+                                // tag, so only enter the container state for a real
+                                // open element — otherwise the flag would stay stuck
+                                // `true` and wrongly capture a later stray
+                                // `zeebe:taskListener` onto a subsequent element.
+                                if !self_closing {
+                                    in_task_listeners = true;
+                                }
                             }
                             "taskListener" if in_task_listeners => {
-                                if let (Some(&idx), Some(job_type)) =
-                                    (io_stack.last(), attr(attrs, "type"))
-                                {
+                                if let Some(job_type) = attr(attrs, "type") {
                                     // `eventType` defaults to "creating" in Zeebe
                                     // when omitted.
                                     let event_type = match attr(attrs, "eventType") {
@@ -1899,13 +1916,51 @@ fn parse_with_captures(
                                         _ => crate::model::TaskListenerEventType::Creating,
                                     };
                                     let retries = attr(attrs, "retries").map(str::to_string);
-                                    acc.nodes[idx].task_listeners.push(
-                                        crate::model::TaskListener {
-                                            event_type,
-                                            job_type: job_type.to_string(),
-                                            retries,
-                                        },
-                                    );
+                                    let listener = crate::model::TaskListener {
+                                        event_type,
+                                        job_type: job_type.to_string(),
+                                        retries,
+                                    };
+                                    // A task listener only runs on a user task, and
+                                    // a user task is never a boundary event or a
+                                    // sequence flow — neither of which enters the
+                                    // `io_stack`. Mirror the execution-listener
+                                    // boundary/flow handling and reject them here
+                                    // explicitly, naming the real owner: routing them
+                                    // through `io_stack.last()` would otherwise
+                                    // silently DROP a top-level one (empty stack) or
+                                    // HOIST a nested one onto the enclosing
+                                    // sub-process and mis-report that as the owner
+                                    // (#1197). The remaining `io_stack` case attaches
+                                    // to the innermost open element; a non-user-task
+                                    // placement there is caught by the build-time
+                                    // `UnsupportedTaskListener` scan.
+                                    if let Some(boundary) = cur_boundary.as_ref() {
+                                        return Err(ParseError::UnsupportedTaskListener {
+                                            process_id: acc.id.clone(),
+                                            element_id: boundary.id.clone(),
+                                            reason: "a task listener only runs on a user task; a \
+                                                     boundary event is never a user task, so it \
+                                                     could never create a task-listener job"
+                                                .to_string(),
+                                        });
+                                    }
+                                    if let Some(flow_idx) = cur_flow {
+                                        return Err(ParseError::UnsupportedTaskListener {
+                                            process_id: acc.id.clone(),
+                                            element_id: acc.flows[flow_idx]
+                                                .id
+                                                .clone()
+                                                .unwrap_or_else(|| "<sequenceFlow>".to_string()),
+                                            reason: "a task listener only runs on a user task; a \
+                                                     sequence flow is an edge, not a user task, so \
+                                                     it could never create a task-listener job"
+                                                .to_string(),
+                                        });
+                                    }
+                                    if let Some(&idx) = io_stack.last() {
+                                        acc.nodes[idx].task_listeners.push(listener);
+                                    }
                                 }
                             }
                             // Any other tag inside a <process> the parser does
@@ -3063,6 +3118,32 @@ impl ProcessAcc {
                          supported: a leaf tool is pruned and a retained embedded tool is \
                          activated/completed with direct lifecycle events, both bypassing the \
                          listener gate, so the listener could never fire"
+                    .to_string(),
+            });
+        }
+        // Reject a **task listener** declared on a *tool* of an ad-hoc sub-process
+        // (#1197). A user-task tool is `NodeKind::User`, so it slips past the
+        // node-based `UnsupportedTaskListener` scan above — but the tool is
+        // flattened into the non-executable ad-hoc catalog and activated through a
+        // direct path that emits `UserTaskCreated` without running task listeners
+        // (`engine/mod.rs`), so the listener could never create a job. This is the
+        // task-listener analogue of the execution-listener ad-hoc-tool rejection
+        // above: refuse the model at deploy rather than accept a silently-pruned
+        // dead listener. Checked pre-pruning and only for the tool ITSELF; task
+        // listeners deeper inside a retained sub-process tool's body would already
+        // have been rejected/attached by the node scan. Document order keeps the
+        // error deterministic.
+        if let Some(bad) = self.nodes.iter().find(|n| {
+            !n.task_listeners.is_empty()
+                && n.parent.as_deref().is_some_and(|p| adhoc_ids.contains(p))
+        }) {
+            return Err(ParseError::UnsupportedTaskListener {
+                process_id: self.id.clone(),
+                element_id: bad.id.clone(),
+                reason: "a task listener on a user-task tool of an ad-hoc sub-process is not \
+                         supported: the tool is flattened into the non-executable ad-hoc \
+                         catalog and activated through a direct path that emits UserTaskCreated \
+                         without running task listeners, so the listener could never fire"
                     .to_string(),
             });
         }
@@ -8947,6 +9028,165 @@ mod io_mapping_tests {
         let ut = def.element("ut").expect("user task present");
         assert_eq!(ut.task_listeners.len(), 1, "task listener on the user task");
         assert_eq!(ut.task_listeners[0].job_type, "ut-creating");
+    }
+
+    #[test]
+    fn task_listener_on_boundary_event_is_rejected() {
+        // #1197: a task listener only runs on a user task, and a boundary event is
+        // never a user task. A boundary event is buffered in `cur_boundary` and
+        // never enters the `io_stack`, so routing a task listener declared on it
+        // through `io_stack.last()` would drop it (top-level host) or hoist it onto
+        // the enclosing sub-process (mis-reporting the owner). It must be rejected
+        // at deploy, naming the boundary event itself — mirroring the
+        // execution-listener boundary handling.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="svc">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="bnd" attachedToRef="svc">
+      <bpmn:extensionElements>
+        <zeebe:taskListeners>
+          <zeebe:taskListener eventType="creating" type="bnd-creating" />
+        </zeebe:taskListeners>
+      </bpmn:extensionElements>
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>PT1M</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="svc" />
+    <bpmn:sequenceFlow id="f2" sourceRef="svc" targetRef="end" />
+    <bpmn:sequenceFlow id="f3" sourceRef="bnd" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        match parse_bpmn(xml) {
+            Err(ParseError::UnsupportedTaskListener { element_id, .. }) => {
+                assert_eq!(element_id, "bnd", "the boundary event is named as the owner");
+            }
+            other => panic!("expected UnsupportedTaskListener for a boundary event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_listener_on_sequence_flow_is_rejected() {
+        // #1197: a sequence flow is an edge, not a user task, and never enters the
+        // `io_stack`. A task listener declared on it must be rejected at deploy
+        // (naming the flow) rather than dropped or hoisted onto a surrounding
+        // element — mirroring the execution-listener sequence-flow handling.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="end">
+      <bpmn:extensionElements>
+        <zeebe:taskListeners>
+          <zeebe:taskListener eventType="creating" type="f1-creating" />
+        </zeebe:taskListeners>
+      </bpmn:extensionElements>
+    </bpmn:sequenceFlow>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        match parse_bpmn(xml) {
+            Err(ParseError::UnsupportedTaskListener { element_id, .. }) => {
+                assert_eq!(element_id, "f1", "the sequence flow is named as the owner");
+            }
+            other => {
+                panic!("expected UnsupportedTaskListener for a sequence flow, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn task_listener_on_adhoc_user_task_tool_is_rejected() {
+        // #1197: a user-task *tool* of an ad-hoc sub-process is `NodeKind::User`,
+        // so it slips past the node-based non-user-task scan — but the tool is
+        // flattened into the non-executable ad-hoc catalog and activated through a
+        // direct path that emits `UserTaskCreated` without running task listeners.
+        // The task listener could never fire, so the deploy is rejected — the
+        // task-listener analogue of `execution_listener_on_adhoc_tool_is_rejected`.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:adHocSubProcess id="agent">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="agent-worker" />
+        <zeebe:adHoc outputCollection="results" outputElement="=result" />
+      </bpmn:extensionElements>
+      <bpmn:userTask id="toolU">
+        <bpmn:extensionElements>
+          <zeebe:userTask />
+          <zeebe:taskListeners>
+            <zeebe:taskListener eventType="creating" type="toolU-creating" />
+          </zeebe:taskListeners>
+        </bpmn:extensionElements>
+      </bpmn:userTask>
+    </bpmn:adHocSubProcess>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+    <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        match parse_bpmn(xml) {
+            Err(ParseError::UnsupportedTaskListener { element_id, .. }) => {
+                assert_eq!(element_id, "toolU", "the ad-hoc user-task tool is named");
+            }
+            other => panic!(
+                "expected UnsupportedTaskListener for an ad-hoc user-task tool, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn self_closing_task_listeners_does_not_leak_to_later_element() {
+        // #1197 mirror of the execution-listener self-closing guard: a self-closing
+        // `<zeebe:taskListeners />` emits no end tag, so the `in_task_listeners`
+        // flag must NOT stay stuck `true` and capture a later stray
+        // `zeebe:taskListener` onto a subsequent element. Here the stray listener
+        // sits *outside* any container on a service task — if the flag leaked it
+        // would attach (or wrongly reject); with the guard it is ignored and the
+        // model deploys clean.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:userTask id="ut">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:taskListeners />
+      </bpmn:extensionElements>
+    </bpmn:userTask>
+    <bpmn:serviceTask id="svc">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" />
+        <zeebe:taskListener eventType="creating" type="stray" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ut" />
+    <bpmn:sequenceFlow id="f2" sourceRef="ut" targetRef="svc" />
+    <bpmn:sequenceFlow id="f3" sourceRef="svc" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).expect("self-closing taskListeners must deploy clean")[0];
+        assert!(
+            def.element("ut").expect("user task present").task_listeners.is_empty(),
+            "the self-closing container declares no listeners"
+        );
+        assert!(
+            def.element("svc").expect("service task present").task_listeners.is_empty(),
+            "the stray taskListener must not leak onto the later service task"
+        );
     }
 
     #[test]

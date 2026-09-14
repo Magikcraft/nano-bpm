@@ -51,14 +51,21 @@ corrections.
 - Listeners are valid on **most flow nodes** (tasks, gateways, events, sub-processes,
   the process itself, call/ad-hoc containers, multi-instance bodies).
 
-### Nano today (the gap)
+### Nano before this ADR (the gap that motivated it)
 
-- **Parse:** `engine-core/src/bpmn.rs` handles a large set of `zeebe:` extension
+> **Historical.** This section records the pre-implementation state that
+> motivated this ADR — it is **not** current behaviour. As of #1197 both
+> `zeebe:executionListeners` and `zeebe:taskListeners` are parsed and run (see
+> the "Subset (honestly stated…)" section below for the implemented surface);
+> `grep -i listener engine-core/src` now returns many matches. It is retained as
+> the "before" picture, not a live limitation.
+
+- **Parse:** `engine-core/src/bpmn.rs` handled a large set of `zeebe:` extension
   elements (`taskDefinition`, `calledDecision`, `calledElement`, `subscription`,
   `assignmentDefinition`, `taskSchedule`, `priorityDefinition`, `adHoc`, `ioMapping`,
   `loopCharacteristics`, `script`) but **not** `executionListeners`/`taskListeners`.
-  A model that declares them **deploys and runs**, with the listeners **silently
-  never firing** — no jobs are created, so a subscribed worker is never activated.
+  A model that declared them **deployed and ran**, with the listeners **silently
+  never firing** — no jobs were created, so a subscribed worker was never activated.
   `grep -i listener engine-core/src` → zero matches.
 - **Lifecycle:** the engine already emits the four lifecycle events
   (`ElementActivating`, `ElementActivated`, `ElementCompleting`, `ElementCompleted`
