@@ -4490,10 +4490,15 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 // the incident (joined by `jobKey`) can attribute the failure even
                 // on the leader-local path, where `JobActivated` is never exported
                 // and the row's `worker` was therefore still NULL (Zeebe parity).
-                // `COALESCE(?4, worker)` keeps any existing value for events
-                // serialized before the field existed (`worker == NULL`).
+                // `COALESCE(?4, worker)` keeps any existing *real*
+                // attribution for events serialized before the field existed
+                // (`worker == NULL`), while `NULLIF(worker, '')` drops a legacy
+                // empty-string attribution — a pre-#1191 read-model DB, migrated
+                // non-destructively, can still hold `worker = ''` written by the
+                // old `JobActivated` projection, and a bare `COALESCE(NULL, '')`
+                // would pin the terminal row to that bogus empty worker (#1191).
                 tx.cexecute(
-                    "UPDATE jobs SET state = ?2, retries = ?3, worker = COALESCE(?4, worker), \
+                    "UPDATE jobs SET state = ?2, retries = ?3, worker = COALESCE(?4, NULLIF(worker, '')), \
                      deadline_ms = NULL WHERE key = ?1",
                     params![
                         *job_key as i64,
@@ -4510,9 +4515,10 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         } => {
             // Terminal, incident-bearing transition: set `worker` from the event
             // for attribution (see `JobFailed`); `COALESCE` keeps any existing
-            // value for pre-field events.
+            // value for pre-field events, and `NULLIF(worker, '')` drops a legacy
+            // empty-string attribution from a pre-#1191 migrated DB.
             tx.cexecute(
-                "UPDATE jobs SET state = ?2, worker = COALESCE(?3, worker), deadline_ms = NULL \
+                "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), deadline_ms = NULL \
                  WHERE key = ?1",
                 params![
                     *job_key as i64,
@@ -4531,11 +4537,13 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // the row's `worker` was therefore still NULL (symmetric with the
             // `JobFailed` / `JobErrorThrown` terminal rows). `COALESCE(?3, worker)`
             // keeps any existing value for events serialized before the field
-            // existed (`worker == NULL`). This is what makes a husked agent round
-            // (a COMPLETED job that minted no AgentInstance) attributable via the
+            // existed (`worker == NULL`), and `NULLIF(worker, '')` drops a legacy
+            // empty-string attribution from a pre-#1191 migrated DB. This is what
+            // makes a husked agent round (a COMPLETED job that minted no
+            // AgentInstance) attributable via the
             // `AgentInstance.jobKey → completed Job.worker` join.
             tx.cexecute(
-                "UPDATE jobs SET state = ?2, worker = COALESCE(?3, worker), deadline_ms = NULL \
+                "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), deadline_ms = NULL \
                  WHERE key = ?1",
                 params![
                     *job_key as i64,
@@ -9012,6 +9020,92 @@ mod element_instance_tests {
         let completed = &jobs[&9401];
         assert_eq!(completed.state, JobState::Completed);
         assert_eq!(completed.worker, None);
+    }
+
+    #[test]
+    fn a_legacy_empty_worker_row_is_cleared_by_a_terminal_event_carrying_no_attribution() {
+        use rusqlite::params;
+
+        // #1191 — the read-model DB is migrated *non-destructively* (additive
+        // ALTER/CREATE; existing rows survive — a destructive rebuild only happens
+        // on a format-version bump, which reprojects anyway), so a database written
+        // before this PR can still hold `worker = ''` for a job the *old*
+        // `JobActivated` projection recorded from an explicitly-empty worker. A
+        // later terminal event carrying no attribution (`worker == None`) must not
+        // resurrect that bogus empty string: a bare `COALESCE(NULL, worker)` would
+        // keep `''`, so the terminal paths fall back through
+        // `COALESCE(?, NULLIF(worker, ''))` and land SQL NULL. Covers all three
+        // terminal paths (completed / failed / errored).
+        for (job_key, terminal) in [
+            (
+                9501u64,
+                Event::JobCompleted {
+                    job_key: 9501,
+                    instance_key: INST,
+                    created_at: 2,
+                    job_type: "review-round".to_string(),
+                    worker: None,
+                },
+            ),
+            (
+                9502,
+                Event::JobFailed {
+                    job_key: 9502,
+                    instance_key: INST,
+                    retries: 0,
+                    worker: None,
+                },
+            ),
+            (
+                9503,
+                Event::JobErrorThrown {
+                    job_key: 9503,
+                    instance_key: INST,
+                    error_code: "BOOM".to_string(),
+                    worker: None,
+                },
+            ),
+        ] {
+            let store = ReadStore::open(None).unwrap();
+            // Simulate the legacy persisted row directly: the current projection
+            // normalizes `''` away at the source, so bypass it and write the row
+            // exactly as a pre-#1191 build would have left it.
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, \
+                     job_type, state, retries, worker, process_definition_id, \
+                     process_definition_key) \
+                     VALUES (?1, ?2, ?3, 't', 'review-round', ?4, 1, '', 'p', '500')",
+                    params![
+                        job_key as i64,
+                        INST as i64,
+                        TASK_EI as i64,
+                        super::job_state_code(JobState::Activated),
+                    ],
+                )
+                .unwrap();
+
+            // Precondition: the legacy row really does hold an empty attribution.
+            let before: HashMap<Key, super::JobRow> =
+                store.jobs().into_iter().map(|j| (j.key, j)).collect();
+            assert_eq!(
+                before[&job_key].worker,
+                Some(String::new()),
+                "legacy row must start with an empty-string worker"
+            );
+
+            store.export(&[&terminal]).unwrap();
+
+            let jobs: HashMap<Key, super::JobRow> =
+                store.jobs().into_iter().map(|j| (j.key, j)).collect();
+            assert_eq!(
+                jobs[&job_key].worker, None,
+                "terminal event carrying no attribution must clear the legacy '' worker to NULL"
+            );
+        }
     }
 
     #[test]
