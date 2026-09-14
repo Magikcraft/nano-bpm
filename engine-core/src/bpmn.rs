@@ -3441,6 +3441,27 @@ impl ProcessAcc {
                 // the note above — none starts are kept for the validator, and
                 // message/timer starts are kept so deploy can wire their triggers).
                 if i != designated && is_signal_start(&self.nodes[i]) {
+                    // A demoted signal start becomes an inert `IntermediateThrow`
+                    // with no incoming flow — it is never activated or completed,
+                    // so any execution listener captured on it (#1197) could never
+                    // fire. Refuse the model at deploy rather than silently drop the
+                    // dead listener into the demotion, the same reject-don't-drop
+                    // contract applied to joins, compensation boundaries, ad-hoc
+                    // tools and sequence flows above.
+                    if !self.nodes[i].start_listeners.is_empty()
+                        || !self.nodes[i].end_listeners.is_empty()
+                    {
+                        return Err(ParseError::UnsupportedExecutionListener {
+                            process_id: self.id.clone(),
+                            element_id: self.nodes[i].id.clone(),
+                            reason: "an execution listener on a surplus signal start event is \
+                                     not supported: Nano has no dedicated signal-start kind, so \
+                                     a second signal start is demoted to an inert throw event \
+                                     with no incoming flow that is never activated or completed, \
+                                     so the listener could never fire"
+                                .to_string(),
+                        });
+                    }
                     self.nodes[i].kind = NodeKind::IntermediateThrow;
                     self.nodes[i].message_ref = None;
                     self.nodes[i].timer_repeating = None;
@@ -8026,6 +8047,42 @@ mod tests {
             ElementKind::IntermediateThrowEvent,
             "surplus signal start is demoted (no dedicated signal-start kind)"
         );
+    }
+
+    #[test]
+    fn execution_listener_on_demoted_signal_start_is_rejected() {
+        // A surplus signal start is demoted to an inert `IntermediateThrowEvent`
+        // (no incoming flow, never activated/completed), so an execution listener
+        // on it could never fire. Reject it at deploy rather than silently drop the
+        // dead listener during demotion — the reject-don't-drop contract (#1197).
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="none_s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+              <bpmn:startEvent id="signal_s">
+                <bpmn:extensionElements>
+                  <zeebe:executionListeners>
+                    <zeebe:executionListener eventType="start" type="ping" />
+                  </zeebe:executionListeners>
+                </bpmn:extensionElements>
+                <bpmn:signalEventDefinition signalRef="Signal_1" />
+                <bpmn:outgoing>f2</bpmn:outgoing>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e1"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+              <bpmn:endEvent id="e2"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+              <bpmn:sequenceFlow id="f1" sourceRef="none_s" targetRef="e1" />
+              <bpmn:sequenceFlow id="f2" sourceRef="signal_s" targetRef="e2" />
+            </bpmn:process>
+            <bpmn:signal id="Signal_1" name="go" />
+          </bpmn:definitions>"#;
+        match parse_bpmn(xml) {
+            Err(ParseError::UnsupportedExecutionListener { element_id, .. }) => {
+                assert_eq!(element_id, "signal_s");
+            }
+            other => panic!(
+                "expected UnsupportedExecutionListener for a demoted signal start, got {other:?}"
+            ),
+        }
     }
 
     #[test]

@@ -213,7 +213,10 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
 - **v1 (this ADR, as implemented):** `zeebe:executionListeners`
   parsed on any task/container that carries a `zeebe:ioMapping` attach point
   (service/script/business-rule/user tasks, call activity, (sub)process,
-  ad-hoc/multi-instance). Sequential in-order execution; literal/FEEL `retries`;
+  ad-hoc/multi-instance) — **and, since #1197, on the non-activity flow nodes
+  enumerated in the "Non-activity flow-node listeners" note below** (gateways,
+  start events, boundary events), with placements where a listener could never
+  fire rejected at deploy. Sequential in-order execution; literal/FEEL `retries`;
   incident on failure; forward variable merge; correct
   `JobKind`/`JobListenerEventType` in the read model and on the activated job.
   - **`start` listeners fire for every element reached through the common
