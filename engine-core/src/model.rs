@@ -425,6 +425,11 @@ pub struct UserTaskProps {
     /// user-task search can surface a `formKey` and downstream `GetFormByKey`
     /// can serve the schema. `None` when the task declares no `formId` (or an
     /// external form instead).
+    ///
+    /// Only Camunda's default `latest` binding is implemented. A
+    /// `<zeebe:formDefinition bindingType="deployment"|"versionTag">` is
+    /// rejected at deploy time (`ParseError::UnsupportedUserTaskFormBinding`)
+    /// rather than silently degraded to `latest` (#1190).
     #[cfg_attr(feature = "serde", serde(default))]
     pub form_id: Option<String>,
     /// The external form reference declared via `<zeebe:formDefinition

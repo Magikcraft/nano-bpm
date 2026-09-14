@@ -93,6 +93,12 @@ const NANO_ZEEBE_MAPPING: &[Mapping] = &[
         origin: "baseline",
     },
     Mapping {
+        nano: "UnsupportedUserTaskFormBinding",
+        zeebe:
+            "INVALID_ARGUMENT (user-task zeebe:formDefinition non-latest bindingType unsupported)",
+        origin: "#1190",
+    },
+    Mapping {
         nano: "UnresolvedReference",
         zeebe: "INVALID_ARGUMENT (camunda-xml-model eager QName resolution failure)",
         origin: "#849/#851",
@@ -148,6 +154,7 @@ fn nano_category(err: &ParseError) -> &'static str {
         ParseError::InvalidBoundaryEvent { .. } => "InvalidBoundaryEvent",
         ParseError::InvalidMessageEvent { .. } => "InvalidMessageEvent",
         ParseError::InvalidLinkedResource { .. } => "InvalidLinkedResource",
+        ParseError::UnsupportedUserTaskFormBinding { .. } => "UnsupportedUserTaskFormBinding",
         ParseError::UnresolvedReference { .. } => "UnresolvedReference",
         ParseError::UnsupportedElement { .. } => "UnsupportedElement",
         ParseError::InvalidGateway { .. } => "InvalidGateway",
@@ -442,6 +449,10 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             task_id: String::new(),
             attribute: String::new(),
         },
+        ParseError::UnsupportedUserTaskFormBinding {
+            task_id: String::new(),
+            binding_type: String::new(),
+        },
         ParseError::UnresolvedReference {
             kind: String::new(),
             id: String::new(),
@@ -498,6 +509,7 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             | ParseError::InvalidBoundaryEvent { .. }
             | ParseError::InvalidMessageEvent { .. }
             | ParseError::InvalidLinkedResource { .. }
+            | ParseError::UnsupportedUserTaskFormBinding { .. }
             | ParseError::UnresolvedReference { .. }
             | ParseError::UnsupportedElement { .. }
             | ParseError::InvalidGateway { .. }

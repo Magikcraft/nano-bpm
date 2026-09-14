@@ -73,7 +73,9 @@
 //!   `zeebe:priorityDefinition` (`priority`). Each may be a literal or a FEEL
 //!   expression resolved against the instance variables when the task is created.
 //!   Its form linkage comes from nested `zeebe:formDefinition` (`formId` for an
-//!   embedded/deployment form, resolved to a numeric form key at task creation;
+//!   embedded/deployment form, resolved to a numeric form key at task creation
+//!   under the default `latest` binding — a `deployment`/`versionTag`
+//!   `bindingType` is rejected at deploy rather than silently degraded, #1190;
 //!   `externalReference` for an external form).
 //! * `sequenceFlow` with `sourceRef`/`targetRef`, and an optional
 //!   `conditionExpression` whose FEEL body is stored verbatim and evaluated by
@@ -124,6 +126,17 @@ pub enum ParseError {
     /// deployment (`INVALID_ARGUMENT` → HTTP 400) rather than silently dropping
     /// the link, so Nano surfaces it as a hard parse error for parity.
     InvalidLinkedResource { task_id: String, attribute: String },
+    /// A user task's `zeebe:formDefinition` declared a `formId` with a
+    /// non-`latest` `bindingType` (`deployment` or `versionTag`). The engine
+    /// only implements the `latest` binding — it resolves a `formId` to the
+    /// latest deployed form version at user-task creation. Rather than silently
+    /// degrading a `deployment`/`versionTag` binding to `latest` (a latent
+    /// mis-binding, #1190), Nano rejects the deploy loudly. `binding_type`
+    /// carries the offending attribute value.
+    UnsupportedUserTaskFormBinding {
+        task_id: String,
+        binding_type: String,
+    },
     /// A dangling QName/id reference: a reference site (`kind`) points at an
     /// `id` that is not declared anywhere the reference can resolve against.
     ///
@@ -233,6 +246,15 @@ impl std::fmt::Display for ParseError {
                     "linkedResource on '{task_id}' is missing required attribute '{attribute}'"
                 )
             }
+            ParseError::UnsupportedUserTaskFormBinding {
+                task_id,
+                binding_type,
+            } => write!(
+                f,
+                "user task '{task_id}' declares an unsupported formDefinition bindingType \
+'{binding_type}': only 'latest' is supported (the engine resolves a formId to the latest \
+deployed form version at user-task creation)"
+            ),
             ParseError::UnresolvedReference {
                 kind,
                 id,
@@ -1236,6 +1258,31 @@ fn parse_with_captures(
                                     } else {
                                         form_id
                                     };
+                                    // Interim guard (#1190): the engine resolves
+                                    // a user-task `formId` to the *latest*
+                                    // deployed form version at task creation. The
+                                    // other two Camunda bindings (`deployment`,
+                                    // `versionTag`) are not implemented; rather
+                                    // than silently degrading them to `latest` (a
+                                    // latent mis-binding), reject the deploy
+                                    // loudly. Only a `formId` binding resolves a
+                                    // version, so an `externalReference` form
+                                    // (which suppresses `formId` above) is
+                                    // unaffected. An absent or explicit `latest`
+                                    // `bindingType` is the default and is
+                                    // accepted unchanged.
+                                    if acc.nodes[idx].user_task.form_id.is_some() {
+                                        if let Some(binding) = attr(attrs, "bindingType")
+                                            .filter(|s| !s.is_empty() && *s != "latest")
+                                        {
+                                            return Err(
+                                                ParseError::UnsupportedUserTaskFormBinding {
+                                                    task_id: acc.nodes[idx].id.clone(),
+                                                    binding_type: binding.to_string(),
+                                                },
+                                            );
+                                        }
+                                    }
                                 } else if let Some(idx) = cur_start {
                                     // Start forms are formId-only by design: the
                                     // `GetStartProcessForm` contract resolves a
@@ -6037,6 +6084,145 @@ mod tests {
         assert_eq!(both.form_id, None);
         assert_eq!(
             both.external_form_reference.as_deref(),
+            Some("https://forms.example/x")
+        );
+    }
+
+    #[test]
+    fn should_accept_explicit_latest_binding_on_a_user_task_form() {
+        // given: a user-task formDefinition that explicitly declares the default
+        // `bindingType="latest"`. This is the binding the engine implements
+        // (resolve `formId` to the latest deployed form version at task
+        // creation), so it parses exactly like an omitted bindingType.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="review-form" bindingType="latest" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: no regression — the form id binds latest-at-creation as before.
+        let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
+            panic!("expected a user task");
+        };
+        assert_eq!(props.form_id.as_deref(), Some("review-form"));
+    }
+
+    #[test]
+    fn should_reject_deployment_binding_on_a_user_task_form() {
+        // given: a user-task formDefinition declaring `bindingType="deployment"`.
+        // The engine does not implement the `deployment` binding; degrading it to
+        // `latest` would silently mis-bind the form (#1190), so the deploy must
+        // be rejected loudly rather than parsed.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="review-form" bindingType="deployment" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when / then
+        let err = parse_bpmn(xml).expect_err("a non-latest form binding is rejected");
+        assert_eq!(
+            err,
+            ParseError::UnsupportedUserTaskFormBinding {
+                task_id: "review".to_string(),
+                binding_type: "deployment".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn should_reject_version_tag_binding_on_a_user_task_form() {
+        // given: a user-task formDefinition declaring `bindingType="versionTag"`.
+        // Like `deployment`, this binding is unimplemented and must fail the
+        // deploy loudly rather than degrade to `latest` (#1190).
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="review-form"
+                                        bindingType="versionTag" versionTag="v2" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when / then
+        let err = parse_bpmn(xml).expect_err("a versionTag form binding is rejected");
+        assert_eq!(
+            err,
+            ParseError::UnsupportedUserTaskFormBinding {
+                task_id: "review".to_string(),
+                binding_type: "versionTag".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn should_ignore_non_latest_binding_on_an_external_reference_form() {
+        // given: an externalReference form that also (redundantly) carries a
+        // non-latest bindingType. The externalReference suppresses `formId` and
+        // no form version is resolved, so the unimplemented binding is moot and
+        // must not trip the interim guard.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition externalReference="https://forms.example/x"
+                                        bindingType="deployment" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).expect("an external-reference form is not version-bound")[0];
+
+        // then
+        let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
+            panic!("expected a user task");
+        };
+        assert_eq!(props.form_id, None);
+        assert_eq!(
+            props.external_form_reference.as_deref(),
             Some("https://forms.example/x")
         );
     }

@@ -104,6 +104,7 @@ correspond. All Zeebe deploy rejections surface as gRPC `INVALID_ARGUMENT`
 | `InvalidBoundaryEvent` | `BoundaryEvent` `attachedToRef` unresolved | baseline |
 | `InvalidMessageEvent` | unresolved `messageRef` / missing `correlationKey` | baseline |
 | `InvalidLinkedResource` | `zeebe:linkedResource` missing required attribute | baseline |
+| `UnsupportedUserTaskFormBinding` | user-task `zeebe:formDefinition` non-`latest` `bindingType` unsupported | #1190 |
 | `UnresolvedReference` | camunda-xml-model eager QName resolution failure | #849 / #851 |
 | `UnsupportedElement` | element type has no Zeebe transformer | #853 |
 | `InvalidGateway` | `SequenceFlowValidator`: condition-or-default | #854 |
