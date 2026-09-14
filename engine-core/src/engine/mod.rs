@@ -1960,6 +1960,15 @@ impl Engine {
                 let element_id = job.element_id.clone();
                 let created_at = job.created_at;
                 let job_type = job.job_type.clone();
+                // The activating worker, stamped from the live job at the
+                // completion site so a *successful* completion carries it forward
+                // for read-model/export attribution (symmetric with the
+                // `JobFailed` / `JobErrorThrown` paths). `Job.worker` is cleared
+                // on completion, so it must be captured here before the job is
+                // removed from state. `attribution_worker()` normalizes a
+                // snapshot-restored empty worker (`Some("")`) to `None`, so a
+                // pre-normalization snapshot can never leak an empty attribution.
+                let worker = job.attribution_worker();
                 let job_kind = job.kind;
 
                 // A task-listener job (ADR 0037 §6) gates a user task's deferred
@@ -2049,6 +2058,7 @@ impl Engine {
                         instance_key,
                         created_at,
                         job_type,
+                        worker,
                     },
                 );
                 if !variables.is_empty() {
@@ -2664,7 +2674,7 @@ impl Engine {
                 let instance_key = job.instance_key;
                 let element_instance_key = job.element_instance_key;
                 let element_id = job.element_id.clone();
-                let worker = job.worker.clone();
+                let worker = job.attribution_worker();
                 let retries = retries.max(0);
 
                 self.emit(
@@ -2724,7 +2734,7 @@ impl Engine {
                 let instance_key = job.instance_key;
                 let element_instance_key = job.element_instance_key;
                 let task_element_id = job.element_id.clone();
-                let worker = job.worker.clone();
+                let worker = job.attribution_worker();
 
                 Self::validate_job_lease(job, lease_token.as_deref(), true)?;
                 // The job is consumed by the thrown error either way.
