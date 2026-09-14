@@ -408,7 +408,10 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > an inert throw event that is never activated), a **tool of an ad-hoc
 > sub-process** (a leaf tool is pruned and a retained embedded tool is
 > activated/completed with direct lifecycle events, both bypassing the listener
-> gate), and a sequence-flow ("take") listener. Sequence-flow ("take") listeners
+> gate), and a sequence-flow ("take") listener. A listener on the `<process>`
+> itself is likewise rejected (the process element has no activation/completion
+> lifecycle and is never ridden by a token, so neither phase could fire).
+> Sequence-flow ("take") listeners
 > are not yet modelled (sequence flows are edges, not elements), so a listener
 > nested in a `<sequenceFlow>` is rejected at deploy rather than silently
 > dropped — tracked in #1198. A `zeebe:taskListener` on a non-user-task element

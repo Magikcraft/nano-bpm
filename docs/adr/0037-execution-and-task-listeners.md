@@ -282,7 +282,10 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
   **compensation boundary event** (a passive structural marker never entered by
   token flow), a **tool of an ad-hoc sub-process** (a leaf tool is pruned into the
   non-executable catalog and a retained embedded tool is activated/completed with
-  direct lifecycle events, both bypassing the listener gate), and a
+  direct lifecycle events, both bypassing the listener gate), a
+  **process-level listener** (a listener on the `<process>`'s own
+  `extensionElements` — the process element has no activation/completion lifecycle
+  and is never ridden by a token, so *neither* phase fires), and a
   **sequence-flow ("take") listener** (a sequence flow is
   modelled as an edge, not an `Element`, so it has no lifecycle to run a listener
   on). Two more placements reject only their *dead* phase, mirroring the

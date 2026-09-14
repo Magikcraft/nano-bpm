@@ -112,7 +112,10 @@
 //!   surplus signal start event (demoted to an inert throw), a **tool of an
 //!   ad-hoc sub-process** (pruned leaf tools and directly-activated embedded
 //!   tools both bypass the listener gate), and a sequence-flow ("take") listener
-//!   (edges, not elements — deferred, #1198). A `zeebe:taskListener` declared on
+//!   (edges, not elements — deferred, #1198). A listener on the `<process>`
+//!   itself is likewise rejected — the process element has no activation/
+//!   completion lifecycle and is never ridden by a token. A `zeebe:taskListener`
+//!   declared on
 //!   a non-user-task element is likewise rejected (`UnsupportedTaskListener`),
 //!   since task-listener jobs only run on the user-task path.
 
