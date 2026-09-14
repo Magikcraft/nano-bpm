@@ -29,7 +29,8 @@ The harness is **hermetic**: it reads the checked-in corpus off disk
 ## How to add a corpus entry
 
 1. Drop a well-formed (or deliberately ill-formed) `.bpmn` model into
-   `corpus/`, named `accept-*.bpmn` or `reject-*.bpmn` by its verdict.
+   `corpus/`, named `accept-*.bpmn`, `reject-*.bpmn`, or `diverge-*.bpmn` by its
+   verdict.
 2. Put a **declarative verdict directive** as a leading XML comment, plus an
    `oracle:` comment recording *why* Zeebe returns that verdict (the Zeebe
    validator / test it came from):
@@ -46,15 +47,28 @@ The harness is **hermetic**: it reads the checked-in corpus off disk
    <!-- oracle: EndEventValidator — an end event must have no outgoing flow (#856) -->
    ```
 
+   or, for an **intentional Nano-only divergence** — a model Zeebe *accepts* but
+   Nano deliberately *rejects* because it does not implement the feature:
+
+   ```xml
+   <!-- verdict: diverge | category: UnsupportedUserTaskFormBinding -->
+   <!-- oracle: Zeebe ACCEPTS this model; Nano rejects it (deliberate divergence, #1190) -->
+   ```
+
    The `category` **must** be one of the Nano `ParseError` category keys in the
-   mapping table below (it is the `ParseError` variant name). The harness reads
-   the directive, runs `parse_bpmn`, and asserts:
+   appropriate registry below — the Zeebe-parity mapping table for `reject`, the
+   Nano-only divergence table for `diverge` (it is the `ParseError` variant
+   name). The harness reads the directive, runs `parse_bpmn`, and asserts:
    - it **accepts iff** the verdict is `accept`; and
    - on `reject`, the actual `ParseError` category equals the declared
-     `category`, and that category is present in the mapping table.
+     `category`, and that category is present in the mapping table; and
+   - on `diverge`, Nano still **rejects** (Zeebe would accept), the actual
+     category equals the declared `category`, and that category is present in the
+     Nano-only divergence table.
 3. Run `cargo test -p nanobpmn-engine-core --test conformance`. If you added a
    new reject category, the coverage ratchet requires a REJECT entry for it (and
-   a `ParseError` variant that maps to a Zeebe class — see below).
+   a `ParseError` variant that maps to a Zeebe class — see below); a new
+   divergence category likewise requires a DIVERGE entry.
 
 > **Tip:** to discover the category Nano actually emits for a model, run the
 > harness with `-- --nocapture`; a mismatch prints both the expected and actual
@@ -112,6 +126,27 @@ correspond. All Zeebe deploy rejections surface as gRPC `INVALID_ARGUMENT`
 | `DuplicateStartEvent` | `ModelUtil.verifyNoDuplicate{Message,Signal}StartEvents` | #856 |
 | `InvalidTaskDefinition` | `ZeebeElementValidator.hasNonEmptyAttribute` | #856 |
 
+## Intentional Nano/Zeebe divergences (`verdict: diverge`)
+
+The mapping table above records genuine **parity**: Nano rejects a model **iff**
+Zeebe rejects it. A handful of cases are deliberately *not* parity — Nano rejects
+a model Zeebe **accepts**, because Nano does not (yet) implement the feature and
+refuses to silently degrade it. Tagging such a model `verdict: reject` and giving
+it a fabricated Zeebe rejection class would make the oracle assert a falsehood
+(that Zeebe rejected a valid model) and blind it to the very divergence it should
+record. These carry `verdict: diverge` instead, and live in their own
+single-source-of-truth registry, `NANO_ONLY_DIVERGENCES` in
+`engine-core/tests/conformance.rs` — with **no** Zeebe rejection class, only the
+rationale for the deliberate difference. The two registries partition the full
+`ParseError` surface (a category is in exactly one; enforced by
+`mapping_covers_every_parse_error_category`), and every divergence category is
+exercised by at least one DIVERGE corpus entry
+(`every_divergence_category_has_a_diverge_corpus_entry`).
+
+| Nano `ParseError` category | Zeebe behaviour | Nano behaviour | Origin |
+|----------------------------|-----------------|----------------|--------|
+| `UnsupportedUserTaskFormBinding` | **accepts** `deployment`/`versionTag` user-task form bindings | rejects the deploy (only `latest` implemented) rather than silently degrading | #1190 |
+
 ### Notes on a few Nano-specific categorisations
 
 Some verdicts Zeebe attributes to a dedicated validator, Nano surfaces from an
@@ -142,9 +177,12 @@ The harness enforces two ratchets so parity coverage cannot silently erode:
 
 1. **Reject-category coverage** — every category in the mapping table must have
    at least one REJECT corpus entry, and `nano_category`'s exhaustive match plus
-   `mapping_covers_every_parse_error_category` guarantee the table covers the
-   full shared `ParseError` enum. Adding a `ParseError` variant forces a mapping
-   row and a corpus entry.
+   `mapping_covers_every_parse_error_category` guarantee the two registries
+   (Zeebe-parity `NANO_ZEEBE_MAPPING` + Nano-only `NANO_ONLY_DIVERGENCES`)
+   partition the full shared `ParseError` enum. Adding a `ParseError` variant
+   forces a row in exactly one registry and a corpus entry — a REJECT entry for a
+   parity category, a DIVERGE entry
+   (`every_divergence_category_has_a_diverge_corpus_entry`) for a divergence.
 2. **Element-family coverage** — `element_kind_family` maps every modelled
    `ElementKind` (the canonical registry mirrored by `processos`'
    `ELEMENT_KIND_SPECS`) to a coarse family via an exhaustive, no-wildcard match.
