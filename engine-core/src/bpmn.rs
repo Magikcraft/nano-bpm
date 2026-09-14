@@ -2972,6 +2972,41 @@ impl ProcessAcc {
                 .iter()
                 .filter_map(|n| n.parent.as_deref().map(|p| (n.id.as_str(), p)))
                 .collect();
+            // Reject an execution listener on a *boundary event attached to a tool*
+            // of an ad-hoc sub-process (#1197). This is the boundary analogue of the
+            // tool-node listener rejection above: the check there only looks at
+            // listeners stored on the tool node itself, but a listener-bearing
+            // boundary is just as dead. For a leaf tool the boundary is dropped by
+            // `self.boundaries.retain` below (its `attached_to` is pruned) *before*
+            // `boundary_listeners` is collected, so the listener silently vanishes;
+            // for a retained embedded-sub-process tool the boundary reaches
+            // `interrupt_activity_via_boundary` with no tool-release path and never
+            // runs its listener gate. Both are the reject-don't-drop class, so refuse
+            // the model at deploy rather than accept a dead listener. A "tool" is a
+            // direct child of an ad-hoc container (both leaf and embedded-sub-process
+            // tools are); a boundary attached to a deeper element inside a retained
+            // sub-process tool's body runs by ordinary token flow and IS fine, so it
+            // is left alone. Checked pre-pruning, in document order for a
+            // deterministic error.
+            if let Some(bad) = self.boundaries.iter().find(|b| {
+                (!b.start_listeners.is_empty() || !b.end_listeners.is_empty())
+                    && b.attached_to
+                        .as_deref()
+                        .and_then(|a| parent_of.get(a).copied())
+                        .is_some_and(|p| adhoc_ids.contains(p))
+            }) {
+                return Err(ParseError::UnsupportedExecutionListener {
+                    process_id: self.id.clone(),
+                    element_id: bad.id.clone(),
+                    reason: "an execution listener on a boundary event attached to a tool of \
+                             an ad-hoc sub-process is not supported: the tool is invoked \
+                             out-of-band, so a leaf tool's boundary is pruned before its \
+                             listener is collected and a retained embedded tool's boundary \
+                             has no activation path, both bypassing the listener gate, so the \
+                             listener could never fire"
+                        .to_string(),
+                });
+            }
             let inside_adhoc = |id: &str| -> bool {
                 let mut cur = parent_of.get(id).copied();
                 while let Some(p) = cur {
@@ -8632,6 +8667,52 @@ mod io_mapping_tests {
             other => {
                 panic!("expected UnsupportedExecutionListener for an ad-hoc tool, got {other:?}")
             }
+        }
+    }
+
+    #[test]
+    fn execution_listener_on_boundary_of_adhoc_tool_is_rejected() {
+        // #1197 reject-don't-drop, boundary analogue: a listener on a boundary
+        // event attached to a *tool* of an ad-hoc sub-process cannot fire — a leaf
+        // tool's boundary is pruned (its `attached_to` is removed) before the
+        // boundary listeners are collected, so the listener would silently vanish.
+        // The deploy is rejected instead of accepting a dead listener.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:adHocSubProcess id="agent">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="agent-worker" />
+        <zeebe:adHoc outputCollection="results" outputElement="=result" />
+      </bpmn:extensionElements>
+      <bpmn:serviceTask id="toolA">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="tool" />
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="tb" attachedToRef="toolA">
+        <bpmn:extensionElements>
+          <zeebe:executionListeners>
+            <zeebe:executionListener eventType="end" type="tb-end" />
+          </zeebe:executionListeners>
+        </bpmn:extensionElements>
+        <bpmn:timerEventDefinition><bpmn:timeDuration>PT1M</bpmn:timeDuration></bpmn:timerEventDefinition>
+      </bpmn:boundaryEvent>
+    </bpmn:adHocSubProcess>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+    <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        match parse_bpmn(xml) {
+            Err(ParseError::UnsupportedExecutionListener { element_id, .. }) => {
+                assert_eq!(element_id, "tb");
+            }
+            other => panic!(
+                "expected UnsupportedExecutionListener for a boundary on an ad-hoc tool, got {other:?}"
+            ),
         }
     }
 
