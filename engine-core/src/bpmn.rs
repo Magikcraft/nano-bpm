@@ -185,6 +185,23 @@ pub enum ParseError {
         gateway_id: String,
         reason: String,
     },
+    /// A `zeebe:executionListener` was declared on an element where it can never
+    /// fire, so accepting it would silently store a listener that creates no job
+    /// (#1197). Rather than mis-advertise support, Nano rejects the deploy. Two
+    /// placements are unsupported:
+    /// * a **multi-incoming parallel/inclusive gateway** (a join): its
+    ///   synchronising lifecycle short-circuits inside [`activate`] and never
+    ///   runs the shared listener-aware activation body, so a `start`/`end`
+    ///   listener on a join is parsed but never enacted. Single-incoming
+    ///   parallel/inclusive gateways (splits) and exclusive merges are fine.
+    /// * a **compensation boundary event**: a passive structural marker, armed
+    ///   implicitly and never entered by token flow, so it has no lifecycle to
+    ///   hang a listener on.
+    UnsupportedExecutionListener {
+        process_id: String,
+        element_id: String,
+        reason: String,
+    },
     /// A process's start events violate Zeebe's start-event rules: it has no
     /// start event ("must have at least one start event"), or it declares more
     /// than one *none* start event ("multiple none start events are not
@@ -287,10 +304,17 @@ deployed form version at user-task creation)"
                 f,
                 "process {process_id}: gateway '{gateway_id}' is invalid: {reason}"
             ),
+            ParseError::UnsupportedExecutionListener {
+                process_id,
+                element_id,
+                reason,
+            } => write!(
+                f,
+                "process {process_id}: execution listener on '{element_id}' is not supported: {reason}"
+            ),
             ParseError::InvalidStartEvents { process_id, reason } => {
                 write!(f, "process {process_id}: {reason}")
-            }
-            ParseError::InvalidEndEvent {
+            }            ParseError::InvalidEndEvent {
                 process_id,
                 element_id,
                 reason,
@@ -1702,6 +1726,19 @@ fn parse_with_captures(
                                             &mut boundary.start_listeners,
                                             &mut boundary.end_listeners,
                                         ))
+                                    } else if cur_flow.is_some() {
+                                        // A `<sequenceFlow>` is an edge, not an
+                                        // `Element`, so it has no listener slot —
+                                        // sequence-flow ("take") listeners are a
+                                        // deferred subset (#1198). Crucially, a
+                                        // sequence flow does NOT push onto the
+                                        // `io_stack`, so without this guard a
+                                        // listener nested in a flow would fall
+                                        // through to `io_stack.last()` and silently
+                                        // hoist onto the enclosing sub-process
+                                        // (the #1197 mis-attachment class). Drop it
+                                        // here rather than mis-attach it.
+                                        None
                                     } else {
                                         io_stack.last().map(|&idx| {
                                             let node = &mut acc.nodes[idx];
@@ -2743,6 +2780,64 @@ impl ProcessAcc {
         signals: &HashMap<String, String>,
         escalations: &HashMap<String, String>,
     ) -> Result<ProcessDefinition, ParseError> {
+        // Reject `zeebe:executionListener`s declared where they can never fire
+        // (#1197), rather than silently storing a listener that creates no job:
+        //
+        // * A **multi-incoming parallel/inclusive gateway** is a *join*: its
+        //   synchronising lifecycle short-circuits inside `Engine::activate`
+        //   (`arrive_at_parallel_join` / `arrive_at_inclusive_join`) and never
+        //   runs the shared listener-aware activation body, so a `start`/`end`
+        //   listener on it is parsed but never enacted. Single-incoming
+        //   parallel/inclusive gateways (splits) and exclusive merges run the
+        //   normal activation body, so their listeners fire — only the join is
+        //   unsupported.
+        // * A **compensation boundary** is a passive structural marker, armed
+        //   implicitly when its host completes and never entered by token flow,
+        //   so it has no lifecycle to hang a listener on.
+        {
+            let mut incoming: HashMap<&str, usize> = HashMap::new();
+            for flow in &self.flows {
+                if let Some(target) = flow.target.as_deref() {
+                    *incoming.entry(target).or_default() += 1;
+                }
+            }
+            for node in &self.nodes {
+                let is_par_or_inc =
+                    matches!(node.kind, NodeKind::Parallel | NodeKind::Inclusive);
+                let has_listeners =
+                    !node.start_listeners.is_empty() || !node.end_listeners.is_empty();
+                if is_par_or_inc
+                    && has_listeners
+                    && incoming.get(node.id.as_str()).copied().unwrap_or(0) > 1
+                {
+                    return Err(ParseError::UnsupportedExecutionListener {
+                        process_id: self.id.clone(),
+                        element_id: node.id.clone(),
+                        reason: "a multi-incoming parallel/inclusive gateway (a join) \
+                                 synchronises tokens and does not run the listener-aware \
+                                 activation body, so its execution listeners would never \
+                                 fire (a listener on a single-incoming split is supported)"
+                            .to_string(),
+                    });
+                }
+            }
+            for boundary in &self.boundaries {
+                if boundary.compensation
+                    && (!boundary.start_listeners.is_empty()
+                        || !boundary.end_listeners.is_empty())
+                {
+                    return Err(ParseError::UnsupportedExecutionListener {
+                        process_id: self.id.clone(),
+                        element_id: boundary.id.clone(),
+                        reason: "a compensation boundary event is a passive structural \
+                                 marker that is never activated by token flow, so its \
+                                 execution listeners would never fire"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+
         // Ad-hoc sub-processes are kept as a single Service job activity; the
         // elements they contain (agent "tools", invoked out-of-band rather than by
         // token flow) are pruned from the executable graph, along with any
@@ -8308,6 +8403,15 @@ mod io_mapping_tests {
           </zeebe:executionListeners>
         </bpmn:extensionElements>
       </bpmn:startEvent>
+      <bpmn:serviceTask id="st" />
+      <bpmn:boundaryEvent id="sb" attachedToRef="st">
+        <bpmn:extensionElements>
+          <zeebe:executionListeners>
+            <zeebe:executionListener eventType="start" type="sb-start" />
+          </zeebe:executionListeners>
+        </bpmn:extensionElements>
+        <bpmn:timerEventDefinition><bpmn:timeDuration>PT1M</bpmn:timeDuration></bpmn:timerEventDefinition>
+      </bpmn:boundaryEvent>
       <bpmn:exclusiveGateway id="sg">
         <bpmn:extensionElements>
           <zeebe:executionListeners>
@@ -8316,8 +8420,11 @@ mod io_mapping_tests {
         </bpmn:extensionElements>
       </bpmn:exclusiveGateway>
       <bpmn:endEvent id="se" />
-      <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="sg" />
-      <bpmn:sequenceFlow id="sf2" sourceRef="sg" targetRef="se" />
+      <bpmn:endEvent id="sbe" />
+      <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="st" />
+      <bpmn:sequenceFlow id="sf2" sourceRef="st" targetRef="sg" />
+      <bpmn:sequenceFlow id="sf3" sourceRef="sg" targetRef="se" />
+      <bpmn:sequenceFlow id="sf4" sourceRef="sb" targetRef="sbe" />
     </bpmn:subProcess>
     <bpmn:endEvent id="e" />
     <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sub" />
@@ -8336,7 +8443,19 @@ mod io_mapping_tests {
             def.element("sg").unwrap().start_listeners[0].job_type,
             "sg-start"
         );
-        // … and the enclosing sub-process must NOT have absorbed either.
+        // … the nested boundary owns its listener — the specific nested-boundary
+        // failure mode of #1197, where `io_stack.last()` is the enclosing
+        // sub-process, so a mis-routed boundary listener would land on `sub`
+        // rather than the boundary. It must sit on `sb`, and neither its host
+        // activity `st` nor the enclosing `sub` may absorb it.
+        assert_eq!(def.element("sb").unwrap().start_listeners.len(), 1);
+        assert_eq!(
+            def.element("sb").unwrap().start_listeners[0].job_type,
+            "sb-start"
+        );
+        assert!(def.element("st").unwrap().start_listeners.is_empty());
+        assert!(def.element("st").unwrap().end_listeners.is_empty());
+        // … and the enclosing sub-process must NOT have absorbed any of them.
         let sub = def.element("sub").unwrap();
         assert!(
             sub.start_listeners.is_empty(),
@@ -8373,6 +8492,192 @@ mod io_mapping_tests {
         let io = &def.element("t").unwrap().io;
         assert_eq!(io.inputs.len(), 1);
         assert_eq!(io.inputs[0].target, "one");
+    }
+
+    #[test]
+    fn listener_on_parallel_join_is_rejected_at_deploy() {
+        // #1197: a multi-incoming parallel gateway is a *join* — its lifecycle
+        // short-circuits inside `Engine::activate` and never runs the shared
+        // listener-aware activation body, so a listener on it would be parsed but
+        // never fire. Reject the deploy rather than silently store a dead listener.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:parallelGateway id="fork" />
+    <bpmn:serviceTask id="a" />
+    <bpmn:serviceTask id="b" />
+    <bpmn:parallelGateway id="join">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="join-start" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:parallelGateway>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="fork" />
+    <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="a" />
+    <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="b" />
+    <bpmn:sequenceFlow id="f3" sourceRef="a" targetRef="join" />
+    <bpmn:sequenceFlow id="f4" sourceRef="b" targetRef="join" />
+    <bpmn:sequenceFlow id="f5" sourceRef="join" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let err = parse_bpmn(xml).unwrap_err();
+        match err {
+            ParseError::UnsupportedExecutionListener { element_id, .. } => {
+                assert_eq!(element_id, "join");
+            }
+            other => panic!("expected UnsupportedExecutionListener, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn listener_on_inclusive_join_is_rejected_at_deploy() {
+        // #1197: same as the parallel join — a multi-incoming inclusive gateway
+        // synchronises tokens (its firing is decided at quiescence, bypassing the
+        // listener gate), so a listener on it can never fire. Reject at deploy.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:inclusiveGateway id="fork" />
+    <bpmn:serviceTask id="a" />
+    <bpmn:serviceTask id="b" />
+    <bpmn:inclusiveGateway id="join">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="end" type="join-end" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:inclusiveGateway>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="fork" />
+    <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="a" />
+    <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="b" />
+    <bpmn:sequenceFlow id="f3" sourceRef="a" targetRef="join" />
+    <bpmn:sequenceFlow id="f4" sourceRef="b" targetRef="join" />
+    <bpmn:sequenceFlow id="f5" sourceRef="join" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let err = parse_bpmn(xml).unwrap_err();
+        match err {
+            ParseError::UnsupportedExecutionListener { element_id, .. } => {
+                assert_eq!(element_id, "join");
+            }
+            other => panic!("expected UnsupportedExecutionListener, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn listener_on_single_incoming_gateway_split_is_supported() {
+        // A single-incoming parallel/inclusive gateway (a *split*) runs the
+        // ordinary activation body, so its listeners DO fire — only the join is
+        // rejected. Guard that the join rejection does not over-reach to splits.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:parallelGateway id="fork">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="fork-start" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:parallelGateway>
+    <bpmn:endEvent id="a" />
+    <bpmn:endEvent id="b" />
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="fork" />
+    <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="a" />
+    <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="b" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(def.element("fork").unwrap().start_listeners.len(), 1);
+        assert_eq!(
+            def.element("fork").unwrap().start_listeners[0].job_type,
+            "fork-start"
+        );
+    }
+
+    #[test]
+    fn listener_on_compensation_boundary_is_rejected_at_deploy() {
+        // #1197: a compensation boundary event is a passive structural marker,
+        // armed implicitly when its host completes and never entered by token
+        // flow, so it has no lifecycle to hang a listener on. Reject the deploy
+        // rather than silently store a listener that can never create a job.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="book" />
+    <bpmn:boundaryEvent id="book-comp" attachedToRef="book">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="comp-start" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+      <bpmn:compensateEventDefinition />
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="undo-book" isForCompensation="true" />
+    <bpmn:association associationDirection="One" sourceRef="book-comp" targetRef="undo-book" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="book" />
+    <bpmn:sequenceFlow id="f2" sourceRef="book" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let err = parse_bpmn(xml).unwrap_err();
+        match err {
+            ParseError::UnsupportedExecutionListener { element_id, .. } => {
+                assert_eq!(element_id, "book-comp");
+            }
+            other => panic!("expected UnsupportedExecutionListener, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn listener_nested_in_sequence_flow_is_dropped_not_hoisted() {
+        // #1198 deferral guard: a sequence flow is an edge, not an `Element`, so
+        // a `zeebe:executionListener` nested inside a `<sequenceFlow>` has no
+        // listener slot. It must be dropped — NOT fall through to
+        // `io_stack.last()` and silently hoist onto the enclosing sub-process
+        // (the #1197 mis-attachment class). Here the flow sits inside `sub`, so a
+        // hoisted listener would land on `sub`.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:subProcess id="sub">
+      <bpmn:startEvent id="ss" />
+      <bpmn:endEvent id="se" />
+      <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="se">
+        <bpmn:extensionElements>
+          <zeebe:executionListeners>
+            <zeebe:executionListener eventType="start" type="take-listener" />
+          </zeebe:executionListeners>
+        </bpmn:extensionElements>
+      </bpmn:sequenceFlow>
+    </bpmn:subProcess>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        // The take listener is dropped (deferred), and crucially the enclosing
+        // sub-process did NOT absorb it.
+        let sub = def.element("sub").unwrap();
+        assert!(
+            sub.start_listeners.is_empty(),
+            "sequence-flow listener must not hoist onto the enclosing sub-process: {:?}",
+            sub.start_listeners
+        );
+        assert!(sub.end_listeners.is_empty());
     }
 }
 

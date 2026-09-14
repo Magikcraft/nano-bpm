@@ -164,6 +164,7 @@ fn nano_category(err: &ParseError) -> &'static str {
         ParseError::DuplicateStartEvent { .. } => "DuplicateStartEvent",
         ParseError::InvalidTaskDefinition { .. } => "InvalidTaskDefinition",
         ParseError::InvalidAgentDefinition { .. } => "InvalidAgentDefinition",
+        ParseError::UnsupportedExecutionListener { .. } => "UnsupportedExecutionListener",
     }
 }
 
@@ -198,14 +199,26 @@ struct Divergence {
 /// intentionally **rejects**. Together with [`NANO_ZEEBE_MAPPING`] it partitions
 /// the full [`ParseError`] surface (every category is in exactly one of the two,
 /// enforced by [`mapping_covers_every_parse_error_category`]).
-const NANO_ONLY_DIVERGENCES: &[Divergence] = &[Divergence {
-    nano: "UnsupportedUserTaskFormBinding",
-    rationale: "Zeebe implements the `deployment` and `versionTag` user-task form \
-                bindings and ACCEPTS such a model; Nano implements only `latest` and \
-                rejects the deploy loudly rather than silently degrading the binding \
-                to `latest` (#1190).",
-    origin: "#1190",
-}];
+const NANO_ONLY_DIVERGENCES: &[Divergence] = &[
+    Divergence {
+        nano: "UnsupportedUserTaskFormBinding",
+        rationale: "Zeebe implements the `deployment` and `versionTag` user-task form \
+                    bindings and ACCEPTS such a model; Nano implements only `latest` and \
+                    rejects the deploy loudly rather than silently degrading the binding \
+                    to `latest` (#1190).",
+        origin: "#1190",
+    },
+    Divergence {
+        nano: "UnsupportedExecutionListener",
+        rationale: "Zeebe ACCEPTS `zeebe:executionListener`s on multi-incoming \
+                    parallel/inclusive joins and on compensation boundary events; Nano's \
+                    join lifecycle short-circuits the listener-aware activation body and \
+                    a compensation boundary is a passive marker never entered by token \
+                    flow, so such a listener could never fire. Nano rejects the deploy \
+                    loudly rather than silently store a dead listener (#1197).",
+        origin: "#1197",
+    },
+];
 
 fn divergence_for(nano: &str) -> Option<&'static Divergence> {
     NANO_ONLY_DIVERGENCES.iter().find(|d| d.nano == nano)
@@ -618,6 +631,11 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             element_id: String::new(),
             reason: String::new(),
         },
+        ParseError::UnsupportedExecutionListener {
+            process_id: String::new(),
+            element_id: String::new(),
+            reason: String::new(),
+        },
     ];
     // Compile-time completeness ratchet: this exhaustive, wildcard-free match
     // will not compile if a `ParseError` variant is added without a witness
@@ -642,6 +660,7 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             | ParseError::DuplicateStartEvent { .. }
             | ParseError::InvalidTaskDefinition { .. } => {}
             ParseError::InvalidAgentDefinition { .. } => {}
+            ParseError::UnsupportedExecutionListener { .. } => {}
         }
     }
     witnesses

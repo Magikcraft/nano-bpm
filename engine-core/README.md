@@ -395,7 +395,10 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > sub-processes, ad-hoc/call containers **and** on gateways
 > (exclusive/parallel/inclusive/event-based), **start events**, and **boundary
 > events** (#1197) — each attaches to its own element and fires through the shared
-> activation/completion listener gate. Sequence-flow ("take") listeners are not
+> activation/completion listener gate. A listener that could never fire is
+> rejected at deploy (`UnsupportedExecutionListener`): a multi-incoming
+> parallel/inclusive gateway (a *join* — a single-incoming split is supported) and
+> a compensation boundary event. Sequence-flow ("take") listeners are not
 > yet modelled (sequence flows are edges, not elements).
 > Deployments assign a per-id **version** and a unique process-definition key.
 > A `sendTask` is parsed as a job-backed **service task** (Zeebe models
