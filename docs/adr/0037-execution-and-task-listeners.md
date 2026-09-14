@@ -254,6 +254,16 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
   their transport/SDK plumbing and read-model projection are the follow-ups.
 - **Deferred:** listener behaviour under process-instance **migration** and **modification**;
   interaction subtleties with non-interrupting boundary events firing mid-chain.
+- **Non-activity flow-node listeners (#1197):** `start`/`end` execution listeners
+  on **gateways** (exclusive/parallel/inclusive/event-based), **start events**, and
+  **boundary events** are parsed (`engine-core/src/bpmn.rs` pushes these nodes onto
+  the `io_stack`; a boundary event, buffered rather than live on the stack, carries
+  its listeners on the pending boundary and re-attaches them by id at build) and
+  fire through the shared activation/completion listener gate — closing the silent
+  drop / mis-attachment gap. **Sequence-flow ("take") listeners remain deferred:**
+  sequence flows are modelled as edges, not `Element`s, so they have no listener
+  slot; firing a take listener between source completion and target activation needs
+  a model + runtime design and is tracked separately in #1198.
 
 ## Phased plan
 

@@ -391,6 +391,12 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > `intermediateCatchEvent`/`timerEventDefinition`, `messageEventDefinition`/
 > `zeebe:subscription` and `startEvent` message/timer definitions) via the
 > [`bpmn`] module (`bpmn::parse_bpmn`), a tiny dependency-free scanner.
+> `zeebe:executionListeners` (`start`/`end`, ADR 0037) are parsed on tasks,
+> sub-processes, ad-hoc/call containers **and** on gateways
+> (exclusive/parallel/inclusive/event-based), **start events**, and **boundary
+> events** (#1197) — each attaches to its own element and fires through the shared
+> activation/completion listener gate. Sequence-flow ("take") listeners are not
+> yet modelled (sequence flows are edges, not elements).
 > Deployments assign a per-id **version** and a unique process-definition key.
 > A `sendTask` is parsed as a job-backed **service task** (Zeebe models
 > send tasks as ordinary job workers). Constructs the engine does not execute

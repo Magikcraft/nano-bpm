@@ -94,6 +94,15 @@
 //!   `AgentDefinitionValidator`: `aiAgentTask` is only valid on a `serviceTask`
 //!   and `aiAgentSubProcess` only on an `adHocSubProcess`; the wrong placement
 //!   (or an unknown `agentType`) is rejected at parse time.
+//! * `zeebe:executionListeners` / nested `zeebe:executionListener`
+//!   (`eventType` `start`/`end`, ADR 0037): parsed on activities, sub-processes,
+//!   ad-hoc/call containers, **gateways** (exclusive/parallel/inclusive/
+//!   event-based), **start events**, and **boundary events** (#1197). Each
+//!   listener attaches to its own element (activities/gateways/start & end events
+//!   ride the `io_stack`; a boundary event carries its listeners on the buffered
+//!   boundary and re-attaches them by id at build) and fires through the shared
+//!   activation/completion listener gate. Sequence-flow ("take") listeners are
+//!   **not** modelled — sequence flows are edges, not elements.
 
 use std::collections::HashMap;
 
@@ -518,6 +527,15 @@ fn parse_with_captures(
     // Index of the call activity currently being read, so a nested
     // `zeebe:calledElement processId="…"` child can record its callee.
     let mut cur_call: Option<usize> = None;
+    // Index of the gateway currently being read (any of exclusive/parallel/
+    // inclusive/event-based). A gateway is a pass-through element that can carry
+    // `start`/`end` execution listeners (ADR 0037 — listeners apply uniformly to
+    // any element); it is pushed onto the `io_stack` while open so a nested
+    // `zeebe:executionListener` attaches to the gateway itself rather than being
+    // dropped (top-level gateway) or mis-attached to the enclosing sub-process
+    // (nested gateway) — issue #1197. Gateways never nest another flow node, so a
+    // single pointer suffices to guard the balancing `io_stack` pop on close.
+    let mut cur_gateway: Option<usize> = None;
     let mut duration_text: Option<String> = None;
     // Index of the start event currently being read (to attach a nested
     // messageEventDefinition or timerEventDefinition), and a buffer for a timer
@@ -557,9 +575,12 @@ fn parse_with_captures(
     let mut flow_node_stack: Vec<Option<usize>> = Vec::new();
     let mut in_io_mapping = false;
     // Gates `zeebe:executionListener` reads to a real `zeebe:executionListeners`
-    // container; each listener attaches to the innermost open activity on the
-    // io_stack (ADR 0037). Listeners on non-activity nodes (gateways, events)
-    // are a deferred subset — they are not on the io_stack.
+    // container; each listener attaches to the innermost open flow node on the
+    // io_stack (ADR 0037) — activities, gateways, start events, and end events
+    // are all pushed there, so listeners land on the correct element (#1197). A
+    // boundary event is buffered in `cur_boundary` rather than on the io_stack,
+    // so its listeners are routed to the pending boundary and re-attached by id
+    // at build; sequence-flow ("take") listeners remain unmodelled.
     let mut in_execution_listeners = false;
     // Gates `zeebe:taskListener` reads to a real `zeebe:taskListeners` container
     // (ADR 0037 §6). Task listeners attach to the innermost open user task.
@@ -673,8 +694,17 @@ fn parse_with_captures(
                         match tag {
                             "startEvent" => {
                                 let idx = acc.add_node(attrs, NodeKind::Start);
+                                // Push onto io_stack so a nested execution listener
+                                // attaches to the start event, not the enclosing
+                                // scope (#1197). A self-closing `<startEvent/>` has
+                                // no children and no end tag, so only a real open
+                                // element enters the io_stack (popped on
+                                // `</startEvent>` when `cur_start` is set).
                                 if !self_closing {
                                     cur_start = idx;
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
                                 }
                             }
                             "endEvent" => {
@@ -700,9 +730,24 @@ fn parse_with_captures(
                                 if let (Some(i), Some(d)) = (idx, attr(attrs, "default")) {
                                     acc.nodes[i].default_flow = Some(d.to_string());
                                 }
+                                // Push onto io_stack so a nested execution listener
+                                // attaches to the gateway, not the enclosing scope
+                                // (#1197). Self-closing gateways carry no children.
+                                if !self_closing {
+                                    cur_gateway = idx;
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
+                                }
                             }
                             "parallelGateway" => {
-                                acc.add_node(attrs, NodeKind::Parallel);
+                                let idx = acc.add_node(attrs, NodeKind::Parallel);
+                                if !self_closing {
+                                    cur_gateway = idx;
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
+                                }
                             }
                             // An inclusive (OR) gateway: a conditional split that
                             // may take several outgoing flows, and a synchronising
@@ -714,9 +759,21 @@ fn parse_with_captures(
                                 if let (Some(i), Some(d)) = (idx, attr(attrs, "default")) {
                                     acc.nodes[i].default_flow = Some(d.to_string());
                                 }
+                                if !self_closing {
+                                    cur_gateway = idx;
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
+                                }
                             }
                             "eventBasedGateway" => {
-                                acc.add_node(attrs, NodeKind::EventBased);
+                                let idx = acc.add_node(attrs, NodeKind::EventBased);
+                                if !self_closing {
+                                    cur_gateway = idx;
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
+                                }
                             }
                             "serviceTask" => {
                                 let idx = acc.add_node(attrs, NodeKind::Service);
@@ -912,6 +969,8 @@ fn parse_with_captures(
                                         escalation: false,
                                         escalation_ref: None,
                                         escalation_dup: false,
+                                        start_listeners: Vec::new(),
+                                        end_listeners: Vec::new(),
                                     });
                                 }
                             }
@@ -1616,9 +1675,7 @@ fn parse_with_captures(
                                 in_execution_listeners = true;
                             }
                             "executionListener" if in_execution_listeners => {
-                                if let (Some(&idx), Some(job_type)) =
-                                    (io_stack.last(), attr(attrs, "type"))
-                                {
+                                if let Some(job_type) = attr(attrs, "type") {
                                     // `eventType` defaults to "start" in Zeebe when
                                     // omitted.
                                     let event_type = match attr(attrs, "eventType") {
@@ -1631,12 +1688,34 @@ fn parse_with_captures(
                                         job_type: job_type.to_string(),
                                         retries,
                                     };
-                                    match event_type {
-                                        crate::model::ListenerEventType::Start => {
-                                            acc.nodes[idx].start_listeners.push(listener)
-                                        }
-                                        crate::model::ListenerEventType::End => {
-                                            acc.nodes[idx].end_listeners.push(listener)
+                                    // A boundary event is buffered in `cur_boundary`
+                                    // and never enters the `io_stack` (it is a
+                                    // sibling of its host, not a nested element), so
+                                    // route its listeners to the pending boundary —
+                                    // otherwise `io_stack.last()` would drop them
+                                    // (top-level host) or mis-attach them to the
+                                    // enclosing sub-process (#1197). A boundary's
+                                    // children cannot open another listener owner, so
+                                    // checking `cur_boundary` first is unambiguous.
+                                    let sink = if let Some(boundary) = cur_boundary.as_mut() {
+                                        Some((
+                                            &mut boundary.start_listeners,
+                                            &mut boundary.end_listeners,
+                                        ))
+                                    } else {
+                                        io_stack.last().map(|&idx| {
+                                            let node = &mut acc.nodes[idx];
+                                            (&mut node.start_listeners, &mut node.end_listeners)
+                                        })
+                                    };
+                                    if let Some((start, end)) = sink {
+                                        match event_type {
+                                            crate::model::ListenerEventType::Start => {
+                                                start.push(listener)
+                                            }
+                                            crate::model::ListenerEventType::End => {
+                                                end.push(listener)
+                                            }
                                         }
                                     }
                                 }
@@ -1788,6 +1867,7 @@ fn parse_with_captures(
                     event_condition_text = None;
                     cur_user_task = None;
                     cur_call = None;
+                    cur_gateway = None;
                     completion_condition_text = None;
                     flow_ref_text = None;
                     flow_ref_owner = None;
@@ -1842,6 +1922,17 @@ fn parse_with_captures(
                     }
                     cur_call = None;
                 }
+                // A gateway (any flavour) balances the io_stack push done for a
+                // non-self-closing open with an `id` (#1197). Guard on
+                // `cur_gateway` so an id-less gateway — never pushed — does not
+                // detach the enclosing activity's mapping owner.
+                "exclusiveGateway" | "parallelGateway" | "inclusiveGateway"
+                | "eventBasedGateway" => {
+                    if cur_gateway.is_some() {
+                        io_stack.pop();
+                    }
+                    cur_gateway = None;
+                }
                 "subProcess" => {
                     if let Some(acc) = current.as_mut() {
                         acc.scope_stack.pop();
@@ -1863,7 +1954,15 @@ fn parse_with_captures(
                 "linkedResources" => in_linked_resources = false,
                 "executionListeners" => in_execution_listeners = false,
                 "taskListeners" => in_task_listeners = false,
-                "startEvent" => cur_start = None,
+                "startEvent" => {
+                    // Balance the io_stack push done for a non-self-closing start
+                    // event (id-less start events are never pushed, so guard on
+                    // `cur_start`) — #1197.
+                    if cur_start.is_some() {
+                        io_stack.pop();
+                    }
+                    cur_start = None;
+                }
                 "message" => cur_message = None,
                 "boundaryEvent" => {
                     // Keep error boundaries (errorEventDefinition), timer
@@ -2340,6 +2439,14 @@ struct PendingBoundary {
     /// diagnostic. Rejected at build as an unsupported multi-definition boundary
     /// (#1173).
     escalation_dup: bool,
+    /// Execution listeners (`zeebe:executionListener`) declared on this boundary
+    /// event, split into `start` (fire on activation) and `end` (fire on
+    /// completion) lists (ADR 0037). A boundary event is buffered here rather
+    /// than as a live `io_stack` node, so its listeners are captured on the
+    /// pending boundary and re-attached to the built element in `build` — never
+    /// mis-attached to the enclosing activity on the `io_stack`.
+    start_listeners: Vec<crate::model::ExecutionListener>,
+    end_listeners: Vec<crate::model::ExecutionListener>,
 }
 
 /// A definitions-level `<message>` declaration: its `name` and the instance
@@ -3533,6 +3640,27 @@ impl ProcessAcc {
             .filter(|b| !b.compensation)
             .map(|b| b.id.clone())
             .collect();
+        // Execution listeners declared on boundary events (#1197). Collected
+        // before the consuming loop below (which moves each `PendingBoundary`)
+        // and re-attached by element id after the boundaries are built, so a
+        // boundary event's `start`/`end` listeners fire on its own lifecycle
+        // rather than being dropped or mis-attached during parsing.
+        let boundary_listeners: Vec<(
+            String,
+            Vec<crate::model::ExecutionListener>,
+            Vec<crate::model::ExecutionListener>,
+        )> = self
+            .boundaries
+            .iter()
+            .filter(|b| !b.start_listeners.is_empty() || !b.end_listeners.is_empty())
+            .map(|b| {
+                (
+                    b.id.clone(),
+                    b.start_listeners.clone(),
+                    b.end_listeners.clone(),
+                )
+            })
+            .collect();
         for boundary in self.boundaries {
             let attached_to =
                 boundary
@@ -3777,6 +3905,13 @@ impl ProcessAcc {
                 })?;
                 builder = builder.error_boundary_event(boundary.id, attached_to, error_code);
             }
+        }
+        // Re-attach the boundary events' execution listeners now that every
+        // boundary element exists (#1197). `with_listeners` resolves by id, so a
+        // boundary listener lands on its own element rather than the enclosing
+        // activity it parsed adjacent to.
+        for (id, start_listeners, end_listeners) in boundary_listeners {
+            builder = builder.with_listeners(id, start_listeners, end_listeners);
         }
         // Compensation boundary events and their `isForCompensation` handlers are
         // structural markers, NOT part of ordinary token flow: a compensation
@@ -8016,6 +8151,228 @@ mod io_mapping_tests {
         let el = def.element("t").unwrap();
         assert_eq!(el.start_listeners.len(), 1);
         assert!(el.end_listeners.is_empty());
+    }
+
+    #[test]
+    fn parses_execution_listeners_on_gateways() {
+        // #1197: start/end execution listeners on every gateway flavour must
+        // attach to the gateway itself, not be dropped.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:exclusiveGateway id="xor">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="xor-start" />
+          <zeebe:executionListener eventType="end" type="xor-end" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:exclusiveGateway>
+    <bpmn:parallelGateway id="and">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="and-start" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:parallelGateway>
+    <bpmn:inclusiveGateway id="or">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="end" type="or-end" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:inclusiveGateway>
+    <bpmn:eventBasedGateway id="evt">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener type="evt-start" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:eventBasedGateway>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="xor" />
+    <bpmn:sequenceFlow id="f2" sourceRef="xor" targetRef="and" />
+    <bpmn:sequenceFlow id="f3" sourceRef="and" targetRef="or" />
+    <bpmn:sequenceFlow id="f4" sourceRef="or" targetRef="evt" />
+    <bpmn:sequenceFlow id="f5" sourceRef="evt" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        let xor = def.element("xor").unwrap();
+        assert_eq!(xor.start_listeners.len(), 1);
+        assert_eq!(xor.start_listeners[0].job_type, "xor-start");
+        assert_eq!(xor.end_listeners.len(), 1);
+        assert_eq!(xor.end_listeners[0].job_type, "xor-end");
+        let and = def.element("and").unwrap();
+        assert_eq!(and.start_listeners.len(), 1);
+        assert_eq!(and.start_listeners[0].job_type, "and-start");
+        assert!(and.end_listeners.is_empty());
+        let or = def.element("or").unwrap();
+        assert!(or.start_listeners.is_empty());
+        assert_eq!(or.end_listeners.len(), 1);
+        assert_eq!(or.end_listeners[0].job_type, "or-end");
+        let evt = def.element("evt").unwrap();
+        assert_eq!(evt.start_listeners.len(), 1);
+        assert_eq!(evt.start_listeners[0].job_type, "evt-start");
+    }
+
+    #[test]
+    fn parses_execution_listeners_on_start_event() {
+        // #1197: a start event's execution listeners must attach to the start
+        // event, not fall through to the enclosing scope.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="s-start" />
+          <zeebe:executionListener eventType="end" type="s-end" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        let s = def.element("s").unwrap();
+        assert_eq!(s.start_listeners.len(), 1);
+        assert_eq!(s.start_listeners[0].job_type, "s-start");
+        assert_eq!(s.end_listeners.len(), 1);
+        assert_eq!(s.end_listeners[0].job_type, "s-end");
+    }
+
+    #[test]
+    fn parses_execution_listeners_on_boundary_event() {
+        // #1197: a boundary event's execution listeners must attach to the
+        // boundary event, not to the activity it is attached to.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="t">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="b" attachedToRef="t">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="b-start" />
+          <zeebe:executionListener eventType="end" type="b-end" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT1M</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:endEvent id="eb" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+    <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+    <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="eb" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        let b = def.element("b").unwrap();
+        assert_eq!(b.start_listeners.len(), 1);
+        assert_eq!(b.start_listeners[0].job_type, "b-start");
+        assert_eq!(b.end_listeners.len(), 1);
+        assert_eq!(b.end_listeners[0].job_type, "b-end");
+        // The host activity must NOT have inherited the boundary's listeners.
+        let t = def.element("t").unwrap();
+        assert!(t.start_listeners.is_empty());
+        assert!(t.end_listeners.is_empty());
+    }
+
+    #[test]
+    fn nested_non_activity_listener_does_not_misattach_to_enclosing_subprocess() {
+        // #1197 guard against the silent io_stack mis-attachment class: a
+        // listener declared on a gateway / start event / boundary event nested
+        // inside a sub-process must land on that node, NOT hoist onto the
+        // enclosing sub-process (the same defect class as the ioMapping bug in
+        // PR #565 / #971).
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:subProcess id="sub">
+      <bpmn:startEvent id="ss">
+        <bpmn:extensionElements>
+          <zeebe:executionListeners>
+            <zeebe:executionListener eventType="start" type="ss-start" />
+          </zeebe:executionListeners>
+        </bpmn:extensionElements>
+      </bpmn:startEvent>
+      <bpmn:exclusiveGateway id="sg">
+        <bpmn:extensionElements>
+          <zeebe:executionListeners>
+            <zeebe:executionListener eventType="start" type="sg-start" />
+          </zeebe:executionListeners>
+        </bpmn:extensionElements>
+      </bpmn:exclusiveGateway>
+      <bpmn:endEvent id="se" />
+      <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="sg" />
+      <bpmn:sequenceFlow id="sf2" sourceRef="sg" targetRef="se" />
+    </bpmn:subProcess>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        // The nested start event and gateway carry their own listeners …
+        assert_eq!(def.element("ss").unwrap().start_listeners.len(), 1);
+        assert_eq!(
+            def.element("ss").unwrap().start_listeners[0].job_type,
+            "ss-start"
+        );
+        assert_eq!(def.element("sg").unwrap().start_listeners.len(), 1);
+        assert_eq!(
+            def.element("sg").unwrap().start_listeners[0].job_type,
+            "sg-start"
+        );
+        // … and the enclosing sub-process must NOT have absorbed either.
+        let sub = def.element("sub").unwrap();
+        assert!(
+            sub.start_listeners.is_empty(),
+            "sub-process must not inherit nested nodes' listeners: {:?}",
+            sub.start_listeners
+        );
+        assert!(sub.end_listeners.is_empty());
+    }
+
+    #[test]
+    fn self_closing_gateway_with_no_children_balances_io_stack() {
+        // A self-closing `<exclusiveGateway/>` emits no end tag; the following
+        // activity's ioMapping must still attach to that activity (no io_stack
+        // imbalance from the gateway) — guards the #1197 push/pop balance.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:exclusiveGateway id="g" />
+    <bpmn:serviceTask id="t">
+      <bpmn:extensionElements>
+        <zeebe:ioMapping><zeebe:input source="=1" target="one" /></zeebe:ioMapping>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="g" />
+    <bpmn:sequenceFlow id="f2" sourceRef="g" targetRef="t" />
+    <bpmn:sequenceFlow id="f3" sourceRef="t" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert!(def.element("g").unwrap().start_listeners.is_empty());
+        let io = &def.element("t").unwrap().io;
+        assert_eq!(io.inputs.len(), 1);
+        assert_eq!(io.inputs[0].target, "one");
     }
 }
 
