@@ -1960,6 +1960,13 @@ impl Engine {
                 let element_id = job.element_id.clone();
                 let created_at = job.created_at;
                 let job_type = job.job_type.clone();
+                // The activating worker, stamped from the live job at the
+                // completion site so a *successful* completion carries it forward
+                // for read-model/export attribution (symmetric with the
+                // `JobFailed` / `JobErrorThrown` paths). `Job.worker` is cleared
+                // on completion, so it must be captured here before the job is
+                // removed from state.
+                let worker = job.worker.clone();
                 let job_kind = job.kind;
 
                 // A task-listener job (ADR 0037 §6) gates a user task's deferred
@@ -2049,6 +2056,7 @@ impl Engine {
                         instance_key,
                         created_at,
                         job_type,
+                        worker,
                     },
                 );
                 if !variables.is_empty() {

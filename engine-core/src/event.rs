@@ -462,6 +462,20 @@ pub enum Event {
         created_at: u64,
         #[cfg_attr(feature = "serde", serde(default))]
         job_type: String,
+        /// The worker that was holding the activation lock at completion time.
+        /// Carried on the event so a successful completion durably retains it for
+        /// attribution across engine restart *and* on the read-model leader-local
+        /// path (where `JobActivated` is never exported, so the row would
+        /// otherwise have `worker = NULL`) — symmetric with
+        /// [`Event::JobFailed::worker`] / [`Event::JobErrorThrown::worker`]. This
+        /// is what lets a *successful* job (including a husked agent round — a
+        /// `COMPLETED` job that minted no `AgentInstance`) be attributed to the
+        /// worker that ran it, via the Camunda-parity join
+        /// `AgentInstance.jobKey → completed Job.worker`. `None` for events
+        /// serialized before this field existed, and when the job had no
+        /// activating worker. Observational: not used by replay.
+        #[cfg_attr(feature = "serde", serde(default))]
+        worker: Option<String>,
     },
     /// A job's remaining retries were updated (e.g. by an operator recovering a
     /// parked job before resolving its incident). Does not change job state.

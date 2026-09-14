@@ -7440,6 +7440,36 @@ fn should_preserve_the_activating_worker_on_a_job_that_fails_with_no_retries() {
 }
 
 #[test]
+fn should_stamp_the_activating_worker_on_a_successful_job_completion() {
+    // #1191 — a *successful* completion must carry the activating `worker` on the
+    // emitted `Event::JobCompleted` (stamped from the live job at the completion
+    // site) so the read-model leader-local job row can attribute the completed
+    // job — including a **husk** (a COMPLETED job that minted no AgentInstance) —
+    // to the worker that ran it, symmetric with the `JobFailed`/`JobErrorThrown`
+    // terminal events. `Job.worker` is cleared on completion, so the event is the
+    // only place the identity survives.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+
+    // when the worker completes the job
+    let events = engine
+        .apply_command(Command::complete_job(job_key))
+        .unwrap();
+
+    // then the emitted completion event carries the activating worker
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::JobCompleted { job_key: k, worker: Some(w), .. } if *k == job_key && w == "w1"
+    )));
+}
+
+#[test]
 fn should_drop_the_worker_when_a_failed_job_returns_to_the_activatable_pool() {
     // #959 — with retries remaining the job is genuinely no longer held (it goes
     // back to the activatable pool), so the activating `worker` must be cleared.

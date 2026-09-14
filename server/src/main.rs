@@ -22364,6 +22364,7 @@ mod adhoc_metrics_tests {
                 instance_key: 2,
                 created_at: 0,
                 job_type: String::new(),
+                worker: None,
             }),
             None
         );

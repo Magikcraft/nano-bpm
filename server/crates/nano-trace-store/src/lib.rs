@@ -1451,6 +1451,7 @@ mod tests {
                     instance_key: 1,
                     created_at: 0,
                     job_type: String::new(),
+                    worker: None,
                 },
                 &vars_updated(1, &[("label", Value::Str("vip".into()))]),
             ],
@@ -1472,6 +1473,7 @@ mod tests {
                     instance_key: 1,
                     created_at: 0,
                     job_type: String::new(),
+                    worker: None,
                 },
                 &vars_updated(1, &[("label", Value::Str("vip".into()))]),
                 &Event::ElementCompleted {
@@ -1554,6 +1556,7 @@ mod tests {
                     instance_key: 1,
                     created_at: 0,
                     job_type: String::new(),
+                    worker: None,
                 },
                 &Event::ElementCompleted {
                     instance_key: 1,

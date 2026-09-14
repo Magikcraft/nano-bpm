@@ -4494,10 +4494,26 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             )?;
         }
 
-        Event::JobCompleted { job_key, .. } => {
+        Event::JobCompleted {
+            job_key, worker, ..
+        } => {
+            // Set `worker` from the event so a *successful* completion is
+            // attributable to the activating worker on the read-model
+            // leader-local path too, where `JobActivated` is never exported and
+            // the row's `worker` was therefore still NULL (symmetric with the
+            // `JobFailed` / `JobErrorThrown` terminal rows). `COALESCE(?3, worker)`
+            // keeps any existing value for events serialized before the field
+            // existed (`worker == NULL`). This is what makes a husked agent round
+            // (a COMPLETED job that minted no AgentInstance) attributable via the
+            // `AgentInstance.jobKey → completed Job.worker` join.
             tx.cexecute(
-                "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL WHERE key = ?1",
-                params![*job_key as i64, job_state_code(JobState::Completed)],
+                "UPDATE jobs SET state = ?2, worker = COALESCE(?3, worker), deadline_ms = NULL \
+                 WHERE key = ?1",
+                params![
+                    *job_key as i64,
+                    job_state_code(JobState::Completed),
+                    worker.as_deref()
+                ],
             )?;
         }
 
@@ -8701,6 +8717,70 @@ mod element_instance_tests {
         let errored = &jobs[&9002];
         assert_eq!(errored.state, JobState::Errored);
         assert_eq!(errored.worker.as_deref(), Some("host-b-senior"));
+    }
+
+    #[test]
+    fn attributes_the_worker_on_a_successful_completion_including_a_husk() {
+        // #1191 — closes the asymmetric attribution gap: a *successful* completion
+        // must retain the activating worker on the read-model leader-local path
+        // too (where `JobActivated` is never exported), mirroring the terminal
+        // `JobFailed` / `JobErrorThrown` rows. This is what makes a **husk** — a
+        // COMPLETED job that minted no AgentInstance — attributable to its worker
+        // via the `AgentInstance.jobKey → completed Job.worker` join.
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                // Completed — NO JobActivated was exported (leader-local path).
+                &Event::JobCreated {
+                    job_key: 9101,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "review-round".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobCompleted {
+                    job_key: 9101,
+                    instance_key: INST,
+                    created_at: 1,
+                    job_type: "review-round".to_string(),
+                    worker: Some("host-a-senior".to_string()),
+                },
+                // A completion with no activating worker leaves it NULL, not "".
+                &Event::JobCreated {
+                    job_key: 9102,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "review-round".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobCompleted {
+                    job_key: 9102,
+                    instance_key: INST,
+                    created_at: 1,
+                    job_type: "review-round".to_string(),
+                    worker: None,
+                },
+            ])
+            .unwrap();
+
+        let jobs: HashMap<Key, super::JobRow> =
+            store.jobs().into_iter().map(|j| (j.key, j)).collect();
+
+        let husk = &jobs[&9101];
+        assert_eq!(husk.state, JobState::Completed);
+        assert_eq!(husk.worker.as_deref(), Some("host-a-senior"));
+
+        let no_worker = &jobs[&9102];
+        assert_eq!(no_worker.state, JobState::Completed);
+        assert_eq!(no_worker.worker, None);
     }
 
     #[test]
