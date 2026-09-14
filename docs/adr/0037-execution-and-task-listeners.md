@@ -260,16 +260,18 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
   the `io_stack`; a boundary event, buffered rather than live on the stack, carries
   its listeners on the pending boundary and re-attaches them by id at build) and
   fire through the shared activation/completion listener gate — closing the silent
-  drop / mis-attachment gap. Two placements where a listener could never fire are
-  **rejected at deploy** rather than silently stored (`UnsupportedExecutionListener`):
-  a **multi-incoming parallel/inclusive gateway** (a *join* synchronises tokens and
-  short-circuits the listener-aware activation body — a single-incoming split is
-  supported), and a **compensation boundary event** (a passive structural marker
-  never entered by token flow). **Sequence-flow ("take") listeners remain deferred:**
-  sequence flows are modelled as edges, not `Element`s, so they have no listener
-  slot (a listener nested in a `<sequenceFlow>` is dropped, not hoisted onto the
-  enclosing node); firing a take listener between source completion and target
-  activation needs a model + runtime design and is tracked separately in #1198.
+  drop / mis-attachment gap. Three placements where a listener could never fire
+  are **rejected at deploy** rather than silently stored
+  (`UnsupportedExecutionListener`): a **multi-incoming parallel/inclusive gateway**
+  (a *join* synchronises tokens and short-circuits the listener-aware activation
+  body — a single-incoming split is supported), a **compensation boundary event**
+  (a passive structural marker never entered by token flow), and a **sequence-flow
+  ("take") listener** (a sequence flow is modelled as an edge, not an `Element`, so
+  it has no lifecycle to run a listener on). **Sequence-flow ("take") listeners
+  remain deferred:** firing a take listener between source completion and target
+  activation needs a model + runtime design and is tracked separately in #1198 —
+  until then a listener nested in a `<sequenceFlow>` is rejected at deploy (naming
+  the offending flow), never silently dropped or hoisted onto the enclosing node.
 
 ## Phased plan
 

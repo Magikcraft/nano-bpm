@@ -314,7 +314,8 @@ deployed form version at user-task creation)"
             ),
             ParseError::InvalidStartEvents { process_id, reason } => {
                 write!(f, "process {process_id}: {reason}")
-            }            ParseError::InvalidEndEvent {
+            }
+            ParseError::InvalidEndEvent {
                 process_id,
                 element_id,
                 reason,
@@ -1726,19 +1727,36 @@ fn parse_with_captures(
                                             &mut boundary.start_listeners,
                                             &mut boundary.end_listeners,
                                         ))
-                                    } else if cur_flow.is_some() {
+                                    } else if let Some(flow_idx) = cur_flow {
                                         // A `<sequenceFlow>` is an edge, not an
-                                        // `Element`, so it has no listener slot —
-                                        // sequence-flow ("take") listeners are a
-                                        // deferred subset (#1198). Crucially, a
-                                        // sequence flow does NOT push onto the
-                                        // `io_stack`, so without this guard a
-                                        // listener nested in a flow would fall
-                                        // through to `io_stack.last()` and silently
-                                        // hoist onto the enclosing sub-process
-                                        // (the #1197 mis-attachment class). Drop it
-                                        // here rather than mis-attach it.
-                                        None
+                                        // `Element`, so it has no lifecycle to run
+                                        // an execution listener on. Rather than
+                                        // silently DROP a declared take listener —
+                                        // the same dead-listener failure mode this
+                                        // change rejects for joins and compensation
+                                        // boundaries (deploy would succeed yet the
+                                        // listener could never create a job) —
+                                        // reject it at deploy until #1198 adds a
+                                        // real sequence-flow ("take") listener slot.
+                                        // Rejecting here also forecloses the #1197
+                                        // mis-attachment class: a sequence flow does
+                                        // NOT push onto the `io_stack`, so a dropped
+                                        // listener would otherwise fall through to
+                                        // `io_stack.last()` and hoist onto the
+                                        // enclosing sub-process.
+                                        return Err(ParseError::UnsupportedExecutionListener {
+                                            process_id: acc.id.clone(),
+                                            element_id: acc.flows[flow_idx]
+                                                .id
+                                                .clone()
+                                                .unwrap_or_else(|| "<sequenceFlow>".to_string()),
+                                            reason: "a sequence flow is an edge, not an \
+                                                     element, so it has no lifecycle to run \
+                                                     an execution listener; sequence-flow \
+                                                     (\"take\") listeners are a deferred \
+                                                     subset (#1198)"
+                                                .to_string(),
+                                        });
                                     } else {
                                         io_stack.last().map(|&idx| {
                                             let node = &mut acc.nodes[idx];
@@ -2802,8 +2820,7 @@ impl ProcessAcc {
                 }
             }
             for node in &self.nodes {
-                let is_par_or_inc =
-                    matches!(node.kind, NodeKind::Parallel | NodeKind::Inclusive);
+                let is_par_or_inc = matches!(node.kind, NodeKind::Parallel | NodeKind::Inclusive);
                 let has_listeners =
                     !node.start_listeners.is_empty() || !node.end_listeners.is_empty();
                 if is_par_or_inc
@@ -2823,8 +2840,7 @@ impl ProcessAcc {
             }
             for boundary in &self.boundaries {
                 if boundary.compensation
-                    && (!boundary.start_listeners.is_empty()
-                        || !boundary.end_listeners.is_empty())
+                    && (!boundary.start_listeners.is_empty() || !boundary.end_listeners.is_empty())
                 {
                     return Err(ParseError::UnsupportedExecutionListener {
                         process_id: self.id.clone(),
@@ -8640,13 +8656,15 @@ mod io_mapping_tests {
     }
 
     #[test]
-    fn listener_nested_in_sequence_flow_is_dropped_not_hoisted() {
+    fn listener_nested_in_sequence_flow_is_rejected_not_hoisted() {
         // #1198 deferral guard: a sequence flow is an edge, not an `Element`, so
         // a `zeebe:executionListener` nested inside a `<sequenceFlow>` has no
-        // listener slot. It must be dropped — NOT fall through to
-        // `io_stack.last()` and silently hoist onto the enclosing sub-process
-        // (the #1197 mis-attachment class). Here the flow sits inside `sub`, so a
-        // hoisted listener would land on `sub`.
+        // lifecycle to run on. It must be REJECTED at deploy — the same
+        // dead-listener failure mode this change rejects for joins and
+        // compensation boundaries — NOT silently dropped (which would let a
+        // declared take listener deploy yet never fire) and NOT fall through to
+        // `io_stack.last()` and hoist onto the enclosing sub-process (the #1197
+        // mis-attachment class). Here the flow sits inside `sub`.
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
@@ -8668,16 +8686,16 @@ mod io_mapping_tests {
     <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
   </bpmn:process>
 </bpmn:definitions>"#;
-        let def = &parse_bpmn(xml).unwrap()[0];
-        // The take listener is dropped (deferred), and crucially the enclosing
-        // sub-process did NOT absorb it.
-        let sub = def.element("sub").unwrap();
-        assert!(
-            sub.start_listeners.is_empty(),
-            "sequence-flow listener must not hoist onto the enclosing sub-process: {:?}",
-            sub.start_listeners
-        );
-        assert!(sub.end_listeners.is_empty());
+        let err = parse_bpmn(xml).expect_err("sequence-flow listener must be rejected at deploy");
+        match err {
+            ParseError::UnsupportedExecutionListener { element_id, .. } => {
+                assert_eq!(
+                    element_id, "sf1",
+                    "the rejection must name the offending sequence flow"
+                );
+            }
+            other => panic!("expected UnsupportedExecutionListener, got {other:?}"),
+        }
     }
 }
 
