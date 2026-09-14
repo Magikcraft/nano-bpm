@@ -3789,7 +3789,14 @@ fn project_engine_state(
                 job.job_type,
                 job_state_code(job.state),
                 job.retries,
-                job.worker.as_ref(),
+                // Normalize the seeded worker exactly as the event-driven
+                // projection does: a pre-normalization snapshot can carry
+                // `Some("")` for a job activated with an explicitly-empty worker,
+                // which is not an attribution and must seed SQL `NULL`, not `""`.
+                // Otherwise a later terminal `COALESCE(?, worker)` (whose own
+                // capture is now `None`) would preserve the empty string and pin
+                // the row to a bogus empty worker (#1191).
+                worker_attribution(job.worker.as_deref()),
                 job.deadline.map(|d| d as i64),
                 def_id,
                 def_key,
@@ -3913,10 +3920,6 @@ fn project_engine_state(
     Ok(())
 }
 
-/// Applies a single event to the read model. Only events that surface in a
-/// `search*`/`get*` projection are materialized; the rest (element lifecycle,
-/// sequence flows, timers, message subscriptions, start subscriptions) carry no
-/// queryable read-model state and are ignored.
 /// An *empty* worker string is not an attribution: a job activated with an
 /// explicitly-supplied `""` (e.g. forwarded verbatim by the REST activation
 /// handler) carries no worker, so a terminal row must project it to SQL `NULL`
@@ -3924,17 +3927,22 @@ fn project_engine_state(
 /// — rather than overwriting the row with an empty attribution. The engine's
 /// `JobActivated` reducer normalizes this at the source for freshly-emitted
 /// events; this guard keeps the projection correct when *replaying* any event
-/// persisted before that normalization existed.
+/// persisted before that normalization existed, and when *seeding* from a
+/// pre-normalization snapshot in `project_engine_state`.
 fn worker_attribution(worker: Option<&str>) -> Option<&str> {
     worker.filter(|w| !w.is_empty())
 }
 
-/// Applies `event` to the read model and returns its exact contribution to the
-/// in-flight instance gauge: `+1` when it genuinely creates a new active
+/// Applies a single event to the read model and returns its exact contribution
+/// to the in-flight instance gauge: `+1` when it genuinely creates a new active
 /// instance, `-1` when it genuinely transitions an active instance to terminal,
 /// and `0` otherwise — crucially including idempotent re-deliveries, which must
 /// not move the gauge (they were the source of the historical `active_backlog`
 /// drift where re-delivered creates permanently inflated the counter).
+///
+/// Only events that surface in a `search*`/`get*` projection are materialized;
+/// the rest (element lifecycle, sequence flows, timers, message subscriptions,
+/// start subscriptions) carry no queryable read-model state and are ignored.
 fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::Result<i64> {
     let mut delta: i64 = 0;
     match event {
@@ -8938,6 +8946,70 @@ mod element_instance_tests {
         let jobs: HashMap<Key, super::JobRow> =
             store.jobs().into_iter().map(|j| (j.key, j)).collect();
         let completed = &jobs[&9301];
+        assert_eq!(completed.state, JobState::Completed);
+        assert_eq!(completed.worker, None);
+    }
+
+    #[test]
+    fn a_snapshot_seeded_empty_worker_is_not_pinned_onto_the_completed_row() {
+        use nanobpmn_engine_core::{Job, JobKind, State};
+
+        // #1191 — below-compaction-floor recovery seeds job rows directly from
+        // the engine snapshot via `project_engine_state`, NOT from the
+        // event-driven projection. A snapshot written before the engine reducer
+        // normalized empty workers can hold `Job.worker == Some("")` for a job
+        // activated with an explicitly-empty worker. Seeding that verbatim would
+        // write `""` into the row; a subsequent `JobCompleted` (whose own capture
+        // is now normalized to `None`) would then `COALESCE(NULL, "")` and pin the
+        // completed row to a bogus empty attribution. The seeding binding must
+        // normalize through `worker_attribution` exactly like the event path, so
+        // the seeded row lands SQL NULL and the terminal COALESCE stays clean.
+        let mut state = State::default();
+        state.jobs.insert(
+            9401,
+            Job {
+                key: 9401,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "t".to_string(),
+                job_type: "review-round".to_string(),
+                state: JobState::Activated,
+                worker: Some(String::new()),
+                deadline: Some(60_000),
+                activated_at: Some(1),
+                activation_timeout: Some(60_000),
+                lease_token: None,
+                durable_activation: true,
+                activated: true,
+                retries: 1,
+                priority: 0,
+                created_at: 1,
+                kind: JobKind::BpmnElement,
+            },
+        );
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+
+        // The seed itself must have normalized the empty worker to NULL.
+        let seeded: HashMap<Key, super::JobRow> =
+            store.jobs().into_iter().map(|j| (j.key, j)).collect();
+        assert_eq!(seeded[&9401].worker, None, "seeded empty worker must be NULL");
+
+        // A completion carrying no attribution must not resurrect the empty string.
+        store
+            .export(&[&Event::JobCompleted {
+                job_key: 9401,
+                instance_key: INST,
+                created_at: 2,
+                job_type: "review-round".to_string(),
+                worker: None,
+            }])
+            .unwrap();
+
+        let jobs: HashMap<Key, super::JobRow> =
+            store.jobs().into_iter().map(|j| (j.key, j)).collect();
+        let completed = &jobs[&9401];
         assert_eq!(completed.state, JobState::Completed);
         assert_eq!(completed.worker, None);
     }
