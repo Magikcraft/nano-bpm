@@ -231,6 +231,11 @@ pub enum ParseError {
     ///   signal-start kind, so a second signal start is demoted to an inert throw
     ///   event with no incoming flow that is never activated or completed — a
     ///   listener captured on it could never fire.
+    /// * a **process-level listener**: a `zeebe:executionListener` declared under
+    ///   the `<process>`'s own extension elements has no open flow-node owner on
+    ///   the `io_stack` (the process itself never rides it), so it is rejected
+    ///   naming the process as owner rather than dropped — a process has no
+    ///   activate/complete lifecycle to run it.
     UnsupportedExecutionListener {
         process_id: String,
         element_id: String,
@@ -252,6 +257,10 @@ pub enum ParseError {
     /// * a **user-task tool of an ad-hoc sub-process** — the tool is flattened
     ///   into the non-executable ad-hoc catalog and activated through a direct
     ///   path that never runs task listeners.
+    /// * a **process-level task listener** — a `zeebe:taskListener` declared
+    ///   under the `<process>`'s own extension elements has no open flow-node
+    ///   owner on the `io_stack`, so it is rejected naming the process as owner
+    ///   rather than dropped; a process is not a user task.
     UnsupportedTaskListener {
         process_id: String,
         element_id: String,
@@ -1859,11 +1868,32 @@ fn parse_with_captures(
                                                      subset (#1198)"
                                                 .to_string(),
                                         });
+                                    } else if let Some(&idx) = io_stack.last() {
+                                        let node = &mut acc.nodes[idx];
+                                        Some((&mut node.start_listeners, &mut node.end_listeners))
                                     } else {
-                                        io_stack.last().map(|&idx| {
-                                            let node = &mut acc.nodes[idx];
-                                            (&mut node.start_listeners, &mut node.end_listeners)
-                                        })
+                                        // No open flow-node owner on the io_stack:
+                                        // the listener is declared under
+                                        // process-level extension elements (the
+                                        // `<process>` itself never rides the
+                                        // io_stack, only its flow nodes do). A
+                                        // process has no activate/complete
+                                        // lifecycle to run an execution listener,
+                                        // so reject it here naming the process as
+                                        // owner rather than let `io_stack.last()`
+                                        // yield `None` and silently drop the
+                                        // declaration — the same reject-don't-drop
+                                        // contract this change enforces for
+                                        // boundaries and sequence flows (#1197).
+                                        return Err(ParseError::UnsupportedExecutionListener {
+                                            process_id: acc.id.clone(),
+                                            element_id: acc.id.clone(),
+                                            reason: "an execution listener must attach to a flow \
+                                                     node; it was declared at process level, \
+                                                     which has no activate/complete lifecycle to \
+                                                     run it"
+                                                .to_string(),
+                                        });
                                     };
                                     if let Some((start, end)) = sink {
                                         match event_type {
@@ -1960,6 +1990,25 @@ fn parse_with_captures(
                                     }
                                     if let Some(&idx) = io_stack.last() {
                                         acc.nodes[idx].task_listeners.push(listener);
+                                    } else {
+                                        // No open flow-node owner on the io_stack:
+                                        // the task listener is declared under
+                                        // process-level extension elements (the
+                                        // `<process>` itself never rides the
+                                        // io_stack). A process is not a user task,
+                                        // so reject it naming the process as owner
+                                        // rather than silently drop the
+                                        // declaration — the reject-don't-drop
+                                        // contract (#1197), mirroring the
+                                        // execution-listener process-level guard.
+                                        return Err(ParseError::UnsupportedTaskListener {
+                                            process_id: acc.id.clone(),
+                                            element_id: acc.id.clone(),
+                                            reason: "a task listener only runs on a user task; it \
+                                                     was declared at process level, which is not \
+                                                     a user task"
+                                                .to_string(),
+                                        });
                                     }
                                 }
                             }
@@ -9187,6 +9236,72 @@ mod io_mapping_tests {
             def.element("svc").expect("service task present").task_listeners.is_empty(),
             "the stray taskListener must not leak onto the later service task"
         );
+    }
+
+    #[test]
+    fn execution_listener_at_process_level_is_rejected() {
+        // #1197 reject-don't-drop: a `zeebe:executionListener` declared under the
+        // `<process>`'s own extension elements has no open flow-node owner on the
+        // `io_stack` (the process itself never rides it). Before the fix the
+        // fallback `io_stack.last()` yielded `None` and the listener was silently
+        // discarded, so the deploy succeeded with a dead listener. It must now be
+        // rejected, naming the process as the owner.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="proc" isExecutable="true">
+    <bpmn:extensionElements>
+      <zeebe:executionListeners>
+        <zeebe:executionListener eventType="start" type="proc-start" />
+      </zeebe:executionListeners>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="start" />
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        match parse_bpmn(xml) {
+            Err(ParseError::UnsupportedExecutionListener { element_id, process_id, .. }) => {
+                assert_eq!(element_id, "proc", "the process is named as the owner");
+                assert_eq!(process_id, "proc");
+            }
+            other => panic!(
+                "expected UnsupportedExecutionListener for a process-level listener, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn task_listener_at_process_level_is_rejected() {
+        // #1197 reject-don't-drop, task-listener analogue: a `zeebe:taskListener`
+        // declared under the `<process>`'s own extension elements has no open
+        // flow-node owner on the `io_stack`. Before the fix the `io_stack.last()`
+        // guard was `None`, so the listener was silently dropped and the deploy
+        // succeeded. A process is not a user task, so it must be rejected, naming
+        // the process as the owner — mirroring the execution-listener guard.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="proc" isExecutable="true">
+    <bpmn:extensionElements>
+      <zeebe:taskListeners>
+        <zeebe:taskListener eventType="creating" type="proc-creating" />
+      </zeebe:taskListeners>
+    </bpmn:extensionElements>
+    <bpmn:startEvent id="start" />
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        match parse_bpmn(xml) {
+            Err(ParseError::UnsupportedTaskListener { element_id, process_id, .. }) => {
+                assert_eq!(element_id, "proc", "the process is named as the owner");
+                assert_eq!(process_id, "proc");
+            }
+            other => panic!(
+                "expected UnsupportedTaskListener for a process-level listener, got {other:?}"
+            ),
+        }
     }
 
     #[test]
