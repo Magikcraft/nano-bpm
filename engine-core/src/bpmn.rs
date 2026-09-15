@@ -9119,7 +9119,10 @@ mod io_mapping_tests {
 </bpmn:definitions>"#;
         match parse_bpmn(xml) {
             Err(ParseError::UnsupportedTaskListener { element_id, .. }) => {
-                assert_eq!(element_id, "bnd", "the boundary event is named as the owner");
+                assert_eq!(
+                    element_id, "bnd",
+                    "the boundary event is named as the owner"
+                );
             }
             other => panic!("expected UnsupportedTaskListener for a boundary event, got {other:?}"),
         }
@@ -9232,11 +9235,17 @@ mod io_mapping_tests {
 </bpmn:definitions>"#;
         let def = &parse_bpmn(xml).expect("self-closing taskListeners must deploy clean")[0];
         assert!(
-            def.element("ut").expect("user task present").task_listeners.is_empty(),
+            def.element("ut")
+                .expect("user task present")
+                .task_listeners
+                .is_empty(),
             "the self-closing container declares no listeners"
         );
         assert!(
-            def.element("svc").expect("service task present").task_listeners.is_empty(),
+            def.element("svc")
+                .expect("service task present")
+                .task_listeners
+                .is_empty(),
             "the stray taskListener must not leak onto the later service task"
         );
     }
@@ -9264,7 +9273,11 @@ mod io_mapping_tests {
   </bpmn:process>
 </bpmn:definitions>"#;
         match parse_bpmn(xml) {
-            Err(ParseError::UnsupportedExecutionListener { element_id, process_id, .. }) => {
+            Err(ParseError::UnsupportedExecutionListener {
+                element_id,
+                process_id,
+                ..
+            }) => {
                 assert_eq!(element_id, "proc", "the process is named as the owner");
                 assert_eq!(process_id, "proc");
             }
@@ -9297,7 +9310,11 @@ mod io_mapping_tests {
   </bpmn:process>
 </bpmn:definitions>"#;
         match parse_bpmn(xml) {
-            Err(ParseError::UnsupportedTaskListener { element_id, process_id, .. }) => {
+            Err(ParseError::UnsupportedTaskListener {
+                element_id,
+                process_id,
+                ..
+            }) => {
                 assert_eq!(element_id, "proc", "the process is named as the owner");
                 assert_eq!(process_id, "proc");
             }
