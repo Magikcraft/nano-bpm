@@ -19778,6 +19778,491 @@ fn end_listener_fires_on_an_exclusive_gateway() {
 }
 
 #[test]
+fn xml_declared_gateway_start_listener_fires_end_to_end() {
+    // #1197: a `start` execution listener declared in BPMN XML on an exclusive
+    // gateway must be parsed AND fire at runtime — the gateway defers its routing
+    // behind the listener job. Guards the whole parser→runtime path, not just the
+    // programmatic ProcessBuilder wiring covered above.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="route" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:exclusiveGateway id="g" default="f3">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="gate-audit" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:exclusiveGateway>
+    <bpmn:endEvent id="yes" />
+    <bpmn:endEvent id="no" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="g" />
+    <bpmn:sequenceFlow id="f2" sourceRef="g" targetRef="yes">
+      <bpmn:conditionExpression>=go</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f3" sourceRef="g" targetRef="no" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let create = engine
+        .apply_command(Command::create_instance_with(
+            "route",
+            vars(&[("go", Value::Bool(true))]),
+        ))
+        .unwrap();
+    let inst = create.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The gateway parked on its start listener: no routing flow taken yet.
+    assert!(
+        !create.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "yes" || to == "no"
+        )),
+        "gateway must not route until its start listener completes"
+    );
+    assert!(kinds(&create).contains(&"ListenerJobCreated"));
+    assert!(!engine.is_completed(inst));
+
+    // Completing the parsed listener drains the chain → the conditional route.
+    let audit = engine.activate_jobs("gate-audit", "W", 10, 1_000, 0);
+    assert_eq!(audit.len(), 1, "one gateway start-listener job from XML");
+    let done = engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    assert!(
+        done.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "yes"
+        )),
+        "conditional flow taken after the parsed start listener"
+    );
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn xml_declared_boundary_start_listener_fires_end_to_end() {
+    // #1197: a `start` execution listener declared in BPMN XML on a boundary
+    // event must be parsed AND fire when the boundary triggers — the boundary
+    // event activates through the shared listener gate, deferring its handler
+    // flow behind the listener job. Guards the parser→runtime path for boundaries.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:signal id="sig" name="kill-switch" />
+  <bpmn:process id="guarded" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="work">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="do-work" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="abort" attachedToRef="work">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="abort-audit" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+      <bpmn:signalEventDefinition signalRef="sig" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="done" />
+    <bpmn:endEvent id="aborted" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="work" />
+    <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="done" />
+    <bpmn:sequenceFlow id="f3" sourceRef="abort" targetRef="aborted" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("guarded"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Trigger the boundary: the activity is interrupted, the boundary event
+    // activates and parks on its parsed start listener rather than routing.
+    let fired = engine.broadcast_signal("kill-switch", HashMap::new(), 0);
+    assert!(fired
+        .iter()
+        .any(|e| matches!(e, Event::ExecutionListenerJobCreated { .. })));
+    assert!(
+        !fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "aborted"
+        )),
+        "boundary must not route until its start listener completes"
+    );
+    assert!(!engine.is_completed(instance_key));
+
+    // Completing the parsed listener drains the chain → the boundary flow runs.
+    let audit = engine.activate_jobs("abort-audit", "W", 10, 1_000, 0);
+    assert_eq!(audit.len(), 1, "one boundary start-listener job from XML");
+    let done = engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    assert!(done.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { to, .. } if to == "aborted"
+    )));
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn xml_declared_boundary_end_listener_fires_end_to_end() {
+    // #1197: an `end` execution listener declared in BPMN XML on a boundary
+    // event must be parsed AND gate the boundary's outgoing flow — when the
+    // boundary triggers and completes, its parsed `end` listener job must fire
+    // and defer the handler route until the listener completes. Complements the
+    // `start`-listener e2e above so a boundary-specific *completion* regression
+    // cannot pass on the parser test alone.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:signal id="sig" name="kill-switch" />
+  <bpmn:process id="guarded" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="work">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="do-work" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="abort" attachedToRef="work">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="end" type="abort-audit-end" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+      <bpmn:signalEventDefinition signalRef="sig" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="done" />
+    <bpmn:endEvent id="aborted" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="work" />
+    <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="done" />
+    <bpmn:sequenceFlow id="f3" sourceRef="abort" targetRef="aborted" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("guarded"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Trigger the boundary: the activity is interrupted and the boundary event
+    // activates. With only an `end` listener, it completes its activation body
+    // and parks in COMPLETING on the parsed end-listener chain rather than
+    // routing to `aborted`.
+    let fired = engine.broadcast_signal("kill-switch", HashMap::new(), 0);
+    assert!(fired
+        .iter()
+        .any(|e| matches!(e, Event::ExecutionListenerJobCreated { .. })));
+    assert!(
+        !fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "aborted"
+        )),
+        "boundary must not route until its end listener completes"
+    );
+    assert!(!engine.is_completed(instance_key));
+
+    // Completing the parsed end listener drains the chain → the boundary flow runs.
+    let audit = engine.activate_jobs("abort-audit-end", "W", 10, 1_000, 0);
+    assert_eq!(audit.len(), 1, "one boundary end-listener job from XML");
+    let done = engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    assert!(done.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { to, .. } if to == "aborted"
+    )));
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn xml_declared_start_event_start_listener_fires_end_to_end() {
+    // #1197: a `start` execution listener declared in BPMN XML on the process
+    // START EVENT must be parsed AND fire when the instance is created — the
+    // start event activates through the shared listener gate and defers taking
+    // its outgoing flow behind the listener job. Instance creation enters through
+    // the dedicated `start_instance` path (which activates the start event), so a
+    // parser-only ownership assertion would NOT catch a regression in the
+    // start-event activation/completion path; this drives it end to end.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="greet" isExecutable="true">
+    <bpmn:startEvent id="s">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="start-audit" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let create = engine
+        .apply_command(Command::create_instance("greet"))
+        .unwrap();
+    let inst = create.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The start event parked on its start listener: the outgoing flow to the end
+    // event is NOT taken yet, and the instance is not complete.
+    assert!(
+        create
+            .iter()
+            .any(|e| matches!(e, Event::ExecutionListenerJobCreated { .. })),
+        "the parsed start-event start listener must create a listener job on instance creation"
+    );
+    assert!(
+        !create.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "e"
+        )),
+        "start event must not take its outgoing flow until its start listener completes"
+    );
+    assert!(!engine.is_completed(inst));
+
+    // Completing the parsed listener drains the chain → the outgoing flow runs
+    // and the instance completes.
+    let audit = engine.activate_jobs("start-audit", "W", 10, 1_000, 0);
+    assert_eq!(
+        audit.len(),
+        1,
+        "one start-event start-listener job from XML"
+    );
+    let done = engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    assert!(
+        done.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "e"
+        )),
+        "outgoing flow taken after the parsed start-event start listener completes"
+    );
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn xml_declared_start_event_end_listener_fires_end_to_end() {
+    // #1197: an `end` execution listener declared in BPMN XML on the process
+    // START EVENT must be parsed AND gate the start event's outgoing flow — the
+    // start event activates through the shared gate and, on completion, defers
+    // taking its outgoing flow behind the parsed end-listener job. Instance
+    // creation enters through the dedicated `start_instance` path, so a
+    // parser-only assertion (or the `start`-listener e2e above) would NOT catch a
+    // regression in the start event's COMPLETION listener path; this drives it
+    // end to end.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="greet" isExecutable="true">
+    <bpmn:startEvent id="s">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="end" type="start-audit-end" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:startEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let create = engine
+        .apply_command(Command::create_instance("greet"))
+        .unwrap();
+    let inst = create.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The start event parked on its END listener: the outgoing flow to the end
+    // event is NOT taken yet, and the instance is not complete.
+    assert!(
+        create
+            .iter()
+            .any(|e| matches!(e, Event::ExecutionListenerJobCreated { .. })),
+        "the parsed start-event end listener must create a listener job on instance creation"
+    );
+    assert!(
+        !create.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "e"
+        )),
+        "start event must not take its outgoing flow until its end listener completes"
+    );
+    assert!(!engine.is_completed(inst));
+
+    // Completing the parsed end listener drains the chain → the outgoing flow
+    // runs and the instance completes.
+    let audit = engine.activate_jobs("start-audit-end", "W", 10, 1_000, 0);
+    assert_eq!(audit.len(), 1, "one start-event end-listener job from XML");
+    let done = engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    assert!(
+        done.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "e"
+        )),
+        "outgoing flow taken after the parsed start-event end listener completes"
+    );
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn xml_declared_receive_task_end_listener_fires_end_to_end() {
+    // #1197: a `receiveTask` is modelled as a pass-through, and an `end`
+    // execution listener declared on it in BPMN XML must be parsed AND gate its
+    // outgoing flow — proving the io_stack push makes the listener attach to the
+    // receive task itself and fire through the shared pass-through gate (rather
+    // than being dropped/hoisted, the mis-attachment class this PR closes).
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="await" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:receiveTask id="rt">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="end" type="rt-audit-end" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:receiveTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="rt" />
+    <bpmn:sequenceFlow id="f2" sourceRef="rt" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let create = engine
+        .apply_command(Command::create_instance("await"))
+        .unwrap();
+    let inst = create.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The receive task parked on its end listener: the outgoing flow to the end
+    // event is NOT taken yet.
+    assert!(
+        create
+            .iter()
+            .any(|e| matches!(e, Event::ExecutionListenerJobCreated { .. })),
+        "the parsed receive-task end listener must create a listener job"
+    );
+    assert!(
+        !create.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "e"
+        )),
+        "receive task must not take its outgoing flow until its end listener completes"
+    );
+    assert!(!engine.is_completed(inst));
+
+    let audit = engine.activate_jobs("rt-audit-end", "W", 10, 1_000, 0);
+    assert_eq!(audit.len(), 1, "one receive-task end-listener job from XML");
+    let done = engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    assert!(
+        done.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "e"
+        )),
+        "outgoing flow taken after the parsed receive-task end listener completes"
+    );
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn xml_declared_escalation_boundary_end_listener_fires_end_to_end() {
+    // #1197: an `end` execution listener declared in BPMN XML on an ESCALATION
+    // boundary event must be parsed AND fire when the boundary triggers — it is
+    // re-attached by id at build even though the escalation branch `continue`s
+    // the boundary-build loop (the re-attach loop runs separately over a
+    // pre-collected vec), and the escalation boundary runs the shared listener
+    // gate on completion, deferring the handler route behind the listener job.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:escalation id="esc" name="Overload" escalationCode="OVERLOAD" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:subProcess id="sub">
+      <bpmn:startEvent id="ss" />
+      <bpmn:intermediateThrowEvent id="thr">
+        <bpmn:escalationEventDefinition escalationRef="esc" />
+      </bpmn:intermediateThrowEvent>
+      <bpmn:endEvent id="se" />
+      <bpmn:sequenceFlow id="a" sourceRef="ss" targetRef="thr" />
+      <bpmn:sequenceFlow id="b" sourceRef="thr" targetRef="se" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="eb" attachedToRef="sub" cancelActivity="false">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="end" type="eb-audit-end" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+      <bpmn:escalationEventDefinition escalationRef="esc" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="done" />
+    <bpmn:endEvent id="handled" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sub" />
+    <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="done" />
+    <bpmn:sequenceFlow id="f3" sourceRef="eb" targetRef="handled" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine.apply_command(Command::create_instance("p")).unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The non-interrupting escalation boundary triggered on creation (the inner
+    // throw raises OVERLOAD). Its parsed end listener parks the handler route.
+    assert!(
+        created
+            .iter()
+            .any(|e| matches!(e, Event::ExecutionListenerJobCreated { .. })),
+        "the parsed escalation-boundary end listener must create a listener job"
+    );
+    assert!(
+        !created.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "handled"
+        )),
+        "escalation boundary must not route to its handler until its end listener completes"
+    );
+
+    let audit = engine.activate_jobs("eb-audit-end", "W", 10, 1_000, 0);
+    assert_eq!(
+        audit.len(),
+        1,
+        "one escalation-boundary end-listener job from XML"
+    );
+    let done = engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    assert!(
+        done.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "handled"
+        )),
+        "handler route taken after the parsed escalation-boundary end listener completes"
+    );
+    let _ = inst;
+}
+
+#[test]
 fn end_listener_fires_on_an_embedded_subprocess() {
     // An `end` execution listener on an embedded sub-process defers the
     // sub-process's completion (and its outgoing flow) until the listener runs.

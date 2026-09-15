@@ -164,6 +164,8 @@ fn nano_category(err: &ParseError) -> &'static str {
         ParseError::DuplicateStartEvent { .. } => "DuplicateStartEvent",
         ParseError::InvalidTaskDefinition { .. } => "InvalidTaskDefinition",
         ParseError::InvalidAgentDefinition { .. } => "InvalidAgentDefinition",
+        ParseError::UnsupportedExecutionListener { .. } => "UnsupportedExecutionListener",
+        ParseError::UnsupportedTaskListener { .. } => "UnsupportedTaskListener",
     }
 }
 
@@ -198,14 +200,53 @@ struct Divergence {
 /// intentionally **rejects**. Together with [`NANO_ZEEBE_MAPPING`] it partitions
 /// the full [`ParseError`] surface (every category is in exactly one of the two,
 /// enforced by [`mapping_covers_every_parse_error_category`]).
-const NANO_ONLY_DIVERGENCES: &[Divergence] = &[Divergence {
-    nano: "UnsupportedUserTaskFormBinding",
-    rationale: "Zeebe implements the `deployment` and `versionTag` user-task form \
-                bindings and ACCEPTS such a model; Nano implements only `latest` and \
-                rejects the deploy loudly rather than silently degrading the binding \
-                to `latest` (#1190).",
-    origin: "#1190",
-}];
+const NANO_ONLY_DIVERGENCES: &[Divergence] = &[
+    Divergence {
+        nano: "UnsupportedUserTaskFormBinding",
+        rationale: "Zeebe implements the `deployment` and `versionTag` user-task form \
+                    bindings and ACCEPTS such a model; Nano implements only `latest` and \
+                    rejects the deploy loudly rather than silently degrading the binding \
+                    to `latest` (#1190).",
+        origin: "#1190",
+    },
+    Divergence {
+        nano: "UnsupportedExecutionListener",
+        rationale: "Zeebe ACCEPTS `zeebe:executionListener`s on multi-incoming \
+                    parallel/inclusive joins, on compensation boundary events, on \
+                    terminate end events, on surplus signal start events, on \
+                    ad-hoc sub-process tools, and \
+                    on sequence flows; Nano rejects those it cannot enact: a parallel \
+                    join completes without running the activation body or the \
+                    end-listener chain (both phases dead), an inclusive join's \
+                    `start` listener never fires (the join short-circuits the \
+                    activation body — but its `end` listener IS supported and is \
+                    accepted, since the quiescence sweep defers the join behind the \
+                    end-listener chain), a compensation boundary is a passive marker \
+                    never entered by token flow, a terminate end event's `end` \
+                    listener never fires (its scope-wide teardown emits completion \
+                    directly, bypassing the end-listener chain — its `start` \
+                    listener IS supported and accepted), a surplus signal start is \
+                    demoted to an inert throw event that is never activated, an \
+                    ad-hoc tool is pruned or \
+                    activated/completed with direct lifecycle events (bypassing the \
+                    listener gate), and a sequence flow is an edge with \
+                    no lifecycle. Nano rejects the unsupported deploy loudly rather \
+                    than silently store (or drop) a dead listener (#1197).",
+        origin: "#1197",
+    },
+    Divergence {
+        nano: "UnsupportedTaskListener",
+        rationale: "Zeebe ACCEPTS a `zeebe:taskListener` only on a user task, but \
+                    its lenient parser does not reject one misplaced on another \
+                    element; Nano rejects a task listener on any non-user-task \
+                    element (e.g. a `receiveTask`, which rides the `io_stack` for \
+                    its execution listeners): task-listener jobs are created only on \
+                    the user-task runtime path, so such a listener could never fire. \
+                    Nano rejects it loudly rather than store a dead task listener \
+                    (#1197).",
+        origin: "#1197",
+    },
+];
 
 fn divergence_for(nano: &str) -> Option<&'static Divergence> {
     NANO_ONLY_DIVERGENCES.iter().find(|d| d.nano == nano)
@@ -618,6 +659,16 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             element_id: String::new(),
             reason: String::new(),
         },
+        ParseError::UnsupportedExecutionListener {
+            process_id: String::new(),
+            element_id: String::new(),
+            reason: String::new(),
+        },
+        ParseError::UnsupportedTaskListener {
+            process_id: String::new(),
+            element_id: String::new(),
+            reason: String::new(),
+        },
     ];
     // Compile-time completeness ratchet: this exhaustive, wildcard-free match
     // will not compile if a `ParseError` variant is added without a witness
@@ -642,6 +693,8 @@ fn parse_error_witnesses() -> Vec<ParseError> {
             | ParseError::DuplicateStartEvent { .. }
             | ParseError::InvalidTaskDefinition { .. } => {}
             ParseError::InvalidAgentDefinition { .. } => {}
+            ParseError::UnsupportedExecutionListener { .. } => {}
+            ParseError::UnsupportedTaskListener { .. } => {}
         }
     }
     witnesses

@@ -1,0 +1,29 @@
+<!-- verdict: diverge | category: UnsupportedTaskListener -->
+<!-- oracle: INTENTIONAL Nano/Zeebe divergence, not parity. A `zeebe:taskListener`
+     is a user-task concept — task-listener jobs are created only on the user-task
+     runtime path. Zeebe's lenient extension-element handling ACCEPTS a
+     `zeebe:taskListeners` declared on a non-user-task element (here a
+     `receiveTask`) and simply never creates a task-listener job for it. Nano
+     instead rejects the deploy loudly (`UnsupportedTaskListener`, naming the
+     element) rather than silently store a task listener that could never fire,
+     the same reject-don't-drop contract applied to misplaced execution listeners
+     (#1197). Tagged `diverge` (not `reject`) so the conformance oracle never
+     falsely claims Zeebe rejected a model it accepts. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="diverge_unsupported_task_listener" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:receiveTask id="rt">
+      <bpmn:extensionElements>
+        <zeebe:taskListeners>
+          <zeebe:taskListener eventType="creating" type="rt-creating" />
+        </zeebe:taskListeners>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:endEvent id="e"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="rt" />
+    <bpmn:sequenceFlow id="f1" sourceRef="rt" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>

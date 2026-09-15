@@ -51,14 +51,21 @@ corrections.
 - Listeners are valid on **most flow nodes** (tasks, gateways, events, sub-processes,
   the process itself, call/ad-hoc containers, multi-instance bodies).
 
-### Nano today (the gap)
+### Nano before this ADR (the gap that motivated it)
 
-- **Parse:** `engine-core/src/bpmn.rs` handles a large set of `zeebe:` extension
+> **Historical.** This section records the pre-implementation state that
+> motivated this ADR — it is **not** current behaviour. As of #1197 both
+> `zeebe:executionListeners` and `zeebe:taskListeners` are parsed and run (see
+> the "Subset (honestly stated…)" section below for the implemented surface);
+> `grep -i listener engine-core/src` now returns many matches. It is retained as
+> the "before" picture, not a live limitation.
+
+- **Parse:** `engine-core/src/bpmn.rs` handled a large set of `zeebe:` extension
   elements (`taskDefinition`, `calledDecision`, `calledElement`, `subscription`,
   `assignmentDefinition`, `taskSchedule`, `priorityDefinition`, `adHoc`, `ioMapping`,
   `loopCharacteristics`, `script`) but **not** `executionListeners`/`taskListeners`.
-  A model that declares them **deploys and runs**, with the listeners **silently
-  never firing** — no jobs are created, so a subscribed worker is never activated.
+  A model that declared them **deployed and ran**, with the listeners **silently
+  never firing** — no jobs were created, so a subscribed worker was never activated.
   `grep -i listener engine-core/src` → zero matches.
 - **Lifecycle:** the engine already emits the four lifecycle events
   (`ElementActivating`, `ElementActivated`, `ElementCompleting`, `ElementCompleted`
@@ -213,7 +220,10 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
 - **v1 (this ADR, as implemented):** `zeebe:executionListeners`
   parsed on any task/container that carries a `zeebe:ioMapping` attach point
   (service/script/business-rule/user tasks, call activity, (sub)process,
-  ad-hoc/multi-instance). Sequential in-order execution; literal/FEEL `retries`;
+  ad-hoc/multi-instance) — **and, since #1197, on the non-activity flow nodes
+  enumerated in the "Non-activity flow-node listeners" note below** (gateways,
+  start events, boundary events), with placements where a listener could never
+  fire rejected at deploy. Sequential in-order execution; literal/FEEL `retries`;
   incident on failure; forward variable merge; correct
   `JobKind`/`JobListenerEventType` in the read model and on the activated job.
   - **`start` listeners fire for every element reached through the common
@@ -254,6 +264,49 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
   their transport/SDK plumbing and read-model projection are the follow-ups.
 - **Deferred:** listener behaviour under process-instance **migration** and **modification**;
   interaction subtleties with non-interrupting boundary events firing mid-chain.
+- **Non-activity flow-node listeners (#1197):** `start`/`end` execution listeners
+  on **gateways** (exclusive/parallel/inclusive/event-based), **start events**, and
+  **boundary events** are parsed (`engine-core/src/bpmn.rs` pushes these nodes onto
+  the `io_stack`; a boundary event, buffered rather than live on the stack, carries
+  its listeners on the pending boundary and re-attaches them by id at build) and
+  fire through the shared activation/completion listener gate — closing the silent
+  drop / mis-attachment gap. Placements where a listener could never fire are
+  **rejected at deploy** rather than silently stored
+  (`UnsupportedExecutionListener`): a **multi-incoming parallel gateway** (a *join*
+  that synchronises tokens and completes without running the activation body or the
+  end-listener chain — so *neither* phase fires; a single-incoming split is
+  supported), the **`start` listener of a multi-incoming inclusive gateway** (the
+  join fires at quiescence and short-circuits the activation body — but its **`end`
+  listener IS supported**, since the quiescence sweep defers the join behind the
+  end-listener chain, so an inclusive-join `end` listener is *not* rejected), a
+  **compensation boundary event** (a passive structural marker never entered by
+  token flow), a **tool of an ad-hoc sub-process** (a leaf tool is pruned into the
+  non-executable catalog and a retained embedded tool is activated/completed with
+  direct lifecycle events, both bypassing the listener gate), a
+  **process-level listener** (a listener on the `<process>`'s own
+  `extensionElements` — the process element has no activation/completion lifecycle
+  and is never ridden by a token, so *neither* phase fires), and a
+  **sequence-flow ("take") listener** (a sequence flow is
+  modelled as an edge, not an `Element`, so it has no lifecycle to run a listener
+  on). Two more placements reject only their *dead* phase, mirroring the
+  inclusive-join treatment: the **`end` listener of a terminate end event** (completing
+  a terminate end drives a scope-wide teardown that emits completion directly,
+  bypassing the end-listener chain — but its **`start` listener IS supported**, firing
+  through the activation start-listener gate), and **any execution listener on a
+  surplus (non-designated) signal start event** (a process may have only one real
+  start, so extra signal starts are demoted to an inert `IntermediateThrowEvent`
+  with no incoming flow that is never activated or completed, so *neither* phase
+  could fire). **Sequence-flow ("take") listeners
+  remain deferred:** firing a take listener between source completion and target
+  activation needs a model + runtime design and is tracked separately in #1198 —
+  until then a listener nested in a `<sequenceFlow>` is rejected at deploy (naming
+  the offending flow), never silently dropped or hoisted onto the enclosing node.
+  A **`zeebe:taskListener` on a non-user-task element** is likewise rejected at
+  deploy (`UnsupportedTaskListener`, naming the element): task-listener jobs are
+  created only on the user-task runtime path, so a task listener attached to any
+  other element (e.g. a `receiveTask`, which rides the `io_stack` for its
+  *execution* listeners) could never fire — reject-don't-drop rather than store a
+  dead task listener.
 
 ## Phased plan
 

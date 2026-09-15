@@ -1,0 +1,50 @@
+<!-- verdict: diverge | category: UnsupportedExecutionListener -->
+<!-- oracle: INTENTIONAL Nano/Zeebe divergence, not parity. Zeebe ACCEPTS a
+     `zeebe:executionListener` on a multi-incoming parallel join (and on a
+     compensation boundary); Nano's parallel join completes without running the
+     activation body or the end-listener chain, so such a listener could never
+     fire, and Nano rejects the deploy loudly rather than silently store a dead
+     listener (#1197). (An inclusive join's `end` listener IS supported and is not
+     a divergence — the quiescence sweep defers the join behind its end-listener
+     chain; only the inclusive-join `start` listener and both parallel-join phases
+     are rejected. This fixture exercises a parallel-join `start` listener.)
+     Tagged `diverge` (not `reject`) so the conformance oracle never falsely claims
+     Zeebe rejected a model it accepts. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="diverge_unsupported_execution_listener" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:parallelGateway id="fork">
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="a">
+      <bpmn:extensionElements><zeebe:taskDefinition type="a-work" /></bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="b">
+      <bpmn:extensionElements><zeebe:taskDefinition type="b-work" /></bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="join">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="join-start" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:incoming>f4</bpmn:incoming>
+      <bpmn:outgoing>f5</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:endEvent id="e"><bpmn:incoming>f5</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="fork" />
+    <bpmn:sequenceFlow id="f1" sourceRef="fork" targetRef="a" />
+    <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="b" />
+    <bpmn:sequenceFlow id="f3" sourceRef="a" targetRef="join" />
+    <bpmn:sequenceFlow id="f4" sourceRef="b" targetRef="join" />
+    <bpmn:sequenceFlow id="f5" sourceRef="join" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>
