@@ -178,12 +178,57 @@ fn add_seconds(nanos: i128, num: &str, allow_fraction: bool) -> Option<i128> {
         return None;
     }
     if allow_fraction {
-        let secs: f64 = num.parse().ok()?;
-        nanos.checked_add((secs * NANOS_PER_SEC as f64).round() as i128)
+        nanos.checked_add(parse_decimal_seconds_nanos(num)?)
     } else {
         let value: i128 = num.parse().ok()?;
         nanos.checked_add(value.checked_mul(NANOS_PER_SEC)?)
     }
+}
+
+/// Parses a (non-negative) decimal seconds field such as `"1.5"` directly into
+/// integer nanoseconds, rounding any digits beyond nanosecond precision
+/// half-up. Parsing the decimal exactly (rather than via `f64`) avoids both
+/// precision loss for large integer second counts and the saturating `as i128`
+/// conversion that would silently clamp an overflow to `i128::MAX` instead of
+/// reporting it. Returns `None` on a malformed number or on `i128` overflow.
+fn parse_decimal_seconds_nanos(num: &str) -> Option<i128> {
+    let (int_str, frac_str) = match num.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (num, ""),
+    };
+    // A single decimal point at most, digits only, and at least one digit.
+    if frac_str.contains('.')
+        || !int_str.bytes().all(|b| b.is_ascii_digit())
+        || !frac_str.bytes().all(|b| b.is_ascii_digit())
+        || (int_str.is_empty() && frac_str.is_empty())
+    {
+        return None;
+    }
+
+    let int_secs: i128 = if int_str.is_empty() {
+        0
+    } else {
+        int_str.parse().ok()?
+    };
+    let mut total = int_secs.checked_mul(NANOS_PER_SEC)?;
+
+    if !frac_str.is_empty() {
+        // Take up to 9 fractional digits as nanoseconds; round on the 10th.
+        let mut nanos_frac: i128 = 0;
+        let mut digits = frac_str.bytes();
+        for _ in 0..9 {
+            let d = digits.next().map(|b| (b - b'0') as i128).unwrap_or(0);
+            nanos_frac = nanos_frac * 10 + d;
+        }
+        if let Some(next) = digits.next() {
+            if next - b'0' >= 5 {
+                nanos_frac += 1;
+            }
+        }
+        total = total.checked_add(nanos_frac)?;
+    }
+
+    Some(total)
 }
 
 /// Strips an optional leading `+`/`-` sign, returning `(is_negative, rest)`.
@@ -272,5 +317,49 @@ mod tests {
     fn millis_overflow_is_none() {
         // Enormous day count overflows u64 milliseconds.
         assert_eq!(parse_duration_millis("P100000000000000000D"), None);
+    }
+
+    #[test]
+    fn fractional_seconds_are_exact_not_f64() {
+        let f = DurationForm::FEEL_DAYTIME;
+        // A large integer second count that is not representable exactly in f64
+        // must convert exactly, not round to the nearest double.
+        assert_eq!(
+            parse_duration_nanos("PT9007199254740993S", f),
+            Some(9_007_199_254_740_993 * NANOS_PER_SEC)
+        );
+        // Full nanosecond precision is preserved.
+        assert_eq!(parse_duration_nanos("PT0.123456789S", f), Some(123_456_789));
+        // Leading/trailing edge fraction forms.
+        assert_eq!(parse_duration_nanos("PT1.S", f), Some(1_000_000_000));
+        assert_eq!(parse_duration_nanos("PT0.5S", f), Some(500_000_000));
+    }
+
+    #[test]
+    fn fractional_seconds_round_half_up_beyond_nanos() {
+        let f = DurationForm::FEEL_DAYTIME;
+        // 10th fractional digit >= 5 rounds up; < 5 truncates.
+        assert_eq!(parse_duration_nanos("PT0.1234567895S", f), Some(123_456_790));
+        assert_eq!(parse_duration_nanos("PT0.1234567891S", f), Some(123_456_789));
+        // Rounding may carry into the whole-second boundary.
+        assert_eq!(parse_duration_nanos("PT0.9999999995S", f), Some(1_000_000_000));
+    }
+
+    #[test]
+    fn fractional_seconds_overflow_is_none() {
+        let f = DurationForm::FEEL_DAYTIME;
+        // A seconds count large enough to overflow i128 nanoseconds must report
+        // overflow (None), not saturate to Some(i128::MAX).
+        assert_eq!(
+            parse_duration_nanos("PT99999999999999999999999999999999999999S", f),
+            None
+        );
+    }
+
+    #[test]
+    fn fractional_seconds_reject_malformed() {
+        let f = DurationForm::FEEL_DAYTIME;
+        assert_eq!(parse_duration_nanos("PT1.2.3S", f), None);
+        assert_eq!(parse_duration_nanos("PT.S", f), None);
     }
 }
