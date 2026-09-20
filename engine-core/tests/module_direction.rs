@@ -469,6 +469,28 @@ fn module_of(rel: &Path) -> (String, Option<String>) {
     }
 }
 
+/// The full module path of a source file relative to the crate root:
+/// `state/apply.rs` -> `[state, apply]`, `state/mod.rs` -> `[state]`,
+/// `event.rs` -> `[event]`. `mod.rs` names the directory module itself, so it
+/// contributes no extra segment. Used to resolve `self`/`super` relative
+/// imports back to an absolute `crate::…` path.
+fn module_path_of(rel: &Path) -> Vec<String> {
+    let comps: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let n = comps.len();
+    let mut segs = Vec::new();
+    for (idx, comp) in comps.iter().enumerate() {
+        let name = comp.trim_end_matches(".rs");
+        if idx == n - 1 && name == "mod" {
+            continue; // `mod.rs` is the directory module itself
+        }
+        segs.push(name.to_string());
+    }
+    segs
+}
+
 /// Skip ASCII whitespace (including newlines) starting at `i`.
 fn skip_ws(b: &[u8], mut i: usize) -> usize {
     while i < b.len() && b[i].is_ascii_whitespace() {
@@ -580,47 +602,65 @@ fn parse_use_tree(b: &[u8], start: usize) -> (Vec<Vec<String>>, usize) {
     }
 }
 
-/// Extract every `use crate::<module>[::<sub>]` edge from already-cleaned source
+/// Extract every crate-internal module edge from already-cleaned source
 /// (comments + string/char literals blanked, inline test modules stripped).
 ///
-/// The full use-tree after each `use crate::` is parsed via [`parse_use_tree`],
-/// so brace use-trees (`use crate::{a::b, c}`) are expanded entry-by-entry and
-/// declarations wrapped across newlines are read as one unit — every leaf whose
-/// first segment is a top-level module (and is not the source module itself)
-/// becomes an edge. A leaf whose first segment is not a module (a crate-root
-/// re-export such as `use crate::Engine`) is not a module edge and is skipped.
+/// Each `use` declaration is tokenized rather than matched as one fixed
+/// substring, so all of these resolve to the same absolute edge and are checked:
+/// * `use crate::state::apply;` — absolute.
+/// * `use\ncrate::state::apply;` / `use /* c */ crate::state::apply;` —
+///   whitespace or a (blanked) comment between `use` and `crate`.
+/// * `use self::foo;` / `use super::super::event::Event;` — `self`/`super`
+///   relative imports, resolved against the file's own [`module_path_of`] path
+///   so a backward edge cannot hide behind relative syntax.
+///
+/// The use-tree after the root is parsed via [`parse_use_tree`], so brace
+/// use-trees (`use crate::{a::b, c}`) are expanded entry-by-entry and
+/// declarations wrapped across newlines are read as one unit. Every leaf whose
+/// resolved first segment is a top-level module (and is not the source module
+/// itself) becomes an edge. A leaf whose first segment is not a module (a
+/// crate-root re-export such as `use crate::Engine`) is not a module edge and
+/// is skipped. External-crate imports (`use serde::…`, `use std::…`) have a
+/// non-`crate`/`self`/`super` root and are ignored.
 fn edges_in_source(
     cleaned: &str,
+    module_path: &[String],
     src_module: &str,
     src_sub: Option<&str>,
     file_label: &str,
     edges: &mut Vec<Edge>,
 ) {
     let bytes = cleaned.as_bytes();
-    const NEEDLE: &str = "use crate::";
     let mut search = 0;
-    while let Some(rel) = cleaned[search..].find(NEEDLE) {
+    while let Some(rel) = cleaned[search..].find("use") {
         let kw_start = search + rel;
-        let after_prefix = kw_start + NEEDLE.len();
-        // Require a word boundary before `use` so an identifier ending in `use`
-        // never matches.
-        let boundary = kw_start == 0
+        let kw_end = kw_start + 3;
+        // Require word boundaries so `reuse`, `used`, `cause` never match.
+        let before_ok = kw_start == 0
             || !(bytes[kw_start - 1] == b'_' || bytes[kw_start - 1].is_ascii_alphanumeric());
-        if !boundary {
-            search = after_prefix;
+        let after_ok = kw_end >= bytes.len()
+            || !(bytes[kw_end] == b'_' || bytes[kw_end].is_ascii_alphanumeric());
+        if !(before_ok && after_ok) {
+            search = kw_end;
             continue;
         }
-        let (paths, end) = parse_use_tree(bytes, after_prefix);
+        let Some((base, tail)) = resolve_use_root(bytes, kw_end, module_path) else {
+            search = kw_end;
+            continue;
+        };
+        let (paths, end) = parse_use_tree(bytes, tail);
         let lineno = 1 + cleaned[..kw_start]
             .bytes()
             .filter(|&byte| byte == b'\n')
             .count();
         for path in paths {
-            let Some(module) = path.first() else {
+            let mut resolved = base.clone();
+            resolved.extend(path);
+            let Some(module) = resolved.first() else {
                 continue;
             };
             if MODULES.contains(&module.as_str()) && module != src_module {
-                let sub = path.get(1).filter(|s| s.as_str() != "*").cloned();
+                let sub = resolved.get(1).filter(|s| s.as_str() != "*").cloned();
                 edges.push(Edge {
                     src_module: src_module.to_string(),
                     src_sub: src_sub.map(str::to_string),
@@ -631,7 +671,48 @@ fn edges_in_source(
                 });
             }
         }
-        search = end.max(after_prefix);
+        search = end.max(kw_end);
+    }
+}
+
+/// Consume `::` (with surrounding whitespace already handled by the caller),
+/// returning the offset just past it, or `None` if `::` is not next.
+fn expect_path_sep(b: &[u8], i: usize) -> Option<usize> {
+    let i = skip_ws(b, i);
+    if i + 2 <= b.len() && b[i] == b':' && b[i + 1] == b':' {
+        Some(i + 2)
+    } else {
+        None
+    }
+}
+
+/// Parse the root of a `use` path starting just after the `use` keyword and
+/// return `(base, tail)`: the absolute module-path segments the tail is rooted
+/// at, and the offset of the first tail segment. `crate` roots at the crate
+/// root (`[]`), `self` at the file's own module, and each leading `super` pops
+/// one segment off the file's module path. Returns `None` for an external root
+/// (`serde`, `std`, …) or a malformed/empty root, so such imports are skipped.
+fn resolve_use_root(b: &[u8], i: usize, module_path: &[String]) -> Option<(Vec<String>, usize)> {
+    let i = skip_ws(b, i);
+    let (first, ni) = read_ident(b, i);
+    match first.as_str() {
+        "crate" => Some((Vec::new(), expect_path_sep(b, ni)?)),
+        "self" => Some((module_path.to_vec(), expect_path_sep(b, ni)?)),
+        "super" => {
+            let mut base = module_path.to_vec();
+            base.pop();
+            let mut after = expect_path_sep(b, ni)?;
+            loop {
+                let (kw, nj) = read_ident(b, skip_ws(b, after));
+                if kw != "super" {
+                    break;
+                }
+                base.pop();
+                after = expect_path_sep(b, nj)?;
+            }
+            Some((base, after))
+        }
+        _ => None,
     }
 }
 
@@ -703,10 +784,12 @@ fn collect_edges() -> Vec<Edge> {
         if src_module == "lib" {
             continue; // crate root: declares modules, has no layering edges of its own
         }
+        let module_path = module_path_of(rel);
         let raw = fs::read_to_string(file).expect("read source file");
         let cleaned = strip_inline_cfg_test_modules(&sanitize(&raw));
         edges_in_source(
             &cleaned,
+            &module_path,
             &src_module,
             src_sub.as_deref(),
             &rel.to_string_lossy(),
@@ -864,14 +947,34 @@ fn guard_accepts_known_good_edges() {
 }
 
 /// Run the real cleaning pipeline (`sanitize` → strip inline test modules →
-/// per-line edge extraction) over a synthetic single-file source and return the
-/// module edges it yields, so the lexer's literal-awareness can be exercised
-/// directly.
+/// use-declaration edge extraction) over a synthetic single-file source and
+/// return the module edges it yields, so the lexer's literal-awareness can be
+/// exercised directly. The file is treated as the top-level module `src_module`
+/// (module path `[src_module]`); use [`edges_of_source_at`] for a deeper file
+/// path when exercising `self`/`super` relative-import resolution.
 #[cfg(test)]
 fn edges_of_source(src_module: &str, src: &str) -> Vec<Edge> {
+    edges_of_source_at(&[src_module], src)
+}
+
+/// Like [`edges_of_source`] but for a file at an explicit module path (e.g.
+/// `["state", "apply"]` for `state/apply.rs`), so `self`/`super` relative
+/// imports resolve exactly as they would on disk.
+#[cfg(test)]
+fn edges_of_source_at(module_path: &[&str], src: &str) -> Vec<Edge> {
     let cleaned = strip_inline_cfg_test_modules(&sanitize(src));
+    let owned: Vec<String> = module_path.iter().map(|s| s.to_string()).collect();
+    let src_module = owned[0].clone();
+    let src_sub = owned.get(1).cloned();
     let mut edges = Vec::new();
-    edges_in_source(&cleaned, src_module, None, "synthetic.rs", &mut edges);
+    edges_in_source(
+        &cleaned,
+        &owned,
+        &src_module,
+        src_sub.as_deref(),
+        "synthetic.rs",
+        &mut edges,
+    );
     edges
 }
 
@@ -1052,5 +1155,79 @@ fn aliased_brace_entry_does_not_drop_later_leaves() {
     assert!(
         edge_allowed(&engine.src_module, None, &engine.tgt_module, None).is_err(),
         "a backward edge hidden after an aliased brace sibling slipped past"
+    );
+}
+
+/// Whitespace or a (blanked) comment between `use` and `crate` must not hide a
+/// declaration: `sanitize` turns comments into spaces, so `use /* c */ crate::`
+/// and `use\ncrate::` are valid Rust the guard must still tokenize.
+#[test]
+fn tolerates_whitespace_and_comments_before_crate() {
+    for src in [
+        "use\ncrate::engine::Engine;\n",
+        "use /* reach around */ crate::engine::Engine;\n",
+        "use    crate  ::  engine :: Engine ;\n",
+    ] {
+        let edges = edges_of_source("event", src);
+        assert!(
+            edges.iter().any(|e| e.tgt_module == "engine"),
+            "a `use crate::` split by whitespace/comment slipped past the scanner: {src:?} -> {edges:?}"
+        );
+    }
+}
+
+/// A `super`-relative import that climbs to the crate root and dips into another
+/// top-level module is the same layering edge as its `crate::` spelling and must
+/// be caught. From `state/apply.rs` (== `crate::state::apply`),
+/// `super::super::event` resolves to `crate::event` (an allowed cycle-break);
+/// from `state/mod.rs` (== `crate::state`), `super::event` also resolves to
+/// `crate::event` but from the module root, where it is forbidden.
+#[test]
+fn resolves_super_relative_imports() {
+    // `state/apply.rs`: two `super`s climb `apply` -> `state` -> crate root,
+    // so `super::super::event` == `crate::event`, the allowed cycle-break edge.
+    let edges = edges_of_source_at(&["state", "apply"], "use super::super::event::Event;\n");
+    let e = edges
+        .iter()
+        .find(|e| e.tgt_module == "event")
+        .expect("a super-relative import crossing into another module produced no edge");
+    assert!(
+        edge_allowed(&e.src_module, Some("apply"), &e.tgt_module, None).is_ok(),
+        "state::apply -> event is an allowed cycle-break edge"
+    );
+
+    // `state/mod.rs`: one `super` reaches the crate root, so `super::event` ==
+    // `crate::event` — a backward edge from the module root that must be rejected.
+    let back = edges_of_source_at(&["state"], "use super::event::Event;\n");
+    let b = back
+        .iter()
+        .find(|e| e.tgt_module == "event")
+        .expect("a super-relative backward import produced no edge");
+    assert!(
+        edge_allowed(&b.src_module, None, &b.tgt_module, None).is_err(),
+        "a backward edge written with `super::` relative syntax slipped past the matcher"
+    );
+}
+
+/// A `super` that stays within the file's own top-level module is not a layering
+/// edge: from `state/apply.rs`, `super::types` == `crate::state::types`, whose
+/// first segment is the source module itself, so it must not be reported.
+#[test]
+fn intra_module_super_import_is_not_an_edge() {
+    let edges = edges_of_source_at(&["state", "apply"], "use super::types::T;\n");
+    assert!(
+        edges.is_empty(),
+        "an intra-module `super::` import was mistaken for a layering edge: {edges:?}"
+    );
+}
+
+/// A `self`-relative import stays inside the file's own module subtree, so it is
+/// never a cross-module layering edge and must not be reported.
+#[test]
+fn self_relative_import_is_intra_module() {
+    let edges = edges_of_source_at(&["state", "apply"], "use self::helpers::run;\n");
+    assert!(
+        edges.is_empty(),
+        "a `self::` intra-module import was mistaken for a layering edge: {edges:?}"
     );
 }
