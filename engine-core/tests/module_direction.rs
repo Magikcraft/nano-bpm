@@ -88,11 +88,8 @@ fn module_level(module: &str) -> Option<u32> {
 /// The only intra-level (`Lt == Ls`) edges the layering permits. Every other
 /// same-level or upward edge is a violation unless it is one of the two special
 /// cases handled in [`edge_allowed`].
-const SAME_LEVEL_ALLOWED: &[(&str, &str)] = &[
-    ("dmn", "feel"),
-    ("bpmn", "validate"),
-    ("ffi", "engine"),
-];
+const SAME_LEVEL_ALLOWED: &[(&str, &str)] =
+    &[("dmn", "feel"), ("bpmn", "validate"), ("ffi", "engine")];
 
 /// A single `use crate::<tgt_module>[::<tgt_sub>]` edge declared in a source
 /// file belonging to `src_module` (with `src_sub` set for sub-moduled files
@@ -162,8 +159,7 @@ fn edge_allowed(
 
 /// Recursively collect every `.rs` file under `dir`.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
     for entry in entries {
         let path = entry.expect("dir entry").path();
         if path.is_dir() {
@@ -174,69 +170,182 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Remove `/* ... */` block comments (depth-aware for Rust's nestable block
-/// comments), replacing them with spaces so line numbers are preserved.
-fn strip_block_comments(src: &str) -> String {
-    let bytes = src.as_bytes();
+/// Blank every comment and the *interior* bytes of every string/char literal,
+/// replacing them with spaces (newlines preserved so line numbers stay stable)
+/// while leaving real code — the literal delimiters, braces, and `use crate::`
+/// paths — intact.
+///
+/// This is deliberately a single small Rust-literal-aware lexer rather than a
+/// set of independent textual scanners. The earlier approach stripped block
+/// comments, line comments, and `#[cfg(test)]` braces in separate passes that
+/// each modelled only a slice of Rust's lexical grammar, so a comment marker or
+/// an unbalanced brace *inside a literal* corrupted detection — e.g. a
+/// `const M = "/*";` opened a spurious block comment that erased following code
+/// (including a forbidden import), a fixture string containing a lone `"{"` /
+/// `"}"` shifted the test-module brace balance, and a lifetime (`'a`) on a line
+/// with a trailing `//` comment left the line-comment scanner stuck "in a
+/// string" so the comment was never stripped. Modelling normal strings, raw
+/// strings (`r#"…"#`), byte strings/chars (`b"…"`, `b'…'`), char literals vs
+/// lifetimes (`'a`), and nestable block comments in one pass closes all of
+/// those gaps so the layering guard stays reliable across the epic #1201 moves,
+/// whose fixtures routinely embed such markers.
+fn sanitize(src: &str) -> String {
+    let b = src.as_bytes();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
-    let mut depth = 0usize;
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            depth += 1;
-            out.push_str("  ");
-            i += 2;
-            continue;
-        }
-        if depth > 0 && i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-            depth -= 1;
-            out.push_str("  ");
-            i += 2;
-            continue;
-        }
-        if depth > 0 {
-            // Preserve newlines so line counting stays accurate.
-            out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
-        } else {
-            out.push(bytes[i] as char);
-        }
-        i += 1;
+    // Was the previous emitted *code* byte part of an identifier/number? Needed
+    // to tell a raw/byte-string prefix (`r"`, `b"`), which follows a non-ident
+    // byte, from an `r`/`b` that is merely inside an identifier such as `for` or
+    // `sub`.
+    let mut prev_ident = false;
+    fn blank(out: &mut String, byte: u8) {
+        out.push(if byte == b'\n' { '\n' } else { ' ' });
     }
-    out
-}
-
-/// Strip a `//`-to-end-of-line comment from a single line, ignoring `//` that
-/// appears inside a string or char literal.
-fn strip_line_comment(line: &str) -> String {
-    let bytes = line.as_bytes();
-    let mut out = String::with_capacity(line.len());
-    let mut i = 0;
-    let mut in_str: Option<u8> = None;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if let Some(q) = in_str {
-            out.push(c as char);
-            if c == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1] as char);
-                i += 2;
+    while i < b.len() {
+        let c = b[i];
+        // Line comment: blank to end of line.
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            while i < b.len() && b[i] != b'\n' {
+                blank(&mut out, b[i]);
+                i += 1;
+            }
+            prev_ident = false;
+            continue;
+        }
+        // Block comment (nestable): blank the whole span, markers included.
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            let mut depth = 0usize;
+            while i < b.len() {
+                if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                if i + 1 < b.len() && b[i] == b'*' && b[i + 1] == b'/' {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                blank(&mut out, b[i]);
+                i += 1;
+            }
+            prev_ident = false;
+            continue;
+        }
+        // Raw string: `r"…"`, `r#"…"#`, or byte-raw `br"…"` — only when the
+        // `r`/`br` is not part of a wider identifier.
+        if !prev_ident && (c == b'r' || (c == b'b' && i + 1 < b.len() && b[i + 1] == b'r')) {
+            let r_pos = if c == b'b' { i + 1 } else { i };
+            let mut j = r_pos + 1;
+            let mut hashes = 0usize;
+            while j < b.len() && b[j] == b'#' {
+                hashes += 1;
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'"' {
+                // Emit the prefix and the opening quote verbatim.
+                for &byte in &b[i..=j] {
+                    out.push(byte as char);
+                }
+                i = j + 1;
+                // Blank the body until the matching `"` + `hashes` `#`.
+                while i < b.len() {
+                    if b[i] == b'"' {
+                        let mut m = 0;
+                        while m < hashes && i + 1 + m < b.len() && b[i + 1 + m] == b'#' {
+                            m += 1;
+                        }
+                        if m == hashes {
+                            out.push('"');
+                            for _ in 0..hashes {
+                                out.push('#');
+                            }
+                            i += 1 + hashes;
+                            break;
+                        }
+                    }
+                    blank(&mut out, b[i]);
+                    i += 1;
+                }
+                prev_ident = false;
                 continue;
             }
-            if c == q {
-                in_str = None;
+            // Not actually a raw string — fall through and treat `r`/`b` as code.
+        }
+        // Normal or byte string: `"…"` / `b"…"`.
+        if c == b'"' || (c == b'b' && i + 1 < b.len() && b[i + 1] == b'"') {
+            let q_pos = if c == b'b' { i + 1 } else { i };
+            for &byte in &b[i..=q_pos] {
+                out.push(byte as char);
             }
-            i += 1;
+            i = q_pos + 1;
+            while i < b.len() {
+                if b[i] == b'\\' && i + 1 < b.len() {
+                    blank(&mut out, b[i]);
+                    blank(&mut out, b[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'"' {
+                    out.push('"');
+                    i += 1;
+                    break;
+                }
+                blank(&mut out, b[i]);
+                i += 1;
+            }
+            prev_ident = false;
             continue;
         }
-        if c == b'"' || c == b'\'' {
-            in_str = Some(c);
-            out.push(c as char);
+        // Char literal vs lifetime/label. `'\x'…'` and `'x'` are char literals
+        // (blank the interior); anything else beginning with `'` is a lifetime
+        // or loop label and stays as code.
+        if c == b'\'' {
+            if i + 1 < b.len() && b[i + 1] == b'\\' {
+                // Escaped char literal: `'\n'`, `'\''`, `'\\'`, `'\xFF'`, …
+                out.push('\'');
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' && i + 1 < b.len() {
+                        blank(&mut out, b[i]);
+                        blank(&mut out, b[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'\'' {
+                        out.push('\'');
+                        i += 1;
+                        break;
+                    }
+                    blank(&mut out, b[i]);
+                    i += 1;
+                }
+                prev_ident = false;
+                continue;
+            }
+            if i + 2 < b.len() && b[i + 2] == b'\'' {
+                // Simple char literal `'x'`.
+                out.push('\'');
+                blank(&mut out, b[i + 1]);
+                out.push('\'');
+                i += 3;
+                prev_ident = false;
+                continue;
+            }
+            // Lifetime / label: emit the quote, let the identifier follow.
+            out.push('\'');
             i += 1;
+            prev_ident = false;
             continue;
         }
-        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            break;
-        }
+        // Ordinary code byte.
         out.push(c as char);
+        prev_ident = c == b'_' || c.is_ascii_alphanumeric();
         i += 1;
     }
     out
@@ -330,10 +439,7 @@ fn read_ident(bytes: &[u8], mut i: usize) -> (String, usize) {
             i += 1;
         }
     }
-    (
-        String::from_utf8_lossy(&bytes[start..i]).into_owned(),
-        i,
-    )
+    (String::from_utf8_lossy(&bytes[start..i]).into_owned(), i)
 }
 
 /// Map a source file path (relative to `src/`) to its top-level module and, for
@@ -364,8 +470,7 @@ fn edges_in_source(
     file_label: &str,
     edges: &mut Vec<Edge>,
 ) {
-    for (lineno, raw_line) in cleaned.lines().enumerate() {
-        let line = strip_line_comment(raw_line);
+    for (lineno, line) in cleaned.lines().enumerate() {
         let bytes = line.as_bytes();
         let mut search = 0;
         while let Some(rel) = line[search..].find("use crate::") {
@@ -401,7 +506,7 @@ fn collect_test_gated_files(src_root: &Path, files: &[PathBuf]) -> BTreeSet<Path
     let mut gated = BTreeSet::new();
     for file in files {
         let raw = fs::read_to_string(file).expect("read source file");
-        let src = strip_block_comments(&raw);
+        let src = sanitize(&raw);
         let bytes = src.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
@@ -412,12 +517,13 @@ fn collect_test_gated_files(src_root: &Path, files: &[PathBuf]) -> BTreeSet<Path
                 let (name, _) = {
                     // re-read the name ending at `after`
                     let mut k = after;
-                    while k > 0
-                        && (bytes[k - 1] == b'_' || bytes[k - 1].is_ascii_alphanumeric())
-                    {
+                    while k > 0 && (bytes[k - 1] == b'_' || bytes[k - 1].is_ascii_alphanumeric()) {
                         k -= 1;
                     }
-                    (String::from_utf8_lossy(&bytes[k..after]).into_owned(), after)
+                    (
+                        String::from_utf8_lossy(&bytes[k..after]).into_owned(),
+                        after,
+                    )
                 };
                 while j < bytes.len() && bytes[j] != b'{' && bytes[j] != b';' {
                     j += 1;
@@ -463,7 +569,7 @@ fn collect_edges() -> Vec<Edge> {
             continue; // crate root: declares modules, has no layering edges of its own
         }
         let raw = fs::read_to_string(file).expect("read source file");
-        let cleaned = strip_inline_cfg_test_modules(&strip_block_comments(&raw));
+        let cleaned = strip_inline_cfg_test_modules(&sanitize(&raw));
         edges_in_source(
             &cleaned,
             &src_module,
@@ -524,10 +630,10 @@ fn guard_rejects_backward_and_forbidden_edges() {
         ("event", None, "engine", None),
         ("state", Some("types"), "engine", None),
         // lateral edges not in the allow-list
-        ("json", None, "model", None),   // L0 -> L0
-        ("agent", None, "lease", None),  // L4 -> L4
-        ("command", None, "agent", None),// L4 -> L4
-        ("validate", None, "bpmn", None),// L5 -> L5
+        ("json", None, "model", None),    // L0 -> L0
+        ("agent", None, "lease", None),   // L4 -> L4
+        ("command", None, "agent", None), // L4 -> L4
+        ("validate", None, "bpmn", None), // L5 -> L5
         // the cycle we broke must stay broken:
         ("state", Some("types"), "event", None), // only apply may import event
         ("state", None, "event", None),          // bare state may not import event
@@ -551,11 +657,11 @@ fn guard_accepts_known_good_edges() {
     let cases: &[(&str, Option<&str>, &str, Option<&str>)] = &[
         ("engine", None, "model", None),
         ("engine", None, "state", None),
-        ("bpmn", None, "agent", None),   // L5 -> L4
+        ("bpmn", None, "agent", None), // L5 -> L4
         ("feel", None, "model", None),
-        ("dmn", None, "feel", None),     // permitted intra-level
-        ("bpmn", None, "validate", None),// permitted intra-level
-        ("ffi", None, "engine", None),   // permitted intra-level
+        ("dmn", None, "feel", None),             // permitted intra-level
+        ("bpmn", None, "validate", None),        // permitted intra-level
+        ("ffi", None, "engine", None),           // permitted intra-level
         ("state", Some("apply"), "event", None), // cycle-breaking exception
         ("event", None, "state", Some("types")), // cycle-breaking exception
     ];
@@ -567,4 +673,84 @@ fn guard_accepts_known_good_edges() {
             ts.map(|s| format!("::{s}")).unwrap_or_default(),
         );
     }
+}
+
+/// Run the real cleaning pipeline (`sanitize` → strip inline test modules →
+/// per-line edge extraction) over a synthetic single-file source and return the
+/// module edges it yields, so the lexer's literal-awareness can be exercised
+/// directly.
+#[cfg(test)]
+fn edges_of_source(src_module: &str, src: &str) -> Vec<Edge> {
+    let cleaned = strip_inline_cfg_test_modules(&sanitize(src));
+    let mut edges = Vec::new();
+    edges_in_source(&cleaned, src_module, None, "synthetic.rs", &mut edges);
+    edges
+}
+
+#[cfg(test)]
+fn has_edge(edges: &[Edge], tgt_module: &str) -> bool {
+    edges.iter().any(|e| e.tgt_module == tgt_module)
+}
+
+/// A comment marker inside a string literal must not open a spurious block
+/// comment that erases the following real code (issue: the guard could silently
+/// miss a forbidden import after a `const M = "/*";` line).
+#[test]
+fn sanitize_ignores_comment_markers_inside_strings() {
+    let src = "const MARKER: &str = \"/*\";\nuse crate::model::Thing;\n";
+    let edges = edges_of_source("engine", src);
+    assert!(
+        has_edge(&edges, "model"),
+        "block-comment marker inside a string literal erased a real `use crate::` edge: {edges:?}"
+    );
+}
+
+/// A lifetime (`'a`) on a line that also carries a trailing `//` comment must
+/// not wedge the scanner "inside a string" and leak the comment's text as code
+/// (which would spuriously report a backward edge named in the comment).
+#[test]
+fn sanitize_strips_line_comment_after_lifetime() {
+    let src = "fn f<'a>() {} // use crate::engine::Foo\nuse crate::model::T;\n";
+    let edges = edges_of_source("feel", src);
+    assert!(
+        !has_edge(&edges, "engine"),
+        "text inside a `//` comment after a lifetime leaked as a real edge: {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, "model"),
+        "the genuine post-comment `use crate::` edge was lost: {edges:?}"
+    );
+}
+
+/// An unbalanced brace inside a string literal must not shift the
+/// `#[cfg(test)] mod { … }` brace balance, which would either leak the test
+/// module's `use crate::` edges or eat real code after it.
+#[test]
+fn sanitize_ignores_braces_inside_test_module_strings() {
+    let src = "#[cfg(test)]\nmod tests {\n    let s = \"}\";\n    use crate::engine::X;\n}\nuse crate::model::Y;\n";
+    let edges = edges_of_source("feel", src);
+    assert!(
+        !has_edge(&edges, "engine"),
+        "a `\"}}\"` string closed the test module early, leaking a test-only edge: {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, "model"),
+        "an unbalanced brace inside a string swallowed real code after the test module: {edges:?}"
+    );
+}
+
+/// Raw-string contents (including embedded `//`, `/*`, and `use crate::` text)
+/// must be blanked, never mistaken for comments or real import edges.
+#[test]
+fn sanitize_blanks_raw_string_contents() {
+    let src = "let q = r#\"use crate::engine::Z and /* not a comment\"#;\nuse crate::model::W;\n";
+    let edges = edges_of_source("feel", src);
+    assert!(
+        !has_edge(&edges, "engine"),
+        "a `use crate::` inside a raw string was reported as a real edge: {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, "model"),
+        "a `/*` inside a raw string opened a spurious block comment: {edges:?}"
+    );
 }
