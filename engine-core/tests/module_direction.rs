@@ -35,13 +35,21 @@
 //! ## What it inspects, and what it does not
 //!
 //! It walks `src/**.rs`, ignores `#[cfg(test)]` modules and test-only files
-//! (`#[cfg(test)] mod tests;`), strips comments, and extracts module-level
-//! `use crate::<module>[::<sub>]` edges. Inline fully-qualified paths
-//! (`crate::feel::eval_bool` used *without* a `use`) and crate-root re-exports
-//! (`use crate::{Command, Engine}`) are intentionally out of scope: the former
-//! is the idiom modules use to reach a helper *without* declaring a layering
-//! dependency (see `model.rs`), and the latter names the crate's public surface
-//! rather than a module, so neither encodes a textual module-direction edge.
+//! (`#[cfg(test)] mod tests;`), strips comments and literals, and extracts
+//! module-level `use crate::<module>[::<sub>]` edges. The extractor parses the
+//! full use-tree after each `use crate::`, so brace use-trees
+//! (`use crate::{event::Event, state::apply}`, expanded entry-by-entry) and
+//! paths wrapped across newlines are handled — no common import form can slip a
+//! backward edge past the guard. Inline fully-qualified paths
+//! (`crate::feel::eval_bool` used *without* a `use`) are out of scope: that is
+//! the idiom modules use to reach a helper *without* declaring a layering
+//! dependency (see `model.rs`). A leaf whose first segment is *not* a top-level
+//! module — a crate-root re-export such as `use crate::Engine` — names the
+//! crate's public surface rather than a module and is ignored. That
+//! module-membership filter is only safe because [`MODULES`] is held in
+//! lock-step with the modules on disk by [`modules_table_matches_src_tree`], so
+//! a newly added module can never be an unlisted first segment that silently
+//! escapes the guard before its layer is assigned.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -461,8 +469,116 @@ fn module_of(rel: &Path) -> (String, Option<String>) {
     }
 }
 
+/// Skip ASCII whitespace (including newlines) starting at `i`.
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Parse a single Rust *use-tree* — the grammar that follows `use crate::` —
+/// expanding brace groups so every leaf becomes its own path. Returns the list
+/// of leaf paths (each a vector of `::`-separated segments) and the offset just
+/// past the tree. Whitespace *including newlines* between tokens is skipped, so
+/// a declaration wrapped across several physical lines is parsed as one unit.
+///
+/// Examples (the `crate::` prefix is already consumed by the caller):
+/// * `state::types::X`              -> `[[state, types, X]]`
+/// * `{event::Event, state::apply}` -> `[[event, Event], [state, apply]]`
+/// * `state::{types::X, apply}`     -> `[[state, types, X], [state, apply]]`
+/// * `model::Thing as Alias`        -> `[[model, Thing]]` (the `as` rename is
+///   irrelevant to the module edge and is left unconsumed)
+fn parse_use_tree(b: &[u8], start: usize) -> (Vec<Vec<String>>, usize) {
+    let mut i = skip_ws(b, start);
+    // Brace group: expand each comma-separated sub-tree.
+    if i < b.len() && b[i] == b'{' {
+        i += 1;
+        let mut out = Vec::new();
+        loop {
+            i = skip_ws(b, i);
+            if i >= b.len() {
+                break;
+            }
+            if b[i] == b'}' {
+                i += 1;
+                break;
+            }
+            let before = i;
+            let (paths, ni) = parse_use_tree(b, i);
+            i = ni;
+            out.extend(paths);
+            i = skip_ws(b, i);
+            if i < b.len() && b[i] == b',' {
+                i += 1;
+                continue;
+            }
+            if i < b.len() && b[i] == b'}' {
+                i += 1;
+                break;
+            }
+            // Malformed input or no forward progress — stop to guarantee
+            // termination rather than spin.
+            if i == before {
+                i += 1;
+            }
+            break;
+        }
+        return (out, i);
+    }
+    // Path: ident (`::` (ident | `*` | `{…}`))*
+    let mut prefix: Vec<String> = Vec::new();
+    loop {
+        i = skip_ws(b, i);
+        if i < b.len() && b[i] == b'{' {
+            // `prefix::{…}` — distribute the shared prefix over each leaf.
+            let (subs, ni) = parse_use_tree(b, i);
+            i = ni;
+            let out = subs
+                .into_iter()
+                .map(|s| {
+                    let mut full = prefix.clone();
+                    full.extend(s);
+                    full
+                })
+                .collect();
+            return (out, i);
+        }
+        if i < b.len() && b[i] == b'*' {
+            i += 1;
+            let mut full = prefix.clone();
+            full.push("*".to_string());
+            return (vec![full], i);
+        }
+        let (ident, ni) = read_ident(b, i);
+        if ident.is_empty() {
+            break;
+        }
+        prefix.push(ident);
+        i = ni;
+        i = skip_ws(b, i);
+        if i + 1 < b.len() && b[i] == b':' && b[i + 1] == b':' {
+            i += 2;
+            continue;
+        }
+        break;
+    }
+    if prefix.is_empty() {
+        (Vec::new(), i)
+    } else {
+        (vec![prefix], i)
+    }
+}
+
 /// Extract every `use crate::<module>[::<sub>]` edge from already-cleaned source
-/// (block comments + inline test modules stripped, line comments removed).
+/// (comments + string/char literals blanked, inline test modules stripped).
+///
+/// The full use-tree after each `use crate::` is parsed via [`parse_use_tree`],
+/// so brace use-trees (`use crate::{a::b, c}`) are expanded entry-by-entry and
+/// declarations wrapped across newlines are read as one unit — every leaf whose
+/// first segment is a top-level module (and is not the source module itself)
+/// becomes an edge. A leaf whose first segment is not a module (a crate-root
+/// re-export such as `use crate::Engine`) is not a module edge and is skipped.
 fn edges_in_source(
     cleaned: &str,
     src_module: &str,
@@ -470,33 +586,42 @@ fn edges_in_source(
     file_label: &str,
     edges: &mut Vec<Edge>,
 ) {
-    for (lineno, line) in cleaned.lines().enumerate() {
-        let bytes = line.as_bytes();
-        let mut search = 0;
-        while let Some(rel) = line[search..].find("use crate::") {
-            let mut i = search + rel + "use crate::".len();
-            let (module, ni) = read_ident(bytes, i);
-            i = ni;
+    let bytes = cleaned.as_bytes();
+    const NEEDLE: &str = "use crate::";
+    let mut search = 0;
+    while let Some(rel) = cleaned[search..].find(NEEDLE) {
+        let kw_start = search + rel;
+        let after_prefix = kw_start + NEEDLE.len();
+        // Require a word boundary before `use` so an identifier ending in `use`
+        // never matches.
+        let boundary = kw_start == 0
+            || !(bytes[kw_start - 1] == b'_' || bytes[kw_start - 1].is_ascii_alphanumeric());
+        if !boundary {
+            search = after_prefix;
+            continue;
+        }
+        let (paths, end) = parse_use_tree(bytes, after_prefix);
+        let lineno = 1 + cleaned[..kw_start]
+            .bytes()
+            .filter(|&byte| byte == b'\n')
+            .count();
+        for path in paths {
+            let Some(module) = path.first() else {
+                continue;
+            };
             if MODULES.contains(&module.as_str()) && module != src_module {
-                // optional `::sub`
-                let mut sub = None;
-                if i + 1 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' {
-                    let (s, _) = read_ident(bytes, i + 2);
-                    if !s.is_empty() {
-                        sub = Some(s);
-                    }
-                }
+                let sub = path.get(1).filter(|s| s.as_str() != "*").cloned();
                 edges.push(Edge {
                     src_module: src_module.to_string(),
                     src_sub: src_sub.map(str::to_string),
-                    tgt_module: module,
+                    tgt_module: module.clone(),
                     tgt_sub: sub,
                     file: file_label.to_string(),
-                    line: lineno + 1,
+                    line: lineno,
                 });
             }
-            search = search + rel + "use crate::".len();
         }
+        search = end.max(after_prefix);
     }
 }
 
@@ -617,6 +742,59 @@ fn dependency_direction_holds() {
          and the table in this test):\n{}",
         violations.join("\n")
     );
+}
+
+/// [`MODULES`] (and therefore [`module_level`] and the allowed-edges table) must
+/// list *exactly* the top-level modules that exist under `src/`. This is the
+/// single source of truth that keeps the extractor honest: [`edges_in_source`]
+/// only records an edge when the imported first segment is in `MODULES`, so a
+/// module added to `src/` but *not* added here would make its imports invisible
+/// to the guard — a backward edge to (or from) it could land unchecked, exactly
+/// the "import of an unlisted top-level module is silently dropped" gap. Failing
+/// the moment the table drifts from disk forces the new/removed module's layer
+/// to be assigned *before* any of its edges can bypass evaluation.
+#[test]
+fn modules_table_matches_src_tree() {
+    let src_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut on_disk: BTreeSet<String> = BTreeSet::new();
+    for entry in fs::read_dir(&src_root).expect("read src") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            // A directory is a module only if it has a `mod.rs`.
+            if path.join("mod.rs").exists() {
+                if let Some(name) = path.file_name() {
+                    on_disk.insert(name.to_string_lossy().into_owned());
+                }
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            if let Some(stem) = path.file_stem() {
+                let stem = stem.to_string_lossy().into_owned();
+                if stem != "lib" {
+                    on_disk.insert(stem);
+                }
+            }
+        }
+    }
+
+    let listed: BTreeSet<String> = MODULES.iter().map(|m| (*m).to_string()).collect();
+    assert_eq!(
+        listed,
+        on_disk,
+        "MODULES has drifted from engine-core/src — update MODULES, `module_level`, and the \
+         layering table so the module's edges are checked (on disk but not in MODULES: {:?}; in \
+         MODULES but not on disk: {:?})",
+        on_disk.difference(&listed).collect::<Vec<_>>(),
+        listed.difference(&on_disk).collect::<Vec<_>>(),
+    );
+
+    // Every listed module must have a layer, or `edge_allowed` cannot classify
+    // its edges (it would report "unknown module" for a real one).
+    for m in MODULES {
+        assert!(
+            module_level(m).is_some(),
+            "module `{m}` is listed in MODULES but has no layer in `module_level`"
+        );
+    }
 }
 
 /// Guard-the-guard: the matcher must *reject* deliberately-wrong edges. If any
@@ -753,4 +931,94 @@ fn sanitize_blanks_raw_string_contents() {
         has_edge(&edges, "model"),
         "a `/*` inside a raw string opened a spurious block comment: {edges:?}"
     );
+}
+
+/// A `use crate::` declaration wrapped across newlines (the module segment on a
+/// separate physical line from `use crate::`) must still be extracted. Scanning
+/// one line at a time missed this form, letting a backward edge land unchecked.
+#[test]
+fn extracts_multiline_use_declaration() {
+    let src = "use crate::\n    engine::Engine;\nuse crate::model::T;\n";
+    let edges = edges_of_source("feel", src);
+    assert!(
+        has_edge(&edges, "engine"),
+        "a `use crate::` path wrapped across newlines was not extracted: {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, "model"),
+        "the single-line edge on the following line was lost: {edges:?}"
+    );
+}
+
+/// A brace use-tree (`use crate::{a::b, c::d}`) must be expanded entry-by-entry
+/// so every leaf module is checked. The old single-path scanner saw the `{`,
+/// read an empty identifier, and dropped the whole declaration — letting a
+/// forbidden edge hide inside braces (`use crate::{engine::Engine}` from a lower
+/// layer would bypass the guard entirely).
+#[test]
+fn extracts_brace_use_tree_entries() {
+    let src = "use crate::{event::Event, model::Thing};\n";
+    let edges = edges_of_source("feel", src);
+    assert!(
+        has_edge(&edges, "event"),
+        "a module edge inside a brace use-tree was ignored: {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, "model"),
+        "a second brace use-tree entry was ignored: {edges:?}"
+    );
+}
+
+/// A nested brace use-tree with a shared prefix (`use crate::state::{types::X,
+/// apply::Y}`) must distribute the prefix over each leaf, so the cycle-breaking
+/// `state::types` vs `state::apply` distinction survives the braced form.
+#[test]
+fn extracts_nested_brace_use_tree_with_shared_prefix() {
+    let src = "use crate::state::{types::T, apply::A};\n";
+    let edges = edges_of_source("event", src);
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.tgt_module == "state" && e.tgt_sub.as_deref() == Some("types")),
+        "the `state::types` leaf of a prefixed brace use-tree was lost: {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.tgt_module == "state" && e.tgt_sub.as_deref() == Some("apply")),
+        "the `state::apply` leaf of a prefixed brace use-tree was lost: {edges:?}"
+    );
+}
+
+/// A backward edge written inside a brace use-tree must be caught by the real
+/// matcher — the whole point of expanding braces. `event` importing `engine`
+/// via `use crate::{engine::Engine}` is a forbidden L3 -> L6 edge and must be
+/// rejected once extracted.
+#[test]
+fn brace_use_tree_backward_edge_is_rejected() {
+    let src = "use crate::{engine::Engine};\n";
+    let edges = edges_of_source("event", src);
+    let engine = edges
+        .iter()
+        .find(|e| e.tgt_module == "engine")
+        .expect("brace-wrapped backward edge should be extracted");
+    assert!(
+        edge_allowed(&engine.src_module, None, &engine.tgt_module, None).is_err(),
+        "a backward edge hidden in a brace use-tree slipped past the matcher"
+    );
+}
+
+/// A crate-root re-export (`use crate::Engine`, `use crate::{Command, Engine}`)
+/// names the crate's public surface, not a module, so its first segment is not
+/// in `MODULES` and it must be ignored — only real module first segments count.
+#[test]
+fn ignores_crate_root_reexports() {
+    let src = "use crate::{Engine, Command};\nuse crate::model::T;\n";
+    let edges = edges_of_source("feel", src);
+    assert_eq!(
+        edges.len(),
+        1,
+        "a crate-root re-export was mistaken for a module edge: {edges:?}"
+    );
+    assert!(has_edge(&edges, "model"));
 }
