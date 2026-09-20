@@ -44,8 +44,8 @@
 //! than a curated set of local names (which cannot cover the open-ended `nano:*`
 //! vocabulary), there is no second source of truth to drift.
 
-use super::ValidationInput;
 use super::ParseError;
+use super::ValidationInput;
 
 /// Rejects the first recorded unmodelled flow element / event definition.
 ///
@@ -78,9 +78,7 @@ mod tests {
     /// `validate` is exercised through the real streaming parser. The parser is
     /// a *downstream* consumer of `validate`, so this is a test-only fixture edge,
     /// not a production dependency (the #1201 layering lint ignores test bodies).
-    fn parse_bpmn(
-        xml: &str,
-    ) -> Result<Vec<crate::model::ProcessDefinition>, ParseError> {
+    fn parse_bpmn(xml: &str) -> Result<Vec<crate::model::ProcessDefinition>, ParseError> {
         crate::bpmn::parse_bpmn(xml)
     }
 

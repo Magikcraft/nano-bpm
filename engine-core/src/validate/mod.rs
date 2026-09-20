@@ -26,8 +26,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::ProcessDefinition;
 pub(crate) use error::ParseError;
+
+use crate::model::ProcessDefinition;
 
 mod cheap_rules;
 pub(crate) mod error;

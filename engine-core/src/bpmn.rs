@@ -122,12 +122,11 @@
 use std::collections::HashMap;
 
 use crate::model::{ProcessBuilder, ProcessDefinition};
-use crate::xml::{attr, local_name, tokenize, Token};
-
 /// The BPMN parse-error type, owned by [`crate::validate::error`] (the
 /// validation seam that raises it) and re-exported here so every downstream
 /// `bpmn::ParseError` path keeps resolving (#1203).
 pub use crate::validate::error::ParseError;
+use crate::xml::{attr, local_name, tokenize, Token};
 
 /// Whether a tag reaching the in-process catch-all is genuinely ignorable
 /// non-flow noise (diagram interchange, documentation, extension-element
