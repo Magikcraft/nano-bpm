@@ -35,7 +35,8 @@
 //! ## What it inspects, and what it does not
 //!
 //! It walks `src/**.rs`, ignores `#[cfg(test)]` modules and test-only files
-//! (`#[cfg(test)] mod tests;`), strips comments and literals, and extracts
+//! (including feature-gated `#[cfg(all(test, feature = "…"))]` modules), strips
+//! comments and literals, and extracts
 //! module-level `use crate::<module>[::<sub>]` edges. The extractor parses the
 //! full use-tree after each `use crate::`, so brace use-trees
 //! (`use crate::{event::Event, state::apply}`, expanded entry-by-entry) and
@@ -360,8 +361,10 @@ fn sanitize(src: &str) -> String {
 }
 
 /// Remove inline `#[cfg(test)] mod name { ... }` blocks (brace-balanced),
-/// replacing them with blank lines. External `#[cfg(test)] mod name;`
-/// declarations are handled separately (they gate a whole file).
+/// replacing them with blank lines. Any `test`-bearing cfg predicate counts
+/// (e.g. `#[cfg(all(test, feature = "serde"))]`), matched by
+/// [`match_cfg_test_mod`]. External `#[cfg(test)] mod name;` declarations are
+/// handled separately (they gate a whole file).
 fn strip_inline_cfg_test_modules(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len());
@@ -404,14 +407,54 @@ fn strip_inline_cfg_test_modules(src: &str) -> String {
     out
 }
 
-/// If `#[cfg(test)]` (ignoring whitespace) is followed by `mod <name>`, return
-/// the byte offset just past `<name>`; otherwise `None`.
+/// If a `#[cfg(<pred>)]` attribute whose predicate mentions the `test`
+/// configuration — `#[cfg(test)]`, but also compound spellings such as
+/// `#[cfg(all(test, feature = "serde"))]` — is followed by `mod <name>`,
+/// return the byte offset just past `<name>`; otherwise `None`.
+///
+/// Matching *any* `test`-bearing predicate (not just the exact `#[cfg(test)]`
+/// spelling) is required so test-only modules gated behind a feature — e.g. the
+/// `#[cfg(all(test, feature = "serde"))]` replay-compat modules in `event.rs`
+/// and `state/apply.rs` — are stripped too; otherwise their `use crate::…`
+/// statements would be scanned as production layering edges. Callers pass
+/// sanitized source, so a `test` substring inside a string literal (e.g.
+/// `feature = "test-utils"`) has already been blanked and cannot false-match.
 fn match_cfg_test_mod(bytes: &[u8], start: usize) -> Option<usize> {
-    let tag = b"#[cfg(test)]";
-    if start + tag.len() > bytes.len() || &bytes[start..start + tag.len()] != tag {
+    let open = b"#[cfg(";
+    if start + open.len() > bytes.len() || &bytes[start..start + open.len()] != open {
         return None;
     }
-    let mut i = start + tag.len();
+    // Balance parens across the cfg predicate; `i` starts at the first `(`.
+    let pred_start = start + open.len();
+    let mut i = pred_start - 1;
+    let mut depth = 0usize;
+    let pred_end;
+    loop {
+        if i >= bytes.len() {
+            return None;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    pred_end = i;
+                    i += 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // Require the attribute's closing `]`.
+    if i >= bytes.len() || bytes[i] != b']' {
+        return None;
+    }
+    i += 1;
+    if !cfg_predicate_has_test(&bytes[pred_start..pred_end]) {
+        return None;
+    }
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
@@ -435,6 +478,28 @@ fn match_cfg_test_mod(bytes: &[u8], start: usize) -> Option<usize> {
         return None;
     }
     Some(i)
+}
+
+/// Does a `cfg` predicate mention the `test` configuration as a whole word?
+/// `test` must appear on an identifier boundary so predicates like
+/// `feature = "attestation"` (already blanked to spaces by `sanitize`, but
+/// guarded regardless) or an unrelated `latest` cfg key cannot false-match.
+fn cfg_predicate_has_test(pred: &[u8]) -> bool {
+    let needle = b"test";
+    let mut i = 0;
+    while i + needle.len() <= pred.len() {
+        if &pred[i..i + needle.len()] == needle {
+            let before_ok = i == 0 || !(pred[i - 1] == b'_' || pred[i - 1].is_ascii_alphanumeric());
+            let after = i + needle.len();
+            let after_ok = after >= pred.len()
+                || !(pred[after] == b'_' || pred[after].is_ascii_alphanumeric());
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Read an identifier `[A-Za-z_][A-Za-z0-9_]*` starting at `i`; return the
@@ -1229,5 +1294,36 @@ fn self_relative_import_is_intra_module() {
     assert!(
         edges.is_empty(),
         "a `self::` intra-module import was mistaken for a layering edge: {edges:?}"
+    );
+}
+
+/// A test-only module gated by a compound `#[cfg(all(test, feature = "…"))]`
+/// predicate — the spelling the `serde` replay-compat modules in `event.rs` and
+/// `state/apply.rs` use — must be stripped like a plain `#[cfg(test)]` module,
+/// so its `use crate::…` imports are never scanned as production layering edges.
+#[test]
+fn strips_feature_gated_test_modules() {
+    let src = "#[cfg(all(test, feature = \"serde\"))]\nmod compat {\n    use crate::engine::X;\n}\nuse crate::model::Y;\n";
+    let edges = edges_of_source("feel", src);
+    assert!(
+        !has_edge(&edges, "engine"),
+        "a `#[cfg(all(test, feature = ...))]` module leaked a test-only edge: {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, "model"),
+        "stripping the feature-gated test module swallowed real code after it: {edges:?}"
+    );
+}
+
+/// The `test`-in-predicate check must be whole-word: a `cfg` key that merely
+/// *contains* the substring `test` (e.g. `latest`) is not the `test`
+/// configuration, so its module must NOT be stripped and its edges stay visible.
+#[test]
+fn cfg_containing_test_substring_is_not_stripped() {
+    let src = "#[cfg(feature = latest)]\nmod real {\n    use crate::engine::X;\n}\nuse crate::model::Y;\n";
+    let edges = edges_of_source("feel", src);
+    assert!(
+        has_edge(&edges, "engine") && has_edge(&edges, "model"),
+        "a `latest` cfg key was mis-read as `test` and its module stripped: {edges:?}"
     );
 }
