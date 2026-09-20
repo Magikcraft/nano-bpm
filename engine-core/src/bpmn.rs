@@ -4506,66 +4506,23 @@ fn feel_timer_expr(
 }
 
 /// Parses an ISO-8601 duration (e.g. `PT5S`, `PT1M30S`, `PT2H`, `P1DT6H`,
-/// `P1W`) into milliseconds. Supports weeks, days, hours, minutes and seconds
-/// (the date-portion years/months are ambiguous in length and not supported).
-/// Returns `None` if the string is not a recognisable duration.
+/// `P1W`) into milliseconds. Thin BPMN-timer wrapper over the canonical
+/// [`crate::temporal`] leaf ([`crate::temporal::DurationForm::BPMN_TIMER`]):
+/// weeks, days, hours, minutes and seconds are supported; the date-portion
+/// years/months are ambiguous in length and not supported. Returns `None` if
+/// the string is not a recognisable duration.
 pub(crate) fn parse_iso8601_duration(raw: &str) -> Option<u64> {
-    let s = raw.trim();
-    let s = s.strip_prefix('P')?;
-    if s.is_empty() {
-        return None;
-    }
-
-    let mut total_millis: u64 = 0;
-    let mut in_time = false;
-    let mut num = String::new();
-    let mut saw_unit = false;
-
-    for c in s.chars() {
-        match c {
-            'T' => in_time = true,
-            '0'..='9' => num.push(c),
-            _ => {
-                if num.is_empty() {
-                    return None;
-                }
-                let value: u64 = num.parse().ok()?;
-                num.clear();
-                let millis = match (in_time, c) {
-                    (false, 'W') => value.checked_mul(7 * 24 * 60 * 60 * 1000),
-                    (false, 'D') => value.checked_mul(24 * 60 * 60 * 1000),
-                    (true, 'H') => value.checked_mul(60 * 60 * 1000),
-                    (true, 'M') => value.checked_mul(60 * 1000),
-                    (true, 'S') => value.checked_mul(1000),
-                    // 'M' before 'T' is months (unsupported) and 'Y' is years.
-                    _ => return None,
-                }?;
-                total_millis = total_millis.checked_add(millis)?;
-                saw_unit = true;
-            }
-        }
-    }
-
-    // Trailing digits without a unit, or no units at all, are invalid.
-    if !num.is_empty() || !saw_unit {
-        return None;
-    }
-    Some(total_millis)
+    crate::temporal::parse_duration_millis(raw)
 }
 
 /// Parses an ISO-8601 repeating interval (a BPMN `timeCycle`, e.g. `R/PT1H` or
-/// `R5/PT1H`) into the interval in milliseconds. The `Rn` repetition-count
-/// prefix is accepted but ignored (the engine repeats unboundedly). A bare
-/// duration without the `R[n]/` prefix is also accepted. Returns `None` if the
-/// interval portion is not a recognisable duration.
+/// `R5/PT1H`) into the interval in milliseconds. Thin wrapper over the canonical
+/// [`crate::temporal`] leaf. The `Rn` repetition-count prefix is accepted but
+/// ignored (the engine repeats unboundedly). A bare duration without the
+/// `R[n]/` prefix is also accepted. Returns `None` if the interval portion is
+/// not a recognisable duration.
 pub(crate) fn parse_iso8601_cycle(raw: &str) -> Option<u64> {
-    let s = raw.trim();
-    let interval = match s.split_once('/') {
-        Some((repeat, interval)) if repeat.starts_with('R') => interval,
-        Some(_) => return None,
-        None => s,
-    };
-    parse_iso8601_duration(interval)
+    crate::temporal::parse_cycle_millis(raw)
 }
 
 /// Parses a `zeebe:subscription correlationKey` expression into the name of an

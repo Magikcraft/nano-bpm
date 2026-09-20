@@ -362,61 +362,13 @@ impl DtDuration {
     }
 
     /// Parse an ISO-8601 `P[n]DT[n]H[n]M[n]S` (with optional leading sign).
+    ///
+    /// Thin wrapper over the canonical [`crate::temporal`] leaf under the
+    /// [`crate::temporal::DurationForm::FEEL_DAYTIME`] policy (signed, no weeks,
+    /// fractional seconds).
     pub fn parse(s: &str) -> Option<DtDuration> {
-        let (neg, body) = strip_sign(s)?;
-        let body = body.strip_prefix('P')?;
-        let (date_part, time_part) = match body.find('T') {
-            Some(idx) => (&body[..idx], &body[idx + 1..]),
-            None => (body, ""),
-        };
-        let mut nanos: i128 = 0;
-        let mut saw = false;
-        // Date part: only D allowed.
-        let mut num = String::new();
-        for c in date_part.chars() {
-            match c {
-                '0'..='9' => num.push(c),
-                'D' => {
-                    nanos += num.parse::<i128>().ok()? * SECS_PER_DAY * NANOS_PER_SEC;
-                    num.clear();
-                    saw = true;
-                }
-                _ => return None,
-            }
-        }
-        if !num.is_empty() {
-            return None;
-        }
-        // Time part: H, M, S (S may carry a fraction).
-        num.clear();
-        for c in time_part.chars() {
-            match c {
-                '0'..='9' | '.' => num.push(c),
-                'H' => {
-                    nanos += num.parse::<i128>().ok()? * 3600 * NANOS_PER_SEC;
-                    num.clear();
-                    saw = true;
-                }
-                'M' => {
-                    nanos += num.parse::<i128>().ok()? * 60 * NANOS_PER_SEC;
-                    num.clear();
-                    saw = true;
-                }
-                'S' => {
-                    let secs: f64 = num.parse().ok()?;
-                    nanos += (secs * NANOS_PER_SEC as f64).round() as i128;
-                    num.clear();
-                    saw = true;
-                }
-                _ => return None,
-            }
-        }
-        if !num.is_empty() || !saw {
-            return None;
-        }
-        Some(DtDuration {
-            nanos: if neg { -nanos } else { nanos },
-        })
+        crate::temporal::parse_duration_nanos(s, crate::temporal::DurationForm::FEEL_DAYTIME)
+            .map(|nanos| DtDuration { nanos })
     }
 
     pub fn format(&self) -> String {

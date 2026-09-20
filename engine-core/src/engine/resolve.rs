@@ -676,12 +676,12 @@ impl Engine {
 
         match def.kind {
             crate::model::TimerDefKind::Duration => {
-                match crate::bpmn::parse_iso8601_duration(text) {
+                match crate::temporal::parse_duration_millis(text) {
                     Some(ms) => (base_now.saturating_add(ms), ms),
                     None => default,
                 }
             }
-            crate::model::TimerDefKind::Cycle => match crate::bpmn::parse_iso8601_cycle(text) {
+            crate::model::TimerDefKind::Cycle => match crate::temporal::parse_cycle_millis(text) {
                 Some(ms) => (base_now.saturating_add(ms), ms),
                 None => default,
             },
