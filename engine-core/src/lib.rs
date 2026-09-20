@@ -78,6 +78,7 @@ mod json;
 mod model;
 mod read_query;
 mod state;
+mod temporal;
 
 pub mod bpmn;
 pub mod dmn;
