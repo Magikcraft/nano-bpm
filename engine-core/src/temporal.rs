@@ -314,7 +314,10 @@ mod tests {
     #[test]
     fn policy_divergence_is_explicit() {
         // Same input, two policies, two answers — the documented divergences.
-        assert_eq!(parse_duration_nanos("PT1.5S", DurationForm::BPMN_TIMER), None);
+        assert_eq!(
+            parse_duration_nanos("PT1.5S", DurationForm::BPMN_TIMER),
+            None
+        );
         assert_eq!(
             parse_duration_nanos("PT1.5S", DurationForm::FEEL_DAYTIME),
             Some(1_500_000_000)
@@ -323,8 +326,14 @@ mod tests {
             parse_duration_nanos("P1W", DurationForm::BPMN_TIMER),
             Some(604_800_000_000_000)
         );
-        assert_eq!(parse_duration_nanos("P1W", DurationForm::FEEL_DAYTIME), None);
-        assert_eq!(parse_duration_nanos("-PT1S", DurationForm::BPMN_TIMER), None);
+        assert_eq!(
+            parse_duration_nanos("P1W", DurationForm::FEEL_DAYTIME),
+            None
+        );
+        assert_eq!(
+            parse_duration_nanos("-PT1S", DurationForm::BPMN_TIMER),
+            None
+        );
         assert_eq!(
             parse_duration_nanos("-PT1S", DurationForm::FEEL_DAYTIME),
             Some(-1_000_000_000)
@@ -357,10 +366,19 @@ mod tests {
     fn fractional_seconds_round_half_up_beyond_nanos() {
         let f = DurationForm::FEEL_DAYTIME;
         // 10th fractional digit >= 5 rounds up; < 5 truncates.
-        assert_eq!(parse_duration_nanos("PT0.1234567895S", f), Some(123_456_790));
-        assert_eq!(parse_duration_nanos("PT0.1234567891S", f), Some(123_456_789));
+        assert_eq!(
+            parse_duration_nanos("PT0.1234567895S", f),
+            Some(123_456_790)
+        );
+        assert_eq!(
+            parse_duration_nanos("PT0.1234567891S", f),
+            Some(123_456_789)
+        );
         // Rounding may carry into the whole-second boundary.
-        assert_eq!(parse_duration_nanos("PT0.9999999995S", f), Some(1_000_000_000));
+        assert_eq!(
+            parse_duration_nanos("PT0.9999999995S", f),
+            Some(1_000_000_000)
+        );
     }
 
     #[test]
