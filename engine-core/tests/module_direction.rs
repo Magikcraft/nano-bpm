@@ -488,7 +488,8 @@ fn skip_ws(b: &[u8], mut i: usize) -> usize {
 /// * `{event::Event, state::apply}` -> `[[event, Event], [state, apply]]`
 /// * `state::{types::X, apply}`     -> `[[state, types, X], [state, apply]]`
 /// * `model::Thing as Alias`        -> `[[model, Thing]]` (the `as` rename is
-///   irrelevant to the module edge and is left unconsumed)
+///   irrelevant to the module edge and is consumed so it cannot stall an
+///   enclosing brace group)
 fn parse_use_tree(b: &[u8], start: usize) -> (Vec<Vec<String>>, usize) {
     let mut i = skip_ws(b, start);
     // Brace group: expand each comma-separated sub-tree.
@@ -566,6 +567,15 @@ fn parse_use_tree(b: &[u8], start: usize) -> (Vec<Vec<String>>, usize) {
     if prefix.is_empty() {
         (Vec::new(), i)
     } else {
+        // Consume an optional `as <alias>` rename. Leaving it unconsumed would
+        // stall an enclosing brace group's `,`/`}` scan and silently drop every
+        // sibling after an aliased entry (e.g. `{state::apply as run, engine}`).
+        i = skip_ws(b, i);
+        let (kw, after_kw) = read_ident(b, i);
+        if kw == "as" {
+            let (_alias, after_alias) = read_ident(b, skip_ws(b, after_kw));
+            i = skip_ws(b, after_alias);
+        }
         (vec![prefix], i)
     }
 }
@@ -1021,4 +1031,26 @@ fn ignores_crate_root_reexports() {
         "a crate-root re-export was mistaken for a module edge: {edges:?}"
     );
     assert!(has_edge(&edges, "model"));
+}
+
+/// An `as <alias>` rename on a brace-group entry must not stall the group and
+/// drop the entries after it. `event` importing `state` (renamed) *and*
+/// `engine` via `use crate::{state::apply as run, engine::Engine}` must still
+/// surface the backward `engine` edge — the sibling hidden after the alias.
+#[test]
+fn aliased_brace_entry_does_not_drop_later_leaves() {
+    let src = "use crate::{state::apply as run, engine::Engine};\n";
+    let edges = edges_of_source("event", src);
+    assert!(
+        edges.iter().any(|e| e.tgt_module == "state"),
+        "the aliased brace entry itself was lost: {edges:?}"
+    );
+    let engine = edges
+        .iter()
+        .find(|e| e.tgt_module == "engine")
+        .expect("the entry after an aliased brace sibling was silently dropped");
+    assert!(
+        edge_allowed(&engine.src_module, None, &engine.tgt_module, None).is_err(),
+        "a backward edge hidden after an aliased brace sibling slipped past"
+    );
 }
