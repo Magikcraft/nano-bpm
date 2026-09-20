@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 
 use crate::model::{ElementId, ProcessDefinition, Value};
-use crate::state::{IncidentKind, IoMappingRedrive, Key, MessageSubscriptionKind, TimerKind};
+use crate::state::types::{
+    IncidentKind, IoMappingRedrive, Key, MessageSubscriptionKind, TimerKind,
+};
 
 /// A fact emitted by the engine. The ordering of a command's returned events is
 /// the order in which they occurred.
@@ -307,12 +309,12 @@ pub enum Event {
         created_at: u64,
         #[cfg_attr(
             feature = "serde",
-            serde(default = "crate::state::default_job_priority")
+            serde(default = "crate::state::types::default_job_priority")
         )]
         priority: i32,
         #[cfg_attr(
             feature = "serde",
-            serde(default = "crate::state::default_job_retries")
+            serde(default = "crate::state::types::default_job_retries")
         )]
         retries: i32,
     },
@@ -337,7 +339,7 @@ pub enum Event {
         created_at: u64,
         #[cfg_attr(
             feature = "serde",
-            serde(default = "crate::state::default_job_retries")
+            serde(default = "crate::state::types::default_job_retries")
         )]
         retries: i32,
     },
@@ -582,7 +584,7 @@ pub enum Event {
         created_at: u64,
         #[cfg_attr(
             feature = "serde",
-            serde(default = "crate::state::default_job_retries")
+            serde(default = "crate::state::types::default_job_retries")
         )]
         retries: i32,
     },
@@ -592,7 +594,7 @@ pub enum Event {
     UserTaskTransitionDeferred {
         user_task_key: Key,
         instance_key: Key,
-        pending: crate::state::PendingUserTaskTransition,
+        pending: crate::state::types::PendingUserTaskTransition,
     },
     /// A task listener returned corrections to user-task data; they merge into
     /// the deferred transition's accumulated corrections (ADR 0037 §6).
