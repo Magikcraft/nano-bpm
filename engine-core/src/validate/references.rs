@@ -50,7 +50,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::ValidationInput;
-use crate::bpmn::ParseError;
+use super::ParseError;
 use crate::model::ElementKind;
 
 pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
@@ -204,7 +204,16 @@ pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::bpmn::{parse_bpmn, ParseError};
+    use super::ParseError;
+
+    /// `validate` is exercised through the real streaming parser. The parser is
+    /// a *downstream* consumer of `validate`, so this is a test-only fixture edge,
+    /// not a production dependency (the #1201 layering lint ignores test bodies).
+    fn parse_bpmn(
+        xml: &str,
+    ) -> Result<Vec<crate::model::ProcessDefinition>, ParseError> {
+        crate::bpmn::parse_bpmn(xml)
+    }
 
     /// Wraps a process body (and optional definitions-level declarations) into a
     /// full `<definitions>` document so a test can focus on one reference site.

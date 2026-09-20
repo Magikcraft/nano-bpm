@@ -26,10 +26,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::bpmn::ParseError;
 use crate::model::ProcessDefinition;
+pub(crate) use error::ParseError;
 
 mod cheap_rules;
+pub(crate) mod error;
 mod gateway_conditions;
 mod incoming_outgoing;
 mod references;
@@ -38,7 +39,6 @@ mod unsupported_elements;
 
 /// A captured `<incoming>`/`<outgoing>` QName reference from a flow node to a
 /// `<sequenceFlow>`.
-#[allow(dead_code)]
 pub(crate) struct FlowRefCapture {
     /// Id of the flow node that declared the reference.
     pub node_id: String,
@@ -52,7 +52,6 @@ pub(crate) struct FlowRefCapture {
 /// (which have their own [`FlowRefCapture`]). `kind` is one of `"messageRef"`,
 /// `"errorRef"`, `"signalRef"`, `"escalationRef"`, `"default"`,
 /// `"attachedToRef"`.
-#[allow(dead_code)]
 pub(crate) struct RefSite {
     pub kind: &'static str,
     /// The referenced id.
@@ -63,7 +62,6 @@ pub(crate) struct RefSite {
 
 /// A flow-element tag / event definition the streaming parser does not model,
 /// recorded rather than silently dropped.
-#[allow(dead_code)]
 pub(crate) struct UnmodelledElement {
     pub tag: String,
     pub element_id: String,
@@ -72,7 +70,6 @@ pub(crate) struct UnmodelledElement {
 /// A captured `zeebe:taskDefinition` on a job-based task, retaining the raw
 /// attribute strings (before `build` defaults an absent `type` to the id) so
 /// the empty-attribute rule (#856) can see an explicitly-empty value.
-#[allow(dead_code)]
 pub(crate) struct TaskDefCapture {
     pub task_id: String,
     pub job_type: Option<String>,
@@ -88,7 +85,6 @@ pub(crate) struct TaskDefCapture {
 /// Many fields are consumed only by the pre-registered wave-1 sibling
 /// validators (#851/#853/#854/#855/#856); the scaffold populates them now so
 /// those slices become pure add-a-file changes.
-#[allow(dead_code)]
 pub(crate) struct ProcessCapture {
     pub process_id: String,
     /// Every declared `<sequenceFlow>` id, before any ad-hoc pruning.
@@ -126,7 +122,6 @@ pub(crate) struct ProcessCapture {
 
 /// The input handed to every validator: the built definition plus the raw parse
 /// capture.
-#[allow(dead_code)]
 pub(crate) struct ValidationInput<'a> {
     pub def: &'a ProcessDefinition,
     pub capture: &'a ProcessCapture,

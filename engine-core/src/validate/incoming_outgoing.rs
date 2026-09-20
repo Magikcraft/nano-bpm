@@ -15,7 +15,7 @@
 //! flows (before ad-hoc pruning), mirroring what Zeebe sees.
 
 use super::ValidationInput;
-use crate::bpmn::ParseError;
+use super::ParseError;
 
 pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
     let capture = input.capture;
