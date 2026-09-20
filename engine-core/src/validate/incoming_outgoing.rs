@@ -14,8 +14,8 @@
 //! `<sequenceFlow>` id (`capture.flow_ids`) — checked against the raw parsed
 //! flows (before ad-hoc pruning), mirroring what Zeebe sees.
 
+use super::ParseError;
 use super::ValidationInput;
-use crate::bpmn::ParseError;
 
 pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
     let capture = input.capture;
