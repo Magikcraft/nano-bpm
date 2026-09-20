@@ -21,6 +21,24 @@
 //! parsing at `camunda/camunda`: the date-portion years (`Y`) and months (`M`)
 //! are calendar-ambiguous and rejected; weeks (`W`), days (`D`), hours (`H`),
 //! minutes (`M`) and seconds (`S`) are accepted.
+//!
+//! One historical divergence is resolved here as an *intended unification*
+//! rather than preserved. The old `bpmn::parse_iso8601_duration` scanned
+//! character-by-character with a single accumulator and did **not** flush its
+//! pending digits at the `T` boundary, so a malformed value like `P1T2H` (a
+//! date-part `1` with no unit designator) concatenated across `T` into `12H`
+//! and was silently accepted as 12 hours; a repeated `T` (e.g. `PT1T2H`)
+//! behaved the same way. The old `feel::temporal::DtDuration::parse` already
+//! split on `T` and **rejected** `P1T2H`. The two parsers had therefore already
+//! drifted, so unification cannot preserve both. This canonical parser splits
+//! cleanly on `T` and rejects trailing unit-less digits in either part, so
+//! `P1T2H` and repeated-`T` forms are rejected — matching Camunda: its
+//! `io.camunda.zeebe.model.bpmn.util.time.Interval.parse` splits on the `T`
+//! index and delegates to `java.time.Period.parse`/`Duration.parse`, and
+//! `Period.parse("P1")` throws `DateTimeParseException` (a bare digit with no
+//! `Y`/`M`/`W`/`D` designator), so Camunda rejects `P1T2H` too. Rejecting
+//! malformed ISO-8601 durations is Camunda's documented contract (see its
+//! `IntervalTest`), so the legacy BPMN 12h reading was the non-conformant quirk.
 
 const NANOS_PER_SEC: i128 = 1_000_000_000;
 const NANOS_PER_MILLI: i128 = 1_000_000;
@@ -361,5 +379,26 @@ mod tests {
         let f = DurationForm::FEEL_DAYTIME;
         assert_eq!(parse_duration_nanos("PT1.2.3S", f), None);
         assert_eq!(parse_duration_nanos("PT.S", f), None);
+    }
+
+    #[test]
+    fn malformed_iso8601_across_t_boundary_is_rejected() {
+        // Defect class: a date/time part digit with no unit designator must
+        // reject, matching Camunda's `Interval.parse` (`Period.parse("P1")`
+        // throws). The legacy `bpmn::parse_iso8601_duration` accepted `P1T2H`
+        // as 12h by concatenating digits across the `T` boundary; that quirk is
+        // deliberately not preserved. This guards the whole class, not just the
+        // single input — every form must reject under both policies.
+        for form in [DurationForm::BPMN_TIMER, DurationForm::FEEL_DAYTIME] {
+            // Bare date-part digit with no designator, concatenated across `T`.
+            assert_eq!(parse_duration_nanos("P1T2H", form), None);
+            // Repeated `T` marker.
+            assert_eq!(parse_duration_nanos("PT1T2H", form), None);
+            // Same class in the time part: a trailing unit-less digit.
+            assert_eq!(parse_duration_nanos("PT1H2", form), None);
+        }
+        // And through the BPMN millis/cycle entry points callers actually use.
+        assert_eq!(parse_duration_millis("P1T2H"), None);
+        assert_eq!(parse_cycle_millis("R/P1T2H"), None);
     }
 }
