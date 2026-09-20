@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 
 use crate::model::{ElementId, ProcessDefinition, Value};
-use crate::state::types::{IncidentKind, IoMappingRedrive, Key, MessageSubscriptionKind, TimerKind};
+use crate::state::types::{
+    IncidentKind, IoMappingRedrive, Key, MessageSubscriptionKind, TimerKind,
+};
 
 /// A fact emitted by the engine. The ordering of a command's returned events is
 /// the order in which they occurred.

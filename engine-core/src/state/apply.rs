@@ -9,10 +9,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use super::types::*;
 use crate::event::Event;
 use crate::model::{ElementId, Value};
-
-use super::types::*;
 
 /// Reads the process id of `instance_key` **iff** it is currently non-terminal,
 /// so the caller can decrement the per-definition in-flight counter exactly once
