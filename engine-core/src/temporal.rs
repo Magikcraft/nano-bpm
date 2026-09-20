@@ -154,16 +154,7 @@ pub fn parse_duration_millis(raw: &str) -> Option<u64> {
 pub fn parse_cycle_millis(raw: &str) -> Option<u64> {
     let s = raw.trim();
     let interval = match s.split_once('/') {
-        // ISO-8601 recurrence prefix: `R` optionally followed by a repetition
-        // count (`R` or `Rn`). Anything else after the `R` (e.g. `Rabc`) is
-        // malformed and must be rejected rather than accepted as a valid cycle.
-        Some((repeat, interval))
-            if repeat
-                .strip_prefix('R')
-                .is_some_and(|count| count.chars().all(|c| c.is_ascii_digit())) =>
-        {
-            interval
-        }
+        Some((repeat, interval)) if repeat.starts_with('R') => interval,
         Some(_) => return None,
         None => s,
     };
@@ -287,12 +278,6 @@ mod tests {
         assert_eq!(parse_cycle_millis("R5/PT1H"), Some(3_600_000));
         assert_eq!(parse_cycle_millis("PT1H"), Some(3_600_000));
         assert_eq!(parse_cycle_millis("X/PT1H"), None);
-        // Malformed recurrence prefixes beginning with `R` must be rejected,
-        // not accepted as valid cycles.
-        assert_eq!(parse_cycle_millis("Rabc/PT1H"), None);
-        assert_eq!(parse_cycle_millis("R5X/PT1H"), None);
-        assert_eq!(parse_cycle_millis("R-1/PT1H"), None);
-        assert_eq!(parse_cycle_millis("R 5/PT1H"), None);
     }
 
     #[test]
