@@ -1122,15 +1122,13 @@ fn collect_test_gated_files(src_root: &Path, files: &[PathBuf]) -> BTreeSet<Path
                     j += 1;
                 }
                 if j < bytes.len() && bytes[j] == b';' {
-                    // external module: `<dir>/<name>.rs` or `<dir>/<name>/mod.rs`
+                    // external module: the flat `<dir>/<name>.rs`, the directory
+                    // module `<dir>/<name>/mod.rs`, and — because child modules
+                    // inherit the parent's `cfg(test)` — every descendant of
+                    // `<dir>/<name>/`.
                     let dir = file.parent().unwrap_or(src_root);
-                    let flat = dir.join(format!("{name}.rs"));
-                    let nested = dir.join(&name).join("mod.rs");
-                    if flat.exists() {
-                        gated.insert(flat);
-                    }
-                    if nested.exists() {
-                        gated.insert(nested);
+                    for f in gated_files_for_external_mod(dir, &name, files) {
+                        gated.insert(f.clone());
                     }
                 }
                 i = after;
@@ -1140,6 +1138,32 @@ fn collect_test_gated_files(src_root: &Path, files: &[PathBuf]) -> BTreeSet<Path
         }
     }
     gated
+}
+
+/// Resolve an external `#[cfg(test)] mod <name>;` declared in `dir` to every
+/// source file it gates, given the full set of `files` under `src`.
+///
+/// A `#[cfg(test)]` module gates not only its own file — the flat
+/// `<dir>/<name>.rs` or the directory module `<dir>/<name>/mod.rs` — but its
+/// *entire* module subtree: child modules inherit the parent's `cfg(test)`, so
+/// once the planned test-file split lands, files like `<dir>/<name>/foo.rs`
+/// (module `<name>::foo`) are equally test-only. Without gating the whole
+/// subtree such a descendant would be scanned as production and could reject a
+/// valid test-only import (e.g. `crate::ffi`), producing a false layering
+/// failure. Membership in `files` (the complete `src` walk) stands in for a
+/// disk `exists()` check, and `starts_with` captures `mod.rs` and every
+/// descendant of the directory in one predicate.
+fn gated_files_for_external_mod<'a>(
+    dir: &Path,
+    name: &str,
+    files: &'a [PathBuf],
+) -> Vec<&'a PathBuf> {
+    let flat = dir.join(format!("{name}.rs"));
+    let subtree = dir.join(name);
+    files
+        .iter()
+        .filter(|f| **f == flat || f.starts_with(&subtree))
+        .collect()
 }
 
 /// Walk `engine-core/src`, apply the exclusions, and return every module edge.
@@ -1933,5 +1957,75 @@ fn keeps_production_module_with_intervening_attribute() {
     assert!(
         has_edge(&edges, "engine"),
         "a production module behind an attribute was wrongly stripped: {edges:?}"
+    );
+}
+
+/// An external `#[cfg(test)] mod tests;` that resolves to a *directory* module
+/// (`<dir>/tests/mod.rs`) gates not just `mod.rs` but the whole subtree: child
+/// modules inherit the parent's `cfg(test)`, so a later test-file split such as
+/// `<dir>/tests/activation.rs` must also be excluded. Otherwise that descendant
+/// would be scanned as production and could reject a valid test-only import,
+/// producing a false layering failure.
+#[test]
+fn external_test_mod_gates_directory_subtree() {
+    let files = vec![
+        PathBuf::from("engine/mod.rs"),
+        PathBuf::from("engine/tests/mod.rs"),
+        PathBuf::from("engine/tests/activation.rs"),
+        PathBuf::from("engine/tests/nested/deep.rs"),
+        PathBuf::from("engine/other.rs"),
+    ];
+    let dir = Path::new("engine");
+    let gated: BTreeSet<&PathBuf> = gated_files_for_external_mod(dir, "tests", &files)
+        .into_iter()
+        .collect();
+    assert!(
+        gated.contains(&PathBuf::from("engine/tests/mod.rs")),
+        "the directory module's `mod.rs` was not gated: {gated:?}"
+    );
+    assert!(
+        gated.contains(&PathBuf::from("engine/tests/activation.rs")),
+        "a descendant of the gated test subtree was left to be scanned: {gated:?}"
+    );
+    assert!(
+        gated.contains(&PathBuf::from("engine/tests/nested/deep.rs")),
+        "a deeply nested descendant of the gated test subtree was not gated: {gated:?}"
+    );
+    assert!(
+        !gated.contains(&PathBuf::from("engine/other.rs")),
+        "an unrelated sibling file was wrongly gated: {gated:?}"
+    );
+    assert!(
+        !gated.contains(&PathBuf::from("engine/mod.rs")),
+        "the declaring parent module was wrongly gated: {gated:?}"
+    );
+}
+
+/// The flat external form `#[cfg(test)] mod tests;` resolving to `<dir>/tests.rs`
+/// gates that file and, under Rust 2018, any sibling `<dir>/tests/` submodule
+/// directory it owns — the whole subtree, not merely the flat file.
+#[test]
+fn external_test_mod_gates_flat_file_and_its_submodules() {
+    let files = vec![
+        PathBuf::from("engine/lib.rs"),
+        PathBuf::from("engine/tests.rs"),
+        PathBuf::from("engine/tests/helpers.rs"),
+        PathBuf::from("engine/testsuite.rs"),
+    ];
+    let dir = Path::new("engine");
+    let gated: BTreeSet<&PathBuf> = gated_files_for_external_mod(dir, "tests", &files)
+        .into_iter()
+        .collect();
+    assert!(
+        gated.contains(&PathBuf::from("engine/tests.rs")),
+        "the flat `<dir>/tests.rs` file was not gated: {gated:?}"
+    );
+    assert!(
+        gated.contains(&PathBuf::from("engine/tests/helpers.rs")),
+        "a 2018-style submodule of the flat test file was not gated: {gated:?}"
+    );
+    assert!(
+        !gated.contains(&PathBuf::from("engine/testsuite.rs")),
+        "a same-prefix but distinct sibling (`testsuite.rs`) was wrongly gated: {gated:?}"
     );
 }
