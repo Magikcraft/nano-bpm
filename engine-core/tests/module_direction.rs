@@ -1125,9 +1125,11 @@ fn collect_test_gated_files(src_root: &Path, files: &[PathBuf]) -> BTreeSet<Path
                     // external module: the flat `<dir>/<name>.rs`, the directory
                     // module `<dir>/<name>/mod.rs`, and — because child modules
                     // inherit the parent's `cfg(test)` — every descendant of
-                    // `<dir>/<name>/`.
-                    let dir = file.parent().unwrap_or(src_root);
-                    for f in gated_files_for_external_mod(dir, &name, files) {
+                    // `<dir>/<name>/`. `<dir>` is the *module source directory*
+                    // of the declaring file, not simply its parent: a flat file
+                    // `src/bpmn.rs` resolves `mod name;` to `src/bpmn/name.rs`.
+                    let dir = module_source_dir(file, src_root);
+                    for f in gated_files_for_external_mod(&dir, &name, files) {
                         gated.insert(f.clone());
                     }
                 }
@@ -1138,6 +1140,27 @@ fn collect_test_gated_files(src_root: &Path, files: &[PathBuf]) -> BTreeSet<Path
         }
     }
     gated
+}
+
+/// Resolve the *module source directory* that an external `mod <name>;`
+/// declared inside `file` resolves its children against, per Rust 2018 module
+/// resolution.
+///
+/// A directory owner — `mod.rs`, `lib.rs`, or `main.rs` — resolves `mod name;`
+/// to `<parent>/name.rs`, so its module source directory is its own parent. A
+/// flat file `<parent>/foo.rs` instead owns the subdirectory `<parent>/foo/`,
+/// resolving `mod name;` to `<parent>/foo/name.rs`. Resolving relative to
+/// `file.parent()` unconditionally (the old behaviour) misplaced children
+/// declared in flat files like `src/bpmn.rs` — looking for `src/name.rs` rather
+/// than `src/bpmn/name.rs` — which would leave a genuine test file in the
+/// production scan and produce a false layering failure.
+fn module_source_dir(file: &Path, src_root: &Path) -> PathBuf {
+    let parent = file.parent().unwrap_or(src_root);
+    match file.file_stem().and_then(|s| s.to_str()) {
+        Some("mod") | Some("lib") | Some("main") => parent.to_path_buf(),
+        Some(stem) => parent.join(stem),
+        None => parent.to_path_buf(),
+    }
 }
 
 /// Resolve an external `#[cfg(test)] mod <name>;` declared in `dir` to every
@@ -2027,5 +2050,48 @@ fn external_test_mod_gates_flat_file_and_its_submodules() {
     assert!(
         !gated.contains(&PathBuf::from("engine/testsuite.rs")),
         "a same-prefix but distinct sibling (`testsuite.rs`) was wrongly gated: {gated:?}"
+    );
+}
+
+/// An external `#[cfg(test)] mod name;` declared inside a *flat* module file
+/// such as `src/bpmn.rs` resolves its child to `src/bpmn/name.rs` — the
+/// subdirectory the flat file owns — not `src/name.rs`. Resolving against the
+/// declaring file's bare parent would look in the wrong directory, leaving the
+/// real test file scanned as production.
+#[test]
+fn module_source_dir_flat_file_owns_named_subdirectory() {
+    let src_root = Path::new("src");
+    let dir = module_source_dir(Path::new("src/bpmn.rs"), src_root);
+    assert_eq!(
+        dir,
+        PathBuf::from("src/bpmn"),
+        "a flat module file must resolve children under `<stem>/`: {dir:?}"
+    );
+    assert_eq!(
+        module_source_dir(Path::new("src/engine/state.rs"), src_root),
+        PathBuf::from("src/engine/state"),
+        "a nested flat module file must resolve children under its own `<stem>/`"
+    );
+}
+
+/// A directory owner — `mod.rs`, `lib.rs`, or `main.rs` — resolves `mod name;`
+/// to `<parent>/name.rs`, so its module source directory is its own parent.
+#[test]
+fn module_source_dir_directory_owner_uses_parent() {
+    let src_root = Path::new("src");
+    assert_eq!(
+        module_source_dir(Path::new("src/engine/mod.rs"), src_root),
+        PathBuf::from("src/engine"),
+        "`mod.rs` must resolve children in its own directory"
+    );
+    assert_eq!(
+        module_source_dir(Path::new("src/lib.rs"), src_root),
+        PathBuf::from("src"),
+        "`lib.rs` must resolve children in the crate root"
+    );
+    assert_eq!(
+        module_source_dir(Path::new("src/main.rs"), src_root),
+        PathBuf::from("src"),
+        "`main.rs` must resolve children in the crate root"
     );
 }
