@@ -846,7 +846,10 @@ fn parse_use_tree(b: &[u8], start: usize) -> (Vec<Vec<String>>, usize) {
 ///
 /// The use-tree after the root is parsed via [`parse_use_tree`], so brace
 /// use-trees (`use crate::{a::b, c}`) are expanded entry-by-entry and
-/// declarations wrapped across newlines are read as one unit. Every leaf whose
+/// declarations wrapped across newlines are read as one unit. A *root* brace
+/// group (`use {crate::a, self::b};`) is likewise expanded, each element rooted
+/// independently (via [`resolve_use_forest`]) so a backward edge cannot hide
+/// behind the leading brace. Every leaf whose
 /// resolved first segment is a top-level module (and is not the source module
 /// itself) becomes an edge. A leaf whose first segment is not a module (a
 /// crate-root re-export such as `use crate::Engine`) is not a module edge and
@@ -874,18 +877,15 @@ fn edges_in_source(
             search = kw_end;
             continue;
         }
-        let Some((base, tail)) = resolve_use_root(bytes, kw_end, module_path) else {
+        let Some((paths, end)) = resolve_use_forest(bytes, kw_end, module_path) else {
             search = kw_end;
             continue;
         };
-        let (paths, end) = parse_use_tree(bytes, tail);
         let lineno = 1 + cleaned[..kw_start]
             .bytes()
             .filter(|&byte| byte == b'\n')
             .count();
-        for path in paths {
-            let mut resolved = base.clone();
-            resolved.extend(path);
+        for resolved in paths {
             let Some(module) = resolved.first() else {
                 continue;
             };
@@ -944,6 +944,98 @@ fn resolve_use_root(b: &[u8], i: usize, module_path: &[String]) -> Option<(Vec<S
         }
         _ => None,
     }
+}
+
+/// Parse a full use-tree *including its root(s)* starting just after the `use`
+/// keyword, returning every leaf resolved to an absolute crate path plus the
+/// offset past the declaration. A bare root (`use crate::…`, `use self::…`) is
+/// resolved via [`resolve_use_root`] and its tail expanded by [`parse_use_tree`].
+/// A *root* brace group (`use {crate::a, self::b};`) is expanded element by
+/// element, each element re-entered through this function so its own root is
+/// resolved — otherwise the leading `{` reads as an empty identifier, the whole
+/// declaration is dropped, and a backward dependency hides inside the root
+/// group. An element with an external/malformed root contributes no paths but
+/// does not discard its siblings. Returns `None` only for a bare external or
+/// malformed root, so the caller skips just that declaration.
+fn resolve_use_forest(
+    b: &[u8],
+    i: usize,
+    module_path: &[String],
+) -> Option<(Vec<Vec<String>>, usize)> {
+    let i = skip_ws(b, i);
+    if i < b.len() && b[i] == b'{' {
+        let mut j = i + 1;
+        let mut out = Vec::new();
+        loop {
+            j = skip_ws(b, j);
+            if j >= b.len() {
+                break;
+            }
+            if b[j] == b'}' {
+                j += 1;
+                break;
+            }
+            let before = j;
+            match resolve_use_forest(b, j, module_path) {
+                Some((paths, nj)) => {
+                    out.extend(paths);
+                    j = nj;
+                }
+                // External/malformed element: skip it, keeping its siblings.
+                None => j = skip_use_element(b, j),
+            }
+            j = skip_ws(b, j);
+            if j < b.len() && b[j] == b',' {
+                j += 1;
+                continue;
+            }
+            if j < b.len() && b[j] == b'}' {
+                j += 1;
+                break;
+            }
+            // Malformed input or no forward progress — stop to guarantee
+            // termination rather than spin.
+            if j == before {
+                j += 1;
+            }
+            break;
+        }
+        return Some((out, j));
+    }
+    let (base, tail) = resolve_use_root(b, i, module_path)?;
+    let (paths, end) = parse_use_tree(b, tail);
+    let out = paths
+        .into_iter()
+        .map(|path| {
+            let mut full = base.clone();
+            full.extend(path);
+            full
+        })
+        .collect();
+    Some((out, end))
+}
+
+/// Advance past one element of a root brace group whose root is external or
+/// otherwise yields no edges, stopping just before the element's terminating
+/// top-level `,` or the group's closing `}` (nested `{…}` are skipped as a
+/// unit). Guarantees forward progress so the enclosing group scan cannot spin.
+fn skip_use_element(b: &[u8], mut i: usize) -> usize {
+    let mut depth = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    i
 }
 
 /// Collect the set of files gated by an external `#[cfg(test)] mod name;`
@@ -1654,5 +1746,73 @@ fn matches_visibility_qualified_external_test_mod() {
         src[..after].ends_with("tests"),
         "the external module name was misparsed: {:?}",
         &src[..after]
+    );
+}
+
+/// A *root* brace group (`use {crate::a, crate::b};`) — with no path before the
+/// `{` — must be expanded so every leaf is checked. The old scanner read an
+/// empty identifier at the leading `{`, resolved no root, and dropped the whole
+/// declaration, letting a backward dependency bypass the guard entirely.
+#[test]
+fn extracts_root_brace_use_tree_entries() {
+    let src = "use {crate::event::Event, crate::model::Thing};\n";
+    let edges = edges_of_source("feel", src);
+    assert!(
+        has_edge(&edges, "event"),
+        "a leaf of a root brace use-tree was ignored: {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, "model"),
+        "a second root brace use-tree leaf was ignored: {edges:?}"
+    );
+}
+
+/// A backward edge hidden in a root brace group must reach the real matcher —
+/// the whole point of expanding the root group. `event` importing `engine` via
+/// `use {crate::engine::Engine};` is a forbidden L3 -> L6 edge.
+#[test]
+fn root_brace_use_tree_backward_edge_is_rejected() {
+    let src = "use {crate::engine::Engine};\n";
+    let edges = edges_of_source("event", src);
+    let engine = edges
+        .iter()
+        .find(|e| e.tgt_module == "engine")
+        .expect("root-brace-wrapped backward edge should be extracted");
+    assert!(
+        edge_allowed(&engine.src_module, None, &engine.tgt_module, None).is_err(),
+        "a backward edge hidden in a root brace use-tree slipped past the matcher"
+    );
+}
+
+/// Each element of a root brace group is rooted independently, so `self`- and
+/// `super`-relative elements resolve against the file's own module path just as
+/// a bare relative import would — a backward edge cannot hide behind a mixed
+/// root group.
+#[test]
+fn root_brace_use_tree_resolves_relative_elements() {
+    // From `state/apply.rs`: `super::super::engine` climbs apply -> state ->
+    // crate root, so the second leaf is the forbidden `engine` edge.
+    let src = "use {self::helper::H, super::super::engine::Engine};\n";
+    let edges = edges_of_source_at(&["state", "apply"], src);
+    assert!(
+        edges.iter().any(|e| e.tgt_module == "engine"),
+        "a `super`-relative leaf of a root brace use-tree was lost: {edges:?}"
+    );
+}
+
+/// An external or crate-root-re-export element in a root brace group must be
+/// skipped without discarding its siblings — the group scan stays aligned past
+/// a `serde::…` element and still finds the following `crate::…` module leaf.
+#[test]
+fn root_brace_use_tree_skips_external_elements() {
+    let src = "use {serde::Serialize, crate::model::Thing};\n";
+    let edges = edges_of_source("feel", src);
+    assert!(
+        has_edge(&edges, "model"),
+        "a `crate::` leaf after an external root-group element was dropped: {edges:?}"
+    );
+    assert!(
+        !has_edge(&edges, "serde"),
+        "an external root-group element was mistaken for a module edge: {edges:?}"
     );
 }
