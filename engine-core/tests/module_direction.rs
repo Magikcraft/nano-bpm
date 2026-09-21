@@ -411,8 +411,8 @@ fn strip_inline_cfg_test_modules(src: &str) -> String {
 /// If a `#[cfg(<pred>)]` attribute whose predicate is *test-only* — it compiles
 /// its item only when the `test` configuration is enabled (`#[cfg(test)]`, but
 /// also compound spellings such as `#[cfg(all(test, feature = "serde"))]`) — is
-/// followed by `mod <name>`, return the byte offset just past `<name>`;
-/// otherwise `None`.
+/// followed by `mod <name>` (optionally behind a visibility modifier such as
+/// `pub(crate)`), return the byte offset just past `<name>`; otherwise `None`.
 ///
 /// Matching *any* test-only predicate (not just the exact `#[cfg(test)]`
 /// spelling) is required so test-only modules gated behind a feature — e.g. the
@@ -462,6 +462,43 @@ fn match_cfg_test_mod(bytes: &[u8], start: usize) -> Option<usize> {
     }
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
+    }
+    // Skip an optional visibility modifier between the attribute and `mod`.
+    // Valid Rust permits `#[cfg(test)] pub(crate) mod tests { … }` (and the
+    // external `#[cfg(test)] pub mod tests;` form); without this the test-only
+    // module — and its `use crate::…` imports — would leak into the layering
+    // scan as production dependencies.
+    let vis = b"pub";
+    if i + vis.len() <= bytes.len()
+        && &bytes[i..i + vis.len()] == vis
+        && (i + vis.len() >= bytes.len()
+            || !(bytes[i + vis.len()] == b'_' || bytes[i + vis.len()].is_ascii_alphanumeric()))
+    {
+        i += vis.len();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // Optional restriction `(crate)`, `(super)`, `(in path)`, …
+        if i < bytes.len() && bytes[i] == b'(' {
+            let mut depth = 0usize;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
     }
     let kw = b"mod";
     if i + kw.len() > bytes.len() || &bytes[i..i + kw.len()] != kw {
@@ -604,8 +641,21 @@ fn parse_cfg_pred(b: &[u8], mut i: usize) -> (CfgPred, usize) {
 }
 
 /// Read an identifier `[A-Za-z_][A-Za-z0-9_]*` starting at `i`; return the
-/// identifier and the offset just past it.
+/// identifier and the offset just past it. A leading raw-identifier prefix
+/// `r#` (e.g. `r#type`) is consumed and stripped from the returned name, so a
+/// raw alias like `use crate::{state::apply as r#type, engine::Engine}` no
+/// longer leaves `#type` unconsumed — which would stall the enclosing brace
+/// scan and silently drop every sibling after it (hiding a forbidden edge). The
+/// `r#"…"#` raw *string* form is excluded by requiring an identifier-start byte
+/// after `#` (sanitized source has already blanked string literals regardless).
 fn read_ident(bytes: &[u8], mut i: usize) -> (String, usize) {
+    if i + 2 < bytes.len()
+        && bytes[i] == b'r'
+        && bytes[i + 1] == b'#'
+        && (bytes[i + 2] == b'_' || bytes[i + 2].is_ascii_alphabetic())
+    {
+        i += 2;
+    }
     let start = i;
     if i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphabetic()) {
         i += 1;
@@ -1523,4 +1573,86 @@ fn module_of_derives_submodule_from_module_path() {
             "module_of({path:?}) misclassified"
         );
     }
+}
+
+/// A raw-identifier alias (`as r#type`) must be fully consumed so it cannot
+/// stall the enclosing brace group and drop the siblings after it. `event`
+/// importing `state` (aliased to the raw keyword `r#type`) *and* `engine` via
+/// `use crate::{state::apply as r#type, engine::Engine}` must still surface the
+/// backward `engine` edge hidden after the raw alias.
+#[test]
+fn raw_identifier_alias_does_not_drop_later_leaves() {
+    let src = "use crate::{state::apply as r#type, engine::Engine};\n";
+    let edges = edges_of_source("event", src);
+    assert!(
+        edges.iter().any(|e| e.tgt_module == "state"),
+        "the raw-aliased brace entry itself was lost: {edges:?}"
+    );
+    let engine = edges
+        .iter()
+        .find(|e| e.tgt_module == "engine")
+        .expect("the entry after a raw-identifier alias was silently dropped");
+    assert!(
+        edge_allowed(&engine.src_module, None, &engine.tgt_module, None).is_err(),
+        "a backward edge hidden after a raw-identifier alias slipped past"
+    );
+}
+
+/// A raw-identifier path segment (`crate::r#type::Thing`) names the module
+/// `type`; `read_ident` must strip the `r#` prefix so the edge resolves to the
+/// real module name rather than a spurious `r#type`.
+#[test]
+fn raw_identifier_path_segment_strips_prefix() {
+    let (segs, _) = parse_use_tree(b"r#state::apply::Thing;", 0);
+    assert_eq!(
+        segs,
+        vec![vec![
+            "state".to_string(),
+            "apply".to_string(),
+            "Thing".to_string()
+        ]],
+        "a raw-identifier path segment kept its `r#` prefix"
+    );
+}
+
+/// A test-only module carrying a visibility modifier — `#[cfg(test)] pub(crate)
+/// mod tests { … }` — is still test-only and must be stripped; without parsing
+/// the optional visibility prefix its `use crate::…` imports would leak into
+/// the layering scan as production dependencies.
+#[test]
+fn strips_visibility_qualified_test_modules() {
+    for vis in [
+        "pub ",
+        "pub(crate) ",
+        "pub(super) ",
+        "pub(in crate::state) ",
+    ] {
+        let src = format!(
+            "#[cfg(test)]\n{vis}mod tests {{\n    use crate::engine::X;\n}}\nuse crate::model::Y;\n"
+        );
+        let edges = edges_of_source("feel", &src);
+        assert!(
+            !has_edge(&edges, "engine"),
+            "a `#[cfg(test)] {vis}mod` leaked a test-only edge: {edges:?}"
+        );
+        assert!(
+            has_edge(&edges, "model"),
+            "stripping the `{vis}mod` test module swallowed real code after it: {edges:?}"
+        );
+    }
+}
+
+/// The external, visibility-qualified form `#[cfg(test)] pub mod name;` gates a
+/// whole file; `match_cfg_test_mod` must see past the `pub` so the declaration
+/// is recognised and its file collected as test-only.
+#[test]
+fn matches_visibility_qualified_external_test_mod() {
+    let src = "#[cfg(test)] pub mod tests;\n";
+    let after = match_cfg_test_mod(src.as_bytes(), 0)
+        .expect("a `#[cfg(test)] pub mod name;` declaration was not recognised");
+    assert!(
+        src[..after].ends_with("tests"),
+        "the external module name was misparsed: {:?}",
+        &src[..after]
+    );
 }
