@@ -3,9 +3,15 @@
 # journal recovery (`seglog::tests`, which live in the `nano-server-storage`
 # crate's lib test binary since the ADR 0064 Phase 1 extraction — the `test()`
 # predicate below matches them by name regardless of which test binary they are
-# in). They are timing sensitive: their fixed
+# in), or launch a real out-of-process JS-runtime trigger driver/worker and
+# assert its events reach the durable inbox over the real ingress within a
+# wall-clock poll budget (`triggers::tests::pack_driver_*` /
+# `pack_worker_*` in the `nano-server-console` crate). They are timing
+# sensitive: their fixed
 # replication/failover readiness budgets (e.g. "the create ships to node 1"
-# within 8s) assume the tokio runtime makes steady progress, which only holds if
+# within 8s) — and, for the pack driver/worker tests, the ~10s budget for a
+# spawned child runtime to boot and deliver its events — assume the tokio
+# runtime and the child process make steady progress, which only holds if
 # the process isn't starved of CPU.
 #
 # `max-threads = 1` (below) already stops these heavy tests from running
@@ -27,11 +33,13 @@
 # every multi-node cluster test (they all boot a 2-node cluster), not a stale
 # test name. A filter that matches nothing silently leaves those tests running
 # under ambient parallel load — the exact starvation flake this override exists
-# to prevent.
+# to prevent. The `pack_driver_`/`pack_worker_` predicates are scoped to
+# `triggers::tests::` so they match only those four out-of-process-launch tests,
+# not the many fast `*pack_*` logic tests elsewhere in the crate.
 [test-groups]
 serial-heavy = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary(cluster_e2e) or test(seglog::tests)'
+filter = 'binary(cluster_e2e) or test(seglog::tests) or test(triggers::tests::pack_driver_) or test(triggers::tests::pack_worker_)'
 test-group = 'serial-heavy'
 threads-required = 'num-test-threads'
