@@ -361,9 +361,10 @@ fn sanitize(src: &str) -> String {
 }
 
 /// Remove inline `#[cfg(test)] mod name { ... }` blocks (brace-balanced),
-/// replacing them with blank lines. Any `test`-bearing cfg predicate counts
+/// replacing them with blank lines. Any *test-only* cfg predicate counts
 /// (e.g. `#[cfg(all(test, feature = "serde"))]`), matched by
-/// [`match_cfg_test_mod`]. External `#[cfg(test)] mod name;` declarations are
+/// [`match_cfg_test_mod`]; production-enabling predicates like `#[cfg(not(test))]`
+/// are left in place. External `#[cfg(test)] mod name;` declarations are
 /// handled separately (they gate a whole file).
 fn strip_inline_cfg_test_modules(src: &str) -> String {
     let bytes = src.as_bytes();
@@ -407,18 +408,22 @@ fn strip_inline_cfg_test_modules(src: &str) -> String {
     out
 }
 
-/// If a `#[cfg(<pred>)]` attribute whose predicate mentions the `test`
-/// configuration — `#[cfg(test)]`, but also compound spellings such as
-/// `#[cfg(all(test, feature = "serde"))]` — is followed by `mod <name>`,
-/// return the byte offset just past `<name>`; otherwise `None`.
+/// If a `#[cfg(<pred>)]` attribute whose predicate is *test-only* — it compiles
+/// its item only when the `test` configuration is enabled (`#[cfg(test)]`, but
+/// also compound spellings such as `#[cfg(all(test, feature = "serde"))]`) — is
+/// followed by `mod <name>`, return the byte offset just past `<name>`;
+/// otherwise `None`.
 ///
-/// Matching *any* `test`-bearing predicate (not just the exact `#[cfg(test)]`
+/// Matching *any* test-only predicate (not just the exact `#[cfg(test)]`
 /// spelling) is required so test-only modules gated behind a feature — e.g. the
 /// `#[cfg(all(test, feature = "serde"))]` replay-compat modules in `event.rs`
 /// and `state/apply.rs` — are stripped too; otherwise their `use crate::…`
-/// statements would be scanned as production layering edges. Callers pass
-/// sanitized source, so a `test` substring inside a string literal (e.g.
-/// `feature = "test-utils"`) has already been blanked and cannot false-match.
+/// statements would be scanned as production layering edges. Test-only-ness is
+/// decided by [`cfg_predicate_is_test_only`], so production-enabling predicates
+/// such as `#[cfg(not(test))]` or `#[cfg(any(test, feature = "…"))]` are NOT
+/// stripped and keep their imports visible. Callers pass sanitized source, so a
+/// `test` substring inside a string literal (e.g. `feature = "test-utils"`) has
+/// already been blanked and cannot false-match.
 fn match_cfg_test_mod(bytes: &[u8], start: usize) -> Option<usize> {
     let open = b"#[cfg(";
     if start + open.len() > bytes.len() || &bytes[start..start + open.len()] != open {
@@ -452,7 +457,7 @@ fn match_cfg_test_mod(bytes: &[u8], start: usize) -> Option<usize> {
         return None;
     }
     i += 1;
-    if !cfg_predicate_has_test(&bytes[pred_start..pred_end]) {
+    if !cfg_predicate_is_test_only(&bytes[pred_start..pred_end]) {
         return None;
     }
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -480,26 +485,122 @@ fn match_cfg_test_mod(bytes: &[u8], start: usize) -> Option<usize> {
     Some(i)
 }
 
-/// Does a `cfg` predicate mention the `test` configuration as a whole word?
-/// `test` must appear on an identifier boundary so predicates like
-/// `feature = "attestation"` (already blanked to spaces by `sanitize`, but
-/// guarded regardless) or an unrelated `latest` cfg key cannot false-match.
-fn cfg_predicate_has_test(pred: &[u8]) -> bool {
-    let needle = b"test";
-    let mut i = 0;
-    while i + needle.len() <= pred.len() {
-        if &pred[i..i + needle.len()] == needle {
-            let before_ok = i == 0 || !(pred[i - 1] == b'_' || pred[i - 1].is_ascii_alphanumeric());
-            let after = i + needle.len();
-            let after_ok = after >= pred.len()
-                || !(pred[after] == b'_' || pred[after].is_ascii_alphanumeric());
-            if before_ok && after_ok {
-                return true;
+/// Does a `cfg` predicate compile its item *only* when the `test`
+/// configuration is enabled? Returns true iff the predicate is unsatisfiable
+/// whenever `test` is off — i.e. it *implies* `test`, so the module/file is
+/// genuinely test-only and safe to strip before layering analysis. `test`,
+/// `all(test, …)`, and nestings thereof qualify. Production-enabling predicates
+/// that compile even without `test` — `not(test)`, `any(test, feature = "…")`,
+/// or a plain non-test atom — do NOT, and are deliberately left in place so
+/// their imports are still scanned as real layering edges. Non-`test` atoms
+/// (`feature = "…"`, `unix`, unknown functions) are treated as independently
+/// free, which keeps the decision conservative: an item is stripped only when
+/// *no* non-test configuration can enable it.
+fn cfg_predicate_is_test_only(pred: &[u8]) -> bool {
+    let (node, _) = parse_cfg_pred(pred, 0);
+    !node.can_be_true_without_test()
+}
+
+/// A parsed `cfg(...)` predicate over the boolean atoms `test`, `feature = "…"`,
+/// `unix`, etc., combined with `all`/`any`/`not`.
+enum CfgPred {
+    /// A leaf config atom; `is_test` marks the `test` configuration specifically.
+    Atom {
+        is_test: bool,
+    },
+    Not(Box<CfgPred>),
+    All(Vec<CfgPred>),
+    Any(Vec<CfgPred>),
+}
+
+impl CfgPred {
+    /// Can this predicate be satisfied in some configuration where `test` is
+    /// off? The `test` atom is pinned false; every other atom is treated as an
+    /// independent free variable (over-approximating satisfiability, so we err
+    /// toward *not* stripping).
+    fn can_be_true_without_test(&self) -> bool {
+        match self {
+            CfgPred::Atom { is_test } => !is_test,
+            CfgPred::Not(p) => p.can_be_false_without_test(),
+            CfgPred::All(ps) => ps.iter().all(CfgPred::can_be_true_without_test),
+            CfgPred::Any(ps) => ps.iter().any(CfgPred::can_be_true_without_test),
+        }
+    }
+
+    /// Dual of [`can_be_true_without_test`]: can the predicate evaluate false in
+    /// some configuration where `test` is off?
+    fn can_be_false_without_test(&self) -> bool {
+        match self {
+            CfgPred::Atom { .. } => true,
+            CfgPred::Not(p) => p.can_be_true_without_test(),
+            CfgPred::All(ps) => ps.iter().any(CfgPred::can_be_false_without_test),
+            CfgPred::Any(ps) => ps.iter().all(CfgPred::can_be_false_without_test),
+        }
+    }
+}
+
+/// Recursive-descent parse of a `cfg` predicate body (the text inside the outer
+/// `cfg(...)`). `all`/`any`/`not` become the matching combinators; anything
+/// else is an atom — its identifier decides `is_test`, and a trailing
+/// `= "value"` (already blanked by `sanitize`) is skipped. Malformed input
+/// degrades to a free non-test atom rather than panicking.
+fn parse_cfg_pred(b: &[u8], mut i: usize) -> (CfgPred, usize) {
+    i = skip_ws(b, i);
+    let (ident, j) = read_ident(b, i);
+    i = skip_ws(b, j);
+    if i < b.len() && b[i] == b'(' {
+        i += 1; // consume '('
+        let mut children = Vec::new();
+        loop {
+            i = skip_ws(b, i);
+            if i >= b.len() || b[i] == b')' {
+                if i < b.len() {
+                    i += 1; // consume ')'
+                }
+                break;
+            }
+            let (child, k) = parse_cfg_pred(b, i);
+            children.push(child);
+            i = skip_ws(b, k);
+            if i < b.len() && b[i] == b',' {
+                i += 1;
+                continue;
+            }
+            if i < b.len() && b[i] == b')' {
+                i += 1;
+                break;
+            }
+            break; // malformed
+        }
+        let node = match ident.as_str() {
+            "not" => CfgPred::Not(Box::new(
+                children
+                    .into_iter()
+                    .next()
+                    .unwrap_or(CfgPred::Atom { is_test: false }),
+            )),
+            "all" => CfgPred::All(children),
+            "any" => CfgPred::Any(children),
+            // Unknown predicate function (e.g. `target_has_atomic("ptr")`): a
+            // non-test config, so treat the whole thing as a free atom.
+            _ => CfgPred::Atom { is_test: false },
+        };
+        (node, i)
+    } else {
+        // Plain atom, optionally `ident = "value"`; only the identifier matters.
+        if i < b.len() && b[i] == b'=' {
+            i += 1;
+            while i < b.len() && b[i] != b',' && b[i] != b')' {
+                i += 1;
             }
         }
-        i += 1;
+        (
+            CfgPred::Atom {
+                is_test: ident == "test",
+            },
+            i,
+        )
     }
-    false
 }
 
 /// Read an identifier `[A-Za-z_][A-Za-z0-9_]*` starting at `i`; return the
@@ -516,7 +617,10 @@ fn read_ident(bytes: &[u8], mut i: usize) -> (String, usize) {
 }
 
 /// Map a source file path (relative to `src/`) to its top-level module and, for
-/// directory modules, its sub-module (file stem, or `mod` for `mod.rs`).
+/// directory modules, its sub-module. The sub-module is the *first* child
+/// component of the Rust module path — `state/apply.rs`, `state/apply/mod.rs`,
+/// and `state/apply/<family>.rs` all map to `state::apply` — while `state/mod.rs`
+/// maps to the module root (`None`).
 fn module_of(rel: &Path) -> (String, Option<String>) {
     let comps: Vec<String> = rel
         .components()
@@ -528,9 +632,20 @@ fn module_of(rel: &Path) -> (String, Option<String>) {
         (stem, None)
     } else {
         let module = comps[0].clone();
-        let last = comps[comps.len() - 1].trim_end_matches(".rs");
-        let sub = last.to_string();
-        (module, Some(sub))
+        // Derive the sub-module from the FIRST child component so the Rust
+        // module path — not the on-disk filename — drives classification. A
+        // directory sub-module `state/apply/…` (whether it lands as
+        // `state/apply/mod.rs` or a `state/apply/<family>.rs` split) then still
+        // classifies as `state::apply`, keeping its `state::apply -> event`
+        // exception; and `state/mod.rs` collapses to the module root (`None`)
+        // rather than a spurious `state::mod`.
+        let child = comps[1].trim_end_matches(".rs");
+        let sub = if child == "mod" {
+            None
+        } else {
+            Some(child.to_string())
+        };
+        (module, sub)
     }
 }
 
@@ -1326,4 +1441,86 @@ fn cfg_containing_test_substring_is_not_stripped() {
         has_edge(&edges, "engine") && has_edge(&edges, "model"),
         "a `latest` cfg key was mis-read as `test` and its module stripped: {edges:?}"
     );
+}
+
+/// A production `cfg` predicate that merely *mentions* `test` — `not(test)` or
+/// `any(test, …)` compiles the item WITHOUT the test config — must NOT be
+/// stripped, or a forbidden layering edge inside it would silently bypass the
+/// guard. Only predicates that *imply* `test` are test-only.
+#[test]
+fn production_cfg_predicates_mentioning_test_are_not_stripped() {
+    for pred in ["not(test)", "any(test, feature = \"serde\")"] {
+        let src = format!(
+            "#[cfg({pred})]\nmod prod {{\n    use crate::engine::X;\n}}\nuse crate::model::Y;\n"
+        );
+        let edges = edges_of_source("feel", &src);
+        assert!(
+            has_edge(&edges, "engine"),
+            "production `#[cfg({pred})]` module was wrongly stripped, hiding its edge: {edges:?}"
+        );
+        assert!(
+            has_edge(&edges, "model"),
+            "stripping the `#[cfg({pred})]` module swallowed real code after it: {edges:?}"
+        );
+    }
+}
+
+/// `cfg_predicate_is_test_only` classifies predicates by whether they imply the
+/// `test` configuration, not by a bare substring match: `test` / `all(test, …)`
+/// (any nesting) are test-only; `not(test)`, `any(test, …)`, a plain feature
+/// atom, and `latest` are not.
+#[test]
+fn cfg_predicate_test_only_classification() {
+    let test_only = [
+        "test",
+        "all(test, feature = \"serde\")",
+        "all(feature = \"x\", test)",
+        "any(all(test, unix), all(test, windows))",
+        "all(test, not(feature = \"x\"))",
+    ];
+    for p in test_only {
+        assert!(
+            cfg_predicate_is_test_only(p.as_bytes()),
+            "`{p}` should be classified test-only"
+        );
+    }
+    let not_test_only = [
+        "not(test)",
+        "any(test, feature = \"serde\")",
+        "feature = \"serde\"",
+        "unix",
+        "feature = latest",
+        "all(feature = \"a\", feature = \"b\")",
+    ];
+    for p in not_test_only {
+        assert!(
+            !cfg_predicate_is_test_only(p.as_bytes()),
+            "`{p}` should NOT be classified test-only"
+        );
+    }
+}
+
+/// `module_of` derives the sub-module from the Rust module path's first child
+/// component, so the anticipated `state` split into directory sub-modules
+/// (`state/apply/mod.rs`, `state/apply/<family>.rs`) still classifies as
+/// `state::apply` and keeps its `state::apply -> event` exception — while
+/// `state/mod.rs` collapses to the module root.
+#[test]
+fn module_of_derives_submodule_from_module_path() {
+    let cases: &[(&str, &str, Option<&str>)] = &[
+        ("event.rs", "event", None),
+        ("state/mod.rs", "state", None),
+        ("state/apply.rs", "state", Some("apply")),
+        ("state/apply/mod.rs", "state", Some("apply")),
+        ("state/apply/transitions.rs", "state", Some("apply")),
+        ("state/types.rs", "state", Some("types")),
+    ];
+    for (path, module, sub) in cases {
+        let (m, s) = module_of(Path::new(path));
+        assert_eq!(
+            (m.as_str(), s.as_deref()),
+            (*module, *sub),
+            "module_of({path:?}) misclassified"
+        );
+    }
 }
