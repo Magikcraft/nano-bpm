@@ -1,0 +1,972 @@
+//! `migration` engine tests (slice 7 of #1201), extracted verbatim.
+use super::*;
+
+#[test]
+fn modify_terminates_one_element_and_activates_another() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(two_service_tasks()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("two"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Token parked on service task `a`.
+    let a_eik = active_eik_of(&engine, inst, "a");
+    let job_a = engine
+        .state()
+        .jobs
+        .values()
+        .find(|j| j.instance_key == inst)
+        .unwrap()
+        .key;
+
+    let events = engine
+        .apply_command(Command::modify_instance(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "b".into(),
+                variables: HashMap::new(),
+            }],
+            vec![a_eik],
+        ))
+        .unwrap();
+
+    // `a`'s job is cancelled and its element instance completed.
+    assert!(events.contains(&Event::JobCanceled {
+        job_key: job_a,
+        instance_key: inst,
+    }));
+    assert_eq!(engine.job(job_a).unwrap().state, state::JobState::Canceled);
+    // The instance stays active, now with a token (and fresh job) on `b`.
+    assert_eq!(
+        engine.instance(inst).unwrap().state,
+        ProcessInstanceState::Active
+    );
+    assert!(engine
+        .instance(inst)
+        .unwrap()
+        .active
+        .values()
+        .any(|id| id.as_str() == "b"));
+    assert!(engine
+        .state()
+        .jobs
+        .values()
+        .any(|j| j.instance_key == inst && j.state == state::JobState::Created));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+}
+
+#[test]
+fn modify_terminating_the_last_token_terminates_the_instance() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let charge_eik = active_eik_of(&engine, inst, "charge");
+    let job = engine
+        .state()
+        .jobs
+        .values()
+        .find(|j| j.instance_key == inst)
+        .unwrap()
+        .key;
+
+    let events = engine
+        .apply_command(Command::modify_instance(inst, vec![], vec![charge_eik]))
+        .unwrap();
+
+    // The token's job is cancelled and the instance is terminated (not
+    // auto-completed) since nothing was activated to replace the last token.
+    assert!(events.contains(&Event::JobCanceled {
+        job_key: job,
+        instance_key: inst,
+    }));
+    assert!(events.contains(&Event::ProcessInstanceTerminated { instance_key: inst }));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
+    assert_eq!(
+        engine.instance(inst).unwrap().state,
+        ProcessInstanceState::Terminated
+    );
+    assert!(engine.instance(inst).unwrap().active.is_empty());
+}
+
+#[test]
+fn modify_activating_an_element_merges_global_variables() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(two_service_tasks()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("two"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let a_eik = active_eik_of(&engine, inst, "a");
+
+    let mut vars = HashMap::new();
+    vars.insert("approved".to_string(), Value::Bool(true));
+    let events = engine
+        .apply_command(Command::modify_instance(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "b".into(),
+                variables: vars,
+            }],
+            vec![a_eik],
+        ))
+        .unwrap();
+
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::VariablesUpdated { instance_key, variables }
+            if *instance_key == inst && variables.get("approved") == Some(&Value::Bool(true))
+    )));
+    assert_eq!(
+        engine.instance(inst).unwrap().variables.get("approved"),
+        Some(&Value::Bool(true))
+    );
+}
+
+#[test]
+fn modify_rejects_unknown_instance_and_element_ids() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(two_service_tasks()))
+        .unwrap();
+
+    // Unknown instance.
+    assert_eq!(
+        engine.apply_command(Command::modify_instance(999, vec![], vec![])),
+        Err(EngineError::InstanceNotFound { instance_key: 999 })
+    );
+
+    let inst = engine
+        .apply_command(Command::create_instance("two"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let a_eik = active_eik_of(&engine, inst, "a");
+
+    // Unknown activate element id — rejected, leaving the instance untouched.
+    assert_eq!(
+        engine.apply_command(Command::modify_instance(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "nope".into(),
+                variables: HashMap::new(),
+            }],
+            vec![],
+        )),
+        Err(EngineError::ElementNotFound {
+            instance_key: inst,
+            element_id: "nope".into(),
+        })
+    );
+
+    // Unknown terminate element-instance key.
+    assert_eq!(
+        engine.apply_command(Command::modify_instance(inst, vec![], vec![424242])),
+        Err(EngineError::ElementInstanceNotFound {
+            instance_key: inst,
+            element_instance_key: 424242,
+        })
+    );
+
+    // The rejected commands changed nothing: the token is still on `a`.
+    assert_eq!(active_eik_of(&engine, inst, "a"), a_eik);
+}
+
+#[test]
+fn modify_survives_replay() {
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    log.extend(
+        engine
+            .apply_command(Command::DeployProcess(two_service_tasks()))
+            .unwrap(),
+    );
+    let inst = {
+        let events = engine
+            .apply_command(Command::create_instance("two"))
+            .unwrap();
+        let k = events.iter().find_map(|e| e.instance_key()).unwrap();
+        log.extend(events);
+        k
+    };
+    let a_eik = active_eik_of(&engine, inst, "a");
+    log.extend(
+        engine
+            .apply_command(Command::modify_instance(
+                inst,
+                vec![ActivateElementInstruction {
+                    element_id: "b".into(),
+                    variables: HashMap::new(),
+                }],
+                vec![a_eik],
+            ))
+            .unwrap(),
+    );
+
+    let recovered = Engine::replay(log);
+    assert_eq!(
+        recovered.instance(inst).unwrap().state,
+        ProcessInstanceState::Active
+    );
+    assert!(recovered
+        .instance(inst)
+        .unwrap()
+        .active
+        .values()
+        .any(|id| id.as_str() == "b"));
+}
+
+#[test]
+fn migration_remaps_active_service_task_and_its_job() {
+    // A token parked on service task `a` of `source` is migrated to `b` of
+    // `target`: the instance now belongs to `target`, its active element and its
+    // pending job are re-pointed at `b`, and the job keeps its type.
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+
+    let inst = create_instance_key(&mut engine, "source");
+    assert_eq!(pending_job_element(&engine, inst), "a");
+
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceMigrated { .. })),
+        "a ProcessInstanceMigrated fact is emitted"
+    );
+
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(
+        instance.process_id, "target",
+        "instance re-homed to target id"
+    );
+    assert_eq!(
+        instance.process_definition_key, target_key,
+        "instance re-pinned to the target definition version, so `definition_for` \
+         resolves execution against the migrated-to model, not the source"
+    );
+    assert!(
+        instance.active.values().any(|e| e == "b"),
+        "active token re-pointed at target element b"
+    );
+    assert!(
+        !instance.active.values().any(|e| e == "a"),
+        "no active token still points at source element a"
+    );
+    assert_eq!(
+        pending_job_element(&engine, inst),
+        "b",
+        "the pending job is re-pointed at b"
+    );
+
+    // The in-flight count moved from source to target.
+    assert_eq!(
+        engine.state().inflight_by_process.get("source").copied(),
+        None,
+        "source has no live instances"
+    );
+    assert_eq!(
+        engine.state().inflight_by_process.get("target").copied(),
+        Some(1),
+        "target has one live instance"
+    );
+}
+
+#[test]
+fn migration_completes_via_remapped_job() {
+    // After migrating, completing the (re-pointed) job drives the token to the
+    // TARGET's end event, so the instance completes cleanly under its new
+    // definition — proving the remap is executable, not cosmetic.
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap();
+
+    let job = engine
+        .activate_jobs("work", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.instance_key == inst)
+        .unwrap();
+    assert_eq!(job.element_id, "b");
+    engine
+        .apply_command(Command::complete_job(job.key))
+        .unwrap();
+
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(
+        instance.state,
+        crate::state::ProcessInstanceState::Completed,
+        "instance completed through the target's end event"
+    );
+}
+
+/// A `par` process `s -> split =< a, b >= join -> e` whose branch `a` has
+/// already reached the join (so the join is half-open) while branch `b` is
+/// still parked, migrated to an identically-shaped `target` with renamed
+/// elements. Both `join_counts` and `join_instances` are keyed by the join
+/// gateway's element id, so the applier must remap them *together*; a regression
+/// that remapped only `join_counts` left `join_instances` pointing at the source
+/// id, desyncing `join_eik` from `join_count` after migration.
+#[test]
+fn migration_remaps_both_parallel_join_maps_together() {
+    fn par_join_process(id: &str, split: &str, a: &str, b: &str, join: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .parallel_gateway(split)
+            .service_task(a, "ja")
+            .service_task(b, "jb")
+            .parallel_gateway(join)
+            .end_event("e")
+            .connect("s", split)
+            .connect(split, a)
+            .connect(split, b)
+            .connect(a, join)
+            .connect(b, join)
+            .connect(join, "e")
+            .build()
+            .unwrap()
+    }
+
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        par_join_process("source", "split", "a", "b", "join"),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        par_join_process("target", "split2", "a2", "b2", "join2"),
+    );
+
+    let inst = create_instance_key(&mut engine, "source");
+    // Drive branch `a` into the join so it opens and waits for branch `b`.
+    complete_one(&mut engine, "ja");
+
+    let instance = engine.instance(inst).unwrap();
+    assert!(
+        instance.join_instances.contains_key("join"),
+        "the join is half-open on the source id before migration"
+    );
+    assert_eq!(
+        instance.join_counts.get("join").copied(),
+        Some(1),
+        "one branch has arrived at the join before migration"
+    );
+
+    // Active elements at this point: the parked task `b` and the open `join`.
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("b".to_string(), "b2".to_string()),
+                ("join".to_string(), "join2".to_string()),
+            ],
+        ))
+        .unwrap();
+
+    let instance = engine.instance(inst).unwrap();
+    assert!(
+        instance.join_counts.contains_key("join2") && !instance.join_counts.contains_key("join"),
+        "join_counts re-keyed onto the target join id"
+    );
+    assert!(
+        instance.join_instances.contains_key("join2")
+            && !instance.join_instances.contains_key("join"),
+        "join_instances re-keyed onto the target join id (kept in sync with join_counts)"
+    );
+    assert_eq!(
+        instance.join_counts.get("join2").copied(),
+        Some(1),
+        "the arrival count survives the remap"
+    );
+
+    // Executable proof: completing the remaining branch fires the join once and
+    // the instance completes cleanly under the target definition.
+    complete_one(&mut engine, "jb");
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(
+        instance.state,
+        crate::state::ProcessInstanceState::Completed,
+        "the remapped join fires and the instance completes under the target"
+    );
+}
+
+/// An already-*open* parallel join (branch `a` has arrived, so a partial count
+/// of 1 is durably recorded) cannot be migrated onto a target join with a
+/// *different* number of incoming flows: the partial count is compared against
+/// the target definition's incoming-flow count at fire time, so a 2-flow join
+/// half-open at count 1, remapped onto a 3-flow join, would deadlock (its third
+/// flow never arrives) — and a wider-to-narrower remap would early-fire.
+/// Reject with `MigratedParallelJoinArityChanged`. Red/Green guard for the
+/// failure-mode class "durable count state whose threshold lives in the
+/// definition being migrated away".
+#[test]
+fn migration_rejects_open_join_with_different_incoming_arity() {
+    fn par_join_2(id: &str, split: &str, a: &str, b: &str, join: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .parallel_gateway(split)
+            .service_task(a, "ja")
+            .service_task(b, "jb")
+            .parallel_gateway(join)
+            .end_event("e")
+            .connect("s", split)
+            .connect(split, a)
+            .connect(split, b)
+            .connect(a, join)
+            .connect(b, join)
+            .connect(join, "e")
+            .build()
+            .unwrap()
+    }
+    // Target join `join2` has THREE incoming flows, versus the source's two.
+    fn par_join_3(id: &str, split: &str, join: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .parallel_gateway(split)
+            .service_task("a2", "ja")
+            .service_task("b2", "jb")
+            .service_task("c2", "jc")
+            .parallel_gateway(join)
+            .end_event("e")
+            .connect("s", split)
+            .connect(split, "a2")
+            .connect(split, "b2")
+            .connect(split, "c2")
+            .connect("a2", join)
+            .connect("b2", join)
+            .connect("c2", join)
+            .connect(join, "e")
+            .build()
+            .unwrap()
+    }
+
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, par_join_2("source", "split", "a", "b", "join"));
+    let target_key = deploy_for_migration(&mut engine, par_join_3("target", "split2", "join2"));
+
+    let inst = create_instance_key(&mut engine, "source");
+    // Open the join: branch `a` arrives, leaving the join half-open at count 1.
+    complete_one(&mut engine, "ja");
+    let instance = engine.instance(inst).unwrap();
+    assert!(
+        instance.join_instances.contains_key("join"),
+        "precondition: the join is open before migration"
+    );
+
+    // Active elements now: parked task `b` and the open `join`. Map both, but
+    // point the open join at the 3-flow target join.
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("b".to_string(), "b2".to_string()),
+                ("join".to_string(), "join2".to_string()),
+            ],
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            EngineError::MigratedParallelJoinArityChanged {
+                source_element_id,
+                target_element_id,
+                source_incoming_count: 2,
+                target_incoming_count: 3,
+                ..
+            } if source_element_id == "join" && target_element_id == "join2"
+        ),
+        "an open 2-flow join mapped onto a 3-flow join is rejected, got {err:?}"
+    );
+
+    // The rejection is all-or-nothing: the instance is untouched (still on the
+    // source definition, join still open on the source id).
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(instance.process_id, "source", "instance not migrated");
+    assert!(
+        instance.join_instances.contains_key("join"),
+        "the open join is left intact on the source id"
+    );
+}
+
+/// An **inclusive**-gateway join reuses the same `join_instances` bookkeeping as
+/// a parallel join, but it fires on token *quiescence/reachability*
+/// (`fire_ready_inclusive_joins`), never by comparing a durable arrival count
+/// against the definition's incoming-flow count. So the arity-parity restriction
+/// that guards parallel joins must **not** apply to it: an open inclusive join
+/// remapped onto a target join with a *different* incoming arity is perfectly
+/// compatible and must migrate. Red/Green guard that the new element (#1168)
+/// did not silently inherit `MigratedParallelJoinArityChanged` by sharing the
+/// join maps.
+#[test]
+fn migration_allows_open_inclusive_join_with_different_incoming_arity() {
+    fn inc_join_2(id: &str, split: &str, a: &str, b: &str, join: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .inclusive_gateway(split)
+            .service_task(a, "ja")
+            .service_task(b, "jb")
+            .inclusive_gateway(join)
+            .end_event("e")
+            .connect("s", split)
+            .connect(split, a)
+            .connect(split, b)
+            .connect(a, join)
+            .connect(b, join)
+            .connect(join, "e")
+            .build()
+            .unwrap()
+    }
+    // Target inclusive join `join2` has THREE incoming flows, versus the two of
+    // the source — an arity change that would reject a *parallel* join.
+    fn inc_join_3(id: &str, split: &str, join: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .inclusive_gateway(split)
+            .service_task("a2", "ja")
+            .service_task("b2", "jb")
+            .service_task("c2", "jc")
+            .inclusive_gateway(join)
+            .end_event("e")
+            .connect("s", split)
+            .connect(split, "a2")
+            .connect(split, "b2")
+            .connect(split, "c2")
+            .connect("a2", join)
+            .connect("b2", join)
+            .connect("c2", join)
+            .connect(join, "e")
+            .build()
+            .unwrap()
+    }
+
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, inc_join_2("source", "split", "a", "b", "join"));
+    let target_key = deploy_for_migration(&mut engine, inc_join_3("target", "split2", "join2"));
+
+    let inst = create_instance_key(&mut engine, "source");
+    // Open the join: branch `a` arrives, leaving it half-open (branch `b` still
+    // parked and able to reach the join, so it has not fired).
+    complete_one(&mut engine, "ja");
+    let instance = engine.instance(inst).unwrap();
+    assert!(
+        instance.join_instances.contains_key("join"),
+        "precondition: the inclusive join is open before migration"
+    );
+
+    // Map the parked branch `b` and the open join onto the 3-flow target join.
+    // Unlike a parallel join, the arity change must be accepted.
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("b".to_string(), "b2".to_string()),
+                ("join".to_string(), "join2".to_string()),
+            ],
+        ))
+        .expect("an open inclusive join tolerates an incoming-arity change on migration");
+
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(instance.process_id, "target", "instance migrated");
+    assert!(
+        instance.join_instances.contains_key("join2"),
+        "the open inclusive join is re-pointed at the target id"
+    );
+
+    // The migrated instance still drives to completion: the parked branch `b`
+    // (now `b2`) finishes and the inclusive join synchronises and completes.
+    complete_one(&mut engine, "jb");
+    assert!(
+        engine.is_completed(inst),
+        "the migrated inclusive join synchronises its branches and completes"
+    );
+}
+
+#[test]
+fn migration_rejects_unknown_instance() {
+    let mut engine = Engine::new();
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            999,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::InstanceNotFound { instance_key: 999 }
+    ));
+}
+
+#[test]
+fn migration_rejects_unknown_target_definition() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            424_242,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::TargetProcessDefinitionNotFound {
+            process_definition_key: 424_242
+        }
+    ));
+}
+
+#[test]
+fn migration_rejects_duplicate_source_mapping() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("a".to_string(), "b".to_string()),
+                ("a".to_string(), "b".to_string()),
+            ],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::DuplicateMappingSourceElement { element_id, .. } if element_id == "a"
+    ));
+}
+
+#[test]
+fn migration_rejects_unknown_source_element() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("nope".to_string(), "b".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::MappingSourceElementNotFound { element_id, .. } if element_id == "nope"
+    ));
+}
+
+#[test]
+fn migration_rejects_unknown_target_element() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("a".to_string(), "nope".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::MappingTargetElementNotFound { element_id, .. } if element_id == "nope"
+    ));
+}
+
+#[test]
+fn migration_rejects_unmapped_active_element() {
+    // No mapping for the active service task `a` → the active token would be
+    // orphaned, so migration is rejected (Zeebe 409 parity).
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(inst, target_key, vec![]))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::UnmappedActiveElement { element_id, .. } if element_id == "a"
+    ));
+}
+
+#[test]
+fn migration_rejects_type_change() {
+    // Mapping the active service task to a user task changes the element type →
+    // rejected (Zeebe 409 parity).
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key = deploy_for_migration(
+        &mut engine,
+        ProcessBuilder::new("target")
+            .start_event("start")
+            .user_task("b")
+            .end_event("end")
+            .connect("start", "b")
+            .connect("b", "end")
+            .build()
+            .unwrap(),
+    );
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::MappedElementTypeChanged {
+            source_element_id,
+            target_element_id,
+            ..
+        } if source_element_id == "a" && target_element_id == "b"
+    ));
+}
+
+#[test]
+fn migration_rejects_unsupported_boundary_event() {
+    // The active service task carries an armed interrupting timer boundary event.
+    // Boundary events are not migratable in this phase (Zeebe rejects several
+    // such cases as "not supported yet") → rejected.
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        ProcessBuilder::new("source")
+            .start_event("start")
+            .service_task("a", "work")
+            .timer_boundary_event("boundary", "a", 60_000)
+            .end_event("end")
+            .end_event("caught")
+            .connect("start", "a")
+            .connect("a", "end")
+            .connect("boundary", "caught")
+            .build()
+            .unwrap(),
+    );
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::UnsupportedMigration { element_id, .. } if element_id == "boundary"
+    ));
+}
+
+#[test]
+fn unsupported_migration_reason_covers_every_reactive_boundary_kind() {
+    // Defect-class guard (#1173): every *reactive* boundary-event kind (one that
+    // can be armed on a still-active scope and fire during flow) must be rejected
+    // by the migration phase — "boundary events are not migratable yet". The
+    // escalation boundary was added to join reachability yet was initially
+    // omitted from `unsupported_migration_reason`; enumerate the whole class so a
+    // future boundary type cannot silently become "migratable" by omission.
+    // (`CompensationBoundaryEvent` is intentionally excluded — it is a passive
+    // marker that never fires reactively, so it is not in this guard.)
+    use crate::model::ElementKind;
+    let boundaries = [
+        ElementKind::ErrorBoundaryEvent {
+            attached_to: "host".to_string(),
+            error_code: "E".to_string(),
+        },
+        ElementKind::TimerBoundaryEvent {
+            attached_to: "host".to_string(),
+            duration_millis: 1_000,
+            interrupting: true,
+            repeating: false,
+        },
+        ElementKind::MessageBoundaryEvent {
+            attached_to: "host".to_string(),
+            message_name: "M".to_string(),
+            correlation_key: "k".to_string(),
+            interrupting: true,
+        },
+        ElementKind::SignalBoundaryEvent {
+            attached_to: "host".to_string(),
+            signal_name: "S".to_string(),
+            interrupting: true,
+        },
+        ElementKind::ConditionalBoundaryEvent {
+            attached_to: "host".to_string(),
+            condition: "=true".to_string(),
+            interrupting: true,
+        },
+        ElementKind::EscalationBoundaryEvent {
+            attached_to: "host".to_string(),
+            escalation_code: "OVERLOAD".to_string(),
+            interrupting: true,
+        },
+    ];
+    for kind in boundaries {
+        assert_eq!(
+            unsupported_migration_reason(&kind),
+            Some("boundary events are not migratable yet"),
+            "{kind:?} must be rejected by the migration phase"
+        );
+    }
+}
+
+#[test]
+fn migration_rejects_active_multi_instance_body() {
+    // An active parallel multi-instance body keeps per-element bookkeeping in
+    // `ProcessInstance.multi_instances` that this phase does not remap, so
+    // migration is rejected as "not supported yet" (Zeebe parity), matching the
+    // boundary-event rejection above.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(
+            false,
+        )))
+        .unwrap();
+    let target = ProcessBuilder::new("mi-target")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=item * 2".to_string()),
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "end")
+        .build()
+        .unwrap();
+    let target_key = deploy_for_migration(&mut engine, target);
+    let inst = create_instance_with_vars(
+        &mut engine,
+        "mi",
+        vars(&[(
+            "items",
+            Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+        )]),
+    );
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("each".to_string(), "each".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::UnsupportedMigration { element_id, reason, .. }
+            if element_id == "each" && reason.contains("multi-instance")
+    ));
+}
+
+#[test]
+fn migration_rejects_active_token_inside_a_nested_flow_scope() {
+    // Defect class (Zeebe's "flow scope unchanged" precondition): an active
+    // token resting inside an embedded sub-process lives in a non-root flow
+    // scope. The applier re-points element ids but does NOT remap the scope
+    // tree (`scopes` / `scope_parents` / `scope_variables`), so migrating such
+    // an instance would leave its scope tree pointing at the source structure.
+    // Migration must be rejected as unsupported. (Here the enclosing sub-process
+    // is itself active and trips the sub-process guard first; the explicit
+    // flow-scope backstop guarantees the class stays rejected even if a future
+    // scope-owning element type is not caught by a more specific guard.)
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    // The instance parks a token on the `work` job INSIDE sub-process `sub`, so
+    // `instance.scopes` is non-empty.
+    let inst =
+        create_instance_with_vars(&mut engine, "sub-scope", vars(&[("seed", Value::Int(4))]));
+    assert!(
+        !engine.instance(inst).unwrap().scopes.is_empty(),
+        "precondition: the token must sit inside a non-root flow scope"
+    );
+
+    // A flat target carrying the inner task at process level.
+    let target = ProcessBuilder::new("flat-target")
+        .start_event("s")
+        .service_task("inner", "work")
+        .end_event("e")
+        .connect("s", "inner")
+        .connect("inner", "e")
+        .build()
+        .unwrap();
+    let target_key = deploy_for_migration(&mut engine, target);
+
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("inner".to_string(), "inner".to_string())],
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::UnsupportedMigration { .. }),
+        "an instance with an active token in a nested flow scope must not migrate; got {err:?}"
+    );
+    // The instance stays on its source definition — nothing was migrated.
+    assert_eq!(engine.instance(inst).unwrap().process_id, "sub-scope");
+}
