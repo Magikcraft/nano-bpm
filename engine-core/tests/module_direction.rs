@@ -411,8 +411,11 @@ fn strip_inline_cfg_test_modules(src: &str) -> String {
 /// If a `#[cfg(<pred>)]` attribute whose predicate is *test-only* — it compiles
 /// its item only when the `test` configuration is enabled (`#[cfg(test)]`, but
 /// also compound spellings such as `#[cfg(all(test, feature = "serde"))]`) — is
-/// followed by `mod <name>` (optionally behind a visibility modifier such as
+/// followed by `mod <name>` (optionally behind intervening outer attributes
+/// such as `#[allow(dead_code)]` and/or a visibility modifier such as
 /// `pub(crate)`), return the byte offset just past `<name>`; otherwise `None`.
+/// The `#[cfg(...)]` attribute is tokenized rather than matched literally, so
+/// whitespace variants like `#[cfg (test)]` are recognized too.
 ///
 /// Matching *any* test-only predicate (not just the exact `#[cfg(test)]`
 /// spelling) is required so test-only modules gated behind a feature — e.g. the
@@ -425,13 +428,31 @@ fn strip_inline_cfg_test_modules(src: &str) -> String {
 /// `test` substring inside a string literal (e.g. `feature = "test-utils"`) has
 /// already been blanked and cannot false-match.
 fn match_cfg_test_mod(bytes: &[u8], start: usize) -> Option<usize> {
-    let open = b"#[cfg(";
-    if start + open.len() > bytes.len() || &bytes[start..start + open.len()] != open {
+    // Match `#[`, then optional whitespace, `cfg`, optional whitespace, `(`.
+    // Rust permits whitespace inside the attribute (`#[cfg (test)]`), so we
+    // tokenize rather than requiring the exact `#[cfg(` spelling.
+    let hash_bracket = b"#[";
+    if start + hash_bracket.len() > bytes.len()
+        || &bytes[start..start + hash_bracket.len()] != hash_bracket
+    {
         return None;
     }
-    // Balance parens across the cfg predicate; `i` starts at the first `(`.
-    let pred_start = start + open.len();
-    let mut i = pred_start - 1;
+    let mut i = skip_ws(bytes, start + hash_bracket.len());
+    let cfg = b"cfg";
+    if i + cfg.len() > bytes.len() || &bytes[i..i + cfg.len()] != cfg {
+        return None;
+    }
+    i += cfg.len();
+    // Require a word boundary so `#[cfgfoo(...)]` cannot false-match.
+    if i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+        return None;
+    }
+    i = skip_ws(bytes, i);
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return None;
+    }
+    // Balance parens across the cfg predicate; `i` is at the opening `(`.
+    let pred_start = i + 1;
     let mut depth = 0usize;
     let pred_end;
     loop {
@@ -452,7 +473,8 @@ fn match_cfg_test_mod(bytes: &[u8], start: usize) -> Option<usize> {
         }
         i += 1;
     }
-    // Require the attribute's closing `]`.
+    // Require the attribute's closing `]` (optional whitespace before it).
+    i = skip_ws(bytes, i);
     if i >= bytes.len() || bytes[i] != b']' {
         return None;
     }
@@ -460,8 +482,13 @@ fn match_cfg_test_mod(bytes: &[u8], start: usize) -> Option<usize> {
     if !cfg_predicate_is_test_only(&bytes[pred_start..pred_end]) {
         return None;
     }
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
+    i = skip_ws(bytes, i);
+    // Skip any intervening outer attributes between the cfg and the module,
+    // e.g. `#[cfg(test)] #[allow(dead_code)] mod tests { … }`; without this the
+    // test-only module and its `use crate::…` imports would leak into the
+    // layering scan as production dependencies.
+    while let Some(after_attr) = skip_outer_attr(bytes, i) {
+        i = skip_ws(bytes, after_attr);
     }
     // Skip an optional visibility modifier between the attribute and `mod`.
     // Valid Rust permits `#[cfg(test)] pub(crate) mod tests { … }` (and the
@@ -520,6 +547,34 @@ fn match_cfg_test_mod(bytes: &[u8], start: usize) -> Option<usize> {
         return None;
     }
     Some(i)
+}
+
+/// If `bytes[start..]` begins an outer attribute `#[ … ]`, return the offset
+/// just past its closing `]` (brackets balanced); otherwise `None`. Used to
+/// step over attributes such as `#[allow(dead_code)]` that may sit between a
+/// `#[cfg(test)]` and its `mod` declaration. Callers pass sanitized source, so
+/// a `]` inside a string literal has already been blanked and cannot unbalance
+/// the scan.
+fn skip_outer_attr(bytes: &[u8], start: usize) -> Option<usize> {
+    if start + 2 > bytes.len() || bytes[start] != b'#' || bytes[start + 1] != b'[' {
+        return None;
+    }
+    let mut i = start + 1; // at the opening `[`
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Does a `cfg` predicate compile its item *only* when the `test`
@@ -1814,5 +1869,69 @@ fn root_brace_use_tree_skips_external_elements() {
     assert!(
         !has_edge(&edges, "serde"),
         "an external root-group element was mistaken for a module edge: {edges:?}"
+    );
+}
+
+/// A test-only module whose `#[cfg(test)]` carries whitespace inside the
+/// attribute (`#[cfg (test)]`) is still test-only and must be stripped; the
+/// matcher tokenizes the attribute rather than requiring the exact `#[cfg(`
+/// spelling, so its `use crate::…` imports do not leak into the layering scan.
+#[test]
+fn strips_spaced_cfg_test_modules() {
+    let src = "#[cfg (test)]\nmod tests {\n    use crate::engine::X;\n}\nuse crate::model::Y;\n";
+    let edges = edges_of_source("feel", src);
+    assert!(
+        !has_edge(&edges, "engine"),
+        "a `#[cfg (test)]` module leaked a test-only edge: {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, "model"),
+        "stripping the `#[cfg (test)]` module swallowed real code after it: {edges:?}"
+    );
+}
+
+/// An intervening outer attribute between the `#[cfg(test)]` and the `mod`
+/// keyword — `#[cfg(test)] #[allow(dead_code)] mod tests { … }` — must not stop
+/// the module being recognised as test-only; otherwise its imports would be
+/// scanned as production layering edges.
+#[test]
+fn strips_test_modules_with_intervening_attributes() {
+    let src = "#[cfg(test)]\n#[allow(dead_code)]\nmod tests {\n    use crate::engine::X;\n}\nuse crate::model::Y;\n";
+    let edges = edges_of_source("feel", src);
+    assert!(
+        !has_edge(&edges, "engine"),
+        "a test module behind an intervening attribute leaked an edge: {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, "model"),
+        "stripping the attributed test module swallowed real code after it: {edges:?}"
+    );
+}
+
+/// The spaced-and-attributed external form
+/// `#[cfg (test)] #[allow(dead_code)] pub mod name;` must also be recognised by
+/// `match_cfg_test_mod` so the whole file it gates is collected as test-only.
+#[test]
+fn matches_spaced_and_attributed_external_test_mod() {
+    let src = "#[cfg (test)] #[allow(dead_code)] pub mod tests;\n";
+    let after = match_cfg_test_mod(src.as_bytes(), 0)
+        .expect("a spaced/attributed external test mod was not recognised");
+    assert!(
+        src[..after].ends_with("tests"),
+        "the external module name was misparsed: {:?}",
+        &src[..after]
+    );
+}
+
+/// A production module must NOT be stripped just because an intervening
+/// attribute follows a non-test `#[cfg(...)]`: `#[cfg(feature = "x")]` keeps its
+/// imports visible even with an `#[allow(...)]` before `mod`.
+#[test]
+fn keeps_production_module_with_intervening_attribute() {
+    let src = "#[cfg(feature = \"x\")]\n#[allow(dead_code)]\nmod real {\n    use crate::engine::X;\n}\nuse crate::model::Y;\n";
+    let edges = edges_of_source("feel", src);
+    assert!(
+        has_edge(&edges, "engine"),
+        "a production module behind an attribute was wrongly stripped: {edges:?}"
     );
 }
