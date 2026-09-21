@@ -1,0 +1,147 @@
+//! Resource-family appliers: decision/form/generic-resource deploys and decision evaluation.
+
+use crate::event::Event;
+use crate::state::types::*;
+
+pub(super) fn apply_resource(state: &mut State, event: &Event) {
+    match event {
+        Event::DecisionRequirementsDeployed {
+            decision_requirements_key,
+            version,
+            drg,
+            ..
+        } => {
+            let deployed = DeployedDrg {
+                key: *decision_requirements_key,
+                version: *version,
+                drg: drg.clone(),
+            };
+            // Retain every version by its unique key so a decision that
+            // references an older DRG (see the DecisionDeployed arm) resolves.
+            state
+                .decision_requirements_versions
+                .insert(*decision_requirements_key, deployed.clone());
+            // Maintain the latest-by-id index; the `>=` guard keeps an
+            // out-of-order durable copy from regressing the latest pointer.
+            let is_latest = state
+                .decision_requirements
+                .get(&drg.id)
+                .map(|existing| *version >= existing.version)
+                .unwrap_or(true);
+            if is_latest {
+                state.decision_requirements.insert(drg.id.clone(), deployed);
+            }
+        }
+
+        Event::DecisionDeployed {
+            decision_requirements_key,
+            decision_key,
+            decision_id,
+            decision_name,
+            version,
+            ..
+        } => {
+            // The DRG carrying this decision was applied by the preceding
+            // DecisionRequirementsDeployed event; look it up by its exact key in
+            // the version-retention map (the latest-by-id index may already point
+            // at a newer DRG) to bind for eval.
+            if let Some(drg) = state
+                .decision_requirements_versions
+                .get(decision_requirements_key)
+                .map(|d| d.drg.clone())
+            {
+                let deployed = DeployedDecision {
+                    key: *decision_key,
+                    version: *version,
+                    decision_requirements_key: *decision_requirements_key,
+                    decision_id: decision_id.clone(),
+                    decision_name: decision_name.clone(),
+                    drg,
+                };
+                // Retain every version by its unique key so an EvaluateDecision
+                // pinned to an older decision key still resolves.
+                state
+                    .decision_versions
+                    .insert(*decision_key, deployed.clone());
+                let is_latest = state
+                    .decisions
+                    .get(decision_id)
+                    .map(|existing| *version >= existing.version)
+                    .unwrap_or(true);
+                if is_latest {
+                    state.decisions.insert(decision_id.clone(), deployed);
+                }
+            }
+        }
+
+        Event::FormDeployed {
+            form_key,
+            version,
+            form_id,
+            resource_name,
+            schema,
+            ..
+        } => {
+            let deployed = DeployedForm {
+                key: *form_key,
+                version: *version,
+                form_id: form_id.clone(),
+                resource_name: resource_name.clone(),
+                schema: schema.clone(),
+            };
+            // Retain every version by its unique key so a form binding pinned to
+            // a specific version resolves.
+            state.form_versions.insert(*form_key, deployed.clone());
+            let is_latest = state
+                .forms
+                .get(form_id)
+                .map(|existing| *version >= existing.version)
+                .unwrap_or(true);
+            if is_latest {
+                state.forms.insert(form_id.clone(), deployed);
+            }
+        }
+
+        Event::GenericResourceDeployed {
+            resource_key,
+            version,
+            resource_id,
+            resource_name,
+            content,
+            ..
+        } => {
+            let deployed = DeployedResource {
+                key: *resource_key,
+                version: *version,
+                resource_id: resource_id.clone(),
+                resource_name: resource_name.clone(),
+                content: content.clone(),
+            };
+            // Retain every version by its unique key so a linked-resource binding
+            // pinned to a specific version (or an older key) resolves.
+            state
+                .resource_versions
+                .insert(*resource_key, deployed.clone());
+            let is_latest = state
+                .resources
+                .get(resource_id)
+                .map(|existing| *version >= existing.version)
+                .unwrap_or(true);
+            if is_latest {
+                state.resources.insert(resource_id.clone(), deployed);
+            }
+        }
+
+        Event::DecisionEvaluated { .. } => {
+            // Informational/audit only: the decision output is propagated to the
+            // instance via a separate VariablesUpdated event, and the record is
+            // surfaced to the exporter. No core state to mutate.
+        }
+
+        Event::DecisionInstanceDeleted { .. } => {
+            // Audit/projection-only: the read model deletes the retracted decision
+            // instance rows. No core engine state to mutate.
+        }
+        _ => unreachable!(),
+    }
+}
