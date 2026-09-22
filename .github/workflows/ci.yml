@@ -284,6 +284,15 @@ jobs:
         # engine-wasm/pkg. Guards the guard injected by scripts/inject-free-guard.mjs.
         run: npm install && npm test
         working-directory: engine-wasm/tests/use-after-free
+      - name: Test-Studio record loop (embedded-engine isolation example)
+        # Worked example + guard (Magikcraft/nano-bpm example): drives a
+        # Test-Studio-style recording session entirely through the committed
+        # engine-wasm/pkg TestEngine, proving the embedded engine gives Camunda's
+        # per-instance recording isolation (RESERVE_JOBS + stubCallActivities) for
+        # free — jobs wait unraced and the debug stepper is the call-activity wait
+        # state — on both the lean (`.`) and read-model (`/readmodel`) entrypoints.
+        run: npm install && npm test
+        working-directory: engine-wasm/tests/test-studio-record-loop
       - name: Read-model DTO types are derived, not hand-written (drift guard)
         # `@nanobpm/engine-wasm/readmodel-types` ships DTO types for the engine's
         # read-model query results (searchUserTasks, …). They are DERIVED from the
