@@ -26,7 +26,9 @@
 //     An `everyStep` breakpoint re-parks the run at nested call activities too
 //     (an id-scoped `elementActivated` breakpoint only matches its own element id).
 //
-// Run against freshly generated artifacts: `npm install && npm test`.
+// Run against the committed artifacts: `npm install && npm test` (this installs
+// the checked-in `engine-wasm/pkg` — it does not regenerate WASM; run `make
+// console-wasm` first if you want to test freshly built artifacts).
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
