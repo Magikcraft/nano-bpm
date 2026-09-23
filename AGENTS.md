@@ -206,7 +206,7 @@ PR — by then the duplicate work already happened.
   agents in one file.
 - **Cross-repo slices claim in the hub.** Work that lands in `nanobpm/nano-ide`,
   `jwulf/c8ctl-plugin-nano` or a demo app is still claimed on its
-  `Magikcraft/nano-bpm` issue, and the resulting PRs link back to it — one place
+  `nanobpm/nano-bpm` issue, and the resulting PRs link back to it — one place
   to look, whatever repo the diff ends up in.
 
 ## Merging PRs
@@ -251,10 +251,10 @@ From the repository root, with console dependencies installed and an admin-capab
 `gh` login, derive the update from this protocol rather than hand-copying names:
 
 ```bash
-gh api repos/Magikcraft/nano-bpm/branches/main/protection/required_status_checks > /tmp/nano-checks-before.json
+gh api repos/nanobpm/nano-bpm/branches/main/protection/required_status_checks > /tmp/nano-checks-before.json
 node console/scripts/merge-gates.mjs --protection-update /tmp/nano-checks-before.json > /tmp/nano-checks-update.json
-gh api --method PATCH repos/Magikcraft/nano-bpm/branches/main/protection/required_status_checks --input /tmp/nano-checks-update.json
-gh api repos/Magikcraft/nano-bpm/branches/main/protection/required_status_checks > /tmp/nano-checks-after.json
+gh api --method PATCH repos/nanobpm/nano-bpm/branches/main/protection/required_status_checks --input /tmp/nano-checks-update.json
+gh api repos/nanobpm/nano-bpm/branches/main/protection/required_status_checks > /tmp/nano-checks-after.json
 node console/scripts/merge-gates.mjs --check-protection /tmp/nano-checks-after.json
 ```
 

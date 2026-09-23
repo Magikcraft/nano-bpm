@@ -33,7 +33,7 @@ On <https://www.npmjs.com/package/@nanobpm/engine-testkit> → **Settings** →
 
 | Field                | Value                             |
 |----------------------|-----------------------------------|
-| Organization / user  | `Magikcraft`                      |
+| Organization / user  | `nanobpm`                         |
 | Repository           | `nano-bpm`                        |
 | Workflow filename    | `release-engine-testkit-npm.yml`  |
 | Environment          | *(leave blank)*                   |

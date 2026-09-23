@@ -24,7 +24,7 @@ export const LOCALDEV_JOURNEY_ID = "localdev";
 
 /** The compatibility-subset boundary published by #416 (audit doc, tracked in-repo). */
 const COMPAT_SUBSET_URL =
-  "https://github.com/Magikcraft/nano-bpm/blob/main/docs/camunda-compatibility.md";
+  "https://github.com/nanobpm/nano-bpm/blob/main/docs/camunda-compatibility.md";
 
 // ---------------------------------------------------------------------------
 // The one line a Camunda user changes.

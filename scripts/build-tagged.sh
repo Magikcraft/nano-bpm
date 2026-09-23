@@ -46,7 +46,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$REF" ] || { echo "usage: build-tagged.sh <ref> [--no-console] [--profile P] [--force] [--stage]" >&2; exit 2; }
-[ -d "$REPO/.git" ] || { echo "ERROR: repo not found at $REPO (clone git@github.com:Magikcraft/nano-bpm.git)" >&2; exit 3; }
+[ -d "$REPO/.git" ] || { echo "ERROR: repo not found at $REPO (clone git@github.com:nanobpm/nano-bpm.git)" >&2; exit 3; }
 
 cd "$REPO"
 git fetch --quiet --all --tags

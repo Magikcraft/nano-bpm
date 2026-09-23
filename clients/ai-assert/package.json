@@ -21,12 +21,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Magikcraft/nano-bpm.git",
+    "url": "git+https://github.com/nanobpm/nano-bpm.git",
     "directory": "clients/ai-assert"
   },
-  "homepage": "https://github.com/Magikcraft/nano-bpm/tree/main/clients/ai-assert#readme",
+  "homepage": "https://github.com/nanobpm/nano-bpm/tree/main/clients/ai-assert#readme",
   "bugs": {
-    "url": "https://github.com/Magikcraft/nano-bpm/issues"
+    "url": "https://github.com/nanobpm/nano-bpm/issues"
   },
   "engines": {
     "node": ">=22.6"

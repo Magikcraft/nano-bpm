@@ -34,7 +34,7 @@ On <https://www.npmjs.com/package/@nanobpm/ai-assert> → **Settings** →
 
 | Field                | Value                        |
 |----------------------|------------------------------|
-| Organization / user  | `Magikcraft`                 |
+| Organization / user  | `nanobpm`                    |
 | Repository           | `nano-bpm`                   |
 | Workflow filename    | `release-ai-assert-npm.yml`  |
 | Environment          | *(leave blank)*              |

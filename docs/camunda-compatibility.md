@@ -291,5 +291,5 @@ service-task worker in place of a message **throw**). If you hit a `501`, the
 operation is genuinely unwired, not misconfigured.
 
 Found drift between this audit and reality, or between it and `README.md` /
-`USERGUIDE.md`? That is exactly the kind of staleness [#388](https://github.com/Magikcraft/nano-bpm/issues/388)
+`USERGUIDE.md`? That is exactly the kind of staleness [#388](https://github.com/nanobpm/nano-bpm/issues/388)
 tracks — please file it.
