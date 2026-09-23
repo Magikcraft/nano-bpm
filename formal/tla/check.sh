@@ -10,10 +10,11 @@
 # `pass` means TLC finds no error: every invariant and property holds, and no
 # state deadlocks. `violates:<Invariant>` records a known engine defect that
 # the model reproduces: TLC must report that invariant as violated (possibly
-# among others). Once the defect is fixed, TLC stops reporting that
-# violation and this script fails until the entry is flipped to `pass`. That is
-# the ratchet: a fixed bug cannot quietly lose its guard, and a known bug cannot
-# be forgotten.
+# among others). The fix PR updates the spec to model the fixed engine. TLC
+# then stops reporting the violation, and this script fails until the entry is
+# flipped to `pass`. That is the ratchet: a known bug cannot be forgotten, and
+# the fixed behaviour stays guarded. (The spec cannot see the Rust code;
+# trace validation, #1226, closes that gap.)
 #
 # Set FORMAL_LOG_DIR to keep each model's generated .cfg and full TLC log
 # (including counterexample traces).

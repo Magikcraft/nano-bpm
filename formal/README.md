@@ -79,9 +79,16 @@ Which violation TLC reaches first depends on state order, not on the defect. For
 `MCParallelJoinMultiArrival` reproduces #1233: a parallel join counts arrivals
 rather than distinct incoming flows.
 
-Once the defect is fixed, the model stops violating and `check.sh` fails until
-you flip the entry to `pass`. A fixed bug therefore keeps its guard, and a
-known bug stays visible.
+The spec models the engine **as it is**, defects included. A PR that fixes
+such a defect in Rust must also update the spec to model the fixed behaviour.
+For #1233, that means `ArriveParallelJoin` counts per incoming flow and keeps
+surplus arrivals. Once the spec changes, the model stops violating and
+`check.sh` fails until the entry is flipped to `pass`. The fixed behaviour
+therefore stays guarded.
+
+TLC cannot see the Rust code, so nothing yet forces the spec update when the
+engine changes. Until trace validation (#1226) links the two, that step is a
+review responsibility.
 
 `check.sh` also fails if a `MC*.tla` has no table entry, if an entry has no
 model, or if TLC prints a warning.
