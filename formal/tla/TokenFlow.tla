@@ -19,11 +19,13 @@
 (*     keeping the surplus (`ParallelJoinFired`, Zeebe's "Tetris"         *)
 (*     principle). A surplus reopens the join, so it stays live (#1233).  *)
 (*   - An inclusive gateway with >1 incoming flow is a join                *)
-(*     (`arrive_at_inclusive_join`): arrivals only count. It fires in the  *)
-(*     quiescence sweep (`fire_ready_inclusive_joins`) once the queue is   *)
-(*     empty and no live token rests on an element that can reach it      *)
-(*     (`elements_reaching`). The engine fires the lowest-id ready join per*)
-(*     sweep; the model may fire any ready join, which covers that choice. *)
+(*     (`arrive_at_inclusive_join`): arrivals count per incoming flow. It  *)
+(*     fires in the quiescence sweep (`fire_ready_inclusive_joins`) once   *)
+(*     the queue is empty and no live token rests on an element that can   *)
+(*     reach it (`elements_reaching`), consuming one token per flow that   *)
+(*     holds one and keeping the surplus, which reopens the join (#1237).  *)
+(*     The engine fires the lowest-id ready join per sweep; the model may  *)
+(*     fire any ready join, which covers that choice.                      *)
 (*   - Conditions are abstracted: an exclusive gateway takes some single   *)
 (*     outgoing flow, an inclusive split or join takes some non-empty      *)
 (*     subset (condition/incident paths are out of scope for this slice). *)
@@ -85,7 +87,6 @@ VARIABLES
     waiting,      \* [Nodes -> Nat]     tokens parked on wait-state tasks
     joinOpen,     \* [Nodes -> BOOLEAN] join_instances has an entry
     joinTokens,   \* [Nodes -> [Flows -> Nat]] tokens per incoming flow: `join_flow_arrivals`
-                  \* (parallel), `join_counts` (inclusive, which only needs "any")
     fireCount,    \* ghost: [Nodes -> Nat] how often each join fired
     premature,    \* ghost: parallel joins that fired before every incoming flow delivered
     completed     \* ProcessInstanceCompleted emitted
@@ -191,14 +192,17 @@ DrainVia(f, S) ==
 
 Drain(f) == \E S \in Choices(Target(f)) : DrainVia(f, S)
 
-(* The quiescence sweep: fire one ready inclusive join, routing to S. *)
+(* The quiescence sweep: fire one ready inclusive join, routing to S. Each
+   incoming flow holding a token gives up one; a surplus reopens the join. *)
 FireInclusiveJoinVia(j, S) ==
+    LET rest == [g \in Flows |-> IF joinTokens[j][g] > 0 THEN joinTokens[j][g] - 1 ELSE 0]
+    IN
     /\ Quiescent
     /\ InclusiveReady(j)
     /\ S \in NonEmptySubsets(Out(j))
     /\ pending'   = Add(pending, S)
-    /\ joinOpen'   = [joinOpen   EXCEPT ![j] = FALSE]
-    /\ joinTokens' = [joinTokens EXCEPT ![j] = NoArrivals]
+    /\ joinOpen'   = [joinOpen   EXCEPT ![j] = \E g \in Flows : rest[g] > 0]
+    /\ joinTokens' = [joinTokens EXCEPT ![j] = rest]
     /\ fireCount'  = [fireCount  EXCEPT ![j] = @ + 1]
     /\ UNCHANGED <<waiting, premature, completed>>
 
@@ -286,7 +290,7 @@ Acyclic == \A n \in Nodes : n \notin Reaching(n)
 \* legitimately re-fires a join. Acyclicity alone does not rule out a second
 \* firing: an acyclic graph that routes several tokens onto one join's inputs
 \* (a parallel split whose branches merge through an exclusive gateway, as in
-\* MCParallelJoinSurplus) can fire it again on the surplus tokens. That is
+\* MCParallelJoinSurplus and MCInclusiveJoinSurplus) can fire it again on the surplus tokens. That is
 \* intended: such a graph is not 1-safe, a BPMN lack-of-synchronization, and
 \* this invariant is how the checker reports it. Record such a model as an
 \* expected violation only when it deliberately reproduces an engine defect or

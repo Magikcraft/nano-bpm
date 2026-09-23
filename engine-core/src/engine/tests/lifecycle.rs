@@ -6263,3 +6263,95 @@ fn link_events_route_by_matching_name() {
         "the throw hands off to the same-named catch 'B'"
     );
 }
+
+/// `multi_arrival_process` with an INCLUSIVE join: `s -> fork =< inner, t >;
+/// inner =< x, y > -> merge (xor) -> join (or);  t -> join;  join -> e`. Two
+/// tokens reach `join` over `merge -> join`, one over `t -> join` (#1237).
+fn inclusive_multi_arrival_process() -> ProcessDefinition {
+    ProcessBuilder::new("inclusive_multi_arrival")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .parallel_gateway("inner")
+        .service_task("x", "jx")
+        .service_task("y", "jy")
+        .exclusive_gateway("merge")
+        .service_task("t", "jt")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .connect("s", "fork")
+        .connect("fork", "inner")
+        .connect("fork", "t")
+        .connect("inner", "x")
+        .connect("inner", "y")
+        .connect("x", "merge")
+        .connect("y", "merge")
+        .connect("merge", "join")
+        .connect("t", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap()
+}
+
+/// Drive `inclusive_multi_arrival_process`, completing its tasks in `order`,
+/// and return every join firing per step plus the instance key.
+fn run_inclusive_multi_arrival(order: [&str; 3]) -> (Engine, Key, Vec<usize>) {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(inclusive_multi_arrival_process()))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("inclusive_multi_arrival"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    let fires = order
+        .iter()
+        .map(|job| join_fire_count(&complete_one(&mut engine, job), "join"))
+        .collect();
+    (engine, instance_key, fires)
+}
+
+#[test]
+fn inclusive_join_keeps_surplus_token_like_zeebe() {
+    // Both `merge -> join` tokens arrive before `t`. Zeebe consumes one token
+    // per incoming flow when an inclusive join activates and keeps the rest
+    // ("Tetris" principle, `ProcessInstanceElementActivatingV3Applier`), so the
+    // second `merge -> join` token is not swallowed by the first firing. Once
+    // nothing can still reach the join, the surplus fires it again (#1237).
+    let (engine, instance_key, fires) = run_inclusive_multi_arrival(["jx", "jy", "jt"]);
+    assert_eq!(fires, vec![0, 0, 2], "one firing per token set, none early");
+    assert!(engine.is_completed(instance_key));
+    let instance = engine.instance(instance_key).unwrap();
+    assert!(instance.join_flow_arrivals.is_empty());
+    assert!(instance.join_instances.is_empty());
+}
+
+#[test]
+fn inclusive_join_surplus_arriving_last_fires_again() {
+    // `t` and the first `merge -> join` token arrive while `y` can still reach
+    // the join, so it waits. `y`'s token then fires it once for the complete
+    // set and once more for the surplus — the order Zeebe also fires twice in.
+    let (engine, instance_key, fires) = run_inclusive_multi_arrival(["jx", "jt", "jy"]);
+    assert_eq!(fires, vec![0, 0, 2]);
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn inclusive_join_records_the_flow_each_token_arrived_over() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(inclusive_multi_arrival_process()))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("inclusive_multi_arrival"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    complete_one(&mut engine, "jx");
+    complete_one(&mut engine, "jy");
+    let instance = engine.instance(instance_key).unwrap();
+    let merge = IncomingFlow {
+        from: "merge".into(),
+        ordinal: 0,
+    };
+    assert_eq!(instance.join_flow_arrivals["join"].count(&merge), 2);
+    assert!(!instance.join_counts.contains_key("join"));
+}

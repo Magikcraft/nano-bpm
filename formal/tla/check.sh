@@ -45,6 +45,10 @@ EXPECTED=(
   # Not 1-safe: every flow into J is taken twice, so J fires twice, keeping the
   # surplus between firings ("Tetris" principle), and the instance completes.
   "MCParallelJoinSurplus       violates:JoinFiresAtMostOnce"
+  # Not 1-safe: two tokens on XA->J, one on B->J. Inclusive J fires once, then
+  # again on the surplus once nothing can reach it, and the instance completes.
+  # Before #1237 the first firing discarded the surplus.
+  "MCInclusiveJoinSurplus      violates:JoinFiresAtMostOnce"
 )
 
 # Every model is checked against the same, full property set. The generated

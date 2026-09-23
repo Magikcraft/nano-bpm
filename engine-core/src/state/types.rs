@@ -556,12 +556,13 @@ pub struct ProcessInstance {
     pub variables: Arc<HashMap<String, Value>>,
     /// For each open join: how many tokens have arrived over an *unidentified*
     /// flow (see [`Event::ParallelJoinTokenArrived`](crate::Event)'s `flow`):
-    /// inclusive-join arrivals, arrivals journaled before #1233, and
+    /// arrivals journaled before #1233 (#1237 for inclusive joins) and
     /// activations that did not come over a flow. A parallel join counts each
-    /// of these as one taken incoming flow.
+    /// of these as one taken incoming flow; a firing clears them all.
     pub join_counts: HashMap<ElementId, usize>,
-    /// For each open parallel-gateway join: arrivals per identified incoming
-    /// flow (Zeebe's "number of taken sequence flows", #1233). Absent from
+    /// For each open parallel- or inclusive-gateway join: arrivals per
+    /// identified incoming flow (Zeebe's "number of taken sequence flows",
+    /// #1233, #1237). Absent from
     /// pre-#1233 snapshots, hence `serde(default)`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub join_flow_arrivals: HashMap<ElementId, FlowArrivals>,

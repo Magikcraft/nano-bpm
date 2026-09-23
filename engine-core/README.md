@@ -326,7 +326,8 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > any surplus for a later firing),
 > **inclusive (OR) gateways** (split takes every outgoing flow whose FEEL
 > condition holds, falling back to the default flow; the join waits at token
-> quiescence until no still-in-flight token could reach it), **timer intermediate
+> quiescence until no still-in-flight token could reach it, then consumes one
+> token per incoming flow and keeps any surplus for a later firing), **timer intermediate
 > catch events** (a token parks until its `timeDuration` elapses, fired by a
 > host clock tick) and **message events** — **message intermediate catch events**
 > (a token parks until a matching message is correlated) and **interrupting

@@ -21275,7 +21275,7 @@ fn migration_error_status(e: &EngineError) -> u16 {
         EngineError::UnmappedActiveElement { .. }
         | EngineError::MappedElementTypeChanged { .. }
         | EngineError::MigratedParallelJoinArityChanged { .. }
-        | EngineError::MigratedParallelJoinFlowMissing { .. }
+        | EngineError::MigratedJoinFlowMissing { .. }
         | EngineError::UnsupportedMigration { .. } => 409,
         _ => 500,
     }
@@ -21297,7 +21297,7 @@ mod migration_error_status_tests {
             source_incoming_count: 2,
             target_incoming_count: 3,
         };
-        let flow = EngineError::MigratedParallelJoinFlowMissing {
+        let flow = EngineError::MigratedJoinFlowMissing {
             instance_key: 1,
             source_element_id: "join".into(),
             target_element_id: "join2".into(),
