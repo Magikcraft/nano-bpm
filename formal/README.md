@@ -50,8 +50,12 @@ single process instance in a single scope:
 
 The model deliberately covers more behaviours than the engine can produce. It
 drains the queue in any order, fires any ready inclusive join, and picks gateway
-branches freely instead of evaluating conditions. Each property checked against
-this superset therefore also holds for the engine's deterministic choices.
+branches freely instead of evaluating conditions. Each *safety* property (the
+invariants and deadlock freedom) checked against this superset therefore also
+holds for the engine's deterministic choices. `Termination` does not transfer
+that way: it assumes fair routing choices, and real condition data can keep
+choosing a loop branch forever. Read it as "the graph allows every instance to
+finish", not "the engine always finishes".
 
 The properties checked:
 
