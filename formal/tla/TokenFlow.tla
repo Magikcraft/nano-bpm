@@ -230,16 +230,18 @@ Next ==
     \/ CompleteInstance
     \/ Done
 
-\* Fairness. The engine always drains each queued activation and fires each
-\* ready inclusive join. A job worker eventually completes every waiting task:
-\* this is *strong* fairness, because `CompleteTask(t)` is enabled only in
-\* settled states and so can be enabled intermittently while other tasks' work
-\* drains. Routing choices are strongly fair too: a gateway that is reached
-\* infinitely often eventually takes each of its branches. This is the "fair data" assumption of classic
-\* workflow-net soundness, and it lets a loop with an exit terminate.
-\* Conditions are abstracted, so this states what a graph *allows*, not that
-\* particular data exits a loop. (Fairness on Next as a whole would only
-\* guarantee that *some* step happens, so one task could starve.)
+\* Fairness, exactly as stated in `Fairness` below:
+\*   - SF on each `DrainVia(f, S)` and `FireInclusiveJoinVia(j, S)`. Each
+\*     routing choice S is its own action, so strong fairness means a gateway
+\*     reached infinitely often eventually takes each of its branches. This is
+\*     the "fair data" assumption of workflow-net soundness, and it lets a loop
+\*     with an exit terminate. Conditions are abstracted, so this states what a
+\*     graph *allows*, not that particular data exits a loop.
+\*   - SF on each `CompleteTask(t)`: a task can only complete in a settled
+\*     state, so it can be enabled intermittently while other work drains.
+\*   - WF on `CompleteInstance`: once enabled, it stays enabled.
+\* (Fairness on Next as a whole would only guarantee that *some* step happens,
+\* so one task could starve.)
 Fairness ==
     /\ \A f \in AllFlows : \A S \in Choices(Target(f)) : SF_vars(DrainVia(f, S))
     /\ \A j \in IncJoins : \A S \in NonEmptySubsets(Out(j)) : SF_vars(FireInclusiveJoinVia(j, S))
