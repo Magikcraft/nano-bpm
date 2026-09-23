@@ -19,6 +19,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,7 +87,7 @@ fn reserve_port() -> u16 {
 
 /// Drains the server's piped stdout (which would otherwise fill its pipe buffer
 /// and block the child) and confirms it reported the expected listening port.
-fn drain_stdout(child: &mut Child, expected_port: u16) {
+fn drain_stdout(child: &mut Child, expected_port: u16) -> std::thread::JoinHandle<()> {
     let stdout = child.stdout.take().expect("server stdout is piped");
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -103,13 +105,27 @@ fn drain_stdout(child: &mut Child, expected_port: u16) {
                 }
             }
         }
-    });
+    })
+}
+
+fn kill_child_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        // SAFETY: server children are spawned as process-group leaders below.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
 }
 
 /// One node of the cluster: a running server child, killed and reaped on drop.
 struct Node {
     child: Child,
     port: u16,
+    stdout_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Node {
@@ -138,13 +154,19 @@ impl Node {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn server binary");
-        drain_stdout(&mut child, port);
-        let node = Self { child, port };
+        let stdout_thread = drain_stdout(&mut child, port);
+        let node = Self {
+            child,
+            port,
+            stdout_thread: Some(stdout_thread),
+        };
         node.wait_until_ready();
         node
     }
@@ -190,8 +212,11 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        kill_child_tree(&mut self.child);
         let _ = self.child.wait();
+        if let Some(stdout_thread) = self.stdout_thread.take() {
+            let _ = stdout_thread.join();
+        }
     }
 }
 
