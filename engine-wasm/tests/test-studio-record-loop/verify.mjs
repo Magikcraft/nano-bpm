@@ -22,8 +22,9 @@
 //     doc warns.
 //   LOOP 2 (replaces stubCallActivities): an `elementActivated` breakpoint on the
 //     call activity is the wait state. Resume to run the real child
-//     (runCalledProcess); clear/complete without driving the child to mock it.
-//     The same breakpoint re-fires for nested call activities — free recursion.
+//     (runCalledProcess); reset without driving the child to mock it.
+//     An `everyStep` breakpoint re-parks the run at nested call activities too
+//     (an id-scoped `elementActivated` breakpoint only matches its own element id).
 //
 // Run against freshly generated artifacts: `npm install && npm test`.
 import assert from "node:assert/strict";
@@ -204,13 +205,16 @@ function callActivityWaitState(TestEngine) {
   // 2b — the MOCK branch reaches the identical wait state and, crucially, no child
   // job has been served: the child has done no observable work, so the recorder
   // holds the decision. (Applying mocked outputs + completing the call element is
-  // the residual — see the README.)
+  // the residual — see the README.) We tear down with `reset()`, not `debugClear()`:
+  // `debugClear()` on a paused run drains the in-flight command (resuming the call
+  // activity and running the real child), which would defeat the point of the mock
+  // branch; `reset()` discards the paused state so the child never runs.
   {
     const eng = new TestEngine();
     eng.deploy(childXml);
     eng.deploy(parentXml);
     assertParkedAtDecision(eng);
-    eng.debugClear();
+    eng.reset();
     eng.free();
   }
 }

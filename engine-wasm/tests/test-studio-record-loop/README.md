@@ -25,10 +25,11 @@ collapse into behaviour the engine already has:
   `completeJob` / `failJob` / `throwError`. No token, no lease, no fencing.
 - **`stubCallActivities` → the debug stepper.** An `elementActivated` breakpoint
   on the call activity *is* the wait state. Resume to let the child do real work
-  (`runCalledProcess`); hold the pause to mock it. A breakpoint with no `id`
-  (`{ kind: "elementActivated" }`) pauses at every element, so nested call
-  activities re-park the run — the mechanism behind Zeebe's "auto-propagated"
-  recursion, without a root flag.
+  (`runCalledProcess`); hold the pause to mock it. An `everyStep` breakpoint
+  pauses at every element, so nested call activities re-park the run — the
+  mechanism behind Zeebe's "auto-propagated" recursion, without a root flag.
+  (`elementActivated` requires an explicit `id` and matches only that element;
+  `everyStep` is the wildcard.)
 
 ## What the probe asserts
 
