@@ -5,7 +5,8 @@
 #   formal/tla/check.sh            # check every model
 #   formal/tla/check.sh MCFoo ...  # check the named models only
 #
-# The EXPECTED table below is the single record of what each model should do.
+# The EXPECTED table below is the single record of what each model should do,
+# and of which properties it is checked against.
 # `pass` means TLC finds no error: every invariant and property holds, and no
 # state deadlocks. `violates:<Invariant>` records a known engine defect that
 # the model reproduces: TLC must report that invariant as violated (possibly
@@ -14,6 +15,9 @@
 # the ratchet: a fixed bug cannot quietly lose its guard, and a known bug cannot
 # be forgotten.
 #
+# Set FORMAL_LOG_DIR to keep each model's generated .cfg and full TLC log
+# (including counterexample traces).
+#
 # TLC is pinned by version and SHA-256. Set TLA2TOOLS_JAR to use a pre-fetched
 # jar; it must match the pinned hash.
 set -euo pipefail
@@ -21,15 +25,24 @@ set -euo pipefail
 TLA_VERSION="1.7.4"
 TLA_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 
+# model                       shape    expected outcome
 EXPECTED=(
-  "MCParallelDiamond           pass"
-  "MCInclusiveDiamond          pass"
-  "MCChainedInclusive          pass"
-  "MCInclusiveInParallel       pass"
-  "MCExclusiveLoop             pass"
-  "MCParallelDuplicateFlows    pass"
-  "MCParallelJoinMultiArrival  violates:ParallelJoinWaitsForEveryFlow  #1233"
+  "MCParallelDiamond           acyclic  pass"
+  "MCInclusiveDiamond          acyclic  pass"
+  "MCChainedInclusive          acyclic  pass"
+  "MCInclusiveInParallel       acyclic  pass"
+  "MCExclusiveLoop             cyclic   pass"
+  "MCParallelDuplicateFlows    acyclic  pass"
+  "MCParallelJoinMultiArrival  acyclic  violates:ParallelJoinWaitsForEveryFlow  #1233"
 )
+
+# Every model is checked against the same property set, derived from its
+# shape. JoinFiresAtMostOnce and Termination only hold without cycles. The
+# TLC configs are generated from this, never hand-written, so no model can
+# silently drop an invariant.
+SAFETY=(TypeOK JoinBookkeepingCoherent ParallelJoinWaitsForEveryFlow NoStuckInstance)
+ACYCLIC_SAFETY=(JoinFiresAtMostOnce)
+ACYCLIC_LIVENESS=(Termination)
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
@@ -53,13 +66,41 @@ if [[ "$(sha256 "$jar")" != "$TLA_SHA256" ]]; then
 fi
 
 # bash 3.2 (macOS) has no associative arrays, so look outcomes up by scan.
-expected_outcome() {
-  local row model outcome
+# Prints field $2 (1 = shape, 2 = outcome) of model $1's row.
+expected_field() {
+  local row model shape outcome
   for row in "${EXPECTED[@]}"; do
-    read -r model outcome _ <<<"$row"
-    if [[ "$model" == "$1" ]]; then echo "$outcome"; return 0; fi
+    read -r model shape outcome _ <<<"$row"
+    if [[ "$model" == "$1" ]]; then
+      if [[ "$2" == 1 ]]; then echo "$shape"; else echo "$outcome"; fi
+      return 0
+    fi
   done
   return 0
+}
+expected_outcome() { expected_field "$1" 2; }
+
+write_cfg() { # model shape out
+  {
+    echo "SPECIFICATION Spec"
+    echo "CONSTANTS"
+    echo "    Nodes <- MCNodes"
+    echo "    Kind  <- MCKind"
+    echo "    Flows <- MCFlows"
+    echo "    Src   <- MCSrc"
+    echo "    Tgt   <- MCTgt"
+    echo "    Start <- MCStart"
+    echo "INVARIANTS"
+    printf '    %s\n' "${SAFETY[@]}"
+    case "$2" in
+      acyclic)
+        printf '    %s\n' "${ACYCLIC_SAFETY[@]}"
+        echo "PROPERTIES"
+        printf '    %s\n' "${ACYCLIC_LIVENESS[@]}" ;;
+      cyclic) ;;
+      *) echo "error: model $1 has unknown shape '$2'" >&2; return 1 ;;
+    esac
+  } >"$3"
 }
 
 # Guard against drift between the table and the model files, in both directions.
@@ -67,7 +108,6 @@ status=0
 for tla in MC*.tla; do
   m="${tla%.tla}"
   [[ -n "$(expected_outcome "$m")" ]] || { echo "error: $tla has no entry in EXPECTED" >&2; status=1; }
-  [[ -f "$m.cfg" ]] || { echo "error: $tla has no $m.cfg" >&2; status=1; }
 done
 for row in "${EXPECTED[@]}"; do
   read -r m _ <<<"$row"
@@ -89,6 +129,8 @@ for m in "${models[@]}"; do
   want="$(expected_outcome "$m")"
   [[ -n "$want" ]] || { echo "error: unknown model $m" >&2; exit 1; }
   log="$metadir/$m.log"
+  cfg="$metadir/$m.cfg"
+  write_cfg "$m" "$(expected_field "$m" 1)" "$cfg"
   # A known-defect model runs with -continue so TLC reports every violated
   # invariant. Which violation BFS happens to reach first is an accident of
   # state order and not a property of the defect, so the ratchet checks that
@@ -97,7 +139,7 @@ for m in "${models[@]}"; do
   if [[ "$want" == violates:* ]]; then continue_flag=(-continue); fi
   set +e
   java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -cleanup ${continue_flag[@]+"${continue_flag[@]}"} \
-    -metadir "$metadir/$m" -config "$m.cfg" "$m.tla" >"$log" 2>&1
+    -metadir "$metadir/$m" -config "$cfg" "$m.tla" >"$log" 2>&1
   code=$?
   set -e
 
@@ -117,6 +159,11 @@ for m in "${models[@]}"; do
     if [[ "$got" == pass ]]; then matches=true; fi
   elif [[ " $violated " == *" ${want#violates:} "* ]]; then
     matches=true
+  fi
+
+  if [[ -n "${FORMAL_LOG_DIR:-}" ]]; then
+    mkdir -p "$FORMAL_LOG_DIR"
+    cp "$cfg" "$log" "$FORMAL_LOG_DIR/"
   fi
 
   states="$(grep -oE '[0-9,]+ distinct states found' "$log" | tail -1 || true)"

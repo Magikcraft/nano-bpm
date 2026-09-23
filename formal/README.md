@@ -8,8 +8,8 @@ about pure semantics (both land slice by slice).
 formal/
 └── tla/
     ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
-    ├── MC*.tla / MC*.cfg     # concrete process graphs to model-check
-    └── check.sh              # runs TLC on every model and compares with EXPECTED
+    ├── MC*.tla               # concrete process graphs to model-check
+    └── check.sh              # generates each TLC config, runs TLC, compares with EXPECTED
 ```
 
 ## Running
@@ -25,12 +25,14 @@ formal/tla/check.sh MCChainedInclusive   # one model
 
 CI runs the `formal (tlc)` job whenever `formal/**` changes.
 
-To read a counterexample trace, run TLC directly:
+To read a counterexample trace, keep the logs:
 
 ```bash
-cd formal/tla
-java -cp ~/.cache/nanobpm-formal/tla2tools-1.7.4.jar tlc2.TLC MCParallelJoinMultiArrival
+FORMAL_LOG_DIR=/tmp/tlc formal/tla/check.sh MCParallelJoinMultiArrival
+# /tmp/tlc/MCParallelJoinMultiArrival.{cfg,log}
 ```
+
+A model that does not match its expectation prints its full TLC log anyway.
 
 ## `TokenFlow.tla`
 
@@ -81,8 +83,8 @@ Once the defect is fixed, the model stops violating and `check.sh` fails until
 you flip the entry to `pass`. A fixed bug therefore keeps its guard, and a
 known bug stays visible.
 
-`check.sh` also fails if a `MC*.tla` has no table entry or no `.cfg`, or if an
-entry has no model.
+`check.sh` also fails if a `MC*.tla` has no table entry, if an entry has no
+model, or if TLC prints a warning.
 
 ## Adding a model
 
@@ -91,9 +93,11 @@ entry has no model.
    plus the derived `MCFlows`, `MCSrc` and `MCTgt` (copy these from an
    existing model). Flows have their own ids, as in the engine, so two
    distinct flows may share endpoints (`MCParallelDuplicateFlows`).
-2. Add `MCFoo.cfg`. Copy an existing one, and drop `JoinFiresAtMostOnce` and
-   `Termination` if the graph has a cycle.
-3. Add a row to `EXPECTED` in `check.sh`.
+2. Add a row to `EXPECTED` in `check.sh` with the model's shape (`acyclic` or
+   `cyclic`) and its expected outcome. There are no hand-written `.cfg` files:
+   `check.sh` generates each TLC config from the shape. Every model gets the
+   full safety set, and acyclic models also get `JoinFiresAtMostOnce` and
+   `Termination`. No model can therefore silently skip a property.
 
 If the model finds a violation, confirm it against the real engine with a red
 Rust test before recording it. The model may simply be wrong.
