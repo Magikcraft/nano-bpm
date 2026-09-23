@@ -284,26 +284,28 @@ pub enum Event {
     },
     /// A token arrived at an open join. `flow` is the incoming sequence flow it
     /// arrived over, so a parallel join can require every incoming flow (not just
-    /// enough arrivals) before it fires (#1233). It is `None` for journals written
-    /// before #1233, for inclusive-join arrivals (which fire by reachability,
-    /// not per flow), and for an activation that did not come over a flow.
+    /// enough arrivals) before it fires (#1233), and a firing join can consume one
+    /// token per flow. It is `None` for journals written before #1233 (and, for
+    /// inclusive joins, before #1237) and for an activation that did not come
+    /// over a flow.
     ParallelJoinTokenArrived {
         instance_key: Key,
         element_id: ElementId,
         #[cfg_attr(feature = "serde", serde(default))]
         flow: Option<IncomingFlow>,
     },
-    /// A join's bookkeeping was cleared outright: an inclusive join fired, a
-    /// pre-#1233 parallel join fired, or the scope holding the join was torn
-    /// down.
+    /// A join's bookkeeping was cleared outright: a join fired under a build
+    /// older than #1233 (parallel) / #1237 (inclusive), or the scope holding the
+    /// join was torn down.
     ParallelJoinReset {
         instance_key: Key,
         element_id: ElementId,
     },
-    /// A parallel-gateway join fired because every incoming flow has been taken.
-    /// It consumes ONE arrival per incoming flow and keeps any surplus for the
-    /// next activation (Zeebe's "Tetris principle",
-    /// `ProcessInstanceElementActivatingV3Applier`, #1233).
+    /// A join fired: a parallel join because every incoming flow has been taken,
+    /// an inclusive join because no live token can still reach it. It consumes
+    /// ONE arrival per incoming flow and keeps any surplus for the next
+    /// activation (Zeebe's "Tetris principle",
+    /// `ProcessInstanceElementActivatingV3Applier`, #1233, #1237).
     ParallelJoinFired {
         instance_key: Key,
         element_id: ElementId,

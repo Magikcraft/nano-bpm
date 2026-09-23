@@ -534,20 +534,30 @@ fn migration_rejects_open_join_with_different_incoming_arity() {
     );
 }
 
-/// An open parallel join has counted a token on `a -> join`, but the target's
-/// join has no incoming flow from `a` (nor from anything `a` is mapped to). The
-/// migrated join would count a flow that does not exist and fire early, so the
-/// migration is rejected, as Zeebe rejects an unmapped taken sequence flow
-/// (`ERROR_TAKEN_SEQUENCE_FLOW_NOT_MAPPED`, #1233).
+/// An open join has counted a token on `a -> join`, but the target's join has
+/// no incoming flow from `a` (nor from anything `a` is mapped to). The migrated
+/// join would count a flow that does not exist, so the migration is rejected,
+/// as Zeebe rejects an unmapped taken sequence flow into a parallel or
+/// inclusive gateway (`ERROR_TAKEN_SEQUENCE_FLOW_NOT_MAPPED`, #1233, #1237).
 #[test]
 fn migration_rejects_open_join_whose_counted_flow_is_missing_in_target() {
-    fn par_join(id: &str, a: &str) -> ProcessDefinition {
-        ProcessBuilder::new(id)
-            .start_event("s")
-            .parallel_gateway("split")
+    assert_counted_join_flow_must_be_mapped(ProcessBuilder::parallel_gateway);
+}
+
+#[test]
+fn migration_rejects_open_inclusive_join_whose_counted_flow_is_missing_in_target() {
+    assert_counted_join_flow_must_be_mapped(ProcessBuilder::inclusive_gateway);
+}
+
+fn assert_counted_join_flow_must_be_mapped(
+    gateway: fn(ProcessBuilder, &'static str) -> ProcessBuilder,
+) {
+    let par_join = |id: &str, a: &str| {
+        let b = ProcessBuilder::new(id).start_event("s");
+        let b = gateway(b, "split")
             .service_task(a, "ja")
-            .service_task("b", "jb")
-            .parallel_gateway("join")
+            .service_task("b", "jb");
+        gateway(b, "join")
             .end_event("e")
             .connect("s", "split")
             .connect("split", a)
@@ -557,7 +567,7 @@ fn migration_rejects_open_join_whose_counted_flow_is_missing_in_target() {
             .connect("join", "e")
             .build()
             .unwrap()
-    }
+    };
     let mut engine = Engine::new();
     deploy_for_migration(&mut engine, par_join("source", "a"));
     let target_key = deploy_for_migration(&mut engine, par_join("target", "a2"));
@@ -577,7 +587,7 @@ fn migration_rejects_open_join_whose_counted_flow_is_missing_in_target() {
     assert!(
         matches!(
             &err,
-            EngineError::MigratedParallelJoinFlowMissing {
+            EngineError::MigratedJoinFlowMissing {
                 source_element_id,
                 flow_source_element_id,
                 ..
@@ -671,13 +681,15 @@ fn migration_allows_open_inclusive_join_with_different_incoming_arity() {
         "precondition: the inclusive join is open before migration"
     );
 
-    // Map the parked branch `b` and the open join onto the 3-flow target join.
+    // Map the parked branch `b` and the open join onto the 3-flow target join,
+    // plus the counted flow's source `a` (a taken flow must be mapped, #1237).
     // Unlike a parallel join, the arity change must be accepted.
     engine
         .apply_command(Command::migrate_instance(
             inst,
             target_key,
             vec![
+                ("a".to_string(), "a2".to_string()),
                 ("b".to_string(), "b2".to_string()),
                 ("join".to_string(), "join2".to_string()),
             ],

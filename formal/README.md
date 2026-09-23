@@ -44,7 +44,7 @@ single process instance in a single scope:
 | `pending` (a bag of flows being taken) | the `Step::Activate` queue, drained to empty per command |
 | `waiting` | tokens parked on wait-state tasks (job completion is `CompleteTask`) |
 | `ArriveParallelJoin` | `arrive_at_parallel_join` (`ParallelJoinOpened` / `TokenArrived` / `Fired`) |
-| `joinTokens` | `join_flow_arrivals` (parallel, per incoming flow), `join_counts` (inclusive) |
+| `joinTokens` | `join_flow_arrivals` (per incoming flow, parallel and inclusive) |
 | `ArriveInclusiveJoin`, `FireInclusiveJoin` | `arrive_at_inclusive_join`, `fire_ready_inclusive_joins` |
 | `Reaching` | `elements_reaching` |
 | `CompleteInstance` | `complete_finished_instances` |
@@ -113,7 +113,10 @@ violations in (a stuck state still shows up, as `NoStuckInstance` and
   `ParallelJoinWaitsForEveryFlow`. `MCParallelJoinSurplus` takes every
   incoming flow twice; the join keeps the surplus between firings (Zeebe's
   "Tetris" principle), fires twice (`JoinFiresAtMostOnce`), and the instance
-  completes.
+  completes. `MCInclusiveJoinSurplus` is the inclusive-join version: the join
+  fires once nothing can reach it, consuming one token per flow, and fires
+  again on the surplus (`JoinFiresAtMostOnce`). Before #1237 the first firing
+  discarded the surplus, and the model passed.
 
 TLC cannot see the Rust code, so nothing yet forces the spec update when the
 engine changes. Until trace validation (#1226) links the two, that step is a

@@ -4071,48 +4071,47 @@ impl Engine {
                 let mut open_joins: Vec<String> = instance.join_instances.keys().cloned().collect();
                 open_joins.sort();
                 for src in open_joins {
-                    // Inclusive-gateway joins reuse this same `join_instances`
-                    // bookkeeping (the count/instance maps are element-kind
-                    // agnostic), but they do **not** fire on a durable
-                    // count-vs-threshold comparison: readiness is decided at
-                    // token quiescence by reachability
-                    // (`fire_ready_inclusive_joins`), never by comparing the
-                    // arrival count against `incoming_count`. So the "durable
-                    // count re-interpreted against a migrated-in threshold"
-                    // hazard this guard exists for cannot occur for them, and
-                    // requiring incoming-arity parity would reject an otherwise
-                    // compatible inclusive migration for an unrelated reason.
-                    // Guard *only* parallel-gateway joins — the sole element
-                    // whose durable count is compared to a definition-resident
-                    // threshold.
-                    let is_parallel_join = source_def
-                        .definition
-                        .elements
-                        .get(&src)
-                        .is_some_and(|e| e.kind == ElementKind::ParallelGateway);
-                    if !is_parallel_join {
+                    let join_kind = source_def.definition.elements.get(&src).map(|e| &e.kind);
+                    let is_parallel_join = matches!(join_kind, Some(ElementKind::ParallelGateway));
+                    let is_inclusive_join =
+                        matches!(join_kind, Some(ElementKind::InclusiveGateway));
+                    if !is_parallel_join && !is_inclusive_join {
                         continue;
                     }
                     let tgt = mapped
                         .get(&src)
                         .expect("an open join is active, so step 5 guarantees it is mapped");
-                    let source_incoming_count = source_def.definition.incoming_count(&src);
-                    let target_incoming_count = target.definition.incoming_count(tgt);
-                    if source_incoming_count != target_incoming_count {
-                        return Err(EngineError::MigratedParallelJoinArityChanged {
-                            instance_key,
-                            source_element_id: src,
-                            target_element_id: tgt.clone(),
-                            source_incoming_count,
-                            target_incoming_count,
-                        });
+                    // Inclusive-gateway joins reuse this same bookkeeping, but
+                    // they do **not** fire on a durable count-vs-threshold
+                    // comparison: readiness is decided at token quiescence by
+                    // reachability (`fire_ready_inclusive_joins`), never by
+                    // comparing the arrivals against `incoming_count`. So the
+                    // "durable count re-interpreted against a migrated-in
+                    // threshold" hazard cannot occur for them, and requiring
+                    // incoming-arity parity would reject an otherwise compatible
+                    // inclusive migration for an unrelated reason. Only the
+                    // per-flow check below applies to them.
+                    if is_parallel_join {
+                        let source_incoming_count = source_def.definition.incoming_count(&src);
+                        let target_incoming_count = target.definition.incoming_count(tgt);
+                        if source_incoming_count != target_incoming_count {
+                            return Err(EngineError::MigratedParallelJoinArityChanged {
+                                instance_key,
+                                source_element_id: src,
+                                target_element_id: tgt.clone(),
+                                source_incoming_count,
+                                target_incoming_count,
+                            });
+                        }
                     }
-                    // Each flow the join has counted a token on must still be an
-                    // incoming flow of the target join (after the applier renames
-                    // its source by the same mapping), or the migrated join would
-                    // count a flow that no longer exists and fire early. Zeebe
-                    // requires a target for every taken sequence flow
-                    // (`requireNonNullTargetSequenceFlowId`, #1233).
+                    // Each flow a parallel or inclusive join has counted a token
+                    // on must still be an incoming flow of the target join (after
+                    // the applier renames its source by the same mapping). A
+                    // parallel join would otherwise count a flow that no longer
+                    // exists and fire early; an inclusive join would carry a token
+                    // no flow can consume. Zeebe requires a target for every taken
+                    // sequence flow into either gateway
+                    // (`requireNonNullTargetSequenceFlowId`, #1233, #1237).
                     //
                     // Unidentified arrivals (`join_counts`: a pre-#1233 journal,
                     // or a modification that activated the join directly) name
@@ -4128,7 +4127,7 @@ impl Engine {
                                 ordinal: flow.ordinal,
                             };
                             if !target.definition.has_incoming_flow(tgt, &migrated) {
-                                return Err(EngineError::MigratedParallelJoinFlowMissing {
+                                return Err(EngineError::MigratedJoinFlowMissing {
                                     instance_key,
                                     source_element_id: src,
                                     target_element_id: tgt.clone(),
@@ -5434,7 +5433,7 @@ impl Engine {
         if matches!(kind, Some(ElementKind::InclusiveGateway))
             && self.incoming_count(instance_key, &element_id) > 1
         {
-            return self.arrive_at_inclusive_join(instance_key, element_id, scope);
+            return self.arrive_at_inclusive_join(instance_key, element_id, scope, via);
         }
 
         // A multi-instance activity: unless we are already inside its body (i.e.
@@ -11027,10 +11026,11 @@ impl Engine {
             element_instance_key,
             element_id: element_id.clone(),
         });
-        self.reset_open_inclusive_join(
+        self.fire_open_inclusive_join(
             instance_key,
             element_instance_key,
             &element_id,
+            scope,
             &mut events,
         );
         let mut followups = Vec::new();
@@ -11062,10 +11062,11 @@ impl Engine {
                     element_instance_key,
                     element_id: element_id.clone(),
                 }];
-                self.reset_open_inclusive_join(
+                self.fire_open_inclusive_join(
                     instance_key,
                     element_instance_key,
                     &element_id,
+                    scope,
                     &mut events,
                 );
                 let mut followups = Vec::new();
@@ -11116,38 +11117,36 @@ impl Engine {
         }
     }
 
-    /// If `element_id` currently rests as an **open inclusive-gateway join**
-    /// (its bookkeeping still sits in `join_instances`/`join_counts` keyed by the
-    /// element id, opened by [`arrive_at_inclusive_join`]), append a
-    /// [`Event::ParallelJoinReset`] to `events` so the join's shared bookkeeping
-    /// is cleared as it completes. A join normally completes *and* resets inside
-    /// the quiescence sweep ([`fire_ready_inclusive_joins`]); but when that sweep
-    /// raised an incident (no-matching-flow / expression failure) on the join, the
-    /// incident is later resolved by re-driving `Step::Complete`, which dispatches
-    /// to the split-completion path ([`complete_inclusive_gateway`] /
-    /// [`finalize_inclusive_gateway`]). That path emits `ElementCompleted` but the
-    /// reducer does not clear the join maps on `ElementCompleted`, so without this
-    /// reset the stale entry would be swept again next quiescence and duplicate the
-    /// outgoing routing. The guard makes this a no-op for an ordinary
+    /// If `element_instance_key` is the *open inclusive join* for `element_id`
+    /// (opened by [`arrive_at_inclusive_join`]), append its firing to `events`:
+    /// [`Event::ParallelJoinFired`] consumes one token per incoming flow, and a
+    /// surplus reopens the join ([`Engine::fire_join`]). A join normally fires
+    /// inside the quiescence sweep ([`fire_ready_inclusive_joins`]); but when that
+    /// sweep raised an incident (no-matching-flow / expression failure) on the
+    /// join, or deferred it behind an `end` listener chain, completion is later
+    /// re-driven through the split-completion path ([`complete_inclusive_gateway`]
+    /// / [`finalize_inclusive_gateway`]). That path emits `ElementCompleted`, but
+    /// the reducer does not clear the join maps on `ElementCompleted`, so without
+    /// this the stale entry would be swept again next quiescence and duplicate
+    /// the outgoing routing. The guard makes this a no-op for an ordinary
     /// single-incoming inclusive split (no open join exists).
-    fn reset_open_inclusive_join(
-        &self,
+    fn fire_open_inclusive_join(
+        &mut self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: &str,
+        scope: Key,
         events: &mut Vec<Event>,
     ) {
         if self.join_eik(instance_key, element_id) == Some(element_instance_key) {
-            events.push(Event::ParallelJoinReset {
-                instance_key,
-                element_id: element_id.to_string(),
-            });
+            let arrivals = self.join_arrivals(instance_key, element_id);
+            self.fire_join(instance_key, element_id, scope, arrivals, events);
         }
     }
 
     /// A token reached an inclusive-gateway join. Open the join on the first
-    /// arrival and count every arrival (reusing the parallel-join bookkeeping —
-    /// the count/instance maps are element-kind-agnostic). Unlike a parallel join
+    /// arrival and count every arrival per incoming flow (reusing the
+    /// parallel-join bookkeeping — the maps are element-kind-agnostic). Unlike a parallel join
     /// it does **not** fire here: firing is decided at token quiescence by
     /// [`fire_ready_inclusive_joins`], once no in-flight token could still reach
     /// it — so an in-transit sibling arrival is never mistaken for a branch that
@@ -11157,34 +11156,19 @@ impl Engine {
         instance_key: Key,
         element_id: String,
         scope: Key,
+        via: Option<IncomingFlow>,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut events = Vec::new();
         if self.join_eik(instance_key, &element_id).is_none() {
-            let eik = self.mint_key();
-            events.push(Event::ElementActivating {
-                instance_key,
-                element_instance_key: eik,
-                element_id: element_id.clone(),
-            });
-            events.push(Event::ElementActivated {
-                instance_key,
-                element_instance_key: eik,
-                element_id: element_id.clone(),
-                scope,
-            });
-            events.push(Event::ParallelJoinOpened {
-                instance_key,
-                element_instance_key: eik,
-                element_id: element_id.clone(),
-            });
+            self.open_join(instance_key, &element_id, scope, &mut events);
         }
-        // An inclusive join fires by reachability, not per flow, and a fire
-        // clears it outright (`ParallelJoinReset`), so its arrivals stay
-        // unidentified.
+        // Readiness is decided by reachability, but the tokens are still
+        // counted per incoming flow: firing consumes one per flow and keeps the
+        // surplus (#1237).
         events.push(Event::ParallelJoinTokenArrived {
             instance_key,
             element_id,
-            flow: None,
+            flow: via,
         });
         (events, Vec::new())
     }
@@ -11361,7 +11345,7 @@ impl Engine {
             // satisfiable. Resolution re-drives `Step::Complete`
             // (`complete_inclusive_gateway`), which is the single completion route
             // for a parked join and clears its bookkeeping via
-            // `reset_open_inclusive_join`. Firing here instead would complete the
+            // `fire_open_inclusive_join`. Firing here instead would complete the
             // element while leaving its incident stale (never resolved), i.e. the
             // duplicate/stale-bookkeeping class this join path already guards
             // against on the raise side.
@@ -11475,13 +11459,14 @@ impl Engine {
                     element_id: element_id.clone(),
                 },
             );
-            self.emit(
-                log,
-                Event::ParallelJoinReset {
-                    instance_key,
-                    element_id: element_id.clone(),
-                },
-            );
+            // Consume one token per incoming flow; a surplus reopens the join,
+            // and a later sweep fires it again once nothing can still reach it.
+            let arrivals = self.join_arrivals(instance_key, &element_id);
+            let mut fired = Vec::new();
+            self.fire_join(instance_key, &element_id, scope, arrivals, &mut fired);
+            for event in fired {
+                self.emit(log, event);
+            }
             for flow_index in selected {
                 let (event, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
                 self.emit(log, event);
@@ -11580,7 +11565,7 @@ impl Engine {
         let mut events = Vec::new();
         let open_eik = match self.join_eik(instance_key, &element_id) {
             Some(eik) => eik,
-            None => self.open_parallel_join(instance_key, &element_id, scope, &mut events),
+            None => self.open_join(instance_key, &element_id, scope, &mut events),
         };
         events.push(Event::ParallelJoinTokenArrived {
             instance_key,
@@ -11600,14 +11585,7 @@ impl Engine {
                 element_instance_key: open_eik,
                 element_id: element_id.clone(),
             });
-            events.push(Event::ParallelJoinFired {
-                instance_key,
-                element_id: element_id.clone(),
-            });
-            arrivals.consume_one_each();
-            if !arrivals.is_empty() {
-                self.open_parallel_join(instance_key, &element_id, scope, &mut events);
-            }
+            self.fire_join(instance_key, &element_id, scope, arrivals, &mut events);
             for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
                 events.push(event);
                 followups.push(step);
@@ -11617,9 +11595,43 @@ impl Engine {
         (events, followups)
     }
 
-    /// Open a parallel join: a fresh element instance that holds its waiting
-    /// tokens. Returns its key.
-    fn open_parallel_join(
+    /// A join fires: [`Event::ParallelJoinFired`] consumes one token per incoming
+    /// flow from `arrivals` (the join's per-flow tokens as they stand once the
+    /// firing arrival is counted) and keeps the surplus, Zeebe's "Tetris
+    /// principle". A surplus is still a live token, so it reopens the join on a
+    /// fresh element instance, which keeps the instance alive. Shared by
+    /// parallel and inclusive joins (#1233, #1237).
+    fn fire_join(
+        &mut self,
+        instance_key: Key,
+        element_id: &str,
+        scope: Key,
+        mut arrivals: state::FlowArrivals,
+        events: &mut Vec<Event>,
+    ) {
+        events.push(Event::ParallelJoinFired {
+            instance_key,
+            element_id: element_id.to_string(),
+        });
+        arrivals.consume_one_each();
+        if !arrivals.is_empty() {
+            self.open_join(instance_key, element_id, scope, events);
+        }
+    }
+
+    /// The per-flow tokens currently waiting on `element_id`'s open join.
+    fn join_arrivals(&self, instance_key: Key, element_id: &str) -> state::FlowArrivals {
+        self.state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.join_flow_arrivals.get(element_id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Open a join (parallel or inclusive): a fresh element instance that holds
+    /// its waiting tokens. Returns its key.
+    fn open_join(
         &mut self,
         instance_key: Key,
         element_id: &str,
@@ -12687,12 +12699,12 @@ pub enum EngineError {
         source_incoming_count: usize,
         target_incoming_count: usize,
     },
-    /// A `MigrateInstance` mapped an open parallel-gateway join that has counted
+    /// A `MigrateInstance` mapped an open parallel- or inclusive-gateway join that has counted
     /// a token on an incoming flow (the `flow_ordinal`-th flow from
     /// `flow_source_element_id` to the join) that is not an incoming flow of the
     /// target gateway. The migrated join would count a flow that no longer
     /// exists and fire early (#1233). Maps to HTTP 409.
-    MigratedParallelJoinFlowMissing {
+    MigratedJoinFlowMissing {
         instance_key: Key,
         source_element_id: String,
         target_element_id: String,
@@ -13008,7 +13020,7 @@ impl std::fmt::Display for EngineError {
                      gateway with the same number of incoming sequence flows"
                 )
             }
-            EngineError::MigratedParallelJoinFlowMissing {
+            EngineError::MigratedJoinFlowMissing {
                 instance_key,
                 source_element_id,
                 target_element_id,
@@ -13017,7 +13029,7 @@ impl std::fmt::Display for EngineError {
             } => {
                 write!(
                     f,
-                    "migration of instance {instance_key} maps open parallel-join {source_element_id} \
+                    "migration of instance {instance_key} maps open join {source_element_id} \
                      to {target_element_id}, but the join holds a token on flow #{flow_ordinal} from \
                      {flow_source_element_id}, which is not an incoming flow of {target_element_id}"
                 )
