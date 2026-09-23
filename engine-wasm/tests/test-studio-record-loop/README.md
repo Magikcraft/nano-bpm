@@ -76,4 +76,4 @@ npm test
 
 Like the sibling probes, this runs against the committed `engine-wasm/pkg/`, so
 source-only changes are not verified until the package is regenerated
-(`make engine-wasm-ffi-dist`).
+(`make console-wasm`).
