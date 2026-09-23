@@ -779,5 +779,609 @@
       "at": 1700000000007,
       "instance_key": 12
     }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 16
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 16,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "e": {
+            "end_listeners": [],
+            "id": "e",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "fork": {
+            "end_listeners": [],
+            "id": "fork",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "ParallelGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "join"
+              },
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "join"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "join": {
+            "end_listeners": [],
+            "id": "join",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "ParallelGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "e"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "fork"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "dup",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 17,
+      "version": 1
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 18
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 18,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "e": {
+            "end_listeners": [],
+            "id": "e",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "fork": {
+            "end_listeners": [],
+            "id": "fork",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "ParallelGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "t"
+              },
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "join"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "join": {
+            "end_listeners": [],
+            "id": "join",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "ParallelGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "e"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "fork"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "t": {
+            "end_listeners": [],
+            "id": "t",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "ServiceTask": {
+                "custom_headers": {},
+                "job_type": "sync-task",
+                "linked_resources": [],
+                "priority": null
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "join"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "sync",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 19,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000009,
+      "instance_key": 20,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 17,
+      "process_id": "dup",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 21,
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 21,
+      "instance_key": 20,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 21,
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 21,
+      "instance_key": 20
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 20,
+      "to": "fork"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "fork",
+      "element_instance_key": 22,
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "fork",
+      "element_instance_key": 22,
+      "instance_key": 20,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "fork",
+      "element_instance_key": 22,
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "fork",
+      "element_instance_key": 22,
+      "instance_key": 20
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "fork",
+      "instance_key": 20,
+      "to": "join"
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "fork",
+      "instance_key": 20,
+      "to": "join"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "join",
+      "element_instance_key": 23,
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "join",
+      "element_instance_key": 23,
+      "instance_key": 20,
+      "scope": 0
+    }
+  },
+  {
+    "ParallelJoinOpened": {
+      "element_id": "join",
+      "element_instance_key": 23,
+      "instance_key": 20
+    }
+  },
+  {
+    "ParallelJoinTokenArrived": {
+      "element_id": "join",
+      "flow": {
+        "from": "fork",
+        "ordinal": 0
+      },
+      "instance_key": 20
+    }
+  },
+  {
+    "ParallelJoinTokenArrived": {
+      "element_id": "join",
+      "flow": {
+        "from": "fork",
+        "ordinal": 1
+      },
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "join",
+      "element_instance_key": 23,
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "join",
+      "element_instance_key": 23,
+      "instance_key": 20
+    }
+  },
+  {
+    "ParallelJoinFired": {
+      "element_id": "join",
+      "instance_key": 20
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "join",
+      "instance_key": 20,
+      "to": "e"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "e",
+      "element_instance_key": 24,
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "e",
+      "element_instance_key": 24,
+      "instance_key": 20,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "e",
+      "element_instance_key": 24,
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "e",
+      "element_instance_key": 24,
+      "instance_key": 20
+    }
+  },
+  {
+    "ProcessInstanceCompleted": {
+      "instance_key": 20
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000010,
+      "instance_key": 25,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 19,
+      "process_id": "sync",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 26,
+      "instance_key": 25
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 26,
+      "instance_key": 25,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 26,
+      "instance_key": 25
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 26,
+      "instance_key": 25
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 25,
+      "to": "fork"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "fork",
+      "element_instance_key": 27,
+      "instance_key": 25
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "fork",
+      "element_instance_key": 27,
+      "instance_key": 25,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "fork",
+      "element_instance_key": 27,
+      "instance_key": 25
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "fork",
+      "element_instance_key": 27,
+      "instance_key": 25
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "fork",
+      "instance_key": 25,
+      "to": "t"
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "fork",
+      "instance_key": 25,
+      "to": "join"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "t",
+      "element_instance_key": 28,
+      "instance_key": 25
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "t",
+      "element_instance_key": 28,
+      "instance_key": 25,
+      "scope": 0
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000010,
+      "element_id": "t",
+      "element_instance_key": 28,
+      "instance_key": 25,
+      "job_key": 29,
+      "job_type": "sync-task",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "join",
+      "element_instance_key": 30,
+      "instance_key": 25
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "join",
+      "element_instance_key": 30,
+      "instance_key": 25,
+      "scope": 0
+    }
+  },
+  {
+    "ParallelJoinOpened": {
+      "element_id": "join",
+      "element_instance_key": 30,
+      "instance_key": 25
+    }
+  },
+  {
+    "ParallelJoinTokenArrived": {
+      "element_id": "join",
+      "flow": {
+        "from": "fork",
+        "ordinal": 0
+      },
+      "instance_key": 25
+    }
   }
 ]

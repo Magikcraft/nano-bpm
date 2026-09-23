@@ -65,6 +65,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::ParallelJoinOpened { .. }
         | Event::ParallelJoinTokenArrived { .. }
         | Event::ParallelJoinReset { .. }
+        | Event::ParallelJoinFired { .. }
         | Event::CompensationSubscriptionCreated { .. }
         | Event::CompensationTriggered { .. }
         | Event::CompensationHandlerCompleted { .. }

@@ -137,6 +137,22 @@ impl Condition {
     }
 }
 
+/// Identifies one sequence flow into an element by its source element and its
+/// ordinal among the source's flows to that same target (`0` for the usual
+/// single flow; a second, parallel flow between the same two elements is `1`).
+///
+/// Nano's [`SequenceFlow`]s carry no BPMN id, so this is the stable identity a
+/// parallel join counts arrivals by. Zeebe keys the same bookkeeping by the
+/// sequence-flow id (#1233). The ordinal is taken over flows to the same target
+/// only, so adding an unrelated outgoing flow to the source does not shift it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct IncomingFlow {
+    pub from: ElementId,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ordinal: usize,
+}
+
 /// An outgoing sequence flow: a target element and an optional guard condition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1468,6 +1484,28 @@ impl ProcessDefinition {
             .flat_map(|e| e.outgoing.iter())
             .filter(|f| f.to == id)
             .count()
+    }
+
+    /// The identity of `from`'s `index`-th outgoing flow as seen by its target:
+    /// the target element id and the flow's [`IncomingFlow`]. `None` when `from`
+    /// has no such flow.
+    pub fn incoming_flow(&self, from: &str, index: usize) -> Option<(ElementId, IncomingFlow)> {
+        let outgoing = &self.element(from)?.outgoing;
+        let to = &outgoing.get(index)?.to;
+        let ordinal = outgoing[..index].iter().filter(|f| &f.to == to).count();
+        Some((
+            to.clone(),
+            IncomingFlow {
+                from: from.to_string(),
+                ordinal,
+            },
+        ))
+    }
+
+    /// Whether `flow` names an existing sequence flow into `to`.
+    pub fn has_incoming_flow(&self, to: &str, flow: &IncomingFlow) -> bool {
+        self.element(&flow.from)
+            .is_some_and(|e| e.outgoing.iter().filter(|f| f.to == to).count() > flow.ordinal)
     }
 
     /// Rewrites every [`ElementKind::CallActivity`] in this definition into an

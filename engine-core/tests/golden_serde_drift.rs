@@ -331,6 +331,50 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("re-suspend instance B"),
     );
 
+    // Parallel-join witnesses (#1233). `dup` joins two distinct flows between
+    // the same pair of elements and completes at once, pinning
+    // `ParallelJoinTokenArrived.flow` (ordinals 0 and 1) and
+    // `ParallelJoinFired`. `sync` parks half-open on its one job, pinning a
+    // non-empty `join_flow_arrivals` in the snapshot.
+    let dup: ProcessDefinition = ProcessBuilder::new("dup")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .parallel_gateway("join")
+        .end_event("e")
+        .connect("s", "fork")
+        .connect("fork", "join")
+        .connect("fork", "join")
+        .connect("join", "e")
+        .build()
+        .expect("build dup process");
+    let sync: ProcessDefinition = ProcessBuilder::new("sync")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .service_task("t", "sync-task")
+        .parallel_gateway("join")
+        .end_event("e")
+        .connect("s", "fork")
+        .connect("fork", "t")
+        .connect("fork", "join")
+        .connect("t", "join")
+        .connect("join", "e")
+        .build()
+        .expect("build sync process");
+    for (def, at) in [(dup, T0 + 8), (sync, T0 + 8)] {
+        journal.extend(
+            engine
+                .apply_command_at(Command::DeployProcess(def), at)
+                .expect("deploy join witness"),
+        );
+    }
+    for (id, at) in [("dup", T0 + 9), ("sync", T0 + 10)] {
+        journal.extend(
+            engine
+                .apply_command_at(Command::create_instance(id), at)
+                .expect("create join witness instance"),
+        );
+    }
+
     let snapshot = engine.snapshot();
     (snapshot, journal)
 }

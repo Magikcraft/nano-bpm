@@ -339,10 +339,12 @@ fn migration_completes_via_remapped_job() {
 /// A `par` process `s -> split =< a, b >= join -> e` whose branch `a` has
 /// already reached the join (so the join is half-open) while branch `b` is
 /// still parked, migrated to an identically-shaped `target` with renamed
-/// elements. Both `join_counts` and `join_instances` are keyed by the join
-/// gateway's element id, so the applier must remap them *together*; a regression
-/// that remapped only `join_counts` left `join_instances` pointing at the source
-/// id, desyncing `join_eik` from `join_count` after migration.
+/// elements. The join's arrival maps (`join_flow_arrivals`, `join_counts`) and
+/// `join_instances` are keyed by the join gateway's element id, so the applier
+/// must remap them *together*; a regression that remapped only the counts left
+/// `join_instances` pointing at the source id, desyncing `join_eik` from the
+/// counts after migration. The counted flow `a -> join` names its source, so
+/// `a` is mapped too (Zeebe requires a mapping for every taken flow, #1233).
 #[test]
 fn migration_remaps_both_parallel_join_maps_together() {
     fn par_join_process(id: &str, split: &str, a: &str, b: &str, join: &str) -> ProcessDefinition {
@@ -383,8 +385,8 @@ fn migration_remaps_both_parallel_join_maps_together() {
         "the join is half-open on the source id before migration"
     );
     assert_eq!(
-        instance.join_counts.get("join").copied(),
-        Some(1),
+        instance.join_flows_taken("join"),
+        1,
         "one branch has arrived at the join before migration"
     );
 
@@ -394,6 +396,7 @@ fn migration_remaps_both_parallel_join_maps_together() {
             inst,
             target_key,
             vec![
+                ("a".to_string(), "a2".to_string()),
                 ("b".to_string(), "b2".to_string()),
                 ("join".to_string(), "join2".to_string()),
             ],
@@ -402,18 +405,23 @@ fn migration_remaps_both_parallel_join_maps_together() {
 
     let instance = engine.instance(inst).unwrap();
     assert!(
-        instance.join_counts.contains_key("join2") && !instance.join_counts.contains_key("join"),
-        "join_counts re-keyed onto the target join id"
+        instance.join_flow_arrivals.contains_key("join2")
+            && !instance.join_flow_arrivals.contains_key("join"),
+        "join_flow_arrivals re-keyed onto the target join id"
     );
     assert!(
         instance.join_instances.contains_key("join2")
             && !instance.join_instances.contains_key("join"),
-        "join_instances re-keyed onto the target join id (kept in sync with join_counts)"
+        "join_instances re-keyed onto the target join id (kept in sync with the counts)"
     );
+    let arrivals = &instance.join_flow_arrivals["join2"];
     assert_eq!(
-        instance.join_counts.get("join2").copied(),
-        Some(1),
-        "the arrival count survives the remap"
+        arrivals.count(&IncomingFlow {
+            from: "a2".to_string(),
+            ordinal: 0
+        }),
+        1,
+        "the counted flow is renamed to the target's `a2 -> join2`"
     );
 
     // Executable proof: completing the remaining branch fires the join once and
@@ -523,6 +531,78 @@ fn migration_rejects_open_join_with_different_incoming_arity() {
     assert!(
         instance.join_instances.contains_key("join"),
         "the open join is left intact on the source id"
+    );
+}
+
+/// An open parallel join has counted a token on `a -> join`, but the target's
+/// join has no incoming flow from `a` (nor from anything `a` is mapped to). The
+/// migrated join would count a flow that does not exist and fire early, so the
+/// migration is rejected, as Zeebe rejects an unmapped taken sequence flow
+/// (`ERROR_TAKEN_SEQUENCE_FLOW_NOT_MAPPED`, #1233).
+#[test]
+fn migration_rejects_open_join_whose_counted_flow_is_missing_in_target() {
+    fn par_join(id: &str, a: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .parallel_gateway("split")
+            .service_task(a, "ja")
+            .service_task("b", "jb")
+            .parallel_gateway("join")
+            .end_event("e")
+            .connect("s", "split")
+            .connect("split", a)
+            .connect("split", "b")
+            .connect(a, "join")
+            .connect("b", "join")
+            .connect("join", "e")
+            .build()
+            .unwrap()
+    }
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, par_join("source", "a"));
+    let target_key = deploy_for_migration(&mut engine, par_join("target", "a2"));
+    let inst = create_instance_key(&mut engine, "source");
+    complete_one(&mut engine, "ja");
+
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("b".to_string(), "b".to_string()),
+                ("join".to_string(), "join".to_string()),
+            ],
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            EngineError::MigratedParallelJoinFlowMissing {
+                source_element_id,
+                flow_source_element_id,
+                ..
+            } if source_element_id == "join" && flow_source_element_id == "a"
+        ),
+        "a counted flow with no target counterpart is rejected, got {err:?}"
+    );
+    assert_eq!(engine.instance(inst).unwrap().process_id, "source");
+
+    // Mapping the flow's source onto the target's `a2` resolves it.
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("a".to_string(), "a2".to_string()),
+                ("b".to_string(), "b".to_string()),
+                ("join".to_string(), "join".to_string()),
+            ],
+        ))
+        .unwrap();
+    complete_one(&mut engine, "jb");
+    assert_eq!(
+        engine.instance(inst).unwrap().state,
+        crate::state::ProcessInstanceState::Completed
     );
 }
 

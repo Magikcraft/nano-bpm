@@ -733,14 +733,6 @@ impl Engine {
             .copied()
     }
 
-    pub(crate) fn join_count(&self, instance_key: Key, element_id: &str) -> usize {
-        self.state
-            .instances
-            .get(&instance_key)
-            .and_then(|i| i.join_counts.get(element_id).copied())
-            .unwrap_or(0)
-    }
-
     /// Writes `value` to `target` (a plain name or a dotted path) inside the
     /// accumulating merge map, seeding nested context from the existing instance
     /// variables so a partial-path mapping (`order.total`) preserves the other

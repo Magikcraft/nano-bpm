@@ -384,6 +384,7 @@ impl Engine {
                 instance_key: child_key,
                 element_id: start_event,
                 scope: 0,
+                via: None,
             }],
         )
     }
@@ -557,17 +558,9 @@ impl Engine {
             }
         }
         let mut followups = Vec::new();
-        for flow in self.outgoing(instance_key, &element_id) {
-            events.push(Event::SequenceFlowTaken {
-                instance_key,
-                from: element_id.clone(),
-                to: flow.to.clone(),
-            });
-            followups.push(Step::Activate {
-                instance_key,
-                element_id: flow.to,
-                scope,
-            });
+        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.push(event);
+            followups.push(step);
         }
         (events, followups)
     }

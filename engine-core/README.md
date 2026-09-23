@@ -321,7 +321,9 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > **exclusive (XOR) gateways** (FEEL condition-based routing with a default flow,
 > raising an incident when nothing matches or a condition fails to evaluate),
 > **parallel (AND) gateways**
-> (split takes all branches; join synchronises them),
+> (split takes all branches; join synchronises them: as in Zeebe, it fires once
+> every incoming flow has delivered a token, consuming one per flow and keeping
+> any surplus for a later firing),
 > **inclusive (OR) gateways** (split takes every outgoing flow whose FEEL
 > condition holds, falling back to the default flow; the join waits at token
 > quiescence until no still-in-flight token could reach it), **timer intermediate

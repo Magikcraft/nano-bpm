@@ -284,6 +284,7 @@ mod tests {
             scopes: HashMap::new(),
             variables: Arc::new(HashMap::new()),
             join_counts: HashMap::new(),
+            join_flow_arrivals: HashMap::new(),
             join_instances: HashMap::new(),
             incidents: Vec::new(),
             variables_spilled: false,
