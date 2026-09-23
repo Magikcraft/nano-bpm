@@ -53,17 +53,35 @@ sha256() {
   else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
-jar="${TLA2TOOLS_JAR:-${XDG_CACHE_HOME:-$HOME/.cache}/nanobpm-formal/tla2tools-$TLA_VERSION.jar}"
-if [[ ! -f "$jar" ]]; then
-  mkdir -p "$(dirname "$jar")"
-  echo "fetching tla2tools $TLA_VERSION -> $jar"
-  curl -fsSL -o "$jar.tmp" \
+fetch_tla2tools() {
+  mkdir -p "$(dirname "$1")"
+  echo "fetching tla2tools $TLA_VERSION -> $1"
+  curl -fsSL -o "$1.tmp" \
     "https://github.com/tlaplus/tlaplus/releases/download/v$TLA_VERSION/tla2tools.jar"
-  mv "$jar.tmp" "$jar"
-fi
-if [[ "$(sha256 "$jar")" != "$TLA_SHA256" ]]; then
-  echo "error: $jar does not match the pinned SHA-256 for tla2tools $TLA_VERSION" >&2
-  exit 1
+  # Verify before the jar enters the cache, so a bad download is never kept.
+  if [[ "$(sha256 "$1.tmp")" != "$TLA_SHA256" ]]; then
+    rm -f "$1.tmp"
+    echo "error: downloaded tla2tools does not match the pinned SHA-256 for $TLA_VERSION" >&2
+    exit 1
+  fi
+  mv "$1.tmp" "$1"
+}
+
+if [[ -n "${TLA2TOOLS_JAR:-}" ]]; then
+  jar="$TLA2TOOLS_JAR"
+  if [[ ! -f "$jar" || "$(sha256 "$jar")" != "$TLA_SHA256" ]]; then
+    echo "error: TLA2TOOLS_JAR=$jar is missing or does not match the pinned SHA-256 for $TLA_VERSION" >&2
+    exit 1
+  fi
+else
+  jar="${XDG_CACHE_HOME:-$HOME/.cache}/nanobpm-formal/tla2tools-$TLA_VERSION.jar"
+  # A cached jar that no longer matches (for example, corrupted) is replaced
+  # instead of failing every run.
+  if [[ -f "$jar" && "$(sha256 "$jar")" != "$TLA_SHA256" ]]; then
+    echo "cached $jar does not match the pinned SHA-256; refetching"
+    rm -f "$jar"
+  fi
+  [[ -f "$jar" ]] || fetch_tla2tools "$jar"
 fi
 
 # bash 3.2 (macOS) has no associative arrays, so look outcomes up by scan.
