@@ -5,7 +5,7 @@ is, where each piece lives, and how they depend on one another.
 
 | Repo | Product name | Role |
 | --- | --- | --- |
-| [`Magikcraft/nano-bpm`](https://github.com/Magikcraft/nano-bpm) | **Nano BPM** | The core product: engine, gateway server, web console, embeddable engine libraries (`nano-bernd`, `engine-wasm`), and schemas. The source of truth. |
+| [`nanobpm/nano-bpm`](https://github.com/nanobpm/nano-bpm) | **Nano BPM** | The core product: engine, gateway server, web console, embeddable engine libraries (`nano-bernd`, `engine-wasm`), and schemas. The source of truth. |
 | [`nanobpm/nano-ide`](https://github.com/nanobpm/nano-ide) | **Nano IDE** | Console extension packs (languages, app templates, examples, themes, triggers/connectors) **and** the published code-first stack: the Urban app runtime (`@nanobpm/urban`), the `create-urban-app` scaffolder, and the code-first workflow SDK (`@nanobpm/workflow`). Published to npm. |
 | [`jwulf/nano-sdk-js`](https://github.com/jwulf/nano-sdk-js) | **Nano SDK (JS)** | `@nanobpm/nano-sdk` — the **engine-transport spine**: a drop-in replacement for `@camunda8/orchestration-cluster-api` that transparently upgrades the hot paths to Nano's **Falcon** protocol (and offers an in-process `embedded` transport). Cross-runtime (Node, Deno, Bun). Published to npm. |
 | [`jwulf/c8ctl-plugin-nano`](https://github.com/jwulf/c8ctl-plugin-nano) | **c8ctl Nano plugin** | A `c8ctl` CLI plugin that installs, runs, and manages a local Nano BPM cluster; ships the prebuilt gateway binary; and turns CLI agents into job workers. |
@@ -32,7 +32,7 @@ At a glance, the dependency direction is one-way into Nano BPM:
 
 ---
 
-## 1. Nano BPM — the core (`Magikcraft/nano-bpm`)
+## 1. Nano BPM — the core (`nanobpm/nano-bpm`)
 
 A Rust + TypeScript monorepo that produces the `nanobpmn` gateway binary and the
 embeddable engine. It owns the REST contract, the Falcon protocol, the console,

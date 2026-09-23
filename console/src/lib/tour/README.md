@@ -1,7 +1,7 @@
 # Guided journeys
 
 Onboarding for the console, per [ADR 0049](../../../../docs/adr/0049-guided-journeys.md).
-Epic: [#406](https://github.com/Magikcraft/nano-bpm/issues/406). This directory is the
+Epic: [#406](https://github.com/nanobpm/nano-bpm/issues/406). This directory is the
 framework; the journeys themselves live in [`journeys/`](./journeys).
 
 ## What changed, and why
@@ -98,7 +98,7 @@ neither happens entirely inside the console: a copyable command or URL.
 
 - With `verify`, the step auto-advances when the console observes the _result_ of the
   command (e.g. `isPolling(jobType)` once
-  [#404](https://github.com/Magikcraft/nano-bpm/issues/404) supplies `consumers`).
+  [#404](https://github.com/nanobpm/nano-bpm/issues/404) supplies `consumers`).
 - Without it, the Next button reads "I've done it" — honest, since the console cannot
   watch a terminal.
 - `copy` is rendered with `textContent` and is **never executed**. Nothing here may
@@ -133,7 +133,7 @@ align), and far healthier upstream (1.4M dl/wk vs 167k; released weekly vs last 
 
 ## Entry points
 
-The front door is the **startup persona panel** ([#464](https://github.com/Magikcraft/nano-bpm/issues/464)):
+The front door is the **startup persona panel** ([#464](https://github.com/nanobpm/nano-bpm/issues/464)):
 a modal shown when the console is opened, listing the offerable journeys as
 first-person personas ("I want to …") the person self-selects. A **"Show at
 startup" checkbox** (default checked, persisted as `showStartupPanel` in
@@ -145,13 +145,13 @@ person, not encoded in whichever link they happened to click.
 Other ways in:
 
 - **`JourneyPicker`** — the same journeys as cards on the Projects/Topology empty
-  state ([#411](https://github.com/Magikcraft/nano-bpm/issues/411)).
+  state ([#411](https://github.com/nanobpm/nano-bpm/issues/411)).
 - **Take a tour** in the rail (**Resume tour** when a journey was interrupted).
 - **`?tour=<journeyId>`** deep links still work (parsed by `deepLink.ts`, stripped
   once started) — a valid, no-longer-advertised entry, kept for links already in
   the wild. The CLI stopped emitting them in
   [jwulf/c8ctl-plugin-nano#22](https://github.com/jwulf/c8ctl-plugin-nano/pull/22)
-  (part of [#464](https://github.com/Magikcraft/nano-bpm/issues/464)); the startup
+  (part of [#464](https://github.com/nanobpm/nano-bpm/issues/464)); the startup
   panel is the front door now.
 
 ## Try it
@@ -168,5 +168,5 @@ npm test          # unit tests (node:test, no browser needed)
 npm run typecheck
 ```
 
-[#417](https://github.com/Magikcraft/nano-bpm/issues/417) adds the Playwright suite
+[#417](https://github.com/nanobpm/nano-bpm/issues/417) adds the Playwright suite
 that asserts every journey's selectors actually resolve in a browser.

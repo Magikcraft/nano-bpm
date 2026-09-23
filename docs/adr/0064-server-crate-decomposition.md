@@ -3,7 +3,7 @@
 Status: Proposed
 Date: 2026-08-29
 Relates to: ADR 0016 (Falcon protocol), ADR 0034 (console observe/studio profiles — the `console` feature this split must preserve)
-Repo: Magikcraft/nano-bpm (`server/`)
+Repo: nanobpm/nano-bpm (`server/`)
 
 ## Context
 
