@@ -1,0 +1,13 @@
+{
+  "name": "engine-wasm-test-studio-record-loop-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Worked example + guard: a Test-Studio-style record loop driven entirely by the committed @nanobpm/engine-wasm TestEngine. Shows that an embedded single-session engine gives Camunda's Test Studio isolation (RESERVE_JOBS + stubCallActivities) for free — jobs wait unraced, and the debug stepper is the call-activity wait state.",
+  "scripts": {
+    "test": "node verify.mjs"
+  },
+  "dependencies": {
+    "@nanobpm/engine-wasm": "file:../../pkg"
+  }
+}
