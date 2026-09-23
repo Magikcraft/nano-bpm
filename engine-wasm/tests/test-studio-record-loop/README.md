@@ -39,9 +39,10 @@ collapse into behaviour the engine already has:
    is ever taken by a phantom worker; none is missed.
 2. **Connector output-mapping caveat, made concrete** — `zeebe:ioMapping` *does*
    run engine-side (the connector *runtime* does not), so a mocked connector value
-   must be the **post-mapping** payload. The probe mocks a raw
-   `{ response: { statusCode: 200 } }` and asserts the model's
-   `=response.statusCode` output mapping yields `shipStatus: 200`.
+   must be the **raw runtime result (pre-mapping)**; the engine applies the model's
+   output mapping itself. The probe mocks a raw `{ response: { statusCode: 200 } }`
+   and asserts the model's `=response.statusCode` output mapping yields
+   `shipStatus: 200`.
 3. **Call-activity wait state** — an `elementActivated` breakpoint pauses the run
    at the call activity. The child instance root exists (the engine spawns it
    eagerly) but is **idle** — no token, no child job — so nothing has raced ahead

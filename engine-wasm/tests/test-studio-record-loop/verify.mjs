@@ -18,7 +18,8 @@
 //   LOOP 1 (replaces RESERVE_JOBS):     jobs sit `Created` (== Zeebe ACTIVATABLE)
 //     with no worker taking them; the recorder drives them by key. `zeebe:ioMapping`
 //     still runs engine-side (the connector *runtime* does not) — so a mocked
-//     connector value must be the POST-mapping payload, exactly as the doc warns.
+//     connector value must be the raw runtime result (pre-mapping), exactly as the
+//     doc warns.
 //   LOOP 2 (replaces stubCallActivities): an `elementActivated` breakpoint on the
 //     call activity is the wait state. Resume to run the real child
 //     (runCalledProcess); clear/complete without driving the child to mock it.
@@ -129,7 +130,7 @@ function recordByMockingEveryJob(TestEngine) {
 
 // The connector caveat, made concrete: `zeebe:ioMapping` DOES run engine-side even
 // though the connector runtime never does — so a mocked connector value must be the
-// POST-mapping payload. We pause on the task AFTER `ship` to read the mapped var
+// raw runtime result (pre-mapping). We pause on the task AFTER `ship` to read the mapped var
 // while the instance is still active (a completed instance reports no variables).
 function connectorOutputMappingRunsEngineSide(TestEngine) {
   const eng = new TestEngine();
