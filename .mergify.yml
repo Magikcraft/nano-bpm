@@ -59,7 +59,8 @@ queue_rules:
 # `changes` job's paths-filter in `.github/workflows/ci.yml`: the six code checks
 # share the `code` filter (`*code_gate`), `processos (clippy + test)` has its own
 # `processos` filter (skipped for PRs that don't touch `processos/**`,
-# `engine-core/**`, or `.github/workflows/ci.yml`), and the two console jobs
+# `engine-core/**`, or `.github/workflows/ci.yml`), `formal (tlc)` has its own
+# `formal` filter (`formal/**` or `.github/workflows/ci.yml`), and the two console jobs
 # (`console (typecheck + test)` and `console (journey e2e)`) are gated by the
 # `console` filter (inputs `console/**`, `spec-console/**`, `spec-app/**`,
 # `.github/workflows/ci.yml`, AGENTS.md and .mergify.yml for the merge-gate guard;
@@ -68,7 +69,7 @@ queue_rules:
 # PR skips all six code checks; a Rust-only PR skips both console jobs). A skipped
 # check never reports `success`, so — matching the authoritative merge-protocol
 # in AGENTS.md ("required-when-run, skip-tolerant": acceptedConclusions
-# `["success", "skipped"]` for all nine) — each is accepted as success OR
+# `["success", "skipped"]` for all ten) — each is accepted as success OR
 # skipped. Required job names must not start with @: Mergify interprets
 # @scope/name as an app-qualified check, so an npm-scoped job name matches the
 # wrong publisher even when its actual GitHub Actions result is successful
@@ -100,6 +101,11 @@ merge_protections:
       - or:
           - check-success=processos (clippy + test)
           - check-skipped=processos (clippy + test)
+      # The TLA+ model checks (formal/README.md), including the known-defect
+      # ratchets. Change-gated on the `formal` filter, so accept skipped too.
+      - or:
+          - check-success=formal (tlc)
+          - check-skipped=formal (tlc)
       # Promoted to a required gate by #1127: the guided-journey browser guards
       # (incl. the modeler agent-task regression guard) were previously
       # non-required, which is how the #1127 properties-panel crash regressed
