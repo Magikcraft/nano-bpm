@@ -1,0 +1,102 @@
+# Formal verification
+
+Machine-checked models of nanobpm's semantics. This is epic #1224: TLA+ for
+concurrency, distribution and state-machine invariants, and Lean 4 for proofs
+about pure semantics (both land slice by slice).
+
+```
+formal/
+└── tla/
+    ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
+    ├── MC*.tla / MC*.cfg     # concrete process graphs to model-check
+    └── check.sh              # runs TLC on every model and compares with EXPECTED
+```
+
+## Running
+
+You need Java 11+ (CI uses Temurin 21). Nothing else to install: on first run,
+`check.sh` fetches the pinned `tla2tools.jar` into
+`~/.cache/nanobpm-formal/` and verifies its SHA-256.
+
+```bash
+formal/tla/check.sh                      # every model (a few seconds)
+formal/tla/check.sh MCChainedInclusive   # one model
+```
+
+CI runs the `formal (tlc)` job whenever `formal/**` changes.
+
+To read a counterexample trace, run TLC directly:
+
+```bash
+cd formal/tla
+java -cp ~/.cache/nanobpm-formal/tla2tools-1.7.4.jar tlc2.TLC MCParallelJoinMultiArrival
+```
+
+## `TokenFlow.tla`
+
+This models the engine-core drain loop (`engine-core/src/engine/mod.rs`) for a
+single process instance in a single scope:
+
+| Spec | Engine |
+|---|---|
+| `pending` (a bag of flows being taken) | the `Step::Activate` queue, drained to empty per command |
+| `waiting` | tokens parked on wait-state tasks (job completion is `CompleteTask`) |
+| `ArriveParallelJoin` | `arrive_at_parallel_join` (`ParallelJoinOpened` / `TokenArrived` / `Reset`) |
+| `ArriveInclusiveJoin`, `FireInclusiveJoin` | `arrive_at_inclusive_join`, `fire_ready_inclusive_joins` |
+| `Reaching` | `elements_reaching` |
+| `CompleteInstance` | `complete_finished_instances` |
+
+The model deliberately covers more behaviours than the engine can produce. It
+drains the queue in any order, fires any ready inclusive join, and picks gateway
+branches freely instead of evaluating conditions. Each property checked against
+this superset therefore also holds for the engine's deterministic choices.
+
+The properties checked:
+
+- `JoinBookkeepingCoherent`: a join is open iff it has counted arrivals, and a
+  parallel join never rests at its threshold. This is the class behind the
+  missing-`ParallelJoinReset` bugs.
+- `ParallelJoinWaitsForEveryFlow`: a parallel join fires only after every
+  incoming flow has delivered, matching BPMN and Zeebe.
+- `NoStuckInstance`: a settled instance with no runnable task has no open join.
+- TLC's deadlock check, which reports any state where nothing can happen and
+  the instance has not completed.
+- On acyclic models, `JoinFiresAtMostOnce` and `Termination`.
+
+The following are out of scope for now: sub-process scopes, boundary and
+intermediate events, incidents, listeners and multi-instance. Each one is a
+future extension of this spec.
+
+## Expected outcomes and known defects
+
+The `EXPECTED` table in `check.sh` records the expected outcome for each model.
+When a model reproduces a real engine defect, its entry reads
+`violates:<Invariant>` and links the bug. For example,
+`MCParallelJoinMultiArrival` reproduces #1233: a parallel join counts arrivals
+rather than distinct incoming flows.
+
+Once the defect is fixed, the model stops violating and `check.sh` fails until
+you flip the entry to `pass`. A fixed bug therefore keeps its guard, and a
+known bug stays visible.
+
+`check.sh` also fails if a `MC*.tla` has no table entry or no `.cfg`, or if an
+entry has no model.
+
+## Adding a model
+
+1. Add `MCFoo.tla` (`EXTENDS TokenFlow`) and define `MCNodes`, `MCKind`,
+   `MCFlows` and `MCStart`.
+2. Add `MCFoo.cfg`. Copy an existing one, and drop `JoinFiresAtMostOnce` and
+   `Termination` if the graph has a cycle.
+3. Add a row to `EXPECTED` in `check.sh`.
+
+If the model finds a violation, confirm it against the real engine with a red
+Rust test before recording it. The model may simply be wrong.
+
+## Keeping the spec honest
+
+The spec is hand-written, so it can drift from the Rust code. Tying the two
+together through trace validation is tracked in #1226: replay TLC-generated
+behaviours against `Engine::apply_command`. Until that lands, any change to
+the drain loop, the join functions or `elements_reaching` should update
+`TokenFlow.tla` in the same PR.
