@@ -3,7 +3,7 @@
 Status: Proposed
 Date: 2026-08-17
 Relates to: ADR 0051 (agent authoring brief / `/agent` + `/llms.txt`), ADR 0053 (derivation is a shared library), ADR 0040 (fused domain model / `nano:meta`), ADR 0033 §3 (worker I/O deriver), ADR 0056 (agent relay / command-stream plane), ADR 0059 (supervisor enrolment), ADR 0061 (ecosystem knowledge plane — the budgeted retrieval boundary; *planned/TBD, not yet merged*)
-Repo: Magikcraft/nano-bpm (`server/src/console/agent_brief.rs`, `spec-app/`), nanobpm/nano-ide (`packages/urban`), nanobpm/nano-workforce (retro / feed-forward)
+Repo: nanobpm/nano-bpm (`server/src/console/agent_brief.rs`, `spec-app/`), nanobpm/nano-ide (`packages/urban`), nanobpm/nano-workforce (retro / feed-forward)
 
 ## Context
 

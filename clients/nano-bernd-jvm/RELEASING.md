@@ -32,7 +32,7 @@ gpg --keyserver keyserver.ubuntu.com --send-keys ABCDEF0123456789
 
 ### 4. Add repository secrets
 
-In <https://github.com/jwulf/nano-bpm/settings/secrets/actions> add four secrets:
+In <https://github.com/nanobpm/nano-bpm/settings/secrets/actions> add four secrets:
 
 | Name              | Value                                                            |
 |-------------------|------------------------------------------------------------------|
