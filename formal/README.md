@@ -65,7 +65,9 @@ The properties checked:
   the instance has not completed.
 - `JoinFiresAtMostOnce`: a join fires at most once per instance. This is
   guarded by `Acyclic`, which the spec derives from the graph, since a rework
-  loop legitimately re-fires a join.
+  loop legitimately re-fires a join. An acyclic graph that piles several
+  tokens onto a join's inputs (not 1-safe, a BPMN lack-of-synchronization)
+  also violates it, and that is intended: it is a finding about the model.
 - `Termination`: every instance eventually completes. The engine's steps are
   weakly fair. Gateway routing choices are *strongly* fair, which is the "fair
   data" assumption of workflow-net soundness. A loop with an exit therefore

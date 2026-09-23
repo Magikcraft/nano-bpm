@@ -276,7 +276,13 @@ NoStuckInstance ==
 Acyclic == \A n \in Nodes : n \notin Reaching(n)
 
 \* Without cycles, every join fires at most once per instance. A rework loop
-\* legitimately re-fires a join.
+\* legitimately re-fires a join. Acyclicity alone does not rule out a second
+\* firing: an acyclic graph that routes several tokens onto one join's inputs
+\* (a parallel split whose branches merge through an exclusive gateway, as in
+\* MCParallelJoinMultiArrival) can fire it again on the surplus tokens. That is
+\* intended: such a graph is not 1-safe, a BPMN lack-of-synchronization, and
+\* this invariant is how the checker reports it. Record such a model as an
+\* expected violation only when it deliberately reproduces an engine defect.
 JoinFiresAtMostOnce == Acyclic => \A j \in ParJoins \cup IncJoins : fireCount[j] <= 1
 
 \* Every instance eventually completes, under the fairness above.

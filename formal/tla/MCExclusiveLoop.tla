@@ -1,6 +1,7 @@
 ------------------------------ MODULE MCExclusiveLoop ------------------------------
 (* A rework loop: S -> A -> X; X -> A (loop back) or X -> E.
-   Cyclic, so only the safety properties are checked (no termination). *)
+   Termination holds under strong fairness on X's routing choice: the exit is
+   eventually taken. Without the exit flow it would be reported as a livelock. *)
 EXTENDS TokenFlow
 
 MCNodes == {"S", "A", "X", "E"}
