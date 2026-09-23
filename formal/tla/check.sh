@@ -115,8 +115,13 @@ for tla in MC*.tla; do
   m="${tla%.tla}"
   [[ -n "$(expected_outcome "$m")" ]] || { echo "error: $tla has no entry in EXPECTED" >&2; status=1; }
 done
+seen=" "
 for row in "${EXPECTED[@]}"; do
   read -r m _ <<<"$row"
+  if [[ "$seen" == *" $m "* ]]; then
+    echo "error: EXPECTED lists $m more than once" >&2; status=1
+  fi
+  seen="$seen$m "
   [[ -f "$m.tla" ]] || { echo "error: EXPECTED lists $m but $m.tla does not exist" >&2; status=1; }
 done
 [[ $status -eq 0 ]] || exit $status

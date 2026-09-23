@@ -68,9 +68,11 @@ The properties checked:
   loop legitimately re-fires a join. An acyclic graph that piles several
   tokens onto a join's inputs (not 1-safe, a BPMN lack-of-synchronization)
   also violates it, and that is intended: it is a finding about the model.
-- `Termination`: every instance eventually completes. The engine's steps are
-  weakly fair. Gateway routing choices are *strongly* fair, which is the "fair
-  data" assumption of workflow-net soundness. A loop with an exit therefore
+- `Termination`: every instance eventually completes. Engine steps (draining
+  and inclusive-join firing) are weakly fair. Task completion is strongly fair,
+  because a task can only complete in a settled state, which is intermittent.
+  Gateway routing choices are also strongly fair, which is the "fair data"
+  assumption of workflow-net soundness. A loop with an exit therefore
   terminates, and a loop without one is reported.
 
 The following are out of scope for now: sub-process scopes, boundary and
