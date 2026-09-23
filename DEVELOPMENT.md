@@ -139,6 +139,7 @@ nanobpmn/
 │       ├── main.rs                # ServerImpl, auth/error glue, bootstrap
 │       └── stub_impls.rs          # generated trait impls (git-ignored)
 ├── console/                       # web console frontend (Vite/React + wasm engine)
+├── formal/                        # TLA+ models of engine semantics (see formal/README.md)
 ├── build/                         # temp sanitized spec + cached generator JAR (git-ignored)
 └── generated/                     # generated library crate (git-ignored)
 ```
