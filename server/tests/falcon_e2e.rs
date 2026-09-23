@@ -10,6 +10,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,10 +62,10 @@ impl Drop for ScratchDir {
 }
 
 /// Reads the `LISTENING_PORT=<n>` line the server prints once it has bound.
-fn read_listening_port(child: &mut Child) -> u16 {
+fn read_listening_port(child: &mut Child) -> (u16, std::thread::JoinHandle<()>) {
     let stdout = child.stdout.take().expect("server stdout is piped");
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let stdout_thread = std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         loop {
@@ -84,14 +86,36 @@ fn read_listening_port(child: &mut Child) -> u16 {
             }
         }
     });
-    rx.recv_timeout(Duration::from_secs(30))
-        .expect("server never reported its listening port")
+    let port = match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(port) => port,
+        Err(e) => {
+            kill_child_tree(child);
+            let _ = child.wait();
+            let _ = stdout_thread.join();
+            panic!("server never reported its listening port: {e}");
+        }
+    };
+    (port, stdout_thread)
+}
+
+fn kill_child_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        // SAFETY: server children are spawned as process-group leaders below.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
 }
 
 /// A running server child process, killed and reaped on drop.
 struct ServerProcess {
     child: Child,
     port: u16,
+    stdout_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ServerProcess {
@@ -102,12 +126,18 @@ impl ServerProcess {
             .env("PORT", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
         for (key, value) in env {
             command.env(key, value);
         }
         let mut child = command.spawn().expect("spawn server binary");
-        let port = read_listening_port(&mut child);
-        let server = Self { child, port };
+        let (port, stdout_thread) = read_listening_port(&mut child);
+        let server = Self {
+            child,
+            port,
+            stdout_thread: Some(stdout_thread),
+        };
         server.wait_until_ready();
         server
     }
@@ -136,8 +166,11 @@ impl ServerProcess {
 
 impl Drop for ServerProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        kill_child_tree(&mut self.child);
         let _ = self.child.wait();
+        if let Some(stdout_thread) = self.stdout_thread.take() {
+            let _ = stdout_thread.join();
+        }
     }
 }
 

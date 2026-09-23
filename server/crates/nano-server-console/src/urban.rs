@@ -276,24 +276,172 @@ async fn urban_help_text(urban: &Path) -> Option<std::sync::Arc<str>> {
     {
         return hit;
     }
-    let help: Option<Arc<str>> = tokio::process::Command::new(urban)
-        .arg("--help")
-        .env("NO_COLOR", "1")
-        .kill_on_drop(true)
-        .output()
-        .await
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            let mut help = String::from_utf8_lossy(&o.stdout).into_owned();
-            help.push_str(&String::from_utf8_lossy(&o.stderr));
-            Arc::from(help)
-        });
+    let help = match urban_help_output(urban).await {
+        UrbanHelpOutput::Success { stdout, stderr } => {
+            let mut help = String::from_utf8_lossy(&stdout).into_owned();
+            help.push_str(&String::from_utf8_lossy(&stderr));
+            Some(Arc::from(help))
+        }
+        UrbanHelpOutput::NoHelp => None,
+        UrbanHelpOutput::TimedOut => return None,
+    };
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(urban.to_path_buf(), help.clone());
     help
+}
+
+enum UrbanHelpOutput {
+    Success { stdout: Vec<u8>, stderr: Vec<u8> },
+    NoHelp,
+    TimedOut,
+}
+
+async fn urban_help_output(urban: &Path) -> UrbanHelpOutput {
+    let program = absolute_urban_path(urban);
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.arg("--help")
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(parent) = program.parent().filter(|p| !p.as_os_str().is_empty()) {
+        cmd.current_dir(parent);
+    }
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => return UrbanHelpOutput::NoHelp,
+    };
+    let pid = child.id();
+    let Some(stdout) = child.stdout.take() else {
+        return UrbanHelpOutput::NoHelp;
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return UrbanHelpOutput::NoHelp;
+    };
+    let mut cleanup = UrbanProbeCleanup::new(pid);
+
+    let probe = async {
+        let (status, pipes) = tokio::join!(child.wait(), read_probe_pipes(stdout, stderr));
+        (status, pipes)
+    };
+    tokio::pin!(probe);
+    let mut killed_after_timeout = false;
+    let (status, pipes) = tokio::select! {
+        output = &mut probe => output,
+        _ = tokio::time::sleep(help_pipe_timeout()) => {
+            kill_urban_probe_group(pid);
+            killed_after_timeout = true;
+            match tokio::time::timeout(help_pipe_timeout(), &mut probe).await {
+                Ok(output) => output,
+                Err(_) => return UrbanHelpOutput::TimedOut,
+            }
+        }
+    };
+    let status = match status {
+        Ok(status) => status,
+        Err(_) if killed_after_timeout => return UrbanHelpOutput::TimedOut,
+        Err(_) => return UrbanHelpOutput::NoHelp,
+    };
+    let (stdout, stderr) = match pipes {
+        Ok(output) => output,
+        Err(_) if killed_after_timeout => return UrbanHelpOutput::TimedOut,
+        Err(_) => return UrbanHelpOutput::NoHelp,
+    };
+    cleanup.disarm();
+    if status.success() {
+        UrbanHelpOutput::Success { stdout, stderr }
+    } else if killed_after_timeout {
+        UrbanHelpOutput::TimedOut
+    } else {
+        UrbanHelpOutput::NoHelp
+    }
+}
+
+struct UrbanProbeCleanup {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl UrbanProbeCleanup {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UrbanProbeCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            kill_urban_probe_group(self.pid);
+        }
+    }
+}
+
+async fn read_probe_pipes(
+    mut stdout: tokio::process::ChildStdout,
+    mut stderr: tokio::process::ChildStderr,
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    use tokio::io::AsyncReadExt;
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    let (stdout_read, stderr_read) = tokio::join!(
+        stdout.read_to_end(&mut stdout_buf),
+        stderr.read_to_end(&mut stderr_buf)
+    );
+    stdout_read?;
+    stderr_read?;
+    Ok((stdout_buf, stderr_buf))
+}
+
+fn absolute_urban_path(urban: &Path) -> PathBuf {
+    if urban.is_absolute() {
+        return urban.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(urban))
+        .unwrap_or_else(|_| urban.to_path_buf())
+}
+
+fn help_pipe_timeout() -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::from_secs(5)
+    } else {
+        std::time::Duration::from_secs(10)
+    }
+}
+
+fn kill_urban_probe_group(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // SAFETY: the probe child was spawned as the leader of a fresh process
+        // group, so a negative pid kills `urban --help` descendants that kept the
+        // captured pipes open after the direct child exited.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(pid) = pid {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+    }
 }
 
 /// Pure predicate over `urban --help` text: does this toolkit expose model
@@ -560,5 +708,186 @@ urban — build and run Urban apps (nano.app.json)
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    fn urban_help_scratch(name: &str) -> PathBuf {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-scratch")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn write_probe_stub(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 probes process existence without delivering a signal.
+        (unsafe { libc::kill(pid, 0) }) == 0
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_dead(pid: i32) -> bool {
+        for _ in 0..20 {
+            if !process_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    fn kill_pid(pid: i32) {
+        // SAFETY: test cleanup for a pid written by the stub itself.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn urban_help_probe_runs_in_tool_dir_not_source_tree() {
+        let dir = urban_help_scratch("urban-help-cwd");
+        let stub = dir.join("urban-cwd.sh");
+        let cwd = std::env::current_dir().unwrap();
+        let relative_stub = stub.strip_prefix(&cwd).unwrap();
+        let source_sentinel = cwd.join("urban-ran.txt");
+        let _ = std::fs::remove_file(&source_sentinel);
+        write_probe_stub(
+            &stub,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > urban-ran.txt\npwd >> urban-ran.txt\nprintf 'urban data\\n'\n",
+        );
+
+        let help = urban_help_text(relative_stub)
+            .await
+            .expect("help should be captured");
+
+        assert!(help.contains("urban data"));
+        assert!(
+            !source_sentinel.exists(),
+            "`urban --help` probes must not inherit the test process cwd and dirty the source tree"
+        );
+        let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap();
+        assert_eq!(sentinel.lines().next(), Some("--help"));
+        assert!(
+            sentinel.contains(&*dir.to_string_lossy()),
+            "probe should run beside the stub, not in the crate cwd: {sentinel:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn urban_help_probe_reaps_descendants_that_keep_pipes_open() {
+        let dir = urban_help_scratch("urban-help-reap");
+        let stub = dir.join("urban-reap.sh");
+        write_probe_stub(
+            &stub,
+            "#!/bin/sh\n(sleep 30) &\necho $! > bg.pid\nprintf 'urban data\\n'\n",
+        );
+
+        let help =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), urban_help_text(&stub))
+                .await
+            {
+                Ok(Some(help)) => help,
+                Ok(None) => panic!("help should be captured after reaping the descendant"),
+                Err(e) => {
+                    if let Ok(pid_text) = std::fs::read_to_string(dir.join("bg.pid"))
+                        && let Ok(pid) = pid_text.trim().parse()
+                    {
+                        kill_pid(pid);
+                    }
+                    panic!("help probe should not hang on descendant-held stdio: {e}");
+                }
+            };
+
+        assert!(help.contains("urban data"));
+        let pid: i32 = std::fs::read_to_string(dir.join("bg.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        if !wait_until_dead(pid).await {
+            kill_pid(pid);
+            panic!("urban --help descendant {pid} survived the probe");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn urban_help_probe_timeout_is_bounded_and_not_cached() {
+        let dir = urban_help_scratch("urban-help-timeout");
+        let stub = dir.join("urban-timeout.sh");
+        write_probe_stub(&stub, "#!/bin/sh\necho $$ > direct.pid\nsleep 30\n");
+
+        let timed_out =
+            tokio::time::timeout(std::time::Duration::from_secs(10), urban_help_text(&stub))
+                .await
+                .expect("hung direct child should be bounded by the probe timeout");
+
+        assert!(
+            timed_out.is_none(),
+            "a timed-out probe should not produce help text"
+        );
+        let pid: i32 = std::fs::read_to_string(dir.join("direct.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        if !wait_until_dead(pid).await {
+            kill_pid(pid);
+            panic!("timed-out urban --help child {pid} survived the probe");
+        }
+
+        write_probe_stub(&stub, "#!/bin/sh\nprintf 'urban data\\n'\n");
+        let help = urban_help_text(&stub)
+            .await
+            .expect("timeout miss must not be cached permanently");
+        assert!(help.contains("urban data"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn urban_help_probe_cancellation_reaps_child_and_readers() {
+        let dir = urban_help_scratch("urban-help-cancel");
+        let stub = dir.join("urban-cancel.sh");
+        write_probe_stub(&stub, "#!/bin/sh\necho $$ > direct.pid\nsleep 30\n");
+        let probe_stub = stub.clone();
+
+        let probe = tokio::spawn(async move { urban_help_text(&probe_stub).await });
+        let pid_file = dir.join("direct.pid");
+        for _ in 0..100 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("probe child should have started")
+            .trim()
+            .parse()
+            .unwrap();
+
+        probe.abort();
+        let _ = probe.await;
+
+        if !wait_until_dead(pid).await {
+            kill_pid(pid);
+            panic!("cancelled urban --help child {pid} survived the probe");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
