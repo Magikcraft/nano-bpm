@@ -28,7 +28,7 @@ The gateway version and the nano-bernd version are independent — bumping one d
 Each train has its own credentials, documented in place:
 
 - **Gateway/ProcessOS**: `C8CTL_PLUGIN_REPO_TOKEN`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` — see the header comments in `.github/workflows/publish-{c8ctl,processos}-binaries.yml`.
-- **npm nano-bernd**: `NPM_TOKEN` — see [`clients/nano-bernd/RELEASING.md`](clients/nano-bernd/RELEASING.md).
+- **npm nano-bernd**: no secret — publishing uses npm OIDC trusted publishing (a Trusted Publisher configured on npmjs.com, no `NPM_TOKEN`); see [`clients/nano-bernd/RELEASING.md`](clients/nano-bernd/RELEASING.md).
 - **JVM nano-bernd**: `CENTRAL_USERNAME`, `CENTRAL_PASSWORD`, `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE` — see [`clients/nano-bernd-jvm/RELEASING.md`](clients/nano-bernd-jvm/RELEASING.md).
 
 Verify all secrets are set at <https://github.com/nanobpm/nano-bpm/settings/secrets/actions> before your first release.
