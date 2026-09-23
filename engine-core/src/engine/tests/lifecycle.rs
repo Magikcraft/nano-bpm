@@ -6268,6 +6268,15 @@ fn link_events_route_by_matching_name() {
 /// inner =< x, y > -> merge (xor) -> join (or);  t -> join;  join -> e`. Two
 /// tokens reach `join` over `merge -> join`, one over `t -> join` (#1237).
 fn inclusive_multi_arrival_process() -> ProcessDefinition {
+    inclusive_multi_arrival_builder()
+        .connect("join", "e")
+        .build()
+        .unwrap()
+}
+
+/// `inclusive_multi_arrival_process` without the join's outgoing flow, so a
+/// test can make it conditional or gate it behind a listener.
+fn inclusive_multi_arrival_builder() -> ProcessBuilder {
     ProcessBuilder::new("inclusive_multi_arrival")
         .start_event("s")
         .parallel_gateway("fork")
@@ -6287,9 +6296,6 @@ fn inclusive_multi_arrival_process() -> ProcessDefinition {
         .connect("y", "merge")
         .connect("merge", "join")
         .connect("t", "join")
-        .connect("join", "e")
-        .build()
-        .unwrap()
 }
 
 /// Drive `inclusive_multi_arrival_process`, completing its tasks in `order`,
@@ -6354,4 +6360,100 @@ fn inclusive_join_records_the_flow_each_token_arrived_over() {
     };
     assert_eq!(instance.join_flow_arrivals["join"].count(&merge), 2);
     assert!(!instance.join_counts.contains_key("join"));
+}
+
+/// Count the `join -> e` routings in `events`.
+fn join_routed_to_end(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::SequenceFlowTaken { from, to, .. } if from == "join" && to == "e"))
+        .count()
+}
+
+#[test]
+fn inclusive_join_surplus_survives_incident_redrive() {
+    // The ready join parks on a `NoMatchingSequenceFlow` incident (go=false).
+    // Resolving it re-drives completion through `complete_inclusive_gateway`,
+    // which must consume one token per flow like the sweep does, so the surplus
+    // `merge -> join` token still fires the join a second time (#1237).
+    let def = inclusive_multi_arrival_builder()
+        .connect_when("join", "e", "go")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "inclusive_multi_arrival",
+            HashMap::from([("go".to_string(), Value::Bool(false))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    for job in ["jx", "jy", "jt"] {
+        complete_one(&mut engine, job);
+    }
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "the ready join parks on one incident");
+    let incident_key = incidents[0].key;
+
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("go".to_string(), Value::Bool(true))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    assert_eq!(
+        join_routed_to_end(&resolved),
+        2,
+        "the redriven firing keeps the surplus, which fires the join again"
+    );
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.active_incidents().is_empty());
+    let instance = engine.instance(instance_key).unwrap();
+    assert!(instance.join_flow_arrivals.is_empty());
+    assert!(instance.join_instances.is_empty());
+}
+
+#[test]
+fn inclusive_join_surplus_survives_end_listener_redrive() {
+    // With an `end` listener the ready join rests in COMPLETING and fires from
+    // `finalize_inclusive_gateway` when the chain drains. That firing must keep
+    // the surplus too, so the join runs its listener and routes twice (#1237).
+    let def = inclusive_multi_arrival_builder()
+        .connect("join", "e")
+        .with_listeners(
+            "join",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "join-audit")],
+        )
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("inclusive_multi_arrival"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    for job in ["jx", "jy", "jt"] {
+        complete_one(&mut engine, job);
+    }
+
+    let mut routed = 0;
+    for firing in 1..=2 {
+        let audit = engine.activate_jobs("join-audit", "W", 10, 60_000, 0);
+        assert_eq!(audit.len(), 1, "firing {firing} runs one end-listener job");
+        let done = engine
+            .apply_command(Command::complete_job(audit[0].key))
+            .unwrap();
+        routed += join_routed_to_end(&done);
+    }
+    assert_eq!(routed, 2, "one routing per firing");
+    assert!(engine
+        .activate_jobs("join-audit", "W", 10, 60_000, 0)
+        .is_empty());
+    assert!(engine.is_completed(instance_key));
 }
