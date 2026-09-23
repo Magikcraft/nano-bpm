@@ -9,6 +9,11 @@ MCKind   == [n \in MCNodes |-> CASE n = "S" -> "start" [] n = "E" -> "end"
                                  [] n \in {"P1", "P2", "J"} -> "and"
                                  [] n = "M" -> "xor" [] OTHER -> "task"]
 MCStart  == "S"
-MCFlows  == {<<"S","P1">>, <<"P1","P2">>, <<"P1","T">>, <<"P2","X">>, <<"P2","Y">>,
-             <<"X","M">>, <<"Y","M">>, <<"M","J">>, <<"T","J">>, <<"J","E">>}
+MCEdges  == [f1 |-> <<"S", "P1">>, f2 |-> <<"P1", "P2">>, f3 |-> <<"P1", "T">>,
+             f4 |-> <<"P2", "X">>, f5 |-> <<"P2", "Y">>, f6 |-> <<"X", "M">>,
+             f7 |-> <<"Y", "M">>, f8 |-> <<"M", "J">>, f9 |-> <<"T", "J">>,
+             f10 |-> <<"J", "E">>]
+MCFlows  == DOMAIN MCEdges
+MCSrc    == [f \in MCFlows |-> MCEdges[f][1]]
+MCTgt    == [f \in MCFlows |-> MCEdges[f][2]]
 =============================================================================

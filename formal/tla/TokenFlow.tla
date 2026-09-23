@@ -35,21 +35,27 @@ EXTENDS Naturals, FiniteSets
 CONSTANTS
     Nodes,        \* element ids
     Kind,         \* [Nodes -> ElementKinds]
-    Flows,        \* sequence flows, a subset of Nodes \X Nodes
+    Flows,        \* sequence-flow ids (distinct ids may share endpoints, as in the engine)
+    Src,          \* [Flows -> Nodes] source element of each flow
+    Tgt,          \* [Flows -> Nodes] target element of each flow
     Start         \* the (single) none start event
 
 ElementKinds == {"start", "end", "task", "xor", "and", "or"}
 
 ASSUME Kind \in [Nodes -> ElementKinds]
-ASSUME Flows \subseteq Nodes \X Nodes
+ASSUME Src \in [Flows -> Nodes] /\ Tgt \in [Flows -> Nodes]
 ASSUME Start \in Nodes /\ Kind[Start] = "start"
 
 \* The pseudo-flow that carries the instance-creation activation of Start.
-InitFlow == <<"<create>", Start>>
+InitFlow == "<create>"
+ASSUME InitFlow \notin Flows
 AllFlows == Flows \cup {InitFlow}
 
-In(n)  == {f \in Flows : f[2] = n}
-Out(n) == {f \in Flows : f[1] = n}
+\* The element a queued activation targets.
+Target(f) == IF f = InitFlow THEN Start ELSE Tgt[f]
+
+In(n)  == {f \in Flows : Tgt[f] = n}
+Out(n) == {f \in Flows : Src[f] = n}
 
 IsJoin(n) == Kind[n] \in {"and", "or"} /\ Cardinality(In(n)) > 1
 ParJoins  == {n \in Nodes : Kind[n] = "and" /\ IsJoin(n)}
@@ -62,9 +68,9 @@ NonEmptySubsets(S) == (SUBSET S) \ {{}}
 \* over directed sequence flows (a fixpoint bounded by |Nodes| rounds).
 ReachingFrom(t) ==
     LET R[k \in 0..Cardinality(Nodes)] ==
-            IF k = 0 THEN {f[1] : f \in In(t)}
+            IF k = 0 THEN {Src[f] : f \in In(t)}
             ELSE LET prev == R[k-1]
-                 IN  prev \cup {f[1] : f \in {g \in Flows : g[2] \in prev}}
+                 IN  prev \cup {Src[f] : f \in {g \in Flows : Tgt[g] \in prev}}
     IN  R[Cardinality(Nodes)]
 
 \* A constant-level map, so TLC evaluates it once instead of in every guard.
@@ -126,7 +132,7 @@ PassThrough(f, next) ==
 
 ActivateTask(f) ==
     /\ pending' = Take(pending, f)
-    /\ waiting' = [waiting EXCEPT ![f[2]] = @ + 1]
+    /\ waiting' = [waiting EXCEPT ![Target(f)] = @ + 1]
     /\ UNCHANGED <<joinOpen, joinCount, arrived, fireCount, premature>>
 
 ActivateEnd(f) ==
@@ -134,7 +140,7 @@ ActivateEnd(f) ==
     /\ UNCHANGED <<waiting, joinOpen, joinCount, arrived, fireCount, premature>>
 
 ArriveParallelJoin(f) ==
-    LET j       == f[2]
+    LET j       == Target(f)
         arr     == [arrived[j] EXCEPT ![f] = @ + 1]
         fires   == joinCount[j] + 1 >= Cardinality(In(j))
     IN  /\ IF fires
@@ -153,7 +159,7 @@ ArriveParallelJoin(f) ==
         /\ UNCHANGED waiting
 
 ArriveInclusiveJoin(f) ==
-    LET j == f[2] IN
+    LET j == Target(f) IN
     /\ pending'   = Take(pending, f)
     /\ joinOpen'  = [joinOpen  EXCEPT ![j] = TRUE]
     /\ joinCount' = [joinCount EXCEPT ![j] = @ + 1]
@@ -161,7 +167,7 @@ ArriveInclusiveJoin(f) ==
     /\ UNCHANGED <<waiting, fireCount, premature>>
 
 Drain(f) ==
-    LET n == f[2] IN
+    LET n == Target(f) IN
     /\ pending[f] > 0
     /\ CASE Kind[n] = "task"             -> ActivateTask(f)
          [] Kind[n] = "end"              -> ActivateEnd(f)

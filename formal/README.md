@@ -71,7 +71,9 @@ future extension of this spec.
 
 The `EXPECTED` table in `check.sh` records the expected outcome for each model.
 When a model reproduces a real engine defect, its entry reads
-`violates:<Invariant>` and links the bug. For example,
+`violates:<Invariant>` and links the bug. Such a model runs with TLC's
+`-continue`, and the named invariant must be among those reported as violated.
+Which violation TLC reaches first depends on state order, not on the defect. For example,
 `MCParallelJoinMultiArrival` reproduces #1233: a parallel join counts arrivals
 rather than distinct incoming flows.
 
@@ -85,7 +87,10 @@ entry has no model.
 ## Adding a model
 
 1. Add `MCFoo.tla` (`EXTENDS TokenFlow`) and define `MCNodes`, `MCKind`,
-   `MCFlows` and `MCStart`.
+   `MCStart` and `MCEdges` (a record from flow id to `<<source, target>>`),
+   plus the derived `MCFlows`, `MCSrc` and `MCTgt` (copy these from an
+   existing model). Flows have their own ids, as in the engine, so two
+   distinct flows may share endpoints (`MCParallelDuplicateFlows`).
 2. Add `MCFoo.cfg`. Copy an existing one, and drop `JoinFiresAtMostOnce` and
    `Termination` if the graph has a cycle.
 3. Add a row to `EXPECTED` in `check.sh`.
