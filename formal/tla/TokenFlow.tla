@@ -166,30 +166,41 @@ ArriveInclusiveJoin(f) ==
     /\ arrived'   = [arrived   EXCEPT ![j][f] = @ + 1]
     /\ UNCHANGED <<waiting, fireCount, premature>>
 
-Drain(f) ==
+\* The routing choices available when an activation of `n` completes: an
+\* exclusive gateway takes one outgoing flow, an inclusive split takes a
+\* non-empty subset, and every other pass-through element takes all of them.
+\* Each choice is its own action, so fairness can range over the choices.
+Choices(n) ==
+    CASE Kind[n] = "xor"                    -> {{g} : g \in Out(n)}
+      [] Kind[n] = "or" /\ n \notin IncJoins -> NonEmptySubsets(Out(n))
+      [] OTHER                              -> {Out(n)}
+
+DrainVia(f, S) ==
     LET n == Target(f) IN
     /\ pending[f] > 0
+    /\ S \in Choices(n)
     /\ CASE Kind[n] = "task"             -> ActivateTask(f)
          [] Kind[n] = "end"              -> ActivateEnd(f)
-         [] Kind[n] = "start"            -> PassThrough(f, Out(n))
-         [] Kind[n] = "xor"              -> \E g \in Out(n) : PassThrough(f, {g})
          [] n \in ParJoins               -> ArriveParallelJoin(f)
          [] n \in IncJoins               -> ArriveInclusiveJoin(f)
-         [] Kind[n] = "and"              -> PassThrough(f, Out(n))
-         [] Kind[n] = "or"               -> \E S \in NonEmptySubsets(Out(n)) :
-                                                PassThrough(f, S)
+         [] OTHER                        -> PassThrough(f, S)
     /\ UNCHANGED completed
 
-(* The quiescence sweep: fire one ready inclusive join. *)
-FireInclusiveJoin(j) ==
+Drain(f) == \E S \in Choices(Target(f)) : DrainVia(f, S)
+
+(* The quiescence sweep: fire one ready inclusive join, routing to S. *)
+FireInclusiveJoinVia(j, S) ==
     /\ Quiescent
     /\ InclusiveReady(j)
-    /\ \E S \in NonEmptySubsets(Out(j)) : pending' = Add(pending, S)
+    /\ S \in NonEmptySubsets(Out(j))
+    /\ pending'   = Add(pending, S)
     /\ joinOpen'  = [joinOpen  EXCEPT ![j] = FALSE]
     /\ joinCount' = [joinCount EXCEPT ![j] = 0]
     /\ arrived'   = [arrived   EXCEPT ![j] = NoArrivals]
     /\ fireCount' = [fireCount EXCEPT ![j] = @ + 1]
     /\ UNCHANGED <<waiting, premature, completed>>
+
+FireInclusiveJoin(j) == \E S \in NonEmptySubsets(Out(j)) : FireInclusiveJoinVia(j, S)
 
 (* External command: a job worker completes a task. *)
 CompleteTask(t) ==
@@ -219,13 +230,18 @@ Next ==
     \/ CompleteInstance
     \/ Done
 
-\* Per-action weak fairness: the engine always drains each queued activation
-\* and fires each ready inclusive join, and a job worker eventually completes
-\* every continuously activatable task. (Fairness on Next as a whole would only
+\* Fairness. The engine always drains each queued activation and fires each
+\* ready inclusive join, and a job worker eventually completes every
+\* activatable task (weak fairness, per action). Routing choices are
+\* *strongly* fair: a gateway that is reached infinitely often eventually takes
+\* each of its branches. This is the "fair data" assumption of classic
+\* workflow-net soundness, and it lets a loop with an exit terminate.
+\* Conditions are abstracted, so this states what a graph *allows*, not that
+\* particular data exits a loop. (Fairness on Next as a whole would only
 \* guarantee that *some* step happens, so one task could starve.)
 Fairness ==
-    /\ \A f \in AllFlows : WF_vars(Drain(f))
-    /\ \A j \in IncJoins : WF_vars(FireInclusiveJoin(j))
+    /\ \A f \in AllFlows : \A S \in Choices(Target(f)) : SF_vars(DrainVia(f, S))
+    /\ \A j \in IncJoins : \A S \in NonEmptySubsets(Out(j)) : SF_vars(FireInclusiveJoinVia(j, S))
     /\ \A t \in Tasks    : WF_vars(CompleteTask(t))
     /\ WF_vars(CompleteInstance)
 
@@ -254,9 +270,15 @@ NoStuckInstance ==
     (Settled /\ ~completed /\ \A t \in Tasks : waiting[t] = 0)
         => \A n \in Nodes : ~joinOpen[n]
 
-\* For acyclic models: every join fires at most once per instance.
-JoinFiresAtMostOnce == \A j \in ParJoins \cup IncJoins : fireCount[j] <= 1
+\* Whether the process graph has no cycle. This is derived from the graph, never
+\* declared, so a model cannot be mislabelled and silently skip the property
+\* below.
+Acyclic == \A n \in Nodes : n \notin Reaching(n)
 
-\* For acyclic models: every instance eventually completes.
+\* Without cycles, every join fires at most once per instance. A rework loop
+\* legitimately re-fires a join.
+JoinFiresAtMostOnce == Acyclic => \A j \in ParJoins \cup IncJoins : fireCount[j] <= 1
+
+\* Every instance eventually completes, under the fairness above.
 Termination == <>completed
 =============================================================================

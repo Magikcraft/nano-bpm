@@ -63,7 +63,13 @@ The properties checked:
 - `NoStuckInstance`: a settled instance with no runnable task has no open join.
 - TLC's deadlock check, which reports any state where nothing can happen and
   the instance has not completed.
-- On acyclic models, `JoinFiresAtMostOnce` and `Termination`.
+- `JoinFiresAtMostOnce`: a join fires at most once per instance. This is
+  guarded by `Acyclic`, which the spec derives from the graph, since a rework
+  loop legitimately re-fires a join.
+- `Termination`: every instance eventually completes. The engine's steps are
+  weakly fair. Gateway routing choices are *strongly* fair, which is the "fair
+  data" assumption of workflow-net soundness. A loop with an exit therefore
+  terminates, and a loop without one is reported.
 
 The following are out of scope for now: sub-process scopes, boundary and
 intermediate events, incidents, listeners and multi-instance. Each one is a
@@ -100,11 +106,9 @@ model, or if TLC prints a warning.
    plus the derived `MCFlows`, `MCSrc` and `MCTgt` (copy these from an
    existing model). Flows have their own ids, as in the engine, so two
    distinct flows may share endpoints (`MCParallelDuplicateFlows`).
-2. Add a row to `EXPECTED` in `check.sh` with the model's shape (`acyclic` or
-   `cyclic`) and its expected outcome. There are no hand-written `.cfg` files:
-   `check.sh` generates each TLC config from the shape. Every model gets the
-   full safety set, and acyclic models also get `JoinFiresAtMostOnce` and
-   `Termination`. No model can therefore silently skip a property.
+2. Add a row to `EXPECTED` in `check.sh` with its expected outcome. There are
+   no hand-written `.cfg` files. `check.sh` generates the same config, with
+   every property, for every model, so no model can skip a property.
 
 If the model finds a violation, confirm it against the real engine with a red
 Rust test before recording it. The model may simply be wrong.
