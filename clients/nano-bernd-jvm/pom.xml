@@ -11,7 +11,7 @@
 
   <name>nano-bernd</name>
   <description>Embedded Nano BPMN engine for the JVM — codename Bernd, per ADR 0005.</description>
-  <url>https://github.com/jwulf/nano-bpm</url>
+  <url>https://github.com/nanobpm/nano-bpm</url>
   <inceptionYear>2026</inceptionYear>
 
   <licenses>
@@ -32,15 +32,15 @@
   </developers>
 
   <scm>
-    <connection>scm:git:https://github.com/jwulf/nano-bpm.git</connection>
-    <developerConnection>scm:git:git@github.com:jwulf/nano-bpm.git</developerConnection>
-    <url>https://github.com/jwulf/nano-bpm</url>
+    <connection>scm:git:https://github.com/nanobpm/nano-bpm.git</connection>
+    <developerConnection>scm:git:git@github.com:nanobpm/nano-bpm.git</developerConnection>
+    <url>https://github.com/nanobpm/nano-bpm</url>
     <tag>HEAD</tag>
   </scm>
 
   <issueManagement>
     <system>GitHub Issues</system>
-    <url>https://github.com/jwulf/nano-bpm/issues</url>
+    <url>https://github.com/nanobpm/nano-bpm/issues</url>
   </issueManagement>
 
   <properties>
