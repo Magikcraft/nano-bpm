@@ -219,9 +219,17 @@ Next ==
     \/ CompleteInstance
     \/ Done
 
-\* Weak fairness: the engine always drains its queue and job workers
-\* eventually complete activated tasks.
-Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+\* Per-action weak fairness: the engine always drains each queued activation
+\* and fires each ready inclusive join, and a job worker eventually completes
+\* every continuously activatable task. (Fairness on Next as a whole would only
+\* guarantee that *some* step happens, so one task could starve.)
+Fairness ==
+    /\ \A f \in AllFlows : WF_vars(Drain(f))
+    /\ \A j \in IncJoins : WF_vars(FireInclusiveJoin(j))
+    /\ \A t \in Tasks    : WF_vars(CompleteTask(t))
+    /\ WF_vars(CompleteInstance)
+
+Spec == Init /\ [][Next]_vars /\ Fairness
 
 -----------------------------------------------------------------------------
 (* Properties *)
