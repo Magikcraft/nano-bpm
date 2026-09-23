@@ -18,7 +18,7 @@ use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
 
 /// Repo-relative README links are rewritten to GitHub blob URLs so they resolve
 /// from the shipped, standalone guide.
-const REPO_BLOB: &str = "https://github.com/jwulf/nano-bpm/blob/main/processos/";
+const REPO_BLOB: &str = "https://github.com/nanobpm/nano-bpm/blob/main/processos/";
 
 /// H2 sections that belong in the contributor-facing README but NOT in the
 /// end-user guide (matched case-insensitively against the heading text).

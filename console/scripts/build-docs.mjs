@@ -44,7 +44,7 @@ const SITE_BUILD = process.env.DOCS_SITE_BUILD === "1";
 
 // Repo links in the README are relative to the repo root; rewrite them to GitHub
 // blob URLs so they resolve from the shipped, standalone docs site.
-const REPO_BLOB = "https://github.com/jwulf/nano-bpm/blob/main/";
+const REPO_BLOB = "https://github.com/nanobpm/nano-bpm/blob/main/";
 
 const esc = (s) =>
   String(s ?? "")
