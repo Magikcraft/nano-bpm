@@ -4113,6 +4113,14 @@ impl Engine {
                     // count a flow that no longer exists and fire early. Zeebe
                     // requires a target for every taken sequence flow
                     // (`requireNonNullTargetSequenceFlowId`, #1233).
+                    //
+                    // Unidentified arrivals (`join_counts`: a pre-#1233 journal,
+                    // or a modification that activated the join directly) name
+                    // no flow, so there is nothing to look up. Each counts as
+                    // one taken flow, exactly as before #1233, and the arity
+                    // parity check above keeps that reading valid in the target.
+                    // Rejecting them instead would strand every half-open
+                    // legacy join on its old definition.
                     if let Some(arrivals) = instance.join_flow_arrivals.get(&src) {
                         for (flow, _) in arrivals.iter() {
                             let migrated = IncomingFlow {
@@ -4125,6 +4133,7 @@ impl Engine {
                                     source_element_id: src,
                                     target_element_id: tgt.clone(),
                                     flow_source_element_id: flow.from.clone(),
+                                    flow_ordinal: flow.ordinal,
                                 });
                             }
                         }
@@ -12679,14 +12688,16 @@ pub enum EngineError {
         target_incoming_count: usize,
     },
     /// A `MigrateInstance` mapped an open parallel-gateway join that has counted
-    /// a token on an incoming flow (from `flow_source_element_id`) that is not
-    /// an incoming flow of the target gateway. The migrated join would count a
-    /// flow that no longer exists and fire early (#1233). Maps to HTTP 409.
+    /// a token on an incoming flow (the `flow_ordinal`-th flow from
+    /// `flow_source_element_id` to the join) that is not an incoming flow of the
+    /// target gateway. The migrated join would count a flow that no longer
+    /// exists and fire early (#1233). Maps to HTTP 409.
     MigratedParallelJoinFlowMissing {
         instance_key: Key,
         source_element_id: String,
         target_element_id: String,
         flow_source_element_id: String,
+        flow_ordinal: usize,
     },
     /// A `MigrateInstance` targeted an instance that contains an active element
     /// class this phase does not yet support migrating (boundary events, event
@@ -13002,11 +13013,12 @@ impl std::fmt::Display for EngineError {
                 source_element_id,
                 target_element_id,
                 flow_source_element_id,
+                flow_ordinal,
             } => {
                 write!(
                     f,
                     "migration of instance {instance_key} maps open parallel-join {source_element_id} \
-                     to {target_element_id}, but the join holds a token on the flow from \
+                     to {target_element_id}, but the join holds a token on flow #{flow_ordinal} from \
                      {flow_source_element_id}, which is not an incoming flow of {target_element_id}"
                 )
             }

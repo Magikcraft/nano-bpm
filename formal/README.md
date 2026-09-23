@@ -68,7 +68,9 @@ The properties checked:
   incoming flow has delivered, matching BPMN and Zeebe.
 - `NoStuckInstance`: a settled instance with no runnable task has no open join.
 - TLC's deadlock check, which reports any state where nothing can happen and
-  the instance has not completed.
+  the instance has not completed. `violates:` models run without it (see
+  below); in this spec such a state is always a `NoStuckInstance` and
+  `Termination` violation, so nothing is lost.
 - `JoinFiresAtMostOnce`: a join fires at most once per instance. This is
   guarded by `Acyclic`, which the spec derives from the graph, since a rework
   loop legitimately re-fires a join. An acyclic graph that piles several

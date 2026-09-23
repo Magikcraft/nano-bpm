@@ -137,6 +137,17 @@ for row in "${EXPECTED[@]}"; do
   fi
   seen="$seen$m "
   [[ -f "$m.tla" ]] || { echo "error: EXPECTED lists $m but $m.tla does not exist" >&2; status=1; }
+  # A violated name must be one this script checks, or the row can never match.
+  # `Deadlock` is not among them: `violates:` rows run with -deadlock (below).
+  outcome="$(expected_outcome "$m")"
+  if [[ "$outcome" == violates:* ]]; then
+    for p in $(tr ',' ' ' <<<"${outcome#violates:}"); do
+      [[ " ${INVARIANTS[*]} ${PROPERTIES[*]} " == *" $p "* ]] ||
+        { echo "error: EXPECTED $m names $p, which is not a checked invariant or property" >&2; status=1; }
+    done
+  elif [[ "$outcome" != pass ]]; then
+    echo "error: EXPECTED $m has outcome $outcome; want pass or violates:<P1>,<P2>,..." >&2; status=1
+  fi
 done
 [[ $status -eq 0 ]] || exit $status
 
@@ -159,8 +170,11 @@ for m in "${models[@]}"; do
   # A `violates:` model runs with -continue so TLC explores the whole state
   # space and reports every violated invariant, whatever order BFS reaches
   # them in. It also runs with -deadlock, because TLC stops at a deadlock even
-  # under -continue. A stuck state is still reported, as NoStuckInstance and
-  # as a Termination violation.
+  # under -continue. Nothing is lost: in TokenFlow a deadlock can only be a
+  # settled, uncompleted state with no waiting task (anything else enables a
+  # drain, a join fire or CompleteTask), where only an open join can disable
+  # CompleteInstance. That is exactly a NoStuckInstance violation, and it also
+  # violates Termination. `pass` rows keep TLC's deadlock check.
   continue_flag=()
   if [[ "$want" == violates:* ]]; then continue_flag=(-continue -deadlock); fi
   set +e

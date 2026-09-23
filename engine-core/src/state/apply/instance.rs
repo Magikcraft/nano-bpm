@@ -372,9 +372,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                         arrivals.remap(remap_id);
                         let merged = remapped.entry(eid).or_default();
                         for (flow, count) in arrivals.iter() {
-                            for _ in 0..count {
-                                merged.record(flow);
-                            }
+                            merged.add(flow, count);
                         }
                     }
                     instance.join_flow_arrivals = remapped;

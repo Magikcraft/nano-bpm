@@ -21281,6 +21281,34 @@ fn migration_error_status(e: &EngineError) -> u16 {
     }
 }
 
+#[cfg(test)]
+mod migration_error_status_tests {
+    use super::*;
+
+    #[test]
+    fn open_parallel_join_rejections_are_conflicts() {
+        // Both open-join guards reject a mapping the instance's current state
+        // cannot survive, not a malformed request: 409, like the other
+        // state-dependent migration rejections.
+        let arity = EngineError::MigratedParallelJoinArityChanged {
+            instance_key: 1,
+            source_element_id: "join".into(),
+            target_element_id: "join2".into(),
+            source_incoming_count: 2,
+            target_incoming_count: 3,
+        };
+        let flow = EngineError::MigratedParallelJoinFlowMissing {
+            instance_key: 1,
+            source_element_id: "join".into(),
+            target_element_id: "join2".into(),
+            flow_source_element_id: "a".into(),
+            flow_ordinal: 0,
+        };
+        assert_eq!(migration_error_status(&arity), 409);
+        assert_eq!(migration_error_status(&flow), 409);
+    }
+}
+
 /// Surface-independent outcome of [`ServerImpl::set_variables_core`].
 pub(crate) enum SetVariablesOutcome {
     /// The variables were merged into the scope.

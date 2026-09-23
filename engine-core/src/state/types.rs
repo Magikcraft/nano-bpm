@@ -118,9 +118,17 @@ pub struct FlowArrivals(Vec<(IncomingFlow, usize)>);
 impl FlowArrivals {
     /// Count one more token over `flow`.
     pub fn record(&mut self, flow: &IncomingFlow) {
+        self.add(flow, 1);
+    }
+
+    /// Record `tokens` arrivals over `flow` at once.
+    pub fn add(&mut self, flow: &IncomingFlow, tokens: usize) {
+        if tokens == 0 {
+            return;
+        }
         match self.0.binary_search_by(|(f, _)| f.cmp(flow)) {
-            Ok(i) => self.0[i].1 += 1,
-            Err(i) => self.0.insert(i, (flow.clone(), 1)),
+            Ok(i) => self.0[i].1 += tokens,
+            Err(i) => self.0.insert(i, (flow.clone(), tokens)),
         }
     }
 
@@ -160,9 +168,7 @@ impl FlowArrivals {
         let old = std::mem::take(&mut self.0);
         for (mut flow, count) in old {
             remap_id(&mut flow.from);
-            for _ in 0..count {
-                self.record(&flow);
-            }
+            self.add(&flow, count);
         }
     }
 }
@@ -1836,5 +1842,51 @@ mod version_lookup_tests {
         assert_eq!(state.process_by_key(20).expect("v2 retained").version, 2);
         assert_eq!(state.process_version("order", 1).expect("v1").key, 10);
         assert_eq!(state.process_version("order", 2).expect("v2").key, 20);
+    }
+}
+
+#[cfg(test)]
+mod flow_arrivals_tests {
+    use super::*;
+
+    fn flow(from: &str, ordinal: usize) -> IncomingFlow {
+        IncomingFlow {
+            from: from.into(),
+            ordinal,
+        }
+    }
+
+    #[test]
+    fn remap_merges_flows_that_collapse_onto_one_identity() {
+        let mut arrivals = FlowArrivals::default();
+        arrivals.add(&flow("a", 0), 2);
+        arrivals.add(&flow("b", 0), 3);
+        arrivals.record(&flow("c", 0));
+        arrivals.remap(|id| {
+            if id == "b" {
+                *id = "a".into();
+            }
+        });
+        assert_eq!(arrivals.count(&flow("a", 0)), 5);
+        assert_eq!(arrivals.count(&flow("c", 0)), 1);
+        assert_eq!(arrivals.distinct_flows(), 2);
+    }
+
+    #[test]
+    fn consume_one_each_keeps_only_the_surplus() {
+        let mut arrivals = FlowArrivals::default();
+        arrivals.add(&flow("a", 0), 2);
+        arrivals.record(&flow("a", 1));
+        arrivals.add(&flow("b", 0), 0);
+        assert_eq!(
+            arrivals.distinct_flows(),
+            2,
+            "a zero-token add records nothing"
+        );
+        arrivals.consume_one_each();
+        assert_eq!(
+            arrivals.iter().collect::<Vec<_>>(),
+            vec![(&flow("a", 0), 1)]
+        );
     }
 }
