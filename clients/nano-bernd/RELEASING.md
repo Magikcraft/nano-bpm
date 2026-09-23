@@ -32,7 +32,7 @@ On <https://www.npmjs.com/package/@nanobpm/nano-bernd> → **Settings** →
 
 | Field                | Value                          |
 |----------------------|--------------------------------|
-| Organization / user  | `Magikcraft`                   |
+| Organization / user  | `nanobpm`                      |
 | Repository           | `nano-bpm`                     |
 | Workflow filename    | `release-nano-bernd-npm.yml`   |
 | Environment          | *(leave blank)*                |

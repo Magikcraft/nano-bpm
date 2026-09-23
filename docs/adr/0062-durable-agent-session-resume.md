@@ -215,7 +215,7 @@ external harness. Each row below is a separate follow-up issue; **none is in sco
 
 | Piece | Repo | Notes |
 |---|---|---|
-| **Decision — ADR 0062** | `Magikcraft/nano-bpm` | *this document*; extends nano-bpm ADR 0056, referenced by number from nwf/nano-ide the way 0056 already is |
+| **Decision — ADR 0062** | `nanobpm/nano-bpm` | *this document*; extends nano-bpm ADR 0056, referenced by number from nwf/nano-ide the way 0056 already is |
 | Generic session substrate + `@nanobpm/agentic/session` contract (`emit` / `checkpoint` / `restore`) + the two ingestion backends (ACP client, `stream-json`/native normalizer), reusing the relay ring + incarnation fence | `nanobpm/nano-ide` — `packages/agentic` | same home as the relay it is promoted from (ADR 0056 §12); ships as the `@nanobpm/agentic` capability |
 | **World** restore: `c8ctl` reconstructs the working tree (invert push → `fetch`+`checkout <sha>`, replay the effect tail through the fence), convergence-loop resume semantics, the `durable-resume` **enrolment gate** on the app registry | `nanobpm/nano-workforce` | the app that leases `senior:pr-review`; consumer of the nano-ide contract |
 | **Mind** tap: the harness's streaming session-event mode + resume-by-id (§5) — normalized via the ACP client where the harness speaks ACP, else a per-harness `stream-json`/native normalizer | external **harness** (opencode = native ACP + world snapshots; DeepSeek/Copilot/Claude/Qwen/Kimi/pi via stream-json/adapters) | not a Nano repo — but the fleet already exposes the seam, so this is normalization, not net-new harness work |

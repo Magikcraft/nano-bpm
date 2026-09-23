@@ -28,10 +28,10 @@ The gateway version and the nano-bernd version are independent — bumping one d
 Each train has its own credentials, documented in place:
 
 - **Gateway/ProcessOS**: `C8CTL_PLUGIN_REPO_TOKEN`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` — see the header comments in `.github/workflows/publish-{c8ctl,processos}-binaries.yml`.
-- **npm nano-bernd**: `NPM_TOKEN` — see [`clients/nano-bernd/RELEASING.md`](clients/nano-bernd/RELEASING.md).
+- **npm nano-bernd**: no secret — publishing uses npm OIDC trusted publishing (a Trusted Publisher configured on npmjs.com, no `NPM_TOKEN`); see [`clients/nano-bernd/RELEASING.md`](clients/nano-bernd/RELEASING.md).
 - **JVM nano-bernd**: `CENTRAL_USERNAME`, `CENTRAL_PASSWORD`, `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE` — see [`clients/nano-bernd-jvm/RELEASING.md`](clients/nano-bernd-jvm/RELEASING.md).
 
-Verify all secrets are set at <https://github.com/jwulf/nano-bpm/settings/secrets/actions> before your first release.
+Verify all secrets are set at <https://github.com/nanobpm/nano-bpm/settings/secrets/actions> before your first release.
 
 ## Cutting a coordinated release
 
@@ -68,10 +68,10 @@ Push all three in a single `git push` — the three workflows run in parallel wi
 
 ### 3. Watch the workflows
 
-- <https://github.com/jwulf/nano-bpm/actions/workflows/publish-c8ctl-binaries.yml>
-- <https://github.com/jwulf/nano-bpm/actions/workflows/publish-processos-binaries.yml>
-- <https://github.com/jwulf/nano-bpm/actions/workflows/release-nano-bernd-npm.yml>
-- <https://github.com/jwulf/nano-bpm/actions/workflows/release-nano-bernd-jvm.yml>
+- <https://github.com/nanobpm/nano-bpm/actions/workflows/publish-c8ctl-binaries.yml>
+- <https://github.com/nanobpm/nano-bpm/actions/workflows/publish-processos-binaries.yml>
+- <https://github.com/nanobpm/nano-bpm/actions/workflows/release-nano-bernd-npm.yml>
+- <https://github.com/nanobpm/nano-bpm/actions/workflows/release-nano-bernd-jvm.yml>
 
 Typical durations:
 - npm nano-bernd: 3–5 min.
@@ -81,7 +81,7 @@ Typical durations:
 ### 4. Verify
 
 - **Gateway binaries**: <https://github.com/jwulf/c8ctl-plugin-nano/releases> — assets attached to the new release. S3 mirror at `s3://sitapati-storage/nanobpm-gateway/<tag>/`.
-- **ProcessOS binaries**: <https://github.com/jwulf/nano-bpm/releases> — assets on the tag. S3 at `s3://sitapati-storage/processos/<tag>/`.
+- **ProcessOS binaries**: <https://github.com/nanobpm/nano-bpm/releases> — assets on the tag. S3 at `s3://sitapati-storage/processos/<tag>/`.
 - **npm**: `npm view @nanobpm/nano-bernd version` → should be the new version. (Provenance is not published — it requires a public source repo, and nano-bpm is private.)
 - **Maven Central**: <https://central.sonatype.com> shows the new version immediately; <https://search.maven.org/artifact/io.github.jwulf/nano-bernd> propagates within ~30 min. Test with `mvn dependency:get -Dartifact=io.github.jwulf:nano-bernd:0.2.0`.
 

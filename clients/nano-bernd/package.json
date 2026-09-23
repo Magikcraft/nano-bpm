@@ -37,13 +37,13 @@
   },
   "keywords": ["nano", "nanobpm", "bernd", "bpmn", "wasm", "embedded", "ffi", "engine"],
   "license": "Apache-2.0",
-  "homepage": "https://github.com/Magikcraft/nano-bpm/tree/main/clients/nano-bernd#readme",
+  "homepage": "https://github.com/nanobpm/nano-bpm/tree/main/clients/nano-bernd#readme",
   "bugs": {
-    "url": "https://github.com/Magikcraft/nano-bpm/issues"
+    "url": "https://github.com/nanobpm/nano-bpm/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Magikcraft/nano-bpm.git",
+    "url": "git+https://github.com/nanobpm/nano-bpm.git",
     "directory": "clients/nano-bernd"
   },
   "publishConfig": {

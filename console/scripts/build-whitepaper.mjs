@@ -21,7 +21,7 @@ const outDir = join(root, "public", "whitepaper");
 
 // Repo links in the paper are relative to the repo root; rewrite them to GitHub
 // blob URLs so they resolve from the shipped, standalone page.
-const REPO_BLOB = "https://github.com/jwulf/nano-bpm/blob/main/";
+const REPO_BLOB = "https://github.com/nanobpm/nano-bpm/blob/main/";
 
 const esc = (s) =>
   String(s ?? "")

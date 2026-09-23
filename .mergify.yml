@@ -23,7 +23,7 @@
 #   * batch_max_wait_time 5 min                -> wait briefly to fill a batch.
 #
 # SETUP (out-of-band, cannot be done from the repo):
-#   1. Install the Mergify GitHub App on Magikcraft/nano-bpm:
+#   1. Install the Mergify GitHub App on nanobpm/nano-bpm:
 #        https://github.com/apps/mergify/installations/new
 #   2. Confirm the plan (free for open source / <=5 active contributors on
 #      private, then per-active-contributor). Dashboard: https://dashboard.mergify.com

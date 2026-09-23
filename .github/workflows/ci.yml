@@ -291,7 +291,7 @@ jobs:
         run: npm install && npm test
         working-directory: engine-wasm/tests/use-after-free
       - name: Test-Studio record loop (embedded-engine isolation example)
-        # Worked example + guard (Magikcraft/nano-bpm example): drives a
+        # Worked example + guard (nanobpm/nano-bpm example): drives a
         # Test-Studio-style recording session entirely through the committed
         # engine-wasm/pkg TestEngine, proving the embedded engine gives Camunda's
         # per-instance recording isolation (RESERVE_JOBS + stubCallActivities) for

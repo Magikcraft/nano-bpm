@@ -30,7 +30,7 @@ Actions**:
 
 | Field               | Value                     |
 |---------------------|---------------------------|
-| Organization / user | `Magikcraft`              |
+| Organization / user | `nanobpm`                 |
 | Repository          | `nano-bpm`                |
 | Workflow filename   | `release-bojtos-npm.yml`  |
 | Environment         | *(leave blank)*           |

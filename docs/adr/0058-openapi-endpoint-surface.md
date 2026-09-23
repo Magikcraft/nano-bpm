@@ -3,7 +3,7 @@
 Status: Proposed
 Date: 2026-08-09
 Relates to: ADR 0055 §3 (app-authored action handlers), ADR 0040 (fused domain model), ADR 0042 (page/screen composer), ADR 0053 (derivation is a shared library), ADR 0027 (App manifest + fail-closed validator)
-Repo: Magikcraft/nano-bpm (`spec-app/`), nanobpm/nano-ide (`packages/urban`)
+Repo: nanobpm/nano-bpm (`spec-app/`), nanobpm/nano-ide (`packages/urban`)
 
 ## Context
 

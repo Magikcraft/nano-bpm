@@ -3,7 +3,7 @@
 Status: Proposed
 Date: 2026-08-17
 Relates to: ADR 0060 (institutional memory / model-grounded context — the *derived* half), ADR 0051 (agent authoring brief / `/agent` + `/llms.txt`), ADR 0056 (agent relay / command-stream plane), ADR 0059 (supervisor enrolment — the multi-app / cross-org world)
-Repo: Magikcraft/nano-bpm (cross-cutting: nanobpmn, nano-ide, nano-workforce, c8ctl-plugin-nano, urban-pr-review, bojtos, nano-sdk-js)
+Repo: nanobpm/nano-bpm (cross-cutting: nanobpmn, nano-ide, nano-workforce, c8ctl-plugin-nano, urban-pr-review, bojtos, nano-sdk-js)
 
 ## Context
 
