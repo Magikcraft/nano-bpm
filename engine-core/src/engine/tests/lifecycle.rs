@@ -1784,6 +1784,7 @@ fn dead_scope_guard_rejects_activation_into_a_torn_down_subprocess_scope() {
         instance_key: key,
         element_id: "inner".to_string(),
         scope: sub_eik,
+        via: None,
     };
 
     // While the scope is live the guard admits the activation.
@@ -1806,7 +1807,199 @@ fn dead_scope_guard_rejects_activation_into_a_torn_down_subprocess_scope() {
         instance_key: key,
         element_id: "after".to_string(),
         scope: 0,
+        via: None,
     }));
+}
+
+/// How many times the parallel join `join` fired (routed its outgoing flow).
+fn join_fire_count(events: &[Event], join: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::SequenceFlowTaken { from, .. } if from == join))
+        .count()
+}
+
+/// `s -> fork =< inner, t >;  inner =< x, y >;  x, y -> merge (xor) -> join;
+/// t -> join;  join -> e`. Two tokens reach `join` over the SAME incoming flow
+/// (`merge -> join`) while `t` is still pending. Found by the TLA+ token-flow
+/// model (`formal/tla/MCParallelJoinMultiArrival`, #1233).
+fn multi_arrival_process() -> ProcessDefinition {
+    ProcessBuilder::new("multi_arrival")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .parallel_gateway("inner")
+        .service_task("x", "jx")
+        .service_task("y", "jy")
+        .exclusive_gateway("merge")
+        .service_task("t", "jt")
+        .parallel_gateway("join")
+        .end_event("e")
+        .connect("s", "fork")
+        .connect("fork", "inner")
+        .connect("fork", "t")
+        .connect("inner", "x")
+        .connect("inner", "y")
+        .connect("x", "merge")
+        .connect("y", "merge")
+        .connect("merge", "join")
+        .connect("t", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn parallel_join_waits_for_every_incoming_flow_not_just_enough_arrivals() {
+    // A BPMN parallel join activates only once every incoming flow has been
+    // taken; Zeebe counts distinct taken flows
+    // (`ProcessInstanceStateTransitionGuard.canActivateParallelGateway`), so two
+    // arrivals over one flow must not fire it while `t` is still pending (#1233).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_arrival_process()))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("multi_arrival"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let first = complete_one(&mut engine, "jx");
+    let second = complete_one(&mut engine, "jy");
+    assert_eq!(
+        join_fire_count(&first, "join") + join_fire_count(&second, "join"),
+        0,
+        "parallel join fired on two arrivals over one incoming flow while `t` is still pending"
+    );
+    assert!(!engine.is_completed(instance_key));
+
+    let third = complete_one(&mut engine, "jt");
+    assert_eq!(
+        join_fire_count(&third, "join"),
+        1,
+        "the join fires once `t` arrives"
+    );
+}
+
+#[test]
+fn parallel_join_keeps_surplus_token_waiting_like_zeebe() {
+    // Zeebe consumes ONE taken-flow count per incoming flow on activation and
+    // keeps the remainder for the next activation (the "Tetris principle",
+    // `ProcessInstanceElementActivatingV3Applier`). The surplus `merge -> join`
+    // token is still an active sequence flow, so the instance does not complete:
+    // it waits at the join for another `t` token (#1233).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_arrival_process()))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("multi_arrival"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    complete_one(&mut engine, "jx");
+    complete_one(&mut engine, "jy");
+    complete_one(&mut engine, "jt");
+
+    assert!(
+        !engine.is_completed(instance_key),
+        "the surplus token keeps the instance alive, as in Zeebe"
+    );
+    let instance = engine.instance(instance_key).unwrap();
+    assert_eq!(instance.join_flows_taken("join"), 1);
+    let open = instance
+        .join_instances
+        .get("join")
+        .copied()
+        .expect("the join is re-opened to hold the surplus token");
+    assert_eq!(
+        instance.active.get(&open).map(String::as_str),
+        Some("join"),
+        "the re-opened join is a live token"
+    );
+}
+
+#[test]
+fn parallel_join_surplus_fires_again_once_every_flow_is_retaken() {
+    // s -> fork =< pa, pb >;  pa =< a1, a2 > -> xa (xor) -> join;
+    //                         pb =< b1, b2 > -> xb (xor) -> join;  join -> e
+    // Each incoming flow of `join` is taken twice. Zeebe fires the join twice:
+    // once per complete set, keeping `xa -> join`'s second token for the second
+    // activation. Dropping the surplus would strand the instance (#1233).
+    let def = ProcessBuilder::new("surplus")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .parallel_gateway("pa")
+        .parallel_gateway("pb")
+        .service_task("a1", "ja1")
+        .service_task("a2", "ja2")
+        .service_task("b1", "jb1")
+        .service_task("b2", "jb2")
+        .exclusive_gateway("xa")
+        .exclusive_gateway("xb")
+        .parallel_gateway("join")
+        .end_event("e")
+        .connect("s", "fork")
+        .connect("fork", "pa")
+        .connect("fork", "pb")
+        .connect("pa", "a1")
+        .connect("pa", "a2")
+        .connect("pb", "b1")
+        .connect("pb", "b2")
+        .connect("a1", "xa")
+        .connect("a2", "xa")
+        .connect("b1", "xb")
+        .connect("b2", "xb")
+        .connect("xa", "join")
+        .connect("xb", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("surplus"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let mut fired = 0;
+    for job in ["ja1", "ja2"] {
+        fired += join_fire_count(&complete_one(&mut engine, job), "join");
+    }
+    assert_eq!(
+        fired, 0,
+        "two tokens on `xa -> join` alone must not fire it"
+    );
+    fired += join_fire_count(&complete_one(&mut engine, "jb1"), "join");
+    assert_eq!(fired, 1);
+    assert!(!engine.is_completed(instance_key));
+    let last = complete_one(&mut engine, "jb2");
+    fired += join_fire_count(&last, "join");
+    assert_eq!(fired, 2, "the kept surplus completes the second activation");
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn parallel_join_counts_duplicate_flows_between_the_same_elements_separately() {
+    // Two distinct sequence flows `fork -> join`. They are different incoming
+    // flows (Zeebe keys by flow id), so one token on each fires the join.
+    let def = ProcessBuilder::new("dup")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .parallel_gateway("join")
+        .end_event("e")
+        .connect("s", "fork")
+        .connect("fork", "join")
+        .connect("fork", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("dup"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(join_fire_count(&events, "join"), 1);
+    assert!(engine.is_completed(instance_key));
 }
 
 #[test]
@@ -1851,8 +2044,8 @@ fn terminate_clears_open_parallel_join_bookkeeping() {
     complete_one(&mut engine, "ja");
     let instance = engine.instance(key).unwrap();
     assert_eq!(
-        instance.join_counts.get("join").copied(),
-        Some(1),
+        instance.join_flows_taken("join"),
+        1,
         "the join is half-open before the terminate"
     );
     assert!(instance.join_instances.contains_key("join"));
@@ -1865,7 +2058,9 @@ fn terminate_clears_open_parallel_join_bookkeeping() {
         crate::state::ProcessInstanceState::Completed
     );
     assert!(
-        instance.join_counts.is_empty() && instance.join_instances.is_empty(),
+        instance.join_counts.is_empty()
+            && instance.join_flow_arrivals.is_empty()
+            && instance.join_instances.is_empty(),
         "the terminal instance must not retain open-join bookkeeping"
     );
 }

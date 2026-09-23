@@ -342,7 +342,7 @@ impl Engine {
                 }
             }
             // Reset a parallel join accumulating on this element instance so its
-            // `join_counts`/`join_instances` bookkeeping (untouched by
+            // `join_counts`/`join_flow_arrivals`/`join_instances` bookkeeping (untouched by
             // `ElementCompleted`) cannot fire against a dead token if the scope
             // is ever re-entered.
             if self

@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::model::{ElementId, ProcessDefinition, Value};
+use crate::model::{ElementId, IncomingFlow, ProcessDefinition, Value};
 
 /// A globally-unique identifier for instances, element instances and jobs.
 ///
@@ -103,6 +103,80 @@ pub enum ProcessInstanceState {
     /// suspension. Tracked alongside [`ProcessInstance::suspended_at`], which
     /// records the most-recent suspension instant.
     Suspended,
+}
+
+/// Arrivals at one parallel join, counted per identified incoming flow. The
+/// single implementation of Zeebe's taken-sequence-flow bookkeeping (#1233): the
+/// state applier and the engine's fire decision both go through it.
+///
+/// Kept sorted by flow with no zero counts, so its serialized form is
+/// deterministic.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FlowArrivals(Vec<(IncomingFlow, usize)>);
+
+impl FlowArrivals {
+    /// Count one more token over `flow`.
+    pub fn record(&mut self, flow: &IncomingFlow) {
+        match self.0.binary_search_by(|(f, _)| f.cmp(flow)) {
+            Ok(i) => self.0[i].1 += 1,
+            Err(i) => self.0.insert(i, (flow.clone(), 1)),
+        }
+    }
+
+    /// How many distinct incoming flows have at least one waiting token.
+    pub fn distinct_flows(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Tokens waiting on `flow`.
+    pub fn count(&self, flow: &IncomingFlow) -> usize {
+        self.0
+            .binary_search_by(|(f, _)| f.cmp(flow))
+            .map_or(0, |i| self.0[i].1)
+    }
+
+    /// The join fired: consume one token per flow and keep the surplus for the
+    /// next activation (Zeebe's "Tetris principle").
+    pub fn consume_one_each(&mut self) {
+        for (_, count) in &mut self.0 {
+            *count -= 1;
+        }
+        self.0.retain(|(_, count)| *count > 0);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Every counted flow with its token count, in flow order.
+    pub fn iter(&self) -> impl Iterator<Item = (&IncomingFlow, usize)> {
+        self.0.iter().map(|(f, c)| (f, *c))
+    }
+
+    /// Rename element ids inside the flow identities (process migration),
+    /// merging flows that collapse onto the same identity.
+    pub fn remap(&mut self, mut remap_id: impl FnMut(&mut ElementId)) {
+        let old = std::mem::take(&mut self.0);
+        for (mut flow, count) in old {
+            remap_id(&mut flow.from);
+            for _ in 0..count {
+                self.record(&flow);
+            }
+        }
+    }
+}
+
+impl ProcessInstance {
+    /// How many of `join`'s incoming flows have been taken: identified flows
+    /// with a waiting token plus unidentified arrivals (each counted as one
+    /// flow).
+    pub fn join_flows_taken(&self, join: &str) -> usize {
+        self.join_flow_arrivals
+            .get(join)
+            .map_or(0, FlowArrivals::distinct_flows)
+            + self.join_counts.get(join).copied().unwrap_or(0)
+    }
 }
 
 impl ProcessInstanceState {
@@ -474,9 +548,17 @@ pub struct ProcessInstance {
     /// refcount bump rather than a deep clone of the (up to 50 KB) decoded value
     /// tree. A mutation (`VariablesUpdated`) copies-on-write via `Arc::make_mut`.
     pub variables: Arc<HashMap<String, Value>>,
-    /// For each open parallel-gateway join: how many incoming tokens have
-    /// arrived so far.
+    /// For each open join: how many tokens have arrived over an *unidentified*
+    /// flow (see [`Event::ParallelJoinTokenArrived`](crate::Event)'s `flow`):
+    /// inclusive-join arrivals, arrivals journaled before #1233, and
+    /// activations that did not come over a flow. A parallel join counts each
+    /// of these as one taken incoming flow.
     pub join_counts: HashMap<ElementId, usize>,
+    /// For each open parallel-gateway join: arrivals per identified incoming
+    /// flow (Zeebe's "number of taken sequence flows", #1233). Absent from
+    /// pre-#1233 snapshots, hence `serde(default)`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub join_flow_arrivals: HashMap<ElementId, FlowArrivals>,
     /// For each open parallel-gateway join: the element instance accumulating
     /// the arriving tokens.
     pub join_instances: HashMap<ElementId, Key>,

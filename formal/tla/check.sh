@@ -7,13 +7,19 @@
 #
 # The EXPECTED table below is the single record of what each model should do.
 # `pass` means TLC finds no error: every invariant and property holds, and no
-# state deadlocks. `violates:<Invariant>` records a known engine defect that
-# the model reproduces: TLC must report that invariant as violated (possibly
-# among others). The fix PR updates the spec to model the fixed engine. TLC
-# then stops reporting the violation, and this script fails until the entry is
-# flipped to `pass`. That is the ratchet: a known bug cannot be forgotten, and
-# the fixed behaviour stays guarded. (The spec cannot see the Rust code;
-# trace validation, #1226, closes that gap.)
+# state deadlocks. `violates:<P1>,<P2>,...` names the EXACT set of invariants
+# and properties TLC must report as violated; every property not listed is
+# thereby proven to hold. It records one of two things, and the row's comment
+# must say which:
+#   - a known engine defect the model reproduces (cite its issue). The fix PR
+#     updates the spec to model the fixed engine, TLC stops reporting the
+#     violation, and this script fails until the entry is flipped. That is the
+#     ratchet: a known bug cannot be forgotten, and the fixed behaviour stays
+#     guarded.
+#   - a deliberately unsound process graph, where the violation is the correct
+#     verdict on the graph (for example a BPMN lack of synchronization, which
+#     Zeebe also leaves stuck).
+# (The spec cannot see the Rust code; trace validation, #1226, closes that gap.)
 #
 # Set FORMAL_LOG_DIR to keep each model's generated .cfg and full TLC log
 # (including counterexample traces).
@@ -33,7 +39,12 @@ EXPECTED=(
   "MCInclusiveInParallel       pass"
   "MCExclusiveLoop             pass"
   "MCParallelDuplicateFlows    pass"
-  "MCParallelJoinMultiArrival  violates:ParallelJoinWaitsForEveryFlow  #1233"
+  # Unsound: two tokens on M->J, one on T->J. J fires once and, as in Zeebe, the
+  # surplus token waits forever for a partner. It never fires early (#1233).
+  "MCParallelJoinMultiArrival  violates:NoStuckInstance,Termination"
+  # Not 1-safe: every flow into J is taken twice, so J fires twice, keeping the
+  # surplus between firings ("Tetris" principle), and the instance completes.
+  "MCParallelJoinSurplus       violates:JoinFiresAtMostOnce"
 )
 
 # Every model is checked against the same, full property set. The generated
@@ -42,6 +53,9 @@ EXPECTED=(
 # `Acyclic`, which is derived from the graph rather than declared.
 INVARIANTS=(TypeOK JoinBookkeepingCoherent ParallelJoinWaitsForEveryFlow NoStuckInstance JoinFiresAtMostOnce)
 PROPERTIES=(Termination)
+# TLC reports a temporal violation without naming the property, so the verdict
+# can only attribute it while there is exactly one.
+[[ ${#PROPERTIES[@]} -eq 1 ]] || { echo "error: check.sh attributes temporal violations to a single property" >&2; exit 1; }
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
@@ -142,25 +156,32 @@ for m in "${models[@]}"; do
   log="$metadir/$m.log"
   cfg="$metadir/$m.cfg"
   write_cfg "$cfg"
-  # A known-defect model runs with -continue so TLC reports every violated
-  # invariant. Which violation BFS happens to reach first is an accident of
-  # state order and not a property of the defect, so the ratchet checks that
-  # the expected invariant is among them.
+  # A `violates:` model runs with -continue so TLC explores the whole state
+  # space and reports every violated invariant, whatever order BFS reaches
+  # them in. It also runs with -deadlock, because TLC stops at a deadlock even
+  # under -continue. A stuck state is still reported, as NoStuckInstance and
+  # as a Termination violation.
   continue_flag=()
-  if [[ "$want" == violates:* ]]; then continue_flag=(-continue); fi
+  if [[ "$want" == violates:* ]]; then continue_flag=(-continue -deadlock); fi
   set +e
   java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -cleanup ${continue_flag[@]+"${continue_flag[@]}"} \
     -metadir "$metadir/$m" -config "$cfg" "$m.tla" >"$log" 2>&1
   code=$?
   set -e
 
-  violated="$(grep -oE 'Invariant [A-Za-z0-9_]+ is violated' "$log" | awk '{print $2}' | sort -u | tr '\n' ' ' || true)"
-  if [[ $code -eq 0 ]] && grep -q "Model checking completed. No error has been found." "$log"; then
+  violated="$(
+    {
+      grep -oE 'Invariant [A-Za-z0-9_]+ is violated' "$log" | awk '{print $2}'
+      if grep -q 'Temporal properties were violated' "$log"; then echo "${PROPERTIES[0]}"; fi
+      if grep -q 'Deadlock reached' "$log"; then echo Deadlock; fi
+    } | sort -u | paste -sd, - || true
+  )"
+  # The expected set, normalized the same way, so row order does not matter.
+  want_set="$(tr ',' '\n' <<<"${want#violates:}" | sort -u | paste -sd, -)"
+  if [[ $code -eq 0 && -z "$violated" ]] && grep -q "Model checking completed. No error has been found." "$log"; then
     got="pass"
   elif [[ -n "$violated" ]]; then
-    got="violates:${violated% }"
-  elif grep -qE 'Temporal properties were violated|Deadlock reached' "$log"; then
-    got="violates:$(grep -oE 'Temporal properties were violated|Deadlock reached' "$log" | head -1 | tr ' ' '_')"
+    got="violates:$violated"
   else
     got="error(exit $code)"
   fi
@@ -168,7 +189,9 @@ for m in "${models[@]}"; do
   matches=false
   if [[ "$want" == pass ]]; then
     if [[ "$got" == pass ]]; then matches=true; fi
-  elif [[ " $violated " == *" ${want#violates:} "* ]]; then
+  elif [[ "$got" == "violates:$want_set" ]] && grep -q ' 0 states left on queue' "$log"; then
+    # The drained queue shows the whole state space was explored, so no
+    # unlisted property can hide behind a run that stopped early.
     matches=true
   fi
 

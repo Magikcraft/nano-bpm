@@ -1,6 +1,6 @@
 {
-  "next_local": 15,
-  "now": 1700000000007,
+  "next_local": 30,
+  "now": 1700000000010,
   "num_partitions": 1,
   "partition_id": 0,
   "start_dispatch_rr": 0,
@@ -11,12 +11,20 @@
           -50,
           15
         ]
+      ],
+      "sync-task": [
+        [
+          -50,
+          29
+        ]
       ]
     },
     "activated_jobs": [],
     "conditional_subscriptions": {},
     "created_by_process": {
-      "order": 2
+      "dup": 1,
+      "order": 2,
+      "sync": 1
     },
     "decision_requirements": {},
     "decision_requirements_versions": {},
@@ -26,7 +34,8 @@
     "forms": {},
     "incidents": {},
     "inflight_by_process": {
-      "order": 1
+      "order": 1,
+      "sync": 1
     },
     "instances": {
       "12": {
@@ -42,6 +51,7 @@
         "created_at": 1700000000004,
         "incidents": [],
         "join_counts": {},
+        "join_flow_arrivals": {},
         "join_instances": {},
         "key": 12,
         "multi_instances": {},
@@ -62,6 +72,77 @@
         },
         "variables_spilled": false
       },
+      "20": {
+        "active": {},
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000009,
+        "incidents": [],
+        "join_counts": {},
+        "join_flow_arrivals": {},
+        "join_instances": {},
+        "key": 20,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "process_definition_key": 17,
+        "process_id": "dup",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Completed",
+        "suspended_at": null,
+        "tags": [],
+        "variables": {},
+        "variables_spilled": false
+      },
+      "25": {
+        "active": {
+          "28": "t",
+          "30": "join"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000010,
+        "incidents": [],
+        "join_counts": {},
+        "join_flow_arrivals": {
+          "join": [
+            [
+              {
+                "from": "fork",
+                "ordinal": 0
+              },
+              1
+            ]
+          ]
+        },
+        "join_instances": {
+          "join": 30
+        },
+        "key": 25,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "process_definition_key": 19,
+        "process_id": "sync",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Active",
+        "suspended_at": null,
+        "tags": [],
+        "variables": {},
+        "variables_spilled": false
+      },
       "7": {
         "active": {},
         "adhoc_instances": {},
@@ -73,6 +154,7 @@
         "created_at": 1700000000001,
         "incidents": [],
         "join_counts": {},
+        "join_flow_arrivals": {},
         "join_instances": {},
         "key": 7,
         "multi_instances": {},
@@ -127,11 +209,32 @@
         "retries": 3,
         "state": "Created",
         "worker": null
+      },
+      "29": {
+        "activated": false,
+        "activated_at": null,
+        "activation_timeout": null,
+        "created_at": 1700000000010,
+        "deadline": null,
+        "element_id": "t",
+        "element_instance_key": 28,
+        "instance_key": 25,
+        "job_type": "sync-task",
+        "key": 29,
+        "kind": "BpmnElement",
+        "lease_token": null,
+        "priority": 50,
+        "retries": 3,
+        "state": "Created",
+        "worker": null
       }
     },
     "jobs_by_instance": {
       "12": [
         15
+      ],
+      "25": [
+        29
       ],
       "7": [
         10
@@ -140,6 +243,246 @@
     "message_start_subscriptions": {},
     "message_subscriptions": {},
     "process_versions": {
+      "17": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "e": {
+              "end_listeners": [],
+              "id": "e",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "fork": {
+              "end_listeners": [],
+              "id": "fork",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "ParallelGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "join"
+                },
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "join"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "join": {
+              "end_listeners": [],
+              "id": "join",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "ParallelGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "e"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "fork"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "dup",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 17,
+        "version": 1
+      },
+      "19": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "e": {
+              "end_listeners": [],
+              "id": "e",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "fork": {
+              "end_listeners": [],
+              "id": "fork",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "ParallelGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "t"
+                },
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "join"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "join": {
+              "end_listeners": [],
+              "id": "join",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "ParallelGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "e"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "fork"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "t": {
+              "end_listeners": [],
+              "id": "t",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "ServiceTask": {
+                  "custom_headers": {},
+                  "job_type": "sync-task",
+                  "linked_resources": [],
+                  "priority": null
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "join"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "sync",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 19,
+        "version": 1
+      },
       "2": {
         "definition": {
           "adhoc": [],
@@ -633,6 +976,111 @@
       }
     },
     "processes": {
+      "dup": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "e": {
+              "end_listeners": [],
+              "id": "e",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "fork": {
+              "end_listeners": [],
+              "id": "fork",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "ParallelGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "join"
+                },
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "join"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "join": {
+              "end_listeners": [],
+              "id": "join",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "ParallelGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "e"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "fork"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "dup",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 17,
+        "version": 1
+      },
       "escalate": {
         "definition": {
           "adhoc": [],
@@ -1122,6 +1570,141 @@
           "xml": ""
         },
         "key": 4,
+        "version": 1
+      },
+      "sync": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "e": {
+              "end_listeners": [],
+              "id": "e",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "fork": {
+              "end_listeners": [],
+              "id": "fork",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "ParallelGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "t"
+                },
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "join"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "join": {
+              "end_listeners": [],
+              "id": "join",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "ParallelGateway",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "e"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "fork"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "t": {
+              "end_listeners": [],
+              "id": "t",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "ServiceTask": {
+                  "custom_headers": {},
+                  "job_type": "sync-task",
+                  "linked_resources": [],
+                  "priority": null
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "join"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "sync",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 19,
         "version": 1
       }
     },

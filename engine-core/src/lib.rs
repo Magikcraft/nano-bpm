@@ -125,9 +125,10 @@ pub use feel::FeelError;
 pub use model::{
     AdHocActivateElement, AdHocImplementationType, AdHocJobResult, AdHocSubProcessDef, AdHocTool,
     AdHocToolKind, BindingType, BuildError, Condition, Element, ElementId, ElementKind,
-    ExecutionListener, IoMapping, LinkedResource, ListenerEventType, Mapping, MultiInstance,
-    ProcessBuilder, ProcessDefinition, SequenceFlow, TaskListener, TaskListenerEventType,
-    TaskListenerJobResult, TimerDef, TimerDefKind, UserTaskCorrections, UserTaskProps, Value,
+    ExecutionListener, IncomingFlow, IoMapping, LinkedResource, ListenerEventType, Mapping,
+    MultiInstance, ProcessBuilder, ProcessDefinition, SequenceFlow, TaskListener,
+    TaskListenerEventType, TaskListenerJobResult, TimerDef, TimerDefKind, UserTaskCorrections,
+    UserTaskProps, Value,
 };
 pub use read_query::ReadQuery;
 pub use state::{

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::model::{ElementId, ProcessDefinition, Value};
+use crate::model::{ElementId, IncomingFlow, ProcessDefinition, Value};
 use crate::state::types::{
     IncidentKind, IoMappingRedrive, Key, MessageSubscriptionKind, TimerKind,
 };
@@ -282,14 +282,29 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
     },
-    /// A token arrived at an open parallel-gateway join.
+    /// A token arrived at an open join. `flow` is the incoming sequence flow it
+    /// arrived over, so a parallel join can require every incoming flow (not just
+    /// enough arrivals) before it fires (#1233). It is `None` for journals written
+    /// before #1233, for inclusive-join arrivals (which fire by reachability,
+    /// not per flow), and for an activation that did not come over a flow.
     ParallelJoinTokenArrived {
         instance_key: Key,
         element_id: ElementId,
+        #[cfg_attr(feature = "serde", serde(default))]
+        flow: Option<IncomingFlow>,
     },
-    /// A parallel-gateway join fired (all incoming tokens present); its counters
-    /// are cleared.
+    /// A join's bookkeeping was cleared outright: an inclusive join fired, a
+    /// pre-#1233 parallel join fired, or the scope holding the join was torn
+    /// down.
     ParallelJoinReset {
+        instance_key: Key,
+        element_id: ElementId,
+    },
+    /// A parallel-gateway join fired because every incoming flow has been taken.
+    /// It consumes ONE arrival per incoming flow and keeps any surplus for the
+    /// next activation (Zeebe's "Tetris principle",
+    /// `ProcessInstanceElementActivatingV3Applier`, #1233).
+    ParallelJoinFired {
         instance_key: Key,
         element_id: ElementId,
     },
@@ -1249,6 +1264,7 @@ impl Event {
             | Event::ParallelJoinOpened { instance_key, .. }
             | Event::ParallelJoinTokenArrived { instance_key, .. }
             | Event::ParallelJoinReset { instance_key, .. }
+            | Event::ParallelJoinFired { instance_key, .. }
             | Event::JobCreated { instance_key, .. }
             | Event::ExecutionListenerJobCreated { instance_key, .. }
             | Event::JobActivated { instance_key, .. }

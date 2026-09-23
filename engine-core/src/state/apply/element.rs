@@ -62,9 +62,17 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
         Event::ParallelJoinTokenArrived {
             instance_key,
             element_id,
+            flow,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
-                *instance.join_counts.entry(element_id.clone()).or_insert(0) += 1;
+                match flow {
+                    Some(flow) => instance
+                        .join_flow_arrivals
+                        .entry(element_id.clone())
+                        .or_default()
+                        .record(flow),
+                    None => *instance.join_counts.entry(element_id.clone()).or_insert(0) += 1,
+                }
             }
         }
 
@@ -74,6 +82,25 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.join_counts.remove(element_id);
+                instance.join_flow_arrivals.remove(element_id);
+                instance.join_instances.remove(element_id);
+            }
+        }
+
+        Event::ParallelJoinFired {
+            instance_key,
+            element_id,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                // Unidentified arrivals predate per-flow counting and were
+                // consumed wholesale, as before #1233.
+                instance.join_counts.remove(element_id);
+                if let Some(arrivals) = instance.join_flow_arrivals.get_mut(element_id) {
+                    arrivals.consume_one_each();
+                    if arrivals.is_empty() {
+                        instance.join_flow_arrivals.remove(element_id);
+                    }
+                }
                 instance.join_instances.remove(element_id);
             }
         }

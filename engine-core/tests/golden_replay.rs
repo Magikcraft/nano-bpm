@@ -44,7 +44,8 @@
 use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{
-    decode_event_json, Engine, EngineSnapshot, Event, EventDecodeError, SNAPSHOT_FORMAT_VERSION,
+    decode_event_json, Command, Engine, EngineSnapshot, Event, EventDecodeError, ProcessBuilder,
+    SNAPSHOT_FORMAT_VERSION,
 };
 
 /// Directory holding the checked-in golden corpus (owned by #1069), relative to
@@ -173,6 +174,62 @@ fn legacy_record_missing_a_defaulted_field_replays() {
     // tolerates an unmatched job-failed as a no-op; the point is that decode +
     // replay of the legacy shape succeed).
     let _engine = Engine::replay(std::iter::once(decoded));
+}
+
+/// **Pre-#1233 parallel join, upgraded mid-flight.** Before #1233 a
+/// `ParallelJoinTokenArrived` carried no `flow`. A journal that left a join
+/// half-open must still decode, replay, and fire the join when the missing
+/// branch arrives under the new build: an unidentified arrival counts as one
+/// taken incoming flow.
+#[test]
+fn pre_1233_half_open_parallel_join_fires_after_upgrade() {
+    let def = ProcessBuilder::new("sync")
+        .start_event("s")
+        .parallel_gateway("fork")
+        .service_task("t", "sync-task")
+        .parallel_gateway("join")
+        .end_event("e")
+        .connect("s", "fork")
+        .connect("fork", "t")
+        .connect("fork", "join")
+        .connect("t", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let mut journal = engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("sync"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    journal.extend(created);
+
+    // Re-encode the journal as a pre-#1233 build wrote it: no `flow` key.
+    let mut stripped = 0;
+    let legacy: Vec<Event> = journal
+        .iter()
+        .map(|event| {
+            let mut json = serde_json::to_value(event).unwrap();
+            if let Some(arrived) = json.get_mut("ParallelJoinTokenArrived") {
+                arrived.as_object_mut().unwrap().remove("flow");
+                stripped += 1;
+            }
+            decode_event_json(&json.to_string()).expect("pre-#1233 record decodes")
+        })
+        .collect();
+    assert_eq!(stripped, 1, "the half-open join journaled one arrival");
+
+    let mut upgraded = Engine::replay(legacy);
+    let instance = upgraded.instance(instance_key).unwrap();
+    assert!(instance.join_flow_arrivals.is_empty());
+    assert_eq!(instance.join_flows_taken("join"), 1);
+
+    let job = upgraded.activate_jobs("sync-task", "w", 1, 60_000, 0)[0].key;
+    upgraded.apply_command(Command::complete_job(job)).unwrap();
+    assert!(
+        upgraded.is_completed(instance_key),
+        "the upgraded join fires once the missing branch arrives"
+    );
 }
 
 /// **Unknown/removed variant rejection.** A record naming a variant this build

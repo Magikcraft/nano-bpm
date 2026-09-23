@@ -12,9 +12,12 @@
 (*   - Tasks are wait states: activation parks a token in `waiting` until  *)
 (*     an external `CompleteTask` command (a job completion).              *)
 (*   - A parallel gateway with >1 incoming flow is a join                  *)
-(*     (`arrive_at_parallel_join`): it opens on the first arrival, counts  *)
-(*     arrivals (`ParallelJoinOpened` / `ParallelJoinTokenArrived`), and   *)
-(*     fires once `count >= |incoming|` (`ParallelJoinReset`).             *)
+(*     (`arrive_at_parallel_join`): it opens on the first arrival and      *)
+(*     counts arrivals per incoming flow (`ParallelJoinOpened` /           *)
+(*     `ParallelJoinTokenArrived`, `join_flow_arrivals`). It fires once    *)
+(*     every incoming flow holds a token, consuming one token per flow and *)
+(*     keeping the surplus (`ParallelJoinFired`, Zeebe's "Tetris"         *)
+(*     principle). A surplus reopens the join, so it stays live (#1233).  *)
 (*   - An inclusive gateway with >1 incoming flow is a join                *)
 (*     (`arrive_at_inclusive_join`): arrivals only count. It fires in the  *)
 (*     quiescence sweep (`fire_ready_inclusive_joins`) once the queue is   *)
@@ -27,7 +30,7 @@
 (*   - An instance completes once it settles with no live tokens           *)
 (*     (`complete_finished_instances`).                                    *)
 (*                                                                         *)
-(* `arrived`, `fireCount` and `premature` are ghost variables: the engine  *)
+(* `fireCount` and `premature` are ghost variables: the engine  *)
 (* keeps none of them, and they exist only to state properties.            *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
@@ -81,13 +84,13 @@ VARIABLES
     pending,      \* [AllFlows -> Nat]  queued Step::Activate, keyed by flow taken
     waiting,      \* [Nodes -> Nat]     tokens parked on wait-state tasks
     joinOpen,     \* [Nodes -> BOOLEAN] join_instances has an entry
-    joinCount,    \* [Nodes -> Nat]     join_counts
-    arrived,      \* ghost: [Nodes -> [Flows -> Nat]] arrivals per incoming flow since open
+    joinTokens,   \* [Nodes -> [Flows -> Nat]] tokens per incoming flow: `join_flow_arrivals`
+                  \* (parallel), `join_counts` (inclusive, which only needs "any")
     fireCount,    \* ghost: [Nodes -> Nat] how often each join fired
     premature,    \* ghost: parallel joins that fired before every incoming flow delivered
     completed     \* ProcessInstanceCompleted emitted
 
-vars == <<pending, waiting, joinOpen, joinCount, arrived, fireCount, premature, completed>>
+vars == <<pending, waiting, joinOpen, joinTokens, fireCount, premature, completed>>
 
 Add(p, S)    == [g \in DOMAIN p |-> IF g \in S THEN p[g] + 1 ELSE p[g]]
 Take(p, f)   == [p EXCEPT ![f] = @ - 1]
@@ -97,8 +100,7 @@ TypeOK ==
     /\ pending   \in [AllFlows -> Nat]
     /\ waiting   \in [Nodes -> Nat]
     /\ joinOpen  \in [Nodes -> BOOLEAN]
-    /\ joinCount \in [Nodes -> Nat]
-    /\ arrived   \in [Nodes -> [Flows -> Nat]]
+    /\ joinTokens \in [Nodes -> [Flows -> Nat]]
     /\ fireCount \in [Nodes -> Nat]
     /\ premature \subseteq ParJoins
     /\ completed \in BOOLEAN
@@ -107,8 +109,7 @@ Init ==
     /\ pending   = [g \in AllFlows |-> IF g = InitFlow THEN 1 ELSE 0]
     /\ waiting   = [n \in Nodes |-> 0]
     /\ joinOpen  = [n \in Nodes |-> FALSE]
-    /\ joinCount = [n \in Nodes |-> 0]
-    /\ arrived   = [n \in Nodes |-> NoArrivals]
+    /\ joinTokens = [n \in Nodes |-> NoArrivals]
     /\ fireCount = [n \in Nodes |-> 0]
     /\ premature = {}
     /\ completed = FALSE
@@ -128,42 +129,44 @@ Settled == Quiescent /\ \A j \in IncJoins : ~InclusiveReady(j)
 \* Pass-through elements: complete immediately and route to `next`.
 PassThrough(f, next) ==
     /\ pending' = Add(Take(pending, f), next)
-    /\ UNCHANGED <<waiting, joinOpen, joinCount, arrived, fireCount, premature>>
+    /\ UNCHANGED <<waiting, joinOpen, joinTokens, fireCount, premature>>
 
 ActivateTask(f) ==
     /\ pending' = Take(pending, f)
     /\ waiting' = [waiting EXCEPT ![Target(f)] = @ + 1]
-    /\ UNCHANGED <<joinOpen, joinCount, arrived, fireCount, premature>>
+    /\ UNCHANGED <<joinOpen, joinTokens, fireCount, premature>>
 
 ActivateEnd(f) ==
     /\ pending' = Take(pending, f)
-    /\ UNCHANGED <<waiting, joinOpen, joinCount, arrived, fireCount, premature>>
+    /\ UNCHANGED <<waiting, joinOpen, joinTokens, fireCount, premature>>
 
+\* Mirrors `arrive_at_parallel_join`. On firing, each incoming flow gives up
+\* one token and any surplus stays; a non-empty surplus reopens the join.
+\* `premature` re-checks the firing guard: it records a firing that some
+\* incoming flow did not feed.
 ArriveParallelJoin(f) ==
     LET j       == Target(f)
-        arr     == [arrived[j] EXCEPT ![f] = @ + 1]
-        fires   == joinCount[j] + 1 >= Cardinality(In(j))
+        arr     == [joinTokens[j] EXCEPT ![f] = @ + 1]
+        fires   == \A g \in In(j) : arr[g] >= 1
+        rest    == [g \in Flows |-> IF g \in In(j) THEN arr[g] - 1 ELSE arr[g]]
     IN  /\ IF fires
-             THEN /\ pending'   = Add(Take(pending, f), Out(j))
-                  /\ joinOpen'  = [joinOpen  EXCEPT ![j] = FALSE]
-                  /\ joinCount' = [joinCount EXCEPT ![j] = 0]
-                  /\ arrived'   = [arrived   EXCEPT ![j] = NoArrivals]
-                  /\ fireCount' = [fireCount EXCEPT ![j] = @ + 1]
-                  /\ premature' = IF \E g \in In(j) : arr[g] = 0
-                                    THEN premature \cup {j} ELSE premature
-             ELSE /\ pending'   = Take(pending, f)
-                  /\ joinOpen'  = [joinOpen  EXCEPT ![j] = TRUE]
-                  /\ joinCount' = [joinCount EXCEPT ![j] = @ + 1]
-                  /\ arrived'   = [arrived   EXCEPT ![j] = arr]
+             THEN /\ pending'    = Add(Take(pending, f), Out(j))
+                  /\ joinOpen'   = [joinOpen   EXCEPT ![j] = \E g \in Flows : rest[g] > 0]
+                  /\ joinTokens' = [joinTokens EXCEPT ![j] = rest]
+                  /\ fireCount'  = [fireCount  EXCEPT ![j] = @ + 1]
+                  /\ premature'  = IF \E g \in In(j) : arr[g] = 0
+                                     THEN premature \cup {j} ELSE premature
+             ELSE /\ pending'    = Take(pending, f)
+                  /\ joinOpen'   = [joinOpen   EXCEPT ![j] = TRUE]
+                  /\ joinTokens' = [joinTokens EXCEPT ![j] = arr]
                   /\ UNCHANGED <<fireCount, premature>>
         /\ UNCHANGED waiting
 
 ArriveInclusiveJoin(f) ==
     LET j == Target(f) IN
     /\ pending'   = Take(pending, f)
-    /\ joinOpen'  = [joinOpen  EXCEPT ![j] = TRUE]
-    /\ joinCount' = [joinCount EXCEPT ![j] = @ + 1]
-    /\ arrived'   = [arrived   EXCEPT ![j][f] = @ + 1]
+    /\ joinOpen'   = [joinOpen   EXCEPT ![j] = TRUE]
+    /\ joinTokens' = [joinTokens EXCEPT ![j][f] = @ + 1]
     /\ UNCHANGED <<waiting, fireCount, premature>>
 
 \* The routing choices available when an activation of `n` completes: an
@@ -194,10 +197,9 @@ FireInclusiveJoinVia(j, S) ==
     /\ InclusiveReady(j)
     /\ S \in NonEmptySubsets(Out(j))
     /\ pending'   = Add(pending, S)
-    /\ joinOpen'  = [joinOpen  EXCEPT ![j] = FALSE]
-    /\ joinCount' = [joinCount EXCEPT ![j] = 0]
-    /\ arrived'   = [arrived   EXCEPT ![j] = NoArrivals]
-    /\ fireCount' = [fireCount EXCEPT ![j] = @ + 1]
+    /\ joinOpen'   = [joinOpen   EXCEPT ![j] = FALSE]
+    /\ joinTokens' = [joinTokens EXCEPT ![j] = NoArrivals]
+    /\ fireCount'  = [fireCount  EXCEPT ![j] = @ + 1]
     /\ UNCHANGED <<waiting, premature, completed>>
 
 FireInclusiveJoin(j) == \E S \in NonEmptySubsets(Out(j)) : FireInclusiveJoinVia(j, S)
@@ -209,7 +211,7 @@ CompleteTask(t) ==
     /\ waiting[t] > 0
     /\ waiting' = [waiting EXCEPT ![t] = @ - 1]
     /\ pending' = Add(pending, Out(t))
-    /\ UNCHANGED <<joinOpen, joinCount, arrived, fireCount, premature, completed>>
+    /\ UNCHANGED <<joinOpen, joinTokens, fireCount, premature, completed>>
 
 (* `complete_finished_instances`. *)
 CompleteInstance ==
@@ -217,7 +219,7 @@ CompleteInstance ==
     /\ ~completed
     /\ \A n \in Nodes : waiting[n] = 0 /\ ~joinOpen[n]
     /\ completed' = TRUE
-    /\ UNCHANGED <<pending, waiting, joinOpen, joinCount, arrived, fireCount, premature>>
+    /\ UNCHANGED <<pending, waiting, joinOpen, joinTokens, fireCount, premature>>
 
 \* Stutter after completion so a completed instance is not reported as a deadlock.
 \* Any other state with no enabled action is a stuck instance, which TLC reports.
@@ -254,12 +256,14 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 (* Properties *)
 
 \* Join bookkeeping stays coherent (the class behind the missing
-\* `ParallelJoinReset` bugs): a join is open iff it has counted arrivals, only
-\* joins are ever open, and a parallel join never rests at or over its threshold.
+\* `ParallelJoinReset` bugs): a join is open iff it holds tokens, tokens only
+\* sit on a join's own incoming flows, only joins are ever open, and a parallel
+\* join never rests with every incoming flow fed (it would have fired).
 JoinBookkeepingCoherent ==
-    /\ \A n \in Nodes : joinOpen[n] <=> joinCount[n] > 0
+    /\ \A n \in Nodes : joinOpen[n] <=> \E g \in Flows : joinTokens[n][g] > 0
+    /\ \A n \in Nodes : \A g \in Flows \ In(n) : joinTokens[n][g] = 0
     /\ \A n \in Nodes \ (ParJoins \cup IncJoins) : ~joinOpen[n]
-    /\ \A j \in ParJoins : joinCount[j] < Cardinality(In(j))
+    /\ \A j \in ParJoins : \E g \in In(j) : joinTokens[j][g] = 0
 
 \* BPMN / Zeebe parity: a parallel join activates only once *every* incoming
 \* sequence flow has been taken (Zeebe counts distinct taken flows,
@@ -282,10 +286,11 @@ Acyclic == \A n \in Nodes : n \notin Reaching(n)
 \* legitimately re-fires a join. Acyclicity alone does not rule out a second
 \* firing: an acyclic graph that routes several tokens onto one join's inputs
 \* (a parallel split whose branches merge through an exclusive gateway, as in
-\* MCParallelJoinMultiArrival) can fire it again on the surplus tokens. That is
+\* MCParallelJoinSurplus) can fire it again on the surplus tokens. That is
 \* intended: such a graph is not 1-safe, a BPMN lack-of-synchronization, and
 \* this invariant is how the checker reports it. Record such a model as an
-\* expected violation only when it deliberately reproduces an engine defect.
+\* expected violation only when it deliberately reproduces an engine defect or
+\* an unsound graph (see check.sh).
 JoinFiresAtMostOnce == Acyclic => \A j \in ParJoins \cup IncJoins : fireCount[j] <= 1
 
 \* Every instance eventually completes, under the fairness above.

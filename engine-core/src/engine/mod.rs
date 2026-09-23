@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::command::Command;
 use crate::event::Event;
-use crate::model::{ElementId, ElementKind, ProcessDefinition, SequenceFlow, Value};
+use crate::model::{ElementId, ElementKind, IncomingFlow, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
 
 mod agent_behavior;
@@ -275,6 +275,12 @@ enum Step {
         /// The enclosing sub-process element instance this activation runs in,
         /// or `0` for the process-level (root) scope.
         scope: Key,
+        /// The sequence flow this token arrived over, or `None` when the
+        /// activation did not come over a flow (a start event, a boundary event,
+        /// a link catch, a modification, ...). A parallel join counts arrivals
+        /// per flow (#1233). Build flow activations with
+        /// [`Engine::take_flow`], never by hand.
+        via: Option<IncomingFlow>,
     },
     /// Run an already-activated element through `COMPLETING -> COMPLETED` and take
     /// its outgoing sequence flows.
@@ -1343,6 +1349,7 @@ impl Engine {
             instance_key,
             element_id: start_event,
             scope: 0,
+            via: None,
         });
         instance_key
     }
@@ -2547,6 +2554,7 @@ impl Engine {
                                 instance_key,
                                 element_id: boundary_element_id,
                                 scope,
+                                via: None,
                             });
                         }
                         // Non-interrupting boundary timer: leave the activity (and
@@ -2560,6 +2568,7 @@ impl Engine {
                                 instance_key,
                                 element_id: boundary_element_id.clone(),
                                 scope: self.scope_of(instance_key, element_instance_key),
+                                via: None,
                             });
                             if let Some(ElementKind::TimerBoundaryEvent {
                                 duration_millis,
@@ -2816,6 +2825,7 @@ impl Engine {
                             instance_key,
                             element_id: boundary_id,
                             scope: boundary_scope,
+                            via: None,
                         });
                     }
                     // Unhandled: the token parks on an incident.
@@ -4033,9 +4043,10 @@ impl Engine {
 
                 // 5b. An already-*open* parallel-gateway join (a token has
                 //     arrived on some but not all of its incoming flows) carries
-                //     durable count-vs-threshold state: `join_counts` holds the
-                //     partial arrival count, but the threshold it is compared
-                //     against is read *live from the definition* at fire time
+                //     durable count-vs-threshold state: `join_flow_arrivals`
+                //     (and, for pre-#1233 journals, `join_counts`) holds the
+                //     tokens counted per incoming flow, but the set of flows it
+                //     must cover is read *live from the definition* at fire time
                 //     (`arrive_at_parallel_join` calls `incoming_count`, which
                 //     resolves against the instance's current process). Migration
                 //     swaps that definition, so mapping an open join onto a target
@@ -4095,6 +4106,28 @@ impl Engine {
                             source_incoming_count,
                             target_incoming_count,
                         });
+                    }
+                    // Each flow the join has counted a token on must still be an
+                    // incoming flow of the target join (after the applier renames
+                    // its source by the same mapping), or the migrated join would
+                    // count a flow that no longer exists and fire early. Zeebe
+                    // requires a target for every taken sequence flow
+                    // (`requireNonNullTargetSequenceFlowId`, #1233).
+                    if let Some(arrivals) = instance.join_flow_arrivals.get(&src) {
+                        for (flow, _) in arrivals.iter() {
+                            let migrated = IncomingFlow {
+                                from: mapped.get(&flow.from).unwrap_or(&flow.from).clone(),
+                                ordinal: flow.ordinal,
+                            };
+                            if !target.definition.has_incoming_flow(tgt, &migrated) {
+                                return Err(EngineError::MigratedParallelJoinFlowMissing {
+                                    instance_key,
+                                    source_element_id: src,
+                                    target_element_id: tgt.clone(),
+                                    flow_source_element_id: flow.from.clone(),
+                                });
+                            }
+                        }
                     }
                 }
 
@@ -4185,6 +4218,7 @@ impl Engine {
                         instance_key,
                         element_id: a.element_id.clone(),
                         scope: 0,
+                        via: None,
                     });
                 }
 
@@ -4588,6 +4622,7 @@ impl Engine {
                         instance_key,
                         element_id: boundary_element_id,
                         scope,
+                        via: None,
                     });
                 }
                 // Non-interrupting boundary: leave the activity running and spawn a
@@ -4601,6 +4636,7 @@ impl Engine {
                         instance_key,
                         element_id: boundary_element_id,
                         scope: self.scope_of(instance_key, element_instance_key),
+                        via: None,
                     });
                 }
             }
@@ -4677,6 +4713,7 @@ impl Engine {
                     instance_key,
                     element_id: boundary_element_id,
                     scope,
+                    via: None,
                 });
             }
             // Non-interrupting boundary subscription: leave the activity (and its
@@ -4691,6 +4728,7 @@ impl Engine {
                     instance_key,
                     element_id: boundary_element_id,
                     scope: self.scope_of(instance_key, element_instance_key),
+                    via: None,
                 });
             }
         }
@@ -4755,6 +4793,7 @@ impl Engine {
                     instance_key,
                     element_id: boundary_element_id,
                     scope,
+                    via: None,
                 });
             }
             state::MessageSubscriptionKind::NonInterruptingBoundary {
@@ -4764,6 +4803,7 @@ impl Engine {
                     instance_key,
                     element_id: boundary_element_id,
                     scope: self.scope_of(instance_key, element_instance_key),
+                    via: None,
                 });
             }
         }
@@ -5020,20 +5060,9 @@ impl Engine {
                     self.emit(log, event);
                 }
             }
-            for flow in self.outgoing(instance_key, &element_id) {
-                self.emit(
-                    log,
-                    Event::SequenceFlowTaken {
-                        instance_key,
-                        from: element_id.clone(),
-                        to: flow.to.clone(),
-                    },
-                );
-                followups.push(Step::Activate {
-                    instance_key,
-                    element_id: flow.to,
-                    scope,
-                });
+            for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
+                self.emit(log, event);
+                followups.push(step);
             }
         }
         followups
@@ -5222,7 +5251,8 @@ impl Engine {
                 instance_key,
                 element_id,
                 scope,
-            } => self.activate(instance_key, element_id, scope),
+                via,
+            } => self.activate(instance_key, element_id, scope, via),
             Step::Complete {
                 instance_key,
                 element_instance_key,
@@ -5374,6 +5404,7 @@ impl Engine {
         instance_key: Key,
         element_id: String,
         scope: Key,
+        via: Option<IncomingFlow>,
     ) -> (Vec<Event>, Vec<Step>) {
         let kind = self.element_kind(instance_key, &element_id);
 
@@ -5382,7 +5413,7 @@ impl Engine {
         if matches!(kind, Some(ElementKind::ParallelGateway))
             && self.incoming_count(instance_key, &element_id) > 1
         {
-            return self.arrive_at_parallel_join(instance_key, element_id, scope);
+            return self.arrive_at_parallel_join(instance_key, element_id, scope, via);
         }
 
         // An inclusive gateway with more than one incoming flow is a join: each
@@ -6061,6 +6092,7 @@ impl Engine {
                     instance_key,
                     element_id: start_event,
                     scope: element_instance_key,
+                    via: None,
                 });
             }
             // A call activity spawns a distinct **child process instance** of its
@@ -6136,6 +6168,7 @@ impl Engine {
                             instance_key,
                             element_id: handler,
                             scope,
+                            via: None,
                         });
                     }
                 }
@@ -6746,6 +6779,7 @@ impl Engine {
                     instance_key,
                     element_id: start_event,
                     scope: child_key,
+                    via: None,
                 });
             }
             // A multi-instance child that is a CALL ACTIVITY parks its token on a
@@ -7227,17 +7261,9 @@ impl Engine {
             events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
         }
         let mut followups = Vec::new();
-        for flow in self.outgoing(instance_key, &element_id) {
-            events.push(Event::SequenceFlowTaken {
-                instance_key,
-                from: element_id.clone(),
-                to: flow.to.clone(),
-            });
-            followups.push(Step::Activate {
-                instance_key,
-                element_id: flow.to,
-                scope,
-            });
+        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.push(event);
+            followups.push(step);
         }
         (events, followups)
     }
@@ -7274,17 +7300,9 @@ impl Engine {
             },
         ];
         let mut followups = Vec::new();
-        for flow in self.outgoing(instance_key, &element_id) {
-            events.push(Event::SequenceFlowTaken {
-                instance_key,
-                from: element_id.clone(),
-                to: flow.to.clone(),
-            });
-            followups.push(Step::Activate {
-                instance_key,
-                element_id: flow.to,
-                scope,
-            });
+        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.push(event);
+            followups.push(step);
         }
         (events, followups)
     }
@@ -8082,6 +8100,7 @@ impl Engine {
                     instance_key,
                     element_id: start_event,
                     scope: child_key,
+                    via: None,
                 });
             }
             // A `callActivity` tool (issue #1159): spawn a distinct CHILD PROCESS
@@ -9000,17 +9019,9 @@ impl Engine {
             cancelled: cancel,
         });
         let mut followups = Vec::new();
-        for flow in self.outgoing(instance_key, &element_id) {
-            events.push(Event::SequenceFlowTaken {
-                instance_key,
-                from: element_id.clone(),
-                to: flow.to.clone(),
-            });
-            followups.push(Step::Activate {
-                instance_key,
-                element_id: flow.to,
-                scope,
-            });
+        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.push(event);
+            followups.push(step);
         }
         (events, followups)
     }
@@ -9048,17 +9059,9 @@ impl Engine {
             },
         ];
         let mut followups = Vec::new();
-        for flow in self.outgoing(instance_key, &element_id) {
-            events.push(Event::SequenceFlowTaken {
-                instance_key,
-                from: element_id.clone(),
-                to: flow.to.clone(),
-            });
-            followups.push(Step::Activate {
-                instance_key,
-                element_id: flow.to,
-                scope,
-            });
+        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.push(event);
+            followups.push(step);
         }
         (events, followups)
     }
@@ -9486,6 +9489,7 @@ impl Engine {
                     instance_key,
                     element_id: catch_id,
                     scope,
+                    via: None,
                 });
             }
             return (events, followups);
@@ -9510,17 +9514,9 @@ impl Engine {
         }
 
         let mut followups = Vec::new();
-        for flow in self.outgoing(instance_key, &element_id) {
-            events.push(Event::SequenceFlowTaken {
-                instance_key,
-                from: element_id.clone(),
-                to: flow.to.clone(),
-            });
-            followups.push(Step::Activate {
-                instance_key,
-                element_id: flow.to,
-                scope,
-            });
+        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.push(event);
+            followups.push(step);
         }
         (events, followups)
     }
@@ -9667,6 +9663,7 @@ impl Engine {
                     instance_key,
                     element_id: catch_id,
                     scope,
+                    via: None,
                 });
             }
             return (events, followups);
@@ -9696,17 +9693,9 @@ impl Engine {
                 scope,
             });
         }
-        for flow in self.outgoing(instance_key, &element_id) {
-            events.push(Event::SequenceFlowTaken {
-                instance_key,
-                from: element_id.clone(),
-                to: flow.to.clone(),
-            });
-            followups.push(Step::Activate {
-                instance_key,
-                element_id: flow.to,
-                scope,
-            });
+        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.push(event);
+            followups.push(step);
         }
         (events, followups)
     }
@@ -9739,25 +9728,13 @@ impl Engine {
     ) -> (Vec<Event>, Vec<Step>) {
         let mut followups = Vec::new();
         let caught = self.find_catching_escalation_boundary(instance_key, scope, &escalation_code);
-        // Collect the throw's outgoing targets up front (owned) so routing does
-        // not hold an immutable borrow of `self` across the teardown mutation.
-        let outgoing_targets: Vec<String> = self
-            .outgoing(instance_key, &throw_element_id)
-            .into_iter()
-            .map(|flow| flow.to)
-            .collect();
+        // Build the throw's outgoing flows up front (owned) so routing does not
+        // hold an immutable borrow of `self` across the teardown mutation.
+        let outgoing_flows = self.take_all_flows(instance_key, &throw_element_id, scope);
         let take_throw_outgoing = |events: &mut Vec<Event>, followups: &mut Vec<Step>| {
-            for to in &outgoing_targets {
-                events.push(Event::SequenceFlowTaken {
-                    instance_key,
-                    from: throw_element_id.clone(),
-                    to: to.clone(),
-                });
-                followups.push(Step::Activate {
-                    instance_key,
-                    element_id: to.clone(),
-                    scope,
-                });
+            for (event, step) in outgoing_flows {
+                events.push(event);
+                followups.push(step);
             }
         };
         match caught {
@@ -9795,6 +9772,7 @@ impl Engine {
                     instance_key,
                     element_id: boundary_id,
                     scope: boundary_scope,
+                    via: None,
                 });
                 let _ = caught_element_id;
             }
@@ -9877,6 +9855,7 @@ impl Engine {
                     instance_key,
                     element_id: boundary_id,
                     scope: boundary_scope,
+                    via: None,
                 });
             }
         }
@@ -10114,17 +10093,9 @@ impl Engine {
             element_id: element_id.clone(),
         }];
         let mut followups = Vec::new();
-        for flow in self.outgoing(instance_key, &element_id) {
-            events.push(Event::SequenceFlowTaken {
-                instance_key,
-                from: element_id.clone(),
-                to: flow.to.clone(),
-            });
-            followups.push(Step::Activate {
-                instance_key,
-                element_id: flow.to,
-                scope,
-            });
+        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.push(event);
+            followups.push(step);
         }
         (events, followups)
     }
@@ -10734,7 +10705,7 @@ impl Engine {
     /// Selects the outgoing flow an exclusive gateway takes, evaluating each
     /// conditional flow in document order against the instance variables and
     /// falling back to the explicit `default` flow when none matches. Returns the
-    /// chosen flow's target id (`Ok(Some)`), `Ok(None)` when nothing matches and
+    /// chosen flow's index in the outgoing list (`Ok(Some)`), `Ok(None)` when nothing matches and
     /// there is no default (the caller raises a no-matching-flow incident), or
     /// `Err(reason)` when a condition failed to evaluate (an expression incident).
     /// Pure over the current variables, so the end-listener gate can re-select at
@@ -10743,21 +10714,25 @@ impl Engine {
         &self,
         instance_key: Key,
         element_id: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<usize>, String> {
         let variables = self.variables(instance_key);
         let mut default_flow = None;
-        for flow in self.outgoing(instance_key, element_id) {
+        for (index, flow) in self
+            .outgoing(instance_key, element_id)
+            .into_iter()
+            .enumerate()
+        {
             // The explicit `default` flow is a fallback only: it is never taken
             // by document order, but kept aside in case no conditional flow
             // matches.
             if flow.is_default {
-                default_flow = Some(flow.to);
+                default_flow = Some(index);
                 continue;
             }
             match &flow.condition {
-                None => return Ok(Some(flow.to)),
+                None => return Ok(Some(index)),
                 Some(condition) => match condition.eval(&variables) {
-                    Ok(true) => return Ok(Some(flow.to)),
+                    Ok(true) => return Ok(Some(index)),
                     Ok(false) => continue,
                     Err(err) => {
                         return Err(format!(
@@ -10800,7 +10775,7 @@ impl Engine {
         };
 
         match selected {
-            Some(flow_to) => {
+            Some(flow_index) => {
                 let scope = self.scope_of(instance_key, element_instance_key);
                 let mut events = vec![Event::ElementCompleting {
                     instance_key,
@@ -10826,19 +10801,9 @@ impl Engine {
                     element_instance_key,
                     element_id: element_id.clone(),
                 });
-                events.push(Event::SequenceFlowTaken {
-                    instance_key,
-                    from: element_id,
-                    to: flow_to.clone(),
-                });
-                (
-                    events,
-                    vec![Step::Activate {
-                        instance_key,
-                        element_id: flow_to,
-                        scope,
-                    }],
-                )
+                let (taken, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
+                events.push(taken);
+                (events, vec![step])
             }
             None => {
                 // The token stays active (parked on the incident) so the instance
@@ -10878,25 +10843,20 @@ impl Engine {
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
         match self.select_exclusive_flow(instance_key, &element_id) {
-            Ok(Some(flow_to)) => (
-                vec![
-                    Event::ElementCompleted {
-                        instance_key,
-                        element_instance_key,
-                        element_id: element_id.clone(),
-                    },
-                    Event::SequenceFlowTaken {
-                        instance_key,
-                        from: element_id,
-                        to: flow_to.clone(),
-                    },
-                ],
-                vec![Step::Activate {
-                    instance_key,
-                    element_id: flow_to,
-                    scope,
-                }],
-            ),
+            Ok(Some(flow_index)) => {
+                let (taken, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
+                (
+                    vec![
+                        Event::ElementCompleted {
+                            instance_key,
+                            element_instance_key,
+                            element_id: element_id.clone(),
+                        },
+                        taken,
+                    ],
+                    vec![step],
+                )
+            }
             Ok(None) => {
                 // No flow matches now (and no default). Keep the token parked on
                 // an incident — do not complete — mirroring the non-listener path.
@@ -10941,7 +10901,7 @@ impl Engine {
     /// Inclusive gateway: selects **every** outgoing flow whose condition holds
     /// (an unconditional non-default flow is always taken), falling back to the
     /// explicit `default` flow only when no conditional flow matches. Returns the
-    /// chosen targets (`Ok(vec)`; an empty vec means nothing matched and there is
+    /// chosen flows' indices in the outgoing list (`Ok(vec)`; an empty vec means nothing matched and there is
     /// no default — the caller raises a no-matching-flow incident), or
     /// `Err(reason)` when a condition failed to evaluate. Pure over the current
     /// variables so the end-listener gate can re-select without captured state.
@@ -10949,19 +10909,23 @@ impl Engine {
         &self,
         instance_key: Key,
         element_id: &str,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<usize>, String> {
         let variables = self.variables(instance_key);
         let mut default_flow = None;
         let mut selected = Vec::new();
-        for flow in self.outgoing(instance_key, element_id) {
+        for (index, flow) in self
+            .outgoing(instance_key, element_id)
+            .into_iter()
+            .enumerate()
+        {
             if flow.is_default {
-                default_flow = Some(flow.to);
+                default_flow = Some(index);
                 continue;
             }
             match &flow.condition {
-                None => selected.push(flow.to),
+                None => selected.push(index),
                 Some(condition) => match condition.eval(&variables) {
-                    Ok(true) => selected.push(flow.to),
+                    Ok(true) => selected.push(index),
                     Ok(false) => continue,
                     Err(err) => {
                         return Err(format!(
@@ -11061,17 +11025,10 @@ impl Engine {
             &mut events,
         );
         let mut followups = Vec::new();
-        for flow_to in selected {
-            events.push(Event::SequenceFlowTaken {
-                instance_key,
-                from: element_id.clone(),
-                to: flow_to.clone(),
-            });
-            followups.push(Step::Activate {
-                instance_key,
-                element_id: flow_to,
-                scope,
-            });
+        for flow_index in selected {
+            let (event, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
+            events.push(event);
+            followups.push(step);
         }
         (events, followups)
     }
@@ -11103,17 +11060,11 @@ impl Engine {
                     &mut events,
                 );
                 let mut followups = Vec::new();
-                for flow_to in selected {
-                    events.push(Event::SequenceFlowTaken {
-                        instance_key,
-                        from: element_id.clone(),
-                        to: flow_to.clone(),
-                    });
-                    followups.push(Step::Activate {
-                        instance_key,
-                        element_id: flow_to,
-                        scope,
-                    });
+                for flow_index in selected {
+                    let (event, step) =
+                        self.take_flow(instance_key, &element_id, flow_index, scope);
+                    events.push(event);
+                    followups.push(step);
                 }
                 (events, followups)
             }
@@ -11218,9 +11169,13 @@ impl Engine {
                 element_id: element_id.clone(),
             });
         }
+        // An inclusive join fires by reachability, not per flow, and a fire
+        // clears it outright (`ParallelJoinReset`), so its arrivals stay
+        // unidentified.
         events.push(Event::ParallelJoinTokenArrived {
             instance_key,
             element_id,
+            flow: None,
         });
         (events, Vec::new())
     }
@@ -11518,20 +11473,10 @@ impl Engine {
                     element_id: element_id.clone(),
                 },
             );
-            for flow_to in selected {
-                self.emit(
-                    log,
-                    Event::SequenceFlowTaken {
-                        instance_key,
-                        from: element_id.clone(),
-                        to: flow_to.clone(),
-                    },
-                );
-                queue.push_back(Step::Activate {
-                    instance_key,
-                    element_id: flow_to,
-                    scope,
-                });
+            for flow_index in selected {
+                let (event, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
+                self.emit(log, event);
+                queue.push_back(step);
             }
             // Fire at most one join per sweep. A fired join's outgoing token is
             // only *queued* here (`state.active` is not updated until the caller
@@ -11548,51 +11493,94 @@ impl Engine {
         false
     }
 
-    /// A token reached a parallel-gateway join. Open the join on the first
-    /// arrival, count every arrival, and fire once a token has arrived on every
-    /// incoming flow.
+    /// Take `from`'s `index`-th outgoing sequence flow: the
+    /// [`Event::SequenceFlowTaken`] fact plus the activation of its target,
+    /// carrying the flow's [`IncomingFlow`] identity so a parallel join counts
+    /// distinct incoming flows (#1233). Every sequence flow the engine takes is
+    /// built here, so no taker can drop the identity.
+    fn take_flow(&self, instance_key: Key, from: &str, index: usize, scope: Key) -> (Event, Step) {
+        let (to, flow) = self
+            .process_of_instance(instance_key)
+            .and_then(|p| p.incoming_flow(from, index))
+            .expect("a taken flow is an outgoing flow of `from` in the instance's definition");
+        (
+            Event::SequenceFlowTaken {
+                instance_key,
+                from: from.to_string(),
+                to: to.clone(),
+            },
+            Step::Activate {
+                instance_key,
+                element_id: to,
+                scope,
+                via: Some(flow),
+            },
+        )
+    }
+
+    /// [`Engine::take_flow`] for every outgoing flow of `from`, in document
+    /// order (a pass-through element or a parallel split).
+    fn take_all_flows(&self, instance_key: Key, from: &str, scope: Key) -> Vec<(Event, Step)> {
+        (0..self.outgoing(instance_key, from).len())
+            .map(|index| self.take_flow(instance_key, from, index, scope))
+            .collect()
+    }
+
+    /// A token reached a parallel-gateway join over `via`. The join fires once
+    /// every incoming flow has been taken at least once; firing consumes one
+    /// token per flow and keeps any surplus for the next activation. This is
+    /// Zeebe's taken-sequence-flow bookkeeping
+    /// (`ProcessInstanceStateTransitionGuard.canActivateParallelGateway` and the
+    /// "Tetris principle" in `ProcessInstanceElementActivatingV3Applier`, #1233).
+    ///
+    /// A surplus token is still waiting, so after firing the join re-opens with
+    /// a fresh element instance holding it. That keeps the instance alive, as
+    /// Zeebe's active-sequence-flow count does.
     fn arrive_at_parallel_join(
         &mut self,
         instance_key: Key,
         element_id: String,
         scope: Key,
+        via: Option<IncomingFlow>,
     ) -> (Vec<Event>, Vec<Step>) {
         let threshold = self.incoming_count(instance_key, &element_id);
-        let already_open = self.join_eik(instance_key, &element_id).is_some();
-        let count_before = self.join_count(instance_key, &element_id);
+        let (mut arrivals, unidentified) = self
+            .state
+            .instances
+            .get(&instance_key)
+            .map(|i| {
+                (
+                    i.join_flow_arrivals
+                        .get(&element_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    i.join_counts.get(&element_id).copied().unwrap_or(0),
+                )
+            })
+            .unwrap_or_default();
+        // Simulate the arrival with the same bookkeeping the applier runs.
+        let unidentified = match &via {
+            Some(flow) => {
+                arrivals.record(flow);
+                unidentified
+            }
+            None => unidentified + 1,
+        };
+        let fires = arrivals.distinct_flows() + unidentified >= threshold;
 
         let mut events = Vec::new();
-
-        let open_eik = if already_open {
-            self.join_eik(instance_key, &element_id).unwrap()
-        } else {
-            let eik = self.mint_key();
-            events.push(Event::ElementActivating {
-                instance_key,
-                element_instance_key: eik,
-                element_id: element_id.clone(),
-            });
-            events.push(Event::ElementActivated {
-                instance_key,
-                element_instance_key: eik,
-                element_id: element_id.clone(),
-                scope,
-            });
-            events.push(Event::ParallelJoinOpened {
-                instance_key,
-                element_instance_key: eik,
-                element_id: element_id.clone(),
-            });
-            eik
+        let open_eik = match self.join_eik(instance_key, &element_id) {
+            Some(eik) => eik,
+            None => self.open_parallel_join(instance_key, &element_id, scope, &mut events),
         };
-
         events.push(Event::ParallelJoinTokenArrived {
             instance_key,
             element_id: element_id.clone(),
+            flow: via,
         });
 
         let mut followups = Vec::new();
-        if count_before + 1 >= threshold {
+        if fires {
             events.push(Event::ElementCompleting {
                 instance_key,
                 element_instance_key: open_eik,
@@ -11603,25 +11591,50 @@ impl Engine {
                 element_instance_key: open_eik,
                 element_id: element_id.clone(),
             });
-            events.push(Event::ParallelJoinReset {
+            events.push(Event::ParallelJoinFired {
                 instance_key,
                 element_id: element_id.clone(),
             });
-            for flow in self.outgoing(instance_key, &element_id) {
-                events.push(Event::SequenceFlowTaken {
-                    instance_key,
-                    from: element_id.clone(),
-                    to: flow.to.clone(),
-                });
-                followups.push(Step::Activate {
-                    instance_key,
-                    element_id: flow.to,
-                    scope,
-                });
+            arrivals.consume_one_each();
+            if !arrivals.is_empty() {
+                self.open_parallel_join(instance_key, &element_id, scope, &mut events);
+            }
+            for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
+                events.push(event);
+                followups.push(step);
             }
         }
 
         (events, followups)
+    }
+
+    /// Open a parallel join: a fresh element instance that holds its waiting
+    /// tokens. Returns its key.
+    fn open_parallel_join(
+        &mut self,
+        instance_key: Key,
+        element_id: &str,
+        scope: Key,
+        events: &mut Vec<Event>,
+    ) -> Key {
+        let eik = self.mint_key();
+        events.push(Event::ElementActivating {
+            instance_key,
+            element_instance_key: eik,
+            element_id: element_id.to_string(),
+        });
+        events.push(Event::ElementActivated {
+            instance_key,
+            element_instance_key: eik,
+            element_id: element_id.to_string(),
+            scope,
+        });
+        events.push(Event::ParallelJoinOpened {
+            instance_key,
+            element_instance_key: eik,
+            element_id: element_id.to_string(),
+        });
+        eik
     }
 
     /// After a command settles, any active instance with no remaining tokens has
@@ -12665,6 +12678,16 @@ pub enum EngineError {
         source_incoming_count: usize,
         target_incoming_count: usize,
     },
+    /// A `MigrateInstance` mapped an open parallel-gateway join that has counted
+    /// a token on an incoming flow (from `flow_source_element_id`) that is not
+    /// an incoming flow of the target gateway. The migrated join would count a
+    /// flow that no longer exists and fire early (#1233). Maps to HTTP 409.
+    MigratedParallelJoinFlowMissing {
+        instance_key: Key,
+        source_element_id: String,
+        target_element_id: String,
+        flow_source_element_id: String,
+    },
     /// A `MigrateInstance` targeted an instance that contains an active element
     /// class this phase does not yet support migrating (boundary events, event
     /// subprocesses, multi-instance bodies, call activities, event-based-gateway
@@ -12972,6 +12995,19 @@ impl std::fmt::Display for EngineError {
                      ({source_incoming_count} incoming flows) to {target_element_id} \
                      ({target_incoming_count} incoming flows); an in-flight join can only map to a \
                      gateway with the same number of incoming sequence flows"
+                )
+            }
+            EngineError::MigratedParallelJoinFlowMissing {
+                instance_key,
+                source_element_id,
+                target_element_id,
+                flow_source_element_id,
+            } => {
+                write!(
+                    f,
+                    "migration of instance {instance_key} maps open parallel-join {source_element_id} \
+                     to {target_element_id}, but the join holds a token on the flow from \
+                     {flow_source_element_id}, which is not an incoming flow of {target_element_id}"
                 )
             }
             EngineError::UnsupportedMigration {

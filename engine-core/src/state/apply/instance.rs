@@ -85,6 +85,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     scopes: HashMap::new(),
                     variables: Arc::new(variables.clone()),
                     join_counts: HashMap::new(),
+                    join_flow_arrivals: HashMap::new(),
                     join_instances: HashMap::new(),
                     incidents: Vec::new(),
                     variables_spilled: false,
@@ -272,6 +273,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 instance.multi_instances.clear();
                 instance.adhoc_instances.clear();
                 instance.join_counts.clear();
+                instance.join_flow_arrivals.clear();
                 instance.join_instances.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
@@ -358,6 +360,24 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                         *remapped.entry(eid).or_insert(0) += count;
                     }
                     instance.join_counts = remapped;
+                }
+                // Per-flow arrivals are keyed by the join AND name each flow's
+                // source element, so both ids are remapped (the migration guard
+                // has already checked every flow exists in the target).
+                if !instance.join_flow_arrivals.is_empty() {
+                    let mut remapped: HashMap<ElementId, FlowArrivals> =
+                        HashMap::with_capacity(instance.join_flow_arrivals.len());
+                    for (mut eid, mut arrivals) in instance.join_flow_arrivals.drain() {
+                        remap_id(&mut eid);
+                        arrivals.remap(remap_id);
+                        let merged = remapped.entry(eid).or_default();
+                        for (flow, count) in arrivals.iter() {
+                            for _ in 0..count {
+                                merged.record(flow);
+                            }
+                        }
+                    }
+                    instance.join_flow_arrivals = remapped;
                 }
                 if !instance.join_instances.is_empty() {
                     let mut remapped: HashMap<ElementId, Key> =
@@ -461,7 +481,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 instance.adhoc_instances.clear();
                 // Same forced-teardown rationale for the remaining runtime
                 // bookkeeping a mid-flight terminate can leave behind: an open
-                // parallel join (`join_counts`/`join_instances`) or a pending
+                // parallel join (`join_counts`/`join_flow_arrivals`/`join_instances`) or a pending
                 // compensation (`compensable`/`compensation_waits`) is drained
                 // naturally only on normal completion. Terminating mid-join or
                 // mid-compensation would otherwise strand this bookkeeping —
@@ -469,6 +489,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // instance shell until eviction, leaving its terminal snapshot
                 // inconsistent with the MI/ad-hoc/variable state cleared above.
                 instance.join_counts.clear();
+                instance.join_flow_arrivals.clear();
                 instance.join_instances.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();

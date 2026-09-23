@@ -43,7 +43,8 @@ single process instance in a single scope:
 |---|---|
 | `pending` (a bag of flows being taken) | the `Step::Activate` queue, drained to empty per command |
 | `waiting` | tokens parked on wait-state tasks (job completion is `CompleteTask`) |
-| `ArriveParallelJoin` | `arrive_at_parallel_join` (`ParallelJoinOpened` / `TokenArrived` / `Reset`) |
+| `ArriveParallelJoin` | `arrive_at_parallel_join` (`ParallelJoinOpened` / `TokenArrived` / `Fired`) |
+| `joinTokens` | `join_flow_arrivals` (parallel, per incoming flow), `join_counts` (inclusive) |
 | `ArriveInclusiveJoin`, `FireInclusiveJoin` | `arrive_at_inclusive_join`, `fire_ready_inclusive_joins` |
 | `Reaching` | `elements_reaching` |
 | `CompleteInstance` | `complete_finished_instances` |
@@ -59,8 +60,9 @@ finish", not "the engine always finishes".
 
 The properties checked:
 
-- `JoinBookkeepingCoherent`: a join is open iff it has counted arrivals, and a
-  parallel join never rests at its threshold. This is the class behind the
+- `JoinBookkeepingCoherent`: a join is open iff it holds tokens, tokens sit
+  only on its own incoming flows, and a parallel join never rests with every
+  incoming flow fed. This is the class behind the
   missing-`ParallelJoinReset` bugs.
 - `ParallelJoinWaitsForEveryFlow`: a parallel join fires only after every
   incoming flow has delivered, matching BPMN and Zeebe.
@@ -87,20 +89,29 @@ future extension of this spec.
 
 ## Expected outcomes and known defects
 
-The `EXPECTED` table in `check.sh` records the expected outcome for each model.
-When a model reproduces a real engine defect, its entry reads
-`violates:<Invariant>` and links the bug. Such a model runs with TLC's
-`-continue`, and the named invariant must be among those reported as violated.
-Which violation TLC reaches first depends on state order, not on the defect. For example,
-`MCParallelJoinMultiArrival` reproduces #1233: a parallel join counts arrivals
-rather than distinct incoming flows.
+The `EXPECTED` table in `check.sh` records the expected outcome for each model:
+`pass`, or `violates:<P1>,<P2>,...`, the **exact** set of invariants and
+properties TLC must report as violated. Every property not listed is thereby
+proven to hold for that model. A `violates:` model runs with TLC's `-continue
+-deadlock`, so TLC explores the whole state space whatever order it reaches
+violations in (a stuck state still shows up, as `NoStuckInstance` and
+`Termination`). A `violates:` entry records one of two things:
 
-The spec models the engine **as it is**, defects included. A PR that fixes
-such a defect in Rust must also update the spec to model the fixed behaviour.
-For #1233, that means `ArriveParallelJoin` counts per incoming flow and keeps
-surplus arrivals. Once the spec changes, the model stops violating and
-`check.sh` fails until the entry is flipped to `pass`. The fixed behaviour
-therefore stays guarded.
+- **A known engine defect** the model reproduces, linked to its issue. The spec
+  models the engine **as it is**, defects included. A PR that fixes the defect
+  in Rust must also update the spec to model the fixed behaviour; the model's
+  verdict then changes, and `check.sh` fails until the entry is updated. The
+  fixed behaviour therefore stays guarded.
+- **A deliberately unsound graph**, where the violation is the correct verdict.
+  `MCParallelJoinMultiArrival` puts two tokens on one incoming flow of a
+  parallel join and one on the other. The join fires once, and, as in Zeebe,
+  the surplus token waits forever (`NoStuckInstance,Termination`). It no
+  longer fires early: before #1233 the engine counted arrivals rather than
+  distinct incoming flows, and the entry also listed
+  `ParallelJoinWaitsForEveryFlow`. `MCParallelJoinSurplus` takes every
+  incoming flow twice; the join keeps the surplus between firings (Zeebe's
+  "Tetris" principle), fires twice (`JoinFiresAtMostOnce`), and the instance
+  completes.
 
 TLC cannot see the Rust code, so nothing yet forces the spec update when the
 engine changes. Until trace validation (#1226) links the two, that step is a
