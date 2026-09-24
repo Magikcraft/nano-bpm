@@ -9,7 +9,7 @@ import { CORPUS, baselineGrowth, evaluate, globToRegExp, markdownReport, shrinkG
 
 const RS = 'engine-core/src/engine/tests/lifecycle.rs';
 const FILES = {
-  [RS]: '// zeebe-cells: element:Task\n#[test]\nfn runs_a_task() {}\n\n#[test]\n#[ignore]\n// zeebe-cells: element:Gone\nfn stale() {}\n\n#[test]\nfn bare() {}\n\n// zeebe-cells: element:Task\nfn helper() {}\n',
+  [RS]: '// zeebe-cells: element:Task\n#[test]\nfn runs_a_task() {}\n\n#[test]\n#[should_panic]\n// zeebe-cells: element:Gone\nfn stale() {}\n\n// zeebe-cells: element:Task\n#[test]\n#[ignore = \"slow\"]\nfn skipped() {}\n\n#[test]\nfn bare() {}\n\n// zeebe-cells: element:Task\nfn helper() {}\n',
   [`${CORPUS}reject-x.bpmn`]: '<!-- verdict: reject | category: X -->\n<!-- zeebe-cells: validation:V:m -->\n<definitions/>',
   [`${CORPUS}reject-z.bpmn`]: '<!-- verdict: reject | category: Z -->\n<definitions/>',
   [`${CORPUS}reject-stale.bpmn`]: '<!-- verdict: reject | category: Z -->\n<!-- zeebe-cells: validation:V:m validation:V:gone -->',
@@ -50,6 +50,7 @@ test('nano-tested evidence must name an existing #[test] fn', () => {
   const rule = (ref) => [{ match: 'element:Task', status: 'nano-tested', evidence: [ref] }];
   assert.match(check(['element:Task'], rule(`${RS}::renamed_away`))[0], /no #\[test\] fn renamed_away/);
   assert.match(check(['element:Task'], rule(`${RS}::helper`))[0], /no #\[test\] fn helper/);
+  assert.match(check(['element:Task'], rule(`${RS}::skipped`))[0], /fn skipped in .* is #\[ignore\]d, so CI never runs it/);
   assert.match(check(['element:Task'], rule('engine-core/gone.rs::runs_a_task'))[0], /missing file/);
   assert.match(check(['element:Task'], rule(RS))[0], /must be path::test_fn/);
   assert.match(check(['element:Task'], [{ match: 'element:Task', status: 'nano-tested' }])[0], /needs evidence/);

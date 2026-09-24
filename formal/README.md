@@ -200,7 +200,7 @@ one status:
 | Status | Required | Meaning |
 |---|---|---|
 | `parity` | `evidence`: fixtures in `engine-core/tests/conformance/corpus/` | Nano's verdict is asserted equal to a Zeebe verdict captured in the fixture (`accept` or `reject`; a `diverge` fixture is not parity). Every claimed cell must be listed in one of the fixtures' `<!-- zeebe-cells: … -->` comment |
-| `nano-tested` | `evidence`: `path::test_fn` | a Nano `#[test]` exercises the behaviour, but not against a Zeebe oracle. Every claimed cell must be listed in a `// zeebe-cells: …` line among the comments and attributes directly above the test fn |
+| `nano-tested` | `evidence`: `path::test_fn` | a Nano `#[test]` (not `#[ignore]`d) exercises the behaviour, but not against a Zeebe oracle. Every claimed cell must be listed in a `// zeebe-cells: …` line among the comments and attributes directly above the test fn |
 | `gap` | `issue`, `note` | no evidence yet; the issue closes it. Only cells in the `gaps.json` baseline may be gaps (see below) |
 | `out-of-scope` | `issue`, `note` | the cell has no Nano meaning (for example, partition-internal records). Use sparingly |
 

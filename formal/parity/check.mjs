@@ -53,14 +53,22 @@ export function fixtureCells(text) {
  * comment and attribute lines directly above the fn).
  */
 export function testCells(text, name) {
-  const lines = text.split('\n');
-  const fn = lines.findIndex((l) => new RegExp(`\\bfn\\s+${name}\\s*\\(`).test(l));
   const out = [];
-  for (let i = fn - 1; i >= 0 && /^\s*(#\[|\/\/)/.test(lines[i]); i--) {
-    const m = /^\s*\/\/\s*zeebe-cells:\s*(.*)$/.exec(lines[i]);
+  for (const line of testHeader(text, name) ?? []) {
+    const m = /^\s*\/\/\s*zeebe-cells:\s*(.*)$/.exec(line);
     if (m) out.push(...m[1].split(/\s+/).filter(Boolean));
   }
   return out;
+}
+
+/** The comment and attribute lines directly above `fn name`, or null if there is no such fn. */
+function testHeader(text, name) {
+  const lines = text.split('\n');
+  const fn = lines.findIndex((l) => new RegExp(`\\bfn\\s+${name}\\s*\\(`).test(l));
+  if (fn < 0) return null;
+  let i = fn;
+  while (i > 0 && /^\s*(#\[|\/\/)/.test(lines[i - 1])) i--;
+  return lines.slice(i, fn);
 }
 
 /** Cells an evidence reference declares, or null if it cannot be read. */
@@ -92,8 +100,10 @@ export function evidenceProblems(status, ref, fs) {
   const [path, name] = [ref.slice(0, sep), ref.slice(sep + 2)];
   if (!/^[a-z_][a-z0-9_]*$/.test(name)) return [`bad test name in ${ref}`];
   if (!fs.exists(path)) return [`missing file: ${path}`];
-  const test = new RegExp(`#\\[test\\][^;{]*?\\bfn\\s+${name}\\s*\\(`);
-  if (!test.test(fs.read(path))) return [`no #[test] fn ${name} in ${path}`];
+  const attrs = (testHeader(fs.read(path), name) ?? []).filter((l) => /^\s*#\[/.test(l));
+  if (!attrs.some((l) => /^\s*#\[test\]/.test(l))) return [`no #[test] fn ${name} in ${path}`];
+  // `cargo test` skips an ignored test, so it would be evidence CI never runs.
+  if (attrs.some((l) => /\bignore\b/.test(l))) return [`#[test] fn ${name} in ${path} is #[ignore]d, so CI never runs it`];
   return [];
 }
 
