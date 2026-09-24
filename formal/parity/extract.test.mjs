@@ -179,6 +179,23 @@ test('lifecycle commands come from processEvent and hooks from the processor int
   assert.deepEqual(cells[0].detail, { processor: 'TaskProcessor', hooks: ['onActivate'] });
 });
 
+test('lifecycle hooks are inherited through extends, and an unreadable parent fails', () => {
+  const task = `${BPMN}/task/TaskProcessor.java`;
+  const inherited = {
+    ...PROCESSORS,
+    [task]: 'public class TaskProcessor extends BaseProcessor<X> {\n}',
+    [`${BPMN}/task/BaseProcessor.java`]:
+      'public abstract class BaseProcessor<T> implements BpmnElementProcessor<T> {\n  protected Either<Failure, ?> onTerminateInternal(final T e, final C c) { return null; }\n}',
+  };
+  const cells = run('lifecycle', inherited);
+  assert.deepEqual(cells.find((c) => c.id === 'lifecycle:TASK:terminate').detail, {
+    processor: 'TaskProcessor',
+    hooks: ['onTerminateInternal'],
+  });
+  const external = { ...PROCESSORS, [task]: 'public class TaskProcessor extends ElsewhereProcessor<X> {\n}' };
+  assert.throws(() => run('lifecycle', external), /extends ElsewhereProcessor, which is not under/);
+});
+
 test('lifecycle fails on an unmapped or stale hook, or an unread registration', () => {
   const api = `${BPMN}/BpmnElementProcessor.java`;
   const added = { ...PROCESSORS, [api]: PROCESSORS[api].replace('Class<T> getType();', 'Class<T> getType();\n  default void onMigrate(final T e) {}') };
@@ -252,6 +269,7 @@ test('rejection family validates against the SBE enum and skips its sentinels', 
     [schema]: xml,
     [`${PROCESSING}/job/JobProcessor.java`]:
       'class JobProcessor { void f() { reject(RejectionType.NOT_FOUND); if (t == RejectionType.NULL_VAL) {} } }',
+    [`${PROCESSING}/Aggregator.java`]: 'class Aggregator { boolean f(R r) { return r.type() == RejectionType.NOT_FOUND; } }',
   });
   assert.deepEqual(cells.map((c) => c.id), ['rejection:JobProcessor:NOT_FOUND']);
   assert.throws(

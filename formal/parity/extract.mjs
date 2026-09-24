@@ -511,7 +511,10 @@ function processorHooks(s, api, index, cls, seen = new Set()) {
   const body = src.slice(decl.index, end);
   const hooks = new Map();
   const parent = /^class\s+\w+(?:<[^{]*?>)?\s+extends\s+(\w+)/.exec(body);
-  if (parent && index.has(parent[1])) {
+  if (parent && !index.has(parent[1])) {
+    fail(`${rel}: ${cls} extends ${parent[1]}, which is not under ${BPMN}, so its inherited hooks cannot be read`);
+  }
+  if (parent) {
     for (const [t, where] of processorHooks(s, api, index, parent[1], seen)) hooks.set(t, where);
   }
   // Only the class's own methods (depth 1), not those of inner behaviour classes.
@@ -665,7 +668,12 @@ function extractValidation(s, cells) {
   if (n === 0) fail('no deploy-time validation messages');
 }
 
-/** `rejection:<Processor>:<RejectionType>` — every command rejection a processor emits. */
+/**
+ * `rejection:<Class>:<RejectionType>` — every command rejection a class in the
+ * processing layer produces: processors, and the validators/helpers that build
+ * the rejection a processor then writes. A comparison against a type is a read
+ * and yields no cell.
+ */
 function extractRejections(s, cells) {
   // RejectionType is generated from the SBE schema, so read it from there.
   const schemaRel = 'zeebe/protocol/src/main/resources/protocol.xml';
@@ -681,6 +689,9 @@ function extractRejections(s, cells) {
     for (const m of src.matchAll(/\bRejectionType\.([A-Z_]+)\b/g)) {
       // SBE's generated sentinels mean "no rejection".
       if (m[1] === 'NULL_VAL' || m[1] === 'SBE_UNKNOWN') continue;
+      const before = src.slice(Math.max(0, m.index - 4), m.index);
+      const after = src.slice(m.index + m[0].length, m.index + m[0].length + 4);
+      if (/[=!]=\s*$/.test(before) || /^\s*[=!]=/.test(after)) continue;
       if (!types.has(m[1])) fail(`${rel}: unknown RejectionType.${m[1]}`);
       cells.add(`rejection:${cls}:${m[1]}`, at(rel, src, m.index));
       n++;

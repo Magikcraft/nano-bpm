@@ -176,7 +176,7 @@ Zeebe declares, one **cell** per behaviour, in `zeebe-surface.json`:
 | `incident:<ErrorType>` | incident type | `ErrorType` |
 | `intent:<Record>:<INTENT>` | record intent | every `*Intent` enum in `protocol/record/intent` |
 | `validation:<Validator>:<message>` | deploy-time rejection message | `addError` calls in the bpmn-model and engine deployment validators |
-| `rejection:<Processor>:<RejectionType>` | command rejection a processor emits | `RejectionType.X` uses under `engine/processing`, checked against the SBE schema |
+| `rejection:<Class>:<RejectionType>` | command rejection a processing-layer class produces: a processor, or a validator/helper that builds the rejection a processor writes | `RejectionType.X` uses under `engine/processing` (comparisons excluded), checked against the SBE schema |
 
 Each cell records the source lines it was read from. The extractor fails
 loudly when an anchor it relies on moves or changes shape. It also fails when

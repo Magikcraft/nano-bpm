@@ -5559,7 +5559,6 @@
     {
       "id": "rejection:RejectionAggregator:FORBIDDEN",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/authorization/aggregator/RejectionAggregator.java:83",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/authorization/aggregator/RejectionAggregator.java:84"
       ]
     },
