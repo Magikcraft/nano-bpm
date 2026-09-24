@@ -616,11 +616,14 @@ export function elementCommands(s) {
     }
   }
   const out = labels.map((l) => l.replace(/_ELEMENT$/, '').toLowerCase().replace(/_/g, '-'));
-  for (const t of ['activate', 'complete', 'terminate']) {
+  for (const t of REQUIRED_COMMANDS) {
     if (!out.includes(t)) fail(`${rel}: processEvent no longer dispatches ${t}`);
   }
   return out;
 }
+
+/** Lifecycle commands the surface is known to carry: losing one stops extraction. */
+export const REQUIRED_COMMANDS = ['activate', 'complete', 'terminate', 'continue-terminating', 'complete-execution-listener'];
 
 /** `lifecycle:<BpmnElementType>:<command>` — every element type the engine processes. */
 function extractLifecycle(s, cells) {

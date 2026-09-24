@@ -247,6 +247,10 @@ test('lifecycle fails on an unmapped or stale hook, or an unread registration', 
   const ids = run('lifecycle', arrow).map((c) => c.id);
   assert.ok(ids.includes('lifecycle:TASK:continue-terminating') && ids.includes('lifecycle:TASK:migrate'));
   assert.ok(!ids.includes('lifecycle:TASK:element-activating'), 'nested switch arms are not commands');
+  for (const [arm, command] of [['CONTINUE_TERMINATING_ELEMENT', 'continue-terminating'], ['COMPLETE_EXECUTION_LISTENER', 'complete-execution-listener']]) {
+    const dropped = { ...PROCESSORS, [STREAM]: STREAM_SRC.replace(`case ${arm}:`, 'case OTHER_ELEMENT:') };
+    assert.throws(() => run('lifecycle', dropped), new RegExp(`processEvent no longer dispatches ${command}`));
+  }
   const odd = { ...PROCESSORS, [STREAM]: STREAM_SRC.replace('case COMPLETE_ELEMENT:', 'case Intent.COMPLETE_ELEMENT:') };
   assert.throws(() => run('lifecycle', odd), /unrecognised switch arm: case Intent\.COMPLETE_ELEMENT/);
   const { [STREAM]: _, ...noStream } = PROCESSORS;
