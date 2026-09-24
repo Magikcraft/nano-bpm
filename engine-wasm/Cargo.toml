@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 description = "wasm-bindgen wrapper around nanobpmn-engine-core for in-browser (modeler) test execution."
-repository = "https://github.com/jwulf/nano-bpm"
+repository = "https://github.com/nanobpm/nano-bpm"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
