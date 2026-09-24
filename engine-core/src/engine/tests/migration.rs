@@ -617,12 +617,12 @@ fn assert_counted_join_flow_must_be_mapped(
 }
 
 /// An **inclusive**-gateway join reuses the same `join_instances` bookkeeping as
-/// a parallel join, but it fires on token *quiescence/reachability*
-/// (`fire_ready_inclusive_joins`), never by comparing a durable arrival count
-/// against the definition's incoming-flow count. So the arity-parity restriction
-/// that guards parallel joins must **not** apply to it: an open inclusive join
-/// remapped onto a target join with a *different* incoming arity is perfectly
-/// compatible and must migrate. Red/Green guard that the new element (#1168)
+/// a parallel join. It fires once its identified taken flows cover the
+/// incoming flows, or when no active path can reach it (#1241). The per-flow
+/// migration check guarantees every identified arrival names a target incoming
+/// flow, so the covering test cannot early-fire under a different arity: an
+/// open inclusive join with only identified arrivals, remapped onto a target
+/// join with a *different* incoming arity, is compatible and must migrate. Red/Green guard that the new element (#1168)
 /// did not silently inherit `MigratedParallelJoinArityChanged` by sharing the
 /// join maps.
 #[test]
@@ -709,6 +709,79 @@ fn migration_allows_open_inclusive_join_with_different_incoming_arity() {
     assert!(
         engine.is_completed(inst),
         "the migrated inclusive join synchronises its branches and completes"
+    );
+}
+
+/// An inclusive join accepts once its taken flows cover its incoming flows
+/// (#1241). An *unidentified* arrival (`join_counts`: a modification that
+/// activated the join directly) names no flow, so it is only a valid "one taken
+/// flow" against the arity it was counted under — exactly the parallel-join
+/// hazard. Migrating it onto a target join with fewer incoming flows would
+/// early-fire, so it must be rejected like a parallel join.
+#[test]
+fn migration_rejects_inclusive_join_with_unidentified_arrival_and_different_arity() {
+    fn inc_join(id: &str, branches: &[&str]) -> ProcessDefinition {
+        let mut b = ProcessBuilder::new(id)
+            .start_event("s")
+            .inclusive_gateway("split");
+        for &t in branches {
+            b = b.service_task(t, format!("j{t}"));
+        }
+        let mut b = b
+            .inclusive_gateway("join")
+            .end_event("e")
+            .connect("s", "split");
+        for &t in branches {
+            b = b.connect("split", t).connect(t, "join");
+        }
+        b.connect("join", "e").build().unwrap()
+    }
+
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, inc_join("source", &["a", "b", "c"]));
+    let target_key = deploy_for_migration(&mut engine, inc_join("target", &["a", "b"]));
+    let inst = create_instance_key(&mut engine, "source");
+    // Park an unidentified arrival on the join and retire branch `c`, which
+    // has no counterpart in the target.
+    let c_eik = active_eik_of(&engine, inst, "c");
+    engine
+        .apply_command(Command::modify_instance(
+            inst,
+            vec![crate::command::ActivateElementInstruction {
+                element_id: "join".to_string(),
+                variables: Default::default(),
+            }],
+            vec![c_eik],
+        ))
+        .unwrap();
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(
+        instance.join_counts.get("join"),
+        Some(&1),
+        "precondition: the join holds one unidentified arrival"
+    );
+
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("a".to_string(), "a".to_string()),
+                ("b".to_string(), "b".to_string()),
+                ("join".to_string(), "join".to_string()),
+            ],
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EngineError::MigratedParallelJoinArityChanged {
+                source_incoming_count: 3,
+                target_incoming_count: 2,
+                ..
+            }
+        ),
+        "got {err:?}"
     );
 }
 

@@ -93,12 +93,12 @@ fn should_raise_incident_when_inclusive_split_matches_no_flow() {
 fn inclusive_join_incident_redrive_does_not_duplicate_outgoing_routing() {
     // #1168 regression (join redrive / stale bookkeeping). A multi-incoming
     // inclusive gateway that is ALSO a conditional split: both branches arrive,
-    // the quiescence-time selection matches no flow (and there is no default), so
+    // the post-consumption selection matches no flow (and there is no default), so
     // the join parks on a `NoMatchingSequenceFlow` incident. Resolving that
     // incident re-drives `Step::Complete`, which lands in the split-completion
     // path. That path emits `ElementCompleted` but the reducer does NOT clear the
     // join maps on `ElementCompleted`; without an explicit `ParallelJoinReset` the
-    // stale open-join entry is swept again at the next quiescence and DUPLICATES
+    // stale open-join entry is fired again by the next arrival and DUPLICATES
     // the outgoing routing. Assert the join routes its outgoing flow exactly once.
     let def = ProcessBuilder::new("inc-redrive")
         .start_event("s")
@@ -169,18 +169,17 @@ fn inclusive_join_incident_redrive_does_not_duplicate_outgoing_routing() {
     assert!(engine.active_incidents().is_empty());
 }
 
-/// Regression (#1168 debugger observability): the in-transit-quiescence inclusive-
-/// join sweep can emit an `IncidentRaised` (unselectable / no-matching-flow at a
-/// ready join) and then return `false` without firing. The run loop must still
-/// notify the `StepDriver` of those events — otherwise a `BreakCondition::EveryStep`
-/// debug session silently skips this event-producing sweep, unlike every other
-/// sweep in the loop. Before the fix, `after_step` was gated on the "fired"
-/// boolean, so the incident landed in the log only in the post-quiescence tail,
-/// never at a pause boundary. This drives the second branch's completion under the
-/// debugger and asserts the incident is observed in a pause *delta* (a slice the
-/// driver was actually consulted on), not merely present in the final tail.
+/// Regression (#1168 debugger observability): a ready inclusive join whose
+/// outgoing conditions select no flow raises an `IncidentRaised` instead of
+/// taking a flow. Originally this came from a quiescence sweep that bypassed
+/// the `StepDriver`; the join is now decided at arrival time inside an ordinary
+/// step (#1241), and this guards that the incident is still observed by a
+/// `BreakCondition::EveryStep` debug session. It drives the second branch's
+/// completion under the debugger and asserts the incident is observed in a
+/// pause *delta* (a slice the driver was actually consulted on), not merely
+/// present in the final tail.
 #[test]
-fn inclusive_join_incident_sweep_is_observed_by_the_step_driver() {
+fn inclusive_join_incident_is_observed_by_the_step_driver() {
     let def = ProcessBuilder::new("inc-redrive")
         .start_event("s")
         .parallel_gateway("psplit")
@@ -210,8 +209,9 @@ fn inclusive_join_incident_sweep_is_observed_by_the_step_driver() {
     complete_one(&mut engine, "ja");
 
     // Drive the SECOND branch's completion under the debugger, single-stepping on
-    // every step. Completing `jb` reaches in-transit quiescence, where the join
-    // sweep raises `NoMatchingSequenceFlow` (go=false, no default) without firing.
+    // every step. Completing `jb` takes the join's last incoming flow: the join
+    // consumes its tokens, then raises `NoMatchingSequenceFlow` (go=false, no
+    // default) before routing.
     let jb = engine
         .activate_jobs("jb", "test-worker", 10, 60_000, 0)
         .into_iter()
@@ -242,7 +242,7 @@ fn inclusive_join_incident_sweep_is_observed_by_the_step_driver() {
     }
     assert!(
         incident_observed_at_a_pause,
-        "EveryStep must observe the inclusive-join incident sweep at a pause boundary"
+        "EveryStep must observe the inclusive-join incident at a pause boundary"
     );
     // Sanity: the incident really was raised on this run.
     assert!(session

@@ -1123,10 +1123,30 @@
     }
   },
   {
+    "ParallelJoinTokenArrived": {
+      "element_id": "join",
+      "flow": {
+        "from": "fork",
+        "ordinal": 0
+      },
+      "instance_key": 20
+    }
+  },
+  {
     "SequenceFlowTaken": {
       "from": "fork",
       "instance_key": 20,
       "to": "join"
+    }
+  },
+  {
+    "ParallelJoinTokenArrived": {
+      "element_id": "join",
+      "flow": {
+        "from": "fork",
+        "ordinal": 1
+      },
+      "instance_key": 20
     }
   },
   {
@@ -1145,29 +1165,8 @@
     }
   },
   {
-    "ParallelJoinOpened": {
+    "ParallelJoinFired": {
       "element_id": "join",
-      "element_instance_key": 23,
-      "instance_key": 20
-    }
-  },
-  {
-    "ParallelJoinTokenArrived": {
-      "element_id": "join",
-      "flow": {
-        "from": "fork",
-        "ordinal": 0
-      },
-      "instance_key": 20
-    }
-  },
-  {
-    "ParallelJoinTokenArrived": {
-      "element_id": "join",
-      "flow": {
-        "from": "fork",
-        "ordinal": 1
-      },
       "instance_key": 20
     }
   },
@@ -1182,12 +1181,6 @@
     "ElementCompleted": {
       "element_id": "join",
       "element_instance_key": 23,
-      "instance_key": 20
-    }
-  },
-  {
-    "ParallelJoinFired": {
-      "element_id": "join",
       "instance_key": 20
     }
   },
@@ -1326,6 +1319,16 @@
     }
   },
   {
+    "ParallelJoinTokenArrived": {
+      "element_id": "join",
+      "flow": {
+        "from": "fork",
+        "ordinal": 0
+      },
+      "instance_key": 25
+    }
+  },
+  {
     "ElementActivating": {
       "element_id": "t",
       "element_instance_key": 28,
@@ -1371,16 +1374,6 @@
     "ParallelJoinOpened": {
       "element_id": "join",
       "element_instance_key": 30,
-      "instance_key": 25
-    }
-  },
-  {
-    "ParallelJoinTokenArrived": {
-      "element_id": "join",
-      "flow": {
-        "from": "fork",
-        "ordinal": 0
-      },
       "instance_key": 25
     }
   }

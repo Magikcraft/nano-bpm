@@ -12,20 +12,22 @@
 (*   - Tasks are wait states: activation parks a token in `waiting` until  *)
 (*     an external `CompleteTask` command (a job completion).              *)
 (*   - A parallel gateway with >1 incoming flow is a join                  *)
-(*     (`arrive_at_parallel_join`): it opens on the first arrival and      *)
-(*     counts arrivals per incoming flow (`ParallelJoinOpened` /           *)
-(*     `ParallelJoinTokenArrived`, `join_flow_arrivals`). It fires once    *)
-(*     every incoming flow holds a token, consuming one token per flow and *)
-(*     keeping the surplus (`ParallelJoinFired`, Zeebe's "Tetris"         *)
-(*     principle). A surplus reopens the join, so it stays live (#1233).  *)
-(*   - An inclusive gateway with >1 incoming flow is a join                *)
-(*     (`arrive_at_inclusive_join`): arrivals count per incoming flow. It  *)
-(*     fires in the quiescence sweep (`fire_ready_inclusive_joins`) once   *)
-(*     the queue is empty and no live token rests on an element that can   *)
-(*     reach it (`elements_reaching`), consuming one token per flow that   *)
-(*     holds one and keeping the surplus, which reopens the join (#1237).  *)
-(*     The engine fires the lowest-id ready join per sweep; the model may  *)
-(*     fire any ready join, which covers that choice.                      *)
+(*     (`activate_join`). As in Zeebe, a flow into a join is counted when  *)
+(*     it is taken (`ParallelJoinTokenArrived`, `join_flow_arrivals`);     *)
+(*     the join opens when an arrival cannot fire it                       *)
+(*     (`ParallelJoinOpened`). It fires once every incoming flow holds a   *)
+(*     token, consuming one token per flow and keeping the surplus         *)
+(*     (`ParallelJoinFired`, Zeebe's "Tetris" principle). A surplus        *)
+(*     reopens the join, so it stays live (#1233).                         *)
+(*   - An inclusive gateway with >1 incoming flow is a join too, with the  *)
+(*     same bookkeeping. As in Zeebe, readiness is decided only when a     *)
+(*     token arrives (#1241): the join fires if every incoming flow holds  *)
+(*     a token, or if some flow holds one and no live source (a waiting    *)
+(*     task, another open join, or a queued activation) can reach it       *)
+(*     without crossing a flow that already holds a token                  *)
+(*     (`has_active_path_to`). It is never re-evaluated otherwise, so a    *)
+(*     join whose remaining path diverged elsewhere, or a surplus with no  *)
+(*     partner, waits forever, as in Zeebe.                                *)
 (*   - Conditions are abstracted: an exclusive gateway takes some single   *)
 (*     outgoing flow, an inclusive split or join takes some non-empty      *)
 (*     subset (condition/incident paths are out of scope for this slice). *)
@@ -69,8 +71,8 @@ Tasks     == {n \in Nodes : Kind[n] = "task"}
 
 NonEmptySubsets(S) == (SUBSET S) \ {{}}
 
-\* Mirrors `elements_reaching`: every element from which `t` is reachable
-\* over directed sequence flows (a fixpoint bounded by |Nodes| rounds).
+\* Every element from which `t` is reachable over directed sequence flows
+\* (a fixpoint bounded by |Nodes| rounds). Only used to derive `Acyclic`.
 ReachingFrom(t) ==
     LET R[k \in 0..Cardinality(Nodes)] ==
             IF k = 0 THEN {Src[f] : f \in In(t)}
@@ -117,20 +119,50 @@ Init ==
 
 Quiescent == \A g \in AllFlows : pending[g] = 0
 
-\* Mirrors the `still_waiting` guard in `fire_ready_inclusive_joins`.
-InclusiveReady(j) ==
-    /\ joinOpen[j]
-    /\ \A m \in Reaching(j) \ {j} : waiting[m] = 0 /\ ~joinOpen[m]
+\* A command settles once its queue is drained: no sweep runs afterwards.
+Settled == Quiescent
 
-Settled == Quiescent /\ \A j \in IncJoins : ~InclusiveReady(j)
+\* The elements one step from `n` over its outgoing flows outside `blocked`.
+Succ(n, blocked) == {Tgt[g] : g \in Out(n) \ blocked}
+
+\* Mirrors `path_reaches_join`: `j` is reachable from `src` over sequence flows
+\* other than those in `blocked` (the join's incoming flows that already hold
+\* a token, Zeebe's `hasActivePathToTheGateway`). Each round names the
+\* previous one exactly once: TLC does not cache that value inside the ENABLED
+\* checks that fairness needs, so a second reference would make the cost
+\* exponential in the round count.
+PathReaches(src, j, blocked) ==
+    LET R[k \in 0..Cardinality(Nodes)] ==
+            IF k = 0 THEN {src}
+            ELSE UNION {{n} \cup Succ(n, blocked) : n \in R[k-1]}
+    IN  j \in R[Cardinality(Nodes)]
+
+\* The live sources of `has_active_path_to`: the element instances of the
+\* scope (waiting tasks and open joins) and the targets of queued activations
+\* still in transit.
+LiveSources ==
+    {m \in Nodes : waiting[m] > 0 \/ joinOpen[m]} \cup {Target(g) : g \in {h \in AllFlows : pending[h] > 0}}
+
+\* Mirrors `has_active_path_to`, which ignores `j` itself as a source, and so
+\* every queued activation into `j` (their flows are already counted).
+HasActivePathTo(j, arr) ==
+    LET blocked == {g \in In(j) : arr[g] > 0}
+    IN  \E m \in LiveSources \ {j} : PathReaches(m, j, blocked)
+
+\* Taking flows `S` (`take_flow`): each is queued, and a flow into a join is
+\* counted on it at once, as Zeebe counts a taken sequence flow (#1241).
+TakeFlows(jt, S) ==
+    [n \in Nodes |-> [g \in Flows |->
+        IF g \in S /\ Tgt[g] = n /\ IsJoin(n) THEN jt[n][g] + 1 ELSE jt[n][g]]]
 
 -----------------------------------------------------------------------------
 (* Draining one queued activation (`activate`). *)
 
 \* Pass-through elements: complete immediately and route to `next`.
 PassThrough(f, next) ==
-    /\ pending' = Add(Take(pending, f), next)
-    /\ UNCHANGED <<waiting, joinOpen, joinTokens, fireCount, premature>>
+    /\ pending'    = Add(Take(pending, f), next)
+    /\ joinTokens' = TakeFlows(joinTokens, next)
+    /\ UNCHANGED <<waiting, joinOpen, fireCount, premature>>
 
 ActivateTask(f) ==
     /\ pending' = Take(pending, f)
@@ -141,42 +173,42 @@ ActivateEnd(f) ==
     /\ pending' = Take(pending, f)
     /\ UNCHANGED <<waiting, joinOpen, joinTokens, fireCount, premature>>
 
-\* Mirrors `arrive_at_parallel_join`. On firing, each incoming flow gives up
-\* one token and any surplus stays; a non-empty surplus reopens the join.
-\* `premature` re-checks the firing guard: it records a firing that some
-\* incoming flow did not feed.
-ArriveParallelJoin(f) ==
-    LET j       == Target(f)
-        arr     == [joinTokens[j] EXCEPT ![f] = @ + 1]
-        fires   == \A g \in In(j) : arr[g] >= 1
-        rest    == [g \in Flows |-> IF g \in In(j) THEN arr[g] - 1 ELSE arr[g]]
+\* Mirrors `activate_join`, which guards both join kinds. The arriving token was
+\* already counted when its flow was taken. A parallel join fires once every
+\* incoming flow holds a token (`canActivateParallelGateway`). An inclusive
+\* join also fires when some flow holds a token and no live source can reach
+\* it (`canActivateInclusiveGateway`). On firing it routes to the chosen subset
+\* `S`; each incoming flow holding a token gives up one, including tokens whose
+\* activation is still queued (that activation later finds nothing to do), and
+\* a surplus reopens the join. A rejected arrival opens the join if it holds a
+\* token. `premature` re-checks the parallel guard.
+ArriveJoin(f, S) ==
+    LET j        == Target(f)
+        arr      == joinTokens[j]
+        allTaken == \A g \in In(j) : arr[g] >= 1
+        fires    == IF j \in ParJoins THEN allTaken
+                    ELSE \/ allTaken
+                         \/ (\E g \in In(j) : arr[g] > 0) /\ ~HasActivePathTo(j, arr)
+        rest     == [g \in Flows |-> IF arr[g] > 0 THEN arr[g] - 1 ELSE 0]
     IN  /\ IF fires
-             THEN /\ pending'    = Add(Take(pending, f), Out(j))
-                  /\ joinOpen'   = [joinOpen   EXCEPT ![j] = \E g \in Flows : rest[g] > 0]
-                  /\ joinTokens' = [joinTokens EXCEPT ![j] = rest]
-                  /\ fireCount'  = [fireCount  EXCEPT ![j] = @ + 1]
-                  /\ premature'  = IF \E g \in In(j) : arr[g] = 0
+             THEN /\ pending'    = Add(Take(pending, f), S)
+                  /\ joinOpen'   = [joinOpen EXCEPT ![j] = \E g \in Flows : rest[g] > 0]
+                  /\ joinTokens' = TakeFlows([joinTokens EXCEPT ![j] = rest], S)
+                  /\ fireCount'  = [fireCount EXCEPT ![j] = @ + 1]
+                  /\ premature'  = IF j \in ParJoins /\ \E g \in In(j) : arr[g] = 0
                                      THEN premature \cup {j} ELSE premature
              ELSE /\ pending'    = Take(pending, f)
-                  /\ joinOpen'   = [joinOpen   EXCEPT ![j] = TRUE]
-                  /\ joinTokens' = [joinTokens EXCEPT ![j] = arr]
-                  /\ UNCHANGED <<fireCount, premature>>
+                  /\ joinOpen'   = [joinOpen EXCEPT ![j] = @ \/ \E g \in Flows : arr[g] > 0]
+                  /\ UNCHANGED <<joinTokens, fireCount, premature>>
         /\ UNCHANGED waiting
 
-ArriveInclusiveJoin(f) ==
-    LET j == Target(f) IN
-    /\ pending'   = Take(pending, f)
-    /\ joinOpen'   = [joinOpen   EXCEPT ![j] = TRUE]
-    /\ joinTokens' = [joinTokens EXCEPT ![j][f] = @ + 1]
-    /\ UNCHANGED <<waiting, fireCount, premature>>
-
 \* The routing choices available when an activation of `n` completes: an
-\* exclusive gateway takes one outgoing flow, an inclusive split takes a
-\* non-empty subset, and every other pass-through element takes all of them.
+\* exclusive gateway takes one outgoing flow, an inclusive gateway (split or
+\* join) takes a non-empty subset, and every other element takes all of them.
 \* Each choice is its own action, so fairness can range over the choices.
 Choices(n) ==
     CASE Kind[n] = "xor"                    -> {{g} : g \in Out(n)}
-      [] Kind[n] = "or" /\ n \notin IncJoins -> NonEmptySubsets(Out(n))
+      [] Kind[n] = "or"                     -> NonEmptySubsets(Out(n))
       [] OTHER                              -> {Out(n)}
 
 DrainVia(f, S) ==
@@ -185,28 +217,11 @@ DrainVia(f, S) ==
     /\ S \in Choices(n)
     /\ CASE Kind[n] = "task"             -> ActivateTask(f)
          [] Kind[n] = "end"              -> ActivateEnd(f)
-         [] n \in ParJoins               -> ArriveParallelJoin(f)
-         [] n \in IncJoins               -> ArriveInclusiveJoin(f)
+         [] IsJoin(n)                    -> ArriveJoin(f, S)
          [] OTHER                        -> PassThrough(f, S)
     /\ UNCHANGED completed
 
 Drain(f) == \E S \in Choices(Target(f)) : DrainVia(f, S)
-
-(* The quiescence sweep: fire one ready inclusive join, routing to S. Each
-   incoming flow holding a token gives up one; a surplus reopens the join. *)
-FireInclusiveJoinVia(j, S) ==
-    LET rest == [g \in Flows |-> IF joinTokens[j][g] > 0 THEN joinTokens[j][g] - 1 ELSE 0]
-    IN
-    /\ Quiescent
-    /\ InclusiveReady(j)
-    /\ S \in NonEmptySubsets(Out(j))
-    /\ pending'   = Add(pending, S)
-    /\ joinOpen'   = [joinOpen   EXCEPT ![j] = \E g \in Flows : rest[g] > 0]
-    /\ joinTokens' = [joinTokens EXCEPT ![j] = rest]
-    /\ fireCount'  = [fireCount  EXCEPT ![j] = @ + 1]
-    /\ UNCHANGED <<waiting, premature, completed>>
-
-FireInclusiveJoin(j) == \E S \in NonEmptySubsets(Out(j)) : FireInclusiveJoinVia(j, S)
 
 (* External command: a job worker completes a task. *)
 CompleteTask(t) ==
@@ -214,8 +229,9 @@ CompleteTask(t) ==
     /\ ~completed
     /\ waiting[t] > 0
     /\ waiting' = [waiting EXCEPT ![t] = @ - 1]
-    /\ pending' = Add(pending, Out(t))
-    /\ UNCHANGED <<joinOpen, joinTokens, fireCount, premature, completed>>
+    /\ pending'    = Add(pending, Out(t))
+    /\ joinTokens' = TakeFlows(joinTokens, Out(t))
+    /\ UNCHANGED <<joinOpen, fireCount, premature, completed>>
 
 (* `complete_finished_instances`. *)
 CompleteInstance ==
@@ -231,13 +247,12 @@ Done == completed /\ UNCHANGED vars
 
 Next ==
     \/ \E f \in AllFlows : Drain(f)
-    \/ \E j \in IncJoins : FireInclusiveJoin(j)
     \/ \E t \in Tasks    : CompleteTask(t)
     \/ CompleteInstance
     \/ Done
 
 \* Fairness, exactly as stated in `Fairness` below:
-\*   - SF on each `DrainVia(f, S)` and `FireInclusiveJoinVia(j, S)`. Each
+\*   - SF on each `DrainVia(f, S)`. Each
 \*     routing choice S is its own action, so strong fairness means a gateway
 \*     reached infinitely often eventually takes each of its branches. This is
 \*     the "fair data" assumption of workflow-net soundness, and it lets a loop
@@ -250,7 +265,6 @@ Next ==
 \* so one task could starve.)
 Fairness ==
     /\ \A f \in AllFlows : \A S \in Choices(Target(f)) : SF_vars(DrainVia(f, S))
-    /\ \A j \in IncJoins : \A S \in NonEmptySubsets(Out(j)) : SF_vars(FireInclusiveJoinVia(j, S))
     /\ \A t \in Tasks    : SF_vars(CompleteTask(t))
     /\ WF_vars(CompleteInstance)
 
@@ -260,14 +274,19 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 (* Properties *)
 
 \* Join bookkeeping stays coherent (the class behind the missing
-\* `ParallelJoinReset` bugs): a join is open iff it holds tokens, tokens only
-\* sit on a join's own incoming flows, only joins are ever open, and a parallel
-\* join never rests with every incoming flow fed (it would have fired).
+\* `ParallelJoinReset` bugs): an open join holds tokens, a join holding tokens
+\* is open unless an activation into it is still queued (flows are counted
+\* when taken), tokens only sit on a join's own incoming flows, only joins are
+\* ever open, and a parallel join never has every incoming flow fed without an
+\* activation on its way to fire it.
+InTransitTo(n) == \E g \in In(n) : pending[g] > 0
+
 JoinBookkeepingCoherent ==
-    /\ \A n \in Nodes : joinOpen[n] <=> \E g \in Flows : joinTokens[n][g] > 0
+    /\ \A n \in Nodes : joinOpen[n] => \E g \in Flows : joinTokens[n][g] > 0
+    /\ \A n \in Nodes : (\E g \in Flows : joinTokens[n][g] > 0) /\ ~joinOpen[n] => InTransitTo(n)
     /\ \A n \in Nodes : \A g \in Flows \ In(n) : joinTokens[n][g] = 0
     /\ \A n \in Nodes \ (ParJoins \cup IncJoins) : ~joinOpen[n]
-    /\ \A j \in ParJoins : \E g \in In(j) : joinTokens[j][g] = 0
+    /\ \A j \in ParJoins : (\A g \in In(j) : joinTokens[j][g] > 0) => InTransitTo(j)
 
 \* BPMN / Zeebe parity: a parallel join activates only once *every* incoming
 \* sequence flow has been taken (Zeebe counts distinct taken flows,

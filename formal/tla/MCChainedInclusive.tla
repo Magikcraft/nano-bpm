@@ -1,5 +1,5 @@
 ------------------------------ MODULE MCChainedInclusive ------------------------------
-(* Chained inclusive joins (the fire-one-join-per-sweep case):
+(* Chained inclusive joins (J2 must wait while J1 can still reach it):
    S -> I1 -> {A, B, C};  A, B -> J1;  J1, C -> J2 -> E *)
 EXTENDS TokenFlow
 

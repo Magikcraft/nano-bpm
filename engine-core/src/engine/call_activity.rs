@@ -558,8 +558,8 @@ impl Engine {
             }
         }
         let mut followups = Vec::new();
-        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
-            events.push(event);
+        for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.extend(taken);
             followups.push(step);
         }
         (events, followups)

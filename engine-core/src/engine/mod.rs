@@ -264,6 +264,14 @@ enum AdHocPostTool {
     Continue,
 }
 
+/// The two synchronising joins: a parallel or inclusive gateway with more than
+/// one incoming flow ([`Engine::activate_join`]).
+#[derive(Clone, Copy)]
+enum JoinKind {
+    Parallel,
+    Inclusive,
+}
+
 /// A unit of internal work in the processing loop — one transition of the BPMN
 /// element lifecycle.
 enum Step {
@@ -4047,7 +4055,7 @@ impl Engine {
                 //     (and, for pre-#1233 journals, `join_counts`) holds the
                 //     tokens counted per incoming flow, but the set of flows it
                 //     must cover is read *live from the definition* at fire time
-                //     (`arrive_at_parallel_join` calls `incoming_count`, which
+                //     (`activate_join` calls `incoming_count`, which
                 //     resolves against the instance's current process). Migration
                 //     swaps that definition, so mapping an open join onto a target
                 //     gateway with a different incoming-flow count silently
@@ -4081,17 +4089,18 @@ impl Engine {
                     let tgt = mapped
                         .get(&src)
                         .expect("an open join is active, so step 5 guarantees it is mapped");
-                    // Inclusive-gateway joins reuse this same bookkeeping, but
-                    // they do **not** fire on a durable count-vs-threshold
-                    // comparison: readiness is decided at token quiescence by
-                    // reachability (`fire_ready_inclusive_joins`), never by
-                    // comparing the arrivals against `incoming_count`. So the
-                    // "durable count re-interpreted against a migrated-in
-                    // threshold" hazard cannot occur for them, and requiring
-                    // incoming-arity parity would reject an otherwise compatible
-                    // inclusive migration for an unrelated reason. Only the
-                    // per-flow check below applies to them.
-                    if is_parallel_join {
+                    // An inclusive join accepts when its taken flows cover its
+                    // incoming flows, or when no active path can still reach it
+                    // (#1241). Every *identified* arrival must name an incoming
+                    // flow of the target (the per-flow check below), so the
+                    // covering test cannot early-fire under a different arity —
+                    // an open inclusive join with only identified arrivals may
+                    // migrate across an arity change. An *unidentified* arrival
+                    // (`join_counts`) counts as one taken flow of the arity it
+                    // was recorded under, so it needs parity just like a
+                    // parallel join.
+                    let has_unidentified = instance.join_counts.get(&src).is_some_and(|n| *n > 0);
+                    if is_parallel_join || has_unidentified {
                         let source_incoming_count = source_def.definition.incoming_count(&src);
                         let target_incoming_count = target.definition.incoming_count(tgt);
                         if source_incoming_count != target_incoming_count {
@@ -4414,7 +4423,7 @@ impl Engine {
     ) -> Option<Paused> {
         loop {
             while let Some(step) = queue.pop_front() {
-                let (events, followups) = self.process_step(step);
+                let (events, followups) = self.process_step(step, &queue);
                 let emitted_from = log.len();
                 for event in events {
                     self.emit(log, event);
@@ -4456,30 +4465,6 @@ impl Engine {
             if !queue.is_empty() {
                 continue;
             }
-            // In-transit quiescence: the step queue is empty, so every token that
-            // was travelling toward an inclusive-gateway join has been counted.
-            // Fire any open inclusive join whose branches have all arrived (no
-            // live token could still reach it); a fire enqueues its outgoing
-            // activation(s), so loop to drain them before declaring completion.
-            let inclusive_from = log.len();
-            let fired_inclusive = self.fire_ready_inclusive_joins(log, &mut queue);
-            // Notify the driver whenever this sweep grew the log — not only when it
-            // fired a join. `fire_ready_inclusive_joins` also emits `IncidentRaised`
-            // (unselectable / no-matching-flow at a ready join) and then returns
-            // `false`, so gating the notification on the boolean would let those
-            // events slip past a `BreakCondition::EveryStep` debugger session,
-            // unlike every other sweep in this loop. The boolean only decides
-            // whether to keep draining. Idempotent on resume: a re-entered sweep
-            // finds the join already carrying its active incident and re-raises
-            // nothing, so the log does not grow and the driver is not re-notified.
-            if log.len() > inclusive_from {
-                if let Drive::Pause = driver.after_step(&log[inclusive_from..]) {
-                    return Some(Paused { queue, cursor });
-                }
-            }
-            if fired_inclusive {
-                continue;
-            }
             // Token quiescence. Complete any instance whose tokens have all
             // retired — the terminal tail shared with `apply_command_at`, folded
             // into the loop (rather than run post-return in `finish_command`) so a
@@ -4502,6 +4487,7 @@ impl Engine {
                 queue.extend(followups);
                 continue;
             }
+            self.debug_assert_join_bookkeeping_coherent(log);
             return None;
         }
     }
@@ -5068,8 +5054,10 @@ impl Engine {
                     self.emit(log, event);
                 }
             }
-            for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
-                self.emit(log, event);
+            for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
+                for event in taken {
+                    self.emit(log, event);
+                }
                 followups.push(step);
             }
         }
@@ -5236,9 +5224,74 @@ impl Engine {
         false
     }
 
+    /// A flow into a join is counted when it is taken ([`Engine::take_flow`]),
+    /// so a join activation the terminal-scope guard drops has already been
+    /// counted. If no join instance is open to hold it, that arrival belongs to
+    /// the dead scope and would otherwise survive as a phantom token a
+    /// re-entered scope fires against: reset the join, as Zeebe's count dies
+    /// with its flow-scope instance. An open join instance in the dead scope is
+    /// already reset by [`scope_teardown_events`](Self::scope_teardown_events).
+    fn revoke_dropped_join_arrival(&self, step: &Step) -> Vec<Event> {
+        let Step::Activate {
+            instance_key,
+            element_id,
+            via: Some(_),
+            ..
+        } = step
+        else {
+            return Vec::new();
+        };
+        let holds_tokens = self.state.instances.get(instance_key).is_some_and(|i| {
+            i.join_flow_arrivals.contains_key(element_id) || i.join_counts.contains_key(element_id)
+        });
+        if holds_tokens
+            && self.join_kind(*instance_key, element_id).is_some()
+            && self.join_eik(*instance_key, element_id).is_none()
+        {
+            vec![Event::ParallelJoinReset {
+                instance_key: *instance_key,
+                element_id: element_id.clone(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Debug-build guard for the join-bookkeeping defect class: once a drain
+    /// quiesces nothing is in transit, so every join still holding tokens must
+    /// have an open join instance holding them (the TLA+ `TokenFlow`
+    /// `JoinBookkeepingCoherent` invariant with no activation queued). A token
+    /// with no open instance is a phantom a later arrival would fire against.
+    fn debug_assert_join_bookkeeping_coherent(&self, log: &[Event]) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let touched: HashSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
+        for key in touched {
+            let Some(instance) = self.state.instances.get(&key) else {
+                continue;
+            };
+            if instance.state != ProcessInstanceState::Active {
+                continue;
+            }
+            for join in instance
+                .join_flow_arrivals
+                .keys()
+                .chain(instance.join_counts.keys())
+            {
+                debug_assert!(
+                    instance.join_instances.contains_key(join),
+                    "instance {key}: join `{join}` holds tokens but no open join instance"
+                );
+            }
+        }
+    }
+
     /// The processor: decides the events and follow-up work for one lifecycle
-    /// step. Reads state, mints keys, but never mutates [`State`].
-    fn process_step(&mut self, step: Step) -> (Vec<Event>, Vec<Step>) {
+    /// step. Reads state, mints keys, but never mutates [`State`]. `pending` is
+    /// the rest of the step queue: the flows taken but not yet activated, which
+    /// an inclusive join's readiness guard counts as live paths.
+    fn process_step(&mut self, step: Step, pending: &VecDeque<Step>) -> (Vec<Event>, Vec<Step>) {
         // Terminal-scope guard (the single dispatch choke point). A queued step
         // can sit behind the very teardown that invalidates it: a top-level
         // terminate end marks its instance `Terminated`, and a sub-process-scoped
@@ -5252,7 +5305,7 @@ impl Engine {
         // own listeners) is deliberately NOT guarded — it must run its remaining
         // steps to finish.
         if self.step_targets_dead_scope(&step) {
-            return (Vec::new(), Vec::new());
+            return (self.revoke_dropped_join_arrival(&step), Vec::new());
         }
         match step {
             Step::Activate {
@@ -5260,7 +5313,7 @@ impl Engine {
                 element_id,
                 scope,
                 via,
-            } => self.activate(instance_key, element_id, scope, via),
+            } => self.activate(instance_key, element_id, scope, via, pending),
             Step::Complete {
                 instance_key,
                 element_instance_key,
@@ -5413,28 +5466,14 @@ impl Engine {
         element_id: String,
         scope: Key,
         via: Option<IncomingFlow>,
+        pending: &VecDeque<Step>,
     ) -> (Vec<Event>, Vec<Step>) {
+        // A parallel or inclusive gateway with more than one incoming flow is a
+        // join: its activation is guarded instead of running per arrival.
+        if let Some(join) = self.join_kind(instance_key, &element_id) {
+            return self.activate_join(instance_key, element_id, scope, via, join, pending);
+        }
         let kind = self.element_kind(instance_key, &element_id);
-
-        // A parallel gateway with more than one incoming flow is a join: it
-        // synchronises tokens instead of activating per arrival.
-        if matches!(kind, Some(ElementKind::ParallelGateway))
-            && self.incoming_count(instance_key, &element_id) > 1
-        {
-            return self.arrive_at_parallel_join(instance_key, element_id, scope, via);
-        }
-
-        // An inclusive gateway with more than one incoming flow is a join: each
-        // arriving token is counted onto the open join; whether the join *fires*
-        // is decided later, at token quiescence, by [`fire_ready_inclusive_joins`]
-        // (when no in-flight token could still reach it). Counting-only here keeps
-        // an in-transit sibling arrival from being mistaken for a branch that will
-        // never come.
-        if matches!(kind, Some(ElementKind::InclusiveGateway))
-            && self.incoming_count(instance_key, &element_id) > 1
-        {
-            return self.arrive_at_inclusive_join(instance_key, element_id, scope, via);
-        }
 
         // A multi-instance activity: unless we are already inside its body (i.e.
         // this is one of its children, running in the body scope), this
@@ -7269,8 +7308,8 @@ impl Engine {
             events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
         }
         let mut followups = Vec::new();
-        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
-            events.push(event);
+        for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.extend(taken);
             followups.push(step);
         }
         (events, followups)
@@ -7308,8 +7347,8 @@ impl Engine {
             },
         ];
         let mut followups = Vec::new();
-        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
-            events.push(event);
+        for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.extend(taken);
             followups.push(step);
         }
         (events, followups)
@@ -9027,8 +9066,8 @@ impl Engine {
             cancelled: cancel,
         });
         let mut followups = Vec::new();
-        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
-            events.push(event);
+        for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.extend(taken);
             followups.push(step);
         }
         (events, followups)
@@ -9067,8 +9106,8 @@ impl Engine {
             },
         ];
         let mut followups = Vec::new();
-        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
-            events.push(event);
+        for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.extend(taken);
             followups.push(step);
         }
         (events, followups)
@@ -9143,7 +9182,7 @@ impl Engine {
         }
 
         // An inclusive gateway reaching completion is a pure split (a join is
-        // intercepted at `activate` and completed via its quiescence-time fire).
+        // intercepted at `activate` and routed by `activate_join`).
         // It routes every outgoing flow whose condition holds (else the default).
         if matches!(
             self.element_kind(instance_key, &element_id),
@@ -9522,8 +9561,8 @@ impl Engine {
         }
 
         let mut followups = Vec::new();
-        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
-            events.push(event);
+        for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.extend(taken);
             followups.push(step);
         }
         (events, followups)
@@ -9701,8 +9740,8 @@ impl Engine {
                 scope,
             });
         }
-        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
-            events.push(event);
+        for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.extend(taken);
             followups.push(step);
         }
         (events, followups)
@@ -9740,8 +9779,8 @@ impl Engine {
         // hold an immutable borrow of `self` across the teardown mutation.
         let outgoing_flows = self.take_all_flows(instance_key, &throw_element_id, scope);
         let take_throw_outgoing = |events: &mut Vec<Event>, followups: &mut Vec<Step>| {
-            for (event, step) in outgoing_flows {
-                events.push(event);
+            for (taken, step) in outgoing_flows {
+                events.extend(taken);
                 followups.push(step);
             }
         };
@@ -10101,8 +10140,8 @@ impl Engine {
             element_id: element_id.clone(),
         }];
         let mut followups = Vec::new();
-        for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
-            events.push(event);
+        for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
+            events.extend(taken);
             followups.push(step);
         }
         (events, followups)
@@ -10810,7 +10849,7 @@ impl Engine {
                     element_id: element_id.clone(),
                 });
                 let (taken, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
-                events.push(taken);
+                events.extend(taken);
                 (events, vec![step])
             }
             None => {
@@ -10853,17 +10892,13 @@ impl Engine {
         match self.select_exclusive_flow(instance_key, &element_id) {
             Ok(Some(flow_index)) => {
                 let (taken, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
-                (
-                    vec![
-                        Event::ElementCompleted {
-                            instance_key,
-                            element_instance_key,
-                            element_id: element_id.clone(),
-                        },
-                        taken,
-                    ],
-                    vec![step],
-                )
+                let mut events = vec![Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                }];
+                events.extend(taken);
+                (events, vec![step])
             }
             Ok(None) => {
                 // No flow matches now (and no default). Keep the token parked on
@@ -10953,17 +10988,44 @@ impl Engine {
         Ok(selected)
     }
 
-    /// Completes an inclusive-gateway **split** (single incoming): routes every
-    /// selected outgoing flow, gating the deferred completion behind the `end`
-    /// execution-listener chain (ADR 0037). A condition that fails to evaluate
-    /// raises an `ExpressionEvaluation` incident; a selection that matches no flow
-    /// (and no default) raises a `NoMatchingSequenceFlow` incident and parks the
-    /// token, mirroring the exclusive gateway.
+    /// Completes an inclusive gateway re-driven through `Step::Complete`: a
+    /// single-incoming split, or a gateway whose incident was resolved. A join
+    /// parked by a build older than #1241 has not consumed its tokens yet, so it
+    /// consumes them first ([`Engine::fire_open_inclusive_join`]).
     fn complete_inclusive_gateway(
         &mut self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let scope = self.scope_of(instance_key, element_instance_key);
+        let mut events = Vec::new();
+        self.fire_open_inclusive_join(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            scope,
+            &mut events,
+        );
+        let (routed, followups) =
+            self.route_inclusive_gateway(instance_key, element_instance_key, element_id, scope);
+        events.extend(routed);
+        (events, followups)
+    }
+
+    /// Routes an activated inclusive gateway (split or accepted join): takes
+    /// every selected outgoing flow, gating the completion behind the `end`
+    /// execution-listener chain (ADR 0037). A condition that fails to evaluate
+    /// raises an `ExpressionEvaluation` incident; a selection that matches no
+    /// flow (and no default) raises a `NoMatchingSequenceFlow` incident and
+    /// parks the token, mirroring the exclusive gateway and Zeebe's
+    /// `InclusiveGatewayProcessor.finalizeActivation`.
+    fn route_inclusive_gateway(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
         let selected = match self.select_inclusive_flows(instance_key, &element_id) {
             Ok(sel) => sel,
@@ -11004,7 +11066,6 @@ impl Engine {
                 Vec::new(),
             );
         }
-        let scope = self.scope_of(instance_key, element_instance_key);
         let mut events = vec![Event::ElementCompleting {
             instance_key,
             element_instance_key,
@@ -11026,17 +11087,10 @@ impl Engine {
             element_instance_key,
             element_id: element_id.clone(),
         });
-        self.fire_open_inclusive_join(
-            instance_key,
-            element_instance_key,
-            &element_id,
-            scope,
-            &mut events,
-        );
         let mut followups = Vec::new();
         for flow_index in selected {
-            let (event, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
-            events.push(event);
+            let (taken, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
+            events.extend(taken);
             followups.push(step);
         }
         (events, followups)
@@ -11055,81 +11109,75 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
+        let mut events = Vec::new();
+        self.fire_open_inclusive_join(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            scope,
+            &mut events,
+        );
         match self.select_inclusive_flows(instance_key, &element_id) {
             Ok(selected) if !selected.is_empty() => {
-                let mut events = vec![Event::ElementCompleted {
+                events.push(Event::ElementCompleted {
                     instance_key,
                     element_instance_key,
                     element_id: element_id.clone(),
-                }];
-                self.fire_open_inclusive_join(
-                    instance_key,
-                    element_instance_key,
-                    &element_id,
-                    scope,
-                    &mut events,
-                );
+                });
                 let mut followups = Vec::new();
                 for flow_index in selected {
-                    let (event, step) =
+                    let (taken, step) =
                         self.take_flow(instance_key, &element_id, flow_index, scope);
-                    events.push(event);
+                    events.extend(taken);
                     followups.push(step);
                 }
                 (events, followups)
             }
             Ok(_) => {
                 let incident_key = self.mint_key();
-                (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id: element_id.clone(),
-                        kind: state::IncidentKind::NoMatchingSequenceFlow,
-                        redrive: None,
-                        reason: format!(
-                            "no matching outgoing sequence flow at inclusive gateway '{element_id}'"
-                        ),
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Vec::new(),
-                )
+                events.push(Event::IncidentRaised {
+                    incident_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                    kind: state::IncidentKind::NoMatchingSequenceFlow,
+                    redrive: None,
+                    reason: format!(
+                        "no matching outgoing sequence flow at inclusive gateway '{element_id}'"
+                    ),
+                    job_key: None,
+                    created_at: self.now,
+                });
+                (events, Vec::new())
             }
             Err(reason) => {
                 let incident_key = self.mint_key();
-                (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        kind: state::IncidentKind::ExpressionEvaluation,
-                        redrive: None,
-                        reason,
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Vec::new(),
-                )
+                events.push(Event::IncidentRaised {
+                    incident_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    kind: state::IncidentKind::ExpressionEvaluation,
+                    redrive: None,
+                    reason,
+                    job_key: None,
+                    created_at: self.now,
+                });
+                (events, Vec::new())
             }
         }
     }
 
-    /// If `element_instance_key` is the *open inclusive join* for `element_id`
-    /// (opened by [`arrive_at_inclusive_join`]), append its firing to `events`:
-    /// [`Event::ParallelJoinFired`] consumes one token per incoming flow, and a
-    /// surplus reopens the join ([`Engine::fire_join`]). A join normally fires
-    /// inside the quiescence sweep ([`fire_ready_inclusive_joins`]); but when that
-    /// sweep raised an incident (no-matching-flow / expression failure) on the
-    /// join, or deferred it behind an `end` listener chain, completion is later
-    /// re-driven through the split-completion path ([`complete_inclusive_gateway`]
-    /// / [`finalize_inclusive_gateway`]). That path emits `ElementCompleted`, but
-    /// the reducer does not clear the join maps on `ElementCompleted`, so without
-    /// this the stale entry would be swept again next quiescence and duplicate
-    /// the outgoing routing. The guard makes this a no-op for an ordinary
-    /// single-incoming inclusive split (no open join exists).
+    /// If `element_instance_key` is still the *open* join for `element_id`,
+    /// append its firing to `events`: [`Event::ParallelJoinFired`] consumes one
+    /// token per incoming flow, and a surplus reopens the join
+    /// ([`Engine::fire_join`]). Since #1241 an accepted join consumes when it
+    /// activates ([`Engine::activate_join`]), so its instance is no longer the
+    /// open join and this is a no-op. It still fires a join that a build older
+    /// than #1241 parked on an incident or an `end` listener chain before
+    /// consuming, when that join's completion is re-driven from a restored
+    /// snapshot or a replayed journal. It is also a no-op for a single-incoming
+    /// inclusive split (no open join exists).
     fn fire_open_inclusive_join(
         &mut self,
         instance_key: Key,
@@ -11144,365 +11192,54 @@ impl Engine {
         }
     }
 
-    /// A token reached an inclusive-gateway join. Open the join on the first
-    /// arrival and count every arrival per incoming flow (reusing the
-    /// parallel-join bookkeeping — the maps are element-kind-agnostic). Unlike a parallel join
-    /// it does **not** fire here: firing is decided at token quiescence by
-    /// [`fire_ready_inclusive_joins`], once no in-flight token could still reach
-    /// it — so an in-transit sibling arrival is never mistaken for a branch that
-    /// will not arrive.
-    fn arrive_at_inclusive_join(
-        &mut self,
-        instance_key: Key,
-        element_id: String,
-        scope: Key,
-        via: Option<IncomingFlow>,
-    ) -> (Vec<Event>, Vec<Step>) {
-        let mut events = Vec::new();
-        if self.join_eik(instance_key, &element_id).is_none() {
-            self.open_join(instance_key, &element_id, scope, &mut events);
-        }
-        // Readiness is decided by reachability, but the tokens are still
-        // counted per incoming flow: firing consumes one per flow and keeps the
-        // surplus (#1237).
-        events.push(Event::ParallelJoinTokenArrived {
-            instance_key,
-            element_id,
-            flow: via,
-        });
-        (events, Vec::new())
-    }
-
-    /// The set of element ids from which the flow graph can reach `target` (over
-    /// directed sequence flows). A live token resting on any such element could
-    /// still arrive at an inclusive-gateway join at `target`, so the join must
-    /// keep waiting while one exists.
-    fn elements_reaching(
-        &self,
-        instance_key: Key,
-        target: &str,
-    ) -> std::collections::HashSet<String> {
-        let mut reaching = std::collections::HashSet::new();
-        let Some(process) = self.process_of_instance(instance_key) else {
-            return reaching;
+    /// Which join `element_id` is, if any: a parallel or inclusive gateway with
+    /// more than one incoming flow.
+    fn join_kind(&self, instance_key: Key, element_id: &str) -> Option<JoinKind> {
+        let join = match self
+            .process_of_instance(instance_key)?
+            .element(element_id)?
+            .kind
+        {
+            ElementKind::ParallelGateway => JoinKind::Parallel,
+            ElementKind::InclusiveGateway => JoinKind::Inclusive,
+            _ => return None,
         };
-        // Reverse adjacency: for each flow src -> dst, record src as a
-        // predecessor of dst.
-        let mut predecessors: HashMap<&str, Vec<&str>> = HashMap::new();
-        for element in process.elements.values() {
-            for flow in &element.outgoing {
-                predecessors
-                    .entry(flow.to.as_str())
-                    .or_default()
-                    .push(element.id.as_str());
-            }
-            // An armed reactive boundary event has no *incoming* sequence flow,
-            // but while its host activity is live the boundary can still fire and
-            // route a token along its outgoing flow. So a join reachable through
-            // such a boundary is still reachable from the host: treat the host as
-            // a predecessor of its boundary. Without this edge the sweep would see
-            // no live token reaching the join (the host itself is not a
-            // sequence-flow predecessor of the join) and fire it prematurely,
-            // before an armed boundary on a still-active branch could route a
-            // token in (#1168). Compensation boundaries are excluded — they are
-            // not armed and never fire reactively during normal flow.
-            let boundary_host = match &element.kind {
-                ElementKind::ErrorBoundaryEvent { attached_to, .. }
-                | ElementKind::TimerBoundaryEvent { attached_to, .. }
-                | ElementKind::MessageBoundaryEvent { attached_to, .. }
-                | ElementKind::SignalBoundaryEvent { attached_to, .. }
-                | ElementKind::EscalationBoundaryEvent { attached_to, .. }
-                | ElementKind::ConditionalBoundaryEvent { attached_to, .. } => Some(attached_to),
-                _ => None,
-            };
-            if let Some(host) = boundary_host {
-                predecessors
-                    .entry(element.id.as_str())
-                    .or_default()
-                    .push(host.as_str());
-            }
-            // A link intermediate *throw* event has no outgoing sequence flow:
-            // on completion it hands its token directly to the matching
-            // same-scope link *catch* (see `resolve_link_catch`). That direct
-            // transition is invisible to the sequence-flow graph, so — exactly
-            // like the reactive-boundary edge above — a token resting on (or
-            // upstream of) a link throw would not be seen as reaching a join
-            // downstream of the catch, and the sweep would fire the join
-            // prematurely before the throw hands off; the throw then activates
-            // the catch and creates a second late arrival (#1168 defect class).
-            // Treat the throw as a predecessor of its matching catch (mirroring
-            // `resolve_link_catch`'s same-name, same-scope pairing).
-            if let ElementKind::LinkIntermediateThrowEvent { link_name } = &element.kind {
-                for other in process.elements.values() {
-                    if let ElementKind::LinkIntermediateCatchEvent { link_name: name } = &other.kind
-                    {
-                        if name == link_name && other.parent == element.parent {
-                            predecessors
-                                .entry(other.id.as_str())
-                                .or_default()
-                                .push(element.id.as_str());
-                        }
-                    }
-                }
-            }
-        }
-        let mut stack = vec![target];
-        while let Some(node) = stack.pop() {
-            if let Some(preds) = predecessors.get(node) {
-                for &pred in preds {
-                    if reaching.insert(pred.to_string()) {
-                        stack.push(pred);
-                    }
-                }
-            }
-        }
-        reaching
-    }
-
-    /// Whether an active incident already rests on this element instance (guards
-    /// the inclusive-join fire sweep from re-raising the same incident every
-    /// quiescence pass when a ready join's outgoing selection cannot be routed).
-    fn has_active_incident_on(&self, instance_key: Key, element_instance_key: Key) -> bool {
-        self.state
-            .instances
-            .get(&instance_key)
-            .map(|instance| {
-                instance.incidents.iter().any(|k| {
-                    self.state
-                        .incidents
-                        .get(k)
-                        .map(|inc| inc.element_instance_key == element_instance_key)
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
-    }
-
-    /// Does `element_instance_key` currently carry an in-flight `end`
-    /// execution-listener job? A join deferred behind its end-listener chain
-    /// rests in COMPLETING (its `ElementCompleting` fired but `ElementCompleted`
-    /// has not, so it is still in `active`) — the quiescence sweep must not treat
-    /// it as ready and re-fire it, which would mint a second listener chain and
-    /// double-route. The pending listener job disappears once the chain drains
-    /// and [`finalize_inclusive_gateway`] completes + resets the join.
-    fn has_pending_end_listener(&self, instance_key: Key, element_instance_key: Key) -> bool {
-        self.state
-            .jobs_by_instance
-            .get(&instance_key)
-            .map(|jobs| {
-                jobs.iter().any(|jk| {
-                    self.state.jobs.get(jk).is_some_and(|job| {
-                        job.element_instance_key == element_instance_key
-                            && matches!(
-                                job.kind,
-                                state::JobKind::ExecutionListener {
-                                    event_type: crate::model::ListenerEventType::End,
-                                    ..
-                                }
-                            )
-                    })
-                })
-            })
-            .unwrap_or(false)
-    }
-
-    /// At token quiescence, fire every open inclusive-gateway join whose branches
-    /// have all arrived — i.e. no live token elsewhere in the instance could
-    /// still reach it. Firing completes the join and routes its outgoing flow(s)
-    /// through the same conditional selection an inclusive split uses (a join that
-    /// is also a split re-evaluates its conditions). Enqueues the resulting
-    /// activations and returns whether it fired anything, so the caller re-runs
-    /// the drain loop.
-    fn fire_ready_inclusive_joins(
-        &mut self,
-        log: &mut Vec<Event>,
-        queue: &mut VecDeque<Step>,
-    ) -> bool {
-        // Snapshot the open joins that are inclusive gateways (deterministic
-        // order: by instance, then element id).
-        let mut candidates: Vec<(Key, String, Key)> = Vec::new();
-        for (instance_key, instance) in &self.state.instances {
-            for (element_id, join_eik) in &instance.join_instances {
-                if matches!(
-                    self.element_kind(*instance_key, element_id),
-                    Some(ElementKind::InclusiveGateway)
-                ) {
-                    candidates.push((*instance_key, element_id.clone(), *join_eik));
-                }
-            }
-        }
-        candidates.sort();
-
-        for (instance_key, element_id, join_eik) in candidates {
-            // Still open? (an earlier fire this pass may have reset a mutual
-            // dependency — re-check against live state).
-            if self.join_eik(instance_key, &element_id) != Some(join_eik) {
-                continue;
-            }
-            // A join already parked on an active incident awaits explicit
-            // incident *resolution* — it must not be opportunistically re-fired by
-            // this sweep just because a variable changed to make its selection
-            // satisfiable. Resolution re-drives `Step::Complete`
-            // (`complete_inclusive_gateway`), which is the single completion route
-            // for a parked join and clears its bookkeeping via
-            // `fire_open_inclusive_join`. Firing here instead would complete the
-            // element while leaving its incident stale (never resolved), i.e. the
-            // duplicate/stale-bookkeeping class this join path already guards
-            // against on the raise side.
-            if self.has_active_incident_on(instance_key, join_eik) {
-                continue;
-            }
-            // A join already resting in COMPLETING behind its `end`
-            // execution-listener chain must not be re-fired: its outgoing routing
-            // is deferred to `finalize_inclusive_gateway` when the chain drains.
-            // Its own resting token is excluded from `still_waiting` below, so
-            // without this guard the next sweep would mint a duplicate listener
-            // chain and double-route.
-            if self.has_pending_end_listener(instance_key, join_eik) {
-                continue;
-            }
-            // Any live token that could still reach the join blocks firing. The
-            // join's own resting instance carries the element id, so exclude it.
-            let reaching = self.elements_reaching(instance_key, &element_id);
-            let still_waiting = self
-                .state
-                .instances
-                .get(&instance_key)
-                .map(|instance| {
-                    instance.active.iter().any(|(eik, elid)| {
-                        *eik != join_eik && elid != &element_id && reaching.contains(elid)
-                    })
-                })
-                .unwrap_or(false);
-            if still_waiting {
-                continue;
-            }
-
-            let scope = self.scope_of(instance_key, join_eik);
-            let selected = match self.select_inclusive_flows(instance_key, &element_id) {
-                Ok(sel) => sel,
-                Err(reason) => {
-                    if !self.has_active_incident_on(instance_key, join_eik) {
-                        let incident_key = self.mint_key();
-                        self.emit(
-                            log,
-                            Event::IncidentRaised {
-                                incident_key,
-                                instance_key,
-                                element_instance_key: join_eik,
-                                element_id: element_id.clone(),
-                                kind: state::IncidentKind::ExpressionEvaluation,
-                                redrive: None,
-                                reason,
-                                job_key: None,
-                                created_at: self.now,
-                            },
-                        );
-                    }
-                    continue;
-                }
-            };
-            if selected.is_empty() {
-                if !self.has_active_incident_on(instance_key, join_eik) {
-                    let incident_key = self.mint_key();
-                    self.emit(
-                        log,
-                        Event::IncidentRaised {
-                            incident_key,
-                            instance_key,
-                            element_instance_key: join_eik,
-                            element_id: element_id.clone(),
-                            kind: state::IncidentKind::NoMatchingSequenceFlow,
-                            redrive: None,
-                            reason: format!(
-                                "no matching outgoing sequence flow at inclusive gateway \
-                                 '{element_id}'"
-                            ),
-                            job_key: None,
-                            created_at: self.now,
-                        },
-                    );
-                }
-                continue;
-            }
-
-            self.emit(
-                log,
-                Event::ElementCompleting {
-                    instance_key,
-                    element_instance_key: join_eik,
-                    element_id: element_id.clone(),
-                },
-            );
-            // End-listener gate (ADR 0037): if the join declares `end` execution
-            // listeners, defer its reset/outgoing routing behind that chain — the
-            // join rests in COMPLETING until the chain drains and redrives
-            // `finalize_inclusive_gateway`, which re-selects (a listener may have
-            // rewritten a condition variable) and routes. This mirrors the split
-            // path (`complete_inclusive_gateway`); without it a multi-incoming
-            // join would skip its listener job and any variable rewrite. The
-            // `has_pending_end_listener` guard above stops this sweep re-firing
-            // the parked join. `return true` keeps the fire-at-most-one-per-sweep
-            // invariant and makes the caller re-drain.
-            let vars = self.variables(instance_key);
-            if let Some(job) =
-                self.begin_end_listener_chain(instance_key, join_eik, &element_id, scope, &vars)
-            {
-                self.emit(log, job);
-                return true;
-            }
-            self.emit(
-                log,
-                Event::ElementCompleted {
-                    instance_key,
-                    element_instance_key: join_eik,
-                    element_id: element_id.clone(),
-                },
-            );
-            // Consume one token per incoming flow; a surplus reopens the join,
-            // and a later sweep fires it again once nothing can still reach it.
-            let arrivals = self.join_arrivals(instance_key, &element_id);
-            let mut fired = Vec::new();
-            self.fire_join(instance_key, &element_id, scope, arrivals, &mut fired);
-            for event in fired {
-                self.emit(log, event);
-            }
-            for flow_index in selected {
-                let (event, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
-                self.emit(log, event);
-                queue.push_back(step);
-            }
-            // Fire at most one join per sweep. A fired join's outgoing token is
-            // only *queued* here (`state.active` is not updated until the caller
-            // drains that queue), so continuing to another candidate in this same
-            // pass would evaluate its `elements_reaching` guard against stale
-            // `active` — a chained downstream join (`J1 -> J2`) would see no live
-            // token reaching it and fire prematurely on an incomplete set, then
-            // reopen when the queued upstream token finally arrives. Returning now
-            // makes the caller drain the queue (registering the token in
-            // `state.active`) and re-run this sweep, so each downstream join only
-            // fires once its upstream token has genuinely arrived.
-            return true;
-        }
-        false
+        (self.incoming_count(instance_key, element_id) > 1).then_some(join)
     }
 
     /// Take `from`'s `index`-th outgoing sequence flow: the
     /// [`Event::SequenceFlowTaken`] fact plus the activation of its target,
-    /// carrying the flow's [`IncomingFlow`] identity so a parallel join counts
-    /// distinct incoming flows (#1233). Every sequence flow the engine takes is
-    /// built here, so no taker can drop the identity.
-    fn take_flow(&self, instance_key: Key, from: &str, index: usize, scope: Key) -> (Event, Step) {
+    /// carrying the flow's [`IncomingFlow`] identity. A flow into a join is
+    /// counted onto the join here, when it is taken, as Zeebe's
+    /// `ProcessInstanceSequenceFlowTakenApplier` does, so the join's guard sees
+    /// every flow taken before its activation is processed (#1233, #1241).
+    /// Every sequence flow the engine takes is built here, so no taker can drop
+    /// the identity or the count.
+    fn take_flow(
+        &self,
+        instance_key: Key,
+        from: &str,
+        index: usize,
+        scope: Key,
+    ) -> (Vec<Event>, Step) {
         let (to, flow) = self
             .process_of_instance(instance_key)
             .and_then(|p| p.incoming_flow(from, index))
             .expect("a taken flow is an outgoing flow of `from` in the instance's definition");
-        (
-            Event::SequenceFlowTaken {
+        let mut events = vec![Event::SequenceFlowTaken {
+            instance_key,
+            from: from.to_string(),
+            to: to.clone(),
+        }];
+        if self.join_kind(instance_key, &to).is_some() {
+            events.push(Event::ParallelJoinTokenArrived {
                 instance_key,
-                from: from.to_string(),
-                to: to.clone(),
-            },
+                element_id: to.clone(),
+                flow: Some(flow.clone()),
+            });
+        }
+        (
+            events,
             Step::Activate {
                 instance_key,
                 element_id: to,
@@ -11514,85 +11251,178 @@ impl Engine {
 
     /// [`Engine::take_flow`] for every outgoing flow of `from`, in document
     /// order (a pass-through element or a parallel split).
-    fn take_all_flows(&self, instance_key: Key, from: &str, scope: Key) -> Vec<(Event, Step)> {
+    fn take_all_flows(&self, instance_key: Key, from: &str, scope: Key) -> Vec<(Vec<Event>, Step)> {
         (0..self.outgoing(instance_key, from).len())
             .map(|index| self.take_flow(instance_key, from, index, scope))
             .collect()
     }
 
-    /// A token reached a parallel-gateway join over `via`. The join fires once
-    /// every incoming flow has been taken at least once; firing consumes one
-    /// token per flow and keeps any surplus for the next activation. This is
-    /// Zeebe's taken-sequence-flow bookkeeping
-    /// (`ProcessInstanceStateTransitionGuard.canActivateParallelGateway` and the
-    /// "Tetris principle" in `ProcessInstanceElementActivatingV3Applier`, #1233).
+    /// A join's activation: Zeebe's `ACTIVATE_ELEMENT` for a parallel or
+    /// inclusive gateway, guarded as in `ProcessInstanceStateTransitionGuard`
+    /// (`canActivateParallelGateway` / `canActivateInclusiveGateway`). A flow's
+    /// token was counted when the flow was taken ([`Engine::take_flow`]); an
+    /// activation that did not come over a flow is counted here, unidentified.
     ///
-    /// A surplus token is still waiting, so after firing the join re-opens with
-    /// a fresh element instance holding it. That keeps the instance alive, as
-    /// Zeebe's active-sequence-flow count does.
-    fn arrive_at_parallel_join(
+    /// - A parallel join is accepted once every incoming flow has been taken.
+    /// - An inclusive join is accepted once every incoming flow has been taken,
+    ///   or once at least one has and no live path can still reach it
+    ///   ([`Engine::has_active_path_to`]).
+    ///
+    /// An accepted join activates, consumes one token per taken flow and keeps
+    /// the surplus (Zeebe's "Tetris principle",
+    /// `ProcessInstanceElementActivatingV3Applier`), then completes and routes.
+    /// A rejected activation changes nothing; tokens still counted wait on an
+    /// open join instance, which keeps the process instance alive as Zeebe's
+    /// active-sequence-flow count does. The guard runs only here, so a join is
+    /// re-evaluated only when another activation reaches it: a surplus nothing
+    /// follows, or a competing path that ends elsewhere, strands the waiting
+    /// tokens exactly as in Zeebe.
+    fn activate_join(
         &mut self,
         instance_key: Key,
         element_id: String,
         scope: Key,
         via: Option<IncomingFlow>,
+        join: JoinKind,
+        pending: &VecDeque<Step>,
     ) -> (Vec<Event>, Vec<Step>) {
-        let threshold = self.incoming_count(instance_key, &element_id);
-        let (mut arrivals, unidentified) = self
+        let mut events = Vec::new();
+        let mut unidentified = self
             .state
             .instances
             .get(&instance_key)
-            .map(|i| {
-                (
-                    i.join_flow_arrivals
-                        .get(&element_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                    i.join_counts.get(&element_id).copied().unwrap_or(0),
-                )
-            })
-            .unwrap_or_default();
-        // Simulate the arrival with the same bookkeeping the applier runs.
-        let unidentified = match &via {
-            Some(flow) => {
-                arrivals.record(flow);
-                unidentified
-            }
-            None => unidentified + 1,
-        };
-        let fires = arrivals.distinct_flows() + unidentified >= threshold;
-
-        let mut events = Vec::new();
-        let open_eik = match self.join_eik(instance_key, &element_id) {
-            Some(eik) => eik,
-            None => self.open_join(instance_key, &element_id, scope, &mut events),
-        };
-        events.push(Event::ParallelJoinTokenArrived {
-            instance_key,
-            element_id: element_id.clone(),
-            flow: via,
-        });
-
-        let mut followups = Vec::new();
-        if fires {
-            events.push(Event::ElementCompleting {
+            .and_then(|i| i.join_counts.get(&element_id).copied())
+            .unwrap_or(0);
+        if via.is_none() {
+            events.push(Event::ParallelJoinTokenArrived {
                 instance_key,
-                element_instance_key: open_eik,
                 element_id: element_id.clone(),
+                flow: None,
             });
-            events.push(Event::ElementCompleted {
-                instance_key,
-                element_instance_key: open_eik,
-                element_id: element_id.clone(),
-            });
-            self.fire_join(instance_key, &element_id, scope, arrivals, &mut events);
-            for (event, step) in self.take_all_flows(instance_key, &element_id, scope) {
-                events.push(event);
-                followups.push(step);
+            unidentified += 1;
+        }
+        let arrivals = self.join_arrivals(instance_key, &element_id);
+        let taken = arrivals.distinct_flows() + unidentified;
+        let all_taken = taken >= self.incoming_count(instance_key, &element_id);
+        let accepted = match join {
+            JoinKind::Parallel => all_taken,
+            JoinKind::Inclusive => {
+                all_taken
+                    || (taken > 0
+                        && !self.has_active_path_to(
+                            instance_key,
+                            &element_id,
+                            scope,
+                            &arrivals,
+                            pending,
+                        ))
             }
+        };
+
+        let open = self.join_eik(instance_key, &element_id);
+        if !accepted {
+            if taken > 0 && open.is_none() {
+                self.open_join(instance_key, &element_id, scope, &mut events);
+            }
+            return (events, Vec::new());
         }
 
+        // The accepted activation takes over the join instance holding the
+        // waiting tokens, or activates a fresh one if none waited.
+        let element_instance_key = match open {
+            Some(eik) => eik,
+            None => {
+                let eik = self.mint_key();
+                events.push(Event::ElementActivating {
+                    instance_key,
+                    element_instance_key: eik,
+                    element_id: element_id.clone(),
+                });
+                events.push(Event::ElementActivated {
+                    instance_key,
+                    element_instance_key: eik,
+                    element_id: element_id.clone(),
+                    scope,
+                });
+                eik
+            }
+        };
+        self.fire_join(instance_key, &element_id, scope, arrivals, &mut events);
+
+        let followups = match join {
+            JoinKind::Parallel => {
+                events.push(Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                });
+                events.push(Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                });
+                let mut followups = Vec::new();
+                for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
+                    events.extend(taken);
+                    followups.push(step);
+                }
+                followups
+            }
+            JoinKind::Inclusive => {
+                let (routed, followups) = self.route_inclusive_gateway(
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    scope,
+                );
+                events.extend(routed);
+                followups
+            }
+        };
         (events, followups)
+    }
+
+    /// Zeebe's `BpmnInclusiveGatewayBehavior.hasActivePathToTheGateway`: can a
+    /// live token in the join's flow scope still reach it? The sources are the
+    /// scope's active element instances other than the join's own, plus the
+    /// targets of flows taken but not yet activated (Zeebe's active sequence
+    /// flows; here the flow activations still queued in `pending`). From each,
+    /// the search follows outgoing flows, an activity's boundary events and a
+    /// link throw's catch, and skips the join's incoming flows already in
+    /// `taken`: every incoming flow needs to be taken only once.
+    fn has_active_path_to(
+        &self,
+        instance_key: Key,
+        join: &str,
+        scope: Key,
+        taken: &state::FlowArrivals,
+        pending: &VecDeque<Step>,
+    ) -> bool {
+        let (Some(process), Some(instance)) = (
+            self.process_of_instance(instance_key),
+            self.state.instances.get(&instance_key),
+        ) else {
+            return false;
+        };
+        let active = instance
+            .active
+            .iter()
+            .filter(|(eik, id)| id.as_str() != join && self.scope_of(instance_key, **eik) == scope)
+            .map(|(_, id)| id.as_str());
+        let in_transit = pending.iter().filter_map(|step| match step {
+            Step::Activate {
+                instance_key: key,
+                element_id,
+                scope: step_scope,
+                via: Some(_),
+            } if *key == instance_key && *step_scope == scope && element_id != join => {
+                Some(element_id.as_str())
+            }
+            _ => None,
+        });
+        active
+            .chain(in_transit)
+            .any(|source| path_reaches_join(process, source, join, taken))
     }
 
     /// A join fires: [`Event::ParallelJoinFired`] consumes one token per incoming
@@ -12504,6 +12334,57 @@ impl OwnedByInstance for state::Incident {
 /// The sorted set of root variable names a conditional event's FEEL `condition`
 /// references, used both to record the subscription's dependencies and to decide
 /// which variable changes re-evaluate it. Sorted for a deterministic event body.
+/// The breadth-first search of Zeebe's `BpmnInclusiveGatewayBehavior`: can a
+/// token at `source` reach `join`? It follows outgoing sequence flows, the
+/// boundary events attached to an element, and a link throw's same-named catch
+/// in the same scope. It skips the join's incoming flows already in `taken`, so
+/// a path that ends on a taken flow does not hold the join.
+fn path_reaches_join(
+    process: &crate::model::ProcessDefinition,
+    source: &str,
+    join: &str,
+    taken: &state::FlowArrivals,
+) -> bool {
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut to_visit: VecDeque<&str> = VecDeque::from([source]);
+    while let Some(node) = to_visit.pop_front() {
+        if node == join {
+            return true;
+        }
+        if !visited.insert(node) {
+            continue;
+        }
+        let Some(element) = process.element(node) else {
+            continue;
+        };
+        if let ElementKind::LinkIntermediateThrowEvent { link_name } = &element.kind {
+            to_visit.extend(process.elements.values().filter_map(|other| {
+                matches!(&other.kind, ElementKind::LinkIntermediateCatchEvent { link_name: name }
+                    if name == link_name && other.parent == element.parent)
+                .then_some(other.id.as_str())
+            }));
+            continue;
+        }
+        for (index, flow) in element.outgoing.iter().enumerate() {
+            let taken_into_join = flow.to == join
+                && process
+                    .incoming_flow(node, index)
+                    .is_some_and(|(_, incoming)| taken.count(&incoming) > 0);
+            if !taken_into_join {
+                to_visit.push_back(flow.to.as_str());
+            }
+        }
+        to_visit.extend(process.elements.values().filter_map(|other| {
+            other
+                .kind
+                .attached_to()
+                .is_some_and(|host| host == node)
+                .then_some(other.id.as_str())
+        }));
+    }
+    false
+}
+
 fn sorted_referenced_vars(condition: &str) -> Vec<String> {
     let mut vars: Vec<String> = crate::feel::referenced_variables(condition)
         .into_iter()
@@ -12686,12 +12567,12 @@ pub enum EngineError {
         source_element_id: String,
         target_element_id: String,
     },
-    /// A `MigrateInstance` mapped an already-open parallel-gateway *join* (a
-    /// token has arrived on some but not all of its incoming flows) onto a
-    /// target gateway with a different number of incoming sequence flows. The
-    /// join's partial arrival count is compared against the target definition's
-    /// incoming-flow count at fire time, so a mismatch would early-fire or
-    /// deadlock the migrated join. Maps to HTTP 409.
+    /// A `MigrateInstance` mapped an already-open join (a token has arrived on
+    /// some but not all of its incoming flows) onto a target gateway with a
+    /// different number of incoming sequence flows, where the join's partial
+    /// count would be re-read against the target's arity: every open parallel
+    /// join, and an inclusive join holding unidentified arrivals (#1241). A
+    /// mismatch would early-fire or deadlock the migrated join. Maps to HTTP 409.
     MigratedParallelJoinArityChanged {
         instance_key: Key,
         source_element_id: String,
@@ -13014,7 +12895,7 @@ impl std::fmt::Display for EngineError {
             } => {
                 write!(
                     f,
-                    "migration of instance {instance_key} maps open parallel-join {source_element_id} \
+                    "migration of instance {instance_key} maps open join {source_element_id} \
                      ({source_incoming_count} incoming flows) to {target_element_id} \
                      ({target_incoming_count} incoming flows); an in-flight join can only map to a \
                      gateway with the same number of incoming sequence flows"

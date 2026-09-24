@@ -37,6 +37,7 @@ EXPECTED=(
   "MCInclusiveDiamond          pass"
   "MCChainedInclusive          pass"
   "MCInclusiveInParallel       pass"
+  "MCInclusiveInTransit        pass"
   "MCExclusiveLoop             pass"
   "MCParallelDuplicateFlows    pass"
   # Unsound: two tokens on M->J, one on T->J. J fires once and, as in Zeebe, the
@@ -45,10 +46,15 @@ EXPECTED=(
   # Not 1-safe: every flow into J is taken twice, so J fires twice, keeping the
   # surplus between firings ("Tetris" principle), and the instance completes.
   "MCParallelJoinSurplus       violates:JoinFiresAtMostOnce"
-  # Not 1-safe: two tokens on XA->J, one on B->J. Inclusive J fires once, then
-  # again on the surplus once nothing can reach it, and the instance completes.
-  # Before #1237 the first firing discarded the surplus.
-  "MCInclusiveJoinSurplus      violates:JoinFiresAtMostOnce"
+  # Not 1-safe: two tokens on XA->J, one on B->J. As in Zeebe (#1241), J fires
+  # twice when B's token is not last (the instance completes), and strands the
+  # surplus when both XA tokens arrive first. Before #1237 the first firing
+  # discarded the surplus; before #1241 a quiescence sweep fired it again.
+  "MCInclusiveJoinSurplus      violates:JoinFiresAtMostOnce,NoStuckInstance,Termination"
+  # Sound in Zeebe's reading, but not live: when A arrives while B is live and
+  # X then routes away from J, J is never re-evaluated and waits forever,
+  # exactly as in Zeebe (#1241).
+  "MCInclusiveDivergentPath    violates:NoStuckInstance,Termination"
 )
 
 # Every model is checked against the same, full property set. The generated
