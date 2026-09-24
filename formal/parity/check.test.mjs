@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { CORPUS, evaluate, globToRegExp, markdownReport, tally } from './check.mjs';
+import { CORPUS, evaluate, globToRegExp, markdownReport, shrinkGaps, tally } from './check.mjs';
 
 const RS = 'engine-core/src/engine/tests/lifecycle.rs';
 const FILES = {
@@ -18,7 +18,10 @@ const FILES = {
 const fs = { exists: (p) => p in FILES, read: (p) => FILES[p] };
 const PIN = { repository: 'r', ref: 'stable/x', sha: 'abc' };
 const surface = (...ids) => ({ zeebe: { ...PIN }, cells: ids.map((id) => ({ id, sources: ['s'] })) });
-const check = (ids, rules) => evaluate(surface(...ids), { reviewedAt: 'abc', rules }, fs, PIN).errors;
+// Unless a test is about the ratchet, the baseline is exactly the cells gap rules claim.
+const gapsOf = (ids, rules) =>
+  ids.filter((id) => rules.find((r) => typeof r?.match === 'string' && globToRegExp(r.match).test(id))?.status === 'gap').sort();
+const check = (ids, rules, gaps = gapsOf(ids, rules)) => evaluate(surface(...ids), { reviewedAt: 'abc', rules }, fs, gaps, PIN).errors;
 
 const tested = { status: 'nano-tested', evidence: [`${RS}::runs_a_task`] };
 const gap = { status: 'gap', issue: 1249, note: 'later' };
@@ -39,7 +42,7 @@ test('an unmapped cell fails — including one a Zeebe bump adds', () => {
 test('a dead rule fails, and the first matching rule wins', () => {
   const errors = check(['element:Task'], [{ match: 'element:*', ...gap }, { match: 'element:Task', ...tested }]);
   assert.deepEqual(errors, ['dead rule (claims no cell): element:Task']);
-  const { assignments } = evaluate(surface('element:Task'), { rules: [{ match: 'element:*', ...gap }] }, fs);
+  const { assignments } = evaluate(surface('element:Task'), { rules: [{ match: 'element:*', ...gap }] }, fs, ['element:Task']);
   assert.equal(assignments.get('element:Task'), 'gap');
 });
 
@@ -82,24 +85,41 @@ test('gap and out-of-scope need an issue and a note, and take no evidence', () =
 test('malformed rules fail', () => {
   assert.match(check(['element:Task'], [{ match: 'element:Task', ...tested, why: 'x' }])[0], /unknown key 'why'/);
   assert.match(check(['element:Task'], [{ match: 'element:Task', status: 'done' }])[0], /status must be one of/);
-  assert.deepEqual(evaluate(surface('element:Task'), {}, fs).errors, ['coverage.json must have a rules array', 'unmapped cell: element:Task']);
+  assert.deepEqual(evaluate(surface('element:Task'), {}, fs, []).errors, ['coverage.json must have a rules array', 'unmapped cell: element:Task']);
 });
 
 test('a surface extracted from another Zeebe repository, ref or revision fails', () => {
   for (const k of ['repository', 'ref', 'sha']) {
-    const errors = evaluate(surface('element:Task'), { reviewedAt: 'abc', rules: [{ match: '*', ...gap }] }, fs, { ...PIN, [k]: 'other' }).errors;
+    const errors = evaluate(surface('element:Task'), { reviewedAt: 'abc', rules: [{ match: '*', ...gap }] }, fs, ['element:Task'], { ...PIN, [k]: 'other' }).errors;
     assert.match(errors[0], /regenerate it$/, k);
   }
 });
 
-test('a pin bump fails until coverage.json is reviewed at the new pin, even when wildcards map every new cell', () => {
+test('a pin bump fails until coverage.json is reviewed at the new pin', () => {
   const rules = [{ match: 'intent:*', ...gap }];
   const bumped = { ...PIN, sha: 'new' };
-  const s = { zeebe: bumped, cells: [{ id: 'intent:Job:CREATED', sources: ['s'] }, { id: 'intent:Job:NEW', sources: ['s'] }] };
-  const errors = evaluate(s, { reviewedAt: 'abc', rules }, fs, bumped).errors;
-  assert.equal(errors.length, 1);
+  const s = { zeebe: bumped, cells: [{ id: 'intent:Job:CREATED', sources: ['s'] }] };
+  const errors = evaluate(s, { reviewedAt: 'abc', rules }, fs, ['intent:Job:CREATED'], bumped).errors;
+  assert.deepEqual(errors.length, 1);
   assert.match(errors[0], /reviewed at abc, but zeebe-pin.json pins new/);
-  assert.deepEqual(evaluate(s, { reviewedAt: 'new', rules }, fs, bumped).errors, []);
+  assert.deepEqual(evaluate(s, { reviewedAt: 'new', rules }, fs, ['intent:Job:CREATED'], bumped).errors, []);
+});
+
+test('the gap ratchet: a new cell cannot hide under a wildcard gap, and the baseline only shrinks', () => {
+  const rules = [{ match: 'element:Task', ...tested }, { match: 'intent:*', ...gap }];
+  const ids = ['element:Task', 'intent:Job:CREATED', 'intent:Job:NEW'];
+  // A bump adds intent:Job:NEW: the wildcard claims it, but it is not in the baseline.
+  assert.deepEqual(check(ids, rules, ['intent:Job:CREATED']), [
+    'new gap cell: intent:Job:NEW is not in the gaps.json baseline; give it evidence or an out-of-scope rule',
+  ]);
+  // A baseline cell that gained evidence, or left the surface, must be dropped.
+  assert.match(check(ids, rules, ['element:Task', 'intent:Job:CREATED', 'intent:Job:NEW'])[0], /lists element:Task, now nano-tested/);
+  assert.match(check(ids.slice(0, 2), rules, ['intent:Job:CREATED', 'intent:Job:NEW'])[0], /lists intent:Job:NEW, which is no longer a mapped cell/);
+  assert.match(check(ids, rules, ['intent:Job:NEW', 'intent:Job:CREATED'])[0], /sorted and unique/);
+  assert.deepEqual(evaluate(surface('element:Task'), { rules: [{ match: '*', ...tested }] }, fs, undefined).errors, ['gaps.json must have a cells array']);
+  // --update-gaps shrinks the baseline but never grows it.
+  const { assignments } = evaluate(surface(...ids), { rules }, fs, []);
+  assert.deepEqual(shrinkGaps(assignments, ['element:Task', 'intent:Job:CREATED', 'intent:Job:GONE']), ['intent:Job:CREATED']);
 });
 
 test('globs treat only * as a wildcard', () => {
@@ -112,6 +132,7 @@ test('the report tallies statuses per family', () => {
     surface('element:Task', 'intent:Job:CREATED', 'intent:Job:COMPLETED'),
     { rules: [{ match: 'element:*', ...tested }, { match: 'intent:*', ...gap }] },
     fs,
+    ['intent:Job:COMPLETED', 'intent:Job:CREATED'],
   );
   const counts = tally(assignments);
   assert.deepEqual(counts.intent, { parity: 0, 'nano-tested': 0, gap: 2, 'out-of-scope': 0 });
@@ -125,6 +146,6 @@ test('the committed coverage.json maps the committed surface', () => {
   const root = join(here, '..', '..');
   const load = (f) => JSON.parse(readFileSync(join(here, f), 'utf8'));
   const repo = { exists: (p) => existsSync(join(root, p)), read: (p) => readFileSync(join(root, p), 'utf8') };
-  const { errors } = evaluate(load('zeebe-surface.json'), load('coverage.json'), repo, load('zeebe-pin.json'));
+  const { errors } = evaluate(load('zeebe-surface.json'), load('coverage.json'), repo, load('gaps.json').cells, load('zeebe-pin.json'));
   assert.deepEqual(errors, []);
 });

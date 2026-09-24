@@ -8,18 +8,22 @@
 //                Zeebe verdict (accept/reject — a `diverge` fixture is not parity)
 //                that declare each claimed cell in `<!-- zeebe-cells: … -->`
 //   nano-tested  evidence: `path::test_fn`, the test must exist in that file
-//   gap          issue: the tracking issue that closes the gap
+//   gap          issue: the tracking issue that closes the gap. Ratcheted:
+//                only cells frozen in `gaps.json` may be gaps, so a cell a pin
+//                bump adds cannot hide under a wildcard, and the baseline may
+//                only shrink (`--update-gaps` never adds to it)
 //   out-of-scope issue + note: why the cell has no Nano meaning
 //
 // Fails on an unmapped cell, a dead rule (claims no cell), unverifiable
 // evidence, a malformed rule, or a surface extracted from a different Zeebe
 // revision than `zeebe-pin.json`, or a `coverage.json` not yet reviewed at that
-// revision (`reviewedAt`). Prints per-family counts, and appends a
-// Markdown table to $GITHUB_STEP_SUMMARY when set.
+// revision (`reviewedAt`), or a `gaps.json` out of step with the gap cells.
+// Prints per-family counts, and appends a Markdown table to
+// $GITHUB_STEP_SUMMARY when set.
 //
-// Usage: node formal/parity/check.mjs
+// Usage: node formal/parity/check.mjs [--update-gaps]
 
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -94,11 +98,11 @@ export function ruleProblems(rule, fs) {
 }
 
 /**
- * Check `coverage` against `surface` (and, when given, the `pin`).
- * Returns `{ errors, assignments }`, where `assignments` maps each cell id to
- * the status of the first rule claiming it.
+ * Check `coverage` against `surface`, the `gaps` baseline (`gaps.json`'s cell
+ * list) and, when given, the `pin`. Returns `{ errors, assignments }`, where
+ * `assignments` maps each cell id to the status of the first rule claiming it.
  */
-export function evaluate(surface, coverage, fs, pin) {
+export function evaluate(surface, coverage, fs, gaps, pin) {
   const errors = [];
   if (pin) {
     const id = (z) => `${z?.repository}@${z?.ref}(${z?.sha})`;
@@ -106,8 +110,8 @@ export function evaluate(surface, coverage, fs, pin) {
       errors.push(`zeebe-surface.json was extracted from ${id(surface?.zeebe)}, but zeebe-pin.json pins ${id(pin)}: regenerate it`);
     }
   }
-  // Broad `gap` rules would silently absorb the cells a pin bump adds; this
-  // makes every bump an explicit review of the new cells.
+  // Every bump is an explicit review of the surface diff, including cells whose
+  // detail changed; the gap ratchet below separately stops new cells hiding.
   if (pin && coverage?.reviewedAt !== pin.sha) {
     errors.push(`coverage.json was reviewed at ${coverage?.reviewedAt}, but zeebe-pin.json pins ${pin.sha}: review the new cells in the zeebe-surface.json diff, map them, then set reviewedAt`);
   }
@@ -146,7 +150,40 @@ export function evaluate(surface, coverage, fs, pin) {
       if (!declared.has(c)) errors.push(`rule ${JSON.stringify(r.match)}: no evidence fixture declares ${c}`);
     }
   });
+  errors.push(...gapProblems(assignments, gaps));
   return { errors, assignments };
+}
+
+/** The gap ratchet: gap cells and the `gaps.json` baseline must agree exactly. */
+export function gapProblems(assignments, gaps) {
+  if (!Array.isArray(gaps)) return ['gaps.json must have a cells array'];
+  const errors = [];
+  const sorted = [...new Set(gaps)].sort();
+  if (sorted.length !== gaps.length || sorted.some((c, i) => c !== gaps[i])) {
+    errors.push('gaps.json cells must be sorted and unique: run check.mjs --update-gaps');
+  }
+  const baseline = new Set(gaps);
+  for (const [id, status] of assignments) {
+    if (status === 'gap' && !baseline.has(id)) {
+      errors.push(`new gap cell: ${id} is not in the gaps.json baseline; give it evidence or an out-of-scope rule`);
+    }
+  }
+  for (const id of baseline) {
+    const status = assignments.get(id);
+    if (status === 'gap') continue;
+    errors.push(
+      status === undefined
+        ? `gaps.json lists ${id}, which is no longer a mapped cell: run check.mjs --update-gaps`
+        : `gaps.json lists ${id}, now ${status}: run check.mjs --update-gaps to shrink the baseline`,
+    );
+  }
+  return errors;
+}
+
+/** The shrunk baseline: current gap cells that were already in it. */
+export function shrinkGaps(assignments, gaps) {
+  const baseline = new Set(gaps);
+  return [...assignments].filter(([id, s]) => s === 'gap' && baseline.has(id)).map(([id]) => id).sort();
 }
 
 /** Per-family status counts: `{ family: { status: n } }`. */
@@ -188,7 +225,16 @@ function main() {
     read: (p) => readFileSync(join(root, p), 'utf8'),
   };
   const surface = load('zeebe-surface.json');
-  const { errors, assignments } = evaluate(surface, load('coverage.json'), fs, load('zeebe-pin.json'));
+  const gapsFile = load('gaps.json');
+  const coverage = load('coverage.json');
+  if (process.argv.includes('--update-gaps')) {
+    const { assignments } = evaluate(surface, coverage, fs, gapsFile.cells);
+    const cells = shrinkGaps(assignments, gapsFile.cells);
+    writeFileSync(join(here, 'gaps.json'), `${JSON.stringify({ ...gapsFile, cells }, null, 2)}\n`);
+    console.log(`gaps.json: ${gapsFile.cells.length} -> ${cells.length} cells`);
+    return;
+  }
+  const { errors, assignments } = evaluate(surface, coverage, fs, gapsFile.cells, load('zeebe-pin.json'));
   const report = markdownReport(tally(assignments), surface);
   process.stdout.write(report);
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, report);
