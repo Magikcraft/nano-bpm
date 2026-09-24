@@ -7,7 +7,9 @@
 //   parity       evidence: conformance-corpus fixtures carrying a captured
 //                Zeebe verdict (accept/reject — a `diverge` fixture is not parity)
 //                that declare each claimed cell in `<!-- zeebe-cells: … -->`
-//   nano-tested  evidence: `path::test_fn`, the test must exist in that file
+//   nano-tested  evidence: `path::test_fn`, a `#[test]` in that file whose
+//                attribute block declares each claimed cell in
+//                `// zeebe-cells: …`
 //   gap          issue: the tracking issue that closes the gap. Ratcheted:
 //                only cells frozen in `gaps.json` may be gaps, so a cell a pin
 //                bump adds cannot hide under a wildcard, and the baseline may
@@ -44,6 +46,30 @@ export function globToRegExp(glob) {
 export function fixtureCells(text) {
   const m = /<!--\s*zeebe-cells:\s*([\s\S]*?)\s*-->/.exec(text);
   return m ? m[1].split(/\s+/).filter(Boolean) : [];
+}
+
+/**
+ * The cell ids a `#[test] fn name` declares (`// zeebe-cells: …` among the
+ * comment and attribute lines directly above the fn).
+ */
+export function testCells(text, name) {
+  const lines = text.split('\n');
+  const fn = lines.findIndex((l) => new RegExp(`\\bfn\\s+${name}\\s*\\(`).test(l));
+  const out = [];
+  for (let i = fn - 1; i >= 0 && /^\s*(#\[|\/\/)/.test(lines[i]); i--) {
+    const m = /^\s*\/\/\s*zeebe-cells:\s*(.*)$/.exec(lines[i]);
+    if (m) out.push(...m[1].split(/\s+/).filter(Boolean));
+  }
+  return out;
+}
+
+/** Cells an evidence reference declares, or null if it cannot be read. */
+function declaredCells(status, ref, fs) {
+  if (typeof ref !== 'string') return null;
+  if (status === 'parity') return fs.exists(ref) ? fixtureCells(fs.read(ref)) : null;
+  const sep = ref.indexOf('::');
+  const path = ref.slice(0, sep);
+  return sep > 0 && fs.exists(path) ? testCells(fs.read(path), ref.slice(sep + 2)) : null;
 }
 
 /** Problems with one evidence reference, given repo-file access `fs`. */
@@ -133,13 +159,13 @@ export function evaluate(surface, coverage, fs, gaps, pin) {
   const known = new Set(surface.cells.map((c) => c.id));
   rules.forEach((r, k) => {
     if (matchers[k] !== null && claims[k].length === 0) errors.push(`dead rule (claims no cell): ${r.match}`);
-    // A parity claim is only as good as its fixtures: each claimed cell must be
-    // one a fixture declares it exercises, and a fixture may only declare real cells.
-    if (r?.status !== 'parity' || !Array.isArray(r.evidence)) return;
+    // A claim is only as good as its evidence: each claimed cell must be one a
+    // fixture or test declares it exercises, and evidence may only declare real cells.
+    if (!['parity', 'nano-tested'].includes(r?.status) || !Array.isArray(r.evidence)) return;
     const declared = new Set();
     for (const ref of r.evidence) {
-      if (typeof ref !== 'string' || !fs.exists(ref)) continue;
-      const cells = fixtureCells(fs.read(ref));
+      const cells = declaredCells(r.status, ref, fs);
+      if (cells === null) continue;
       if (cells.length === 0) errors.push(`rule ${JSON.stringify(r.match)}: ${ref} declares no zeebe-cells`);
       for (const c of cells) {
         if (!known.has(c)) errors.push(`${ref} declares a cell not in zeebe-surface.json: ${c}`);
@@ -147,7 +173,7 @@ export function evaluate(surface, coverage, fs, gaps, pin) {
       }
     }
     for (const c of claims[k]) {
-      if (!declared.has(c)) errors.push(`rule ${JSON.stringify(r.match)}: no evidence fixture declares ${c}`);
+      if (!declared.has(c)) errors.push(`rule ${JSON.stringify(r.match)}: no evidence declares ${c}`);
     }
   });
   errors.push(...gapProblems(assignments, gaps));

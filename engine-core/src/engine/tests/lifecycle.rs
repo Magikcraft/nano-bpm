@@ -947,6 +947,7 @@ fn bpmn_rejects_linked_resource_missing_required_attributes() {
     assert_eq!(linked_resources[0].link_name, "");
 }
 
+// zeebe-cells: element:ScriptTask
 #[test]
 fn inline_script_task_evaluates_feel_and_writes_result_variable() {
     // A zeebe:script script task evaluates its FEEL expression on activation,
@@ -1290,6 +1291,7 @@ fn should_recover_an_open_message_subscription_via_replay() {
     assert!(recovered.is_completed(instance_key));
 }
 
+// zeebe-cells: element:EndEvent element:StartEvent event:end:none
 #[test]
 fn should_complete_immediately_when_no_task() {
     let def = ProcessBuilder::new("noop")
@@ -1310,6 +1312,7 @@ fn should_complete_immediately_when_no_task() {
     assert!(events.contains(&Event::ProcessInstanceCompleted { instance_key }));
 }
 
+// zeebe-cells: element:ParallelGateway
 #[test]
 fn should_run_parallel_split_and_join() {
     // s -> split =< a, b >= join -> e   (a and b are service tasks)
@@ -2066,6 +2069,7 @@ fn terminate_clears_open_parallel_join_bookkeeping() {
     );
 }
 
+// zeebe-cells: element:ExclusiveGateway element:SequenceFlow
 #[test]
 fn should_route_exclusive_gateway_by_variable() {
     let mut engine = Engine::new();
@@ -6212,6 +6216,7 @@ fn agent_instance_complete_on_unknown_instance_is_rejected() {
 
 /// A link throw hands its token to the matching catch *by name*, so multiple
 /// distinct link pairs in one model each route to their own catch.
+// zeebe-cells: element:IntermediateThrowEvent event:intermediate-throw:link
 #[test]
 fn link_events_route_by_matching_name() {
     let xml = r#"

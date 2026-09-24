@@ -607,6 +607,7 @@ fn activated_job_omits_linked_resources_header_when_nothing_resolves() {
     );
 }
 
+// zeebe-cells: element:ServiceTask
 #[test]
 fn should_park_on_service_task_then_complete_on_job() {
     let mut engine = Engine::new();
@@ -1538,6 +1539,7 @@ fn job_type_expression_resolves_against_the_enclosing_sub_process_scope() {
         .is_empty());
 }
 
+// zeebe-cells: element:BusinessRuleTask
 #[test]
 fn business_rule_task_evaluates_decision_and_binds_result_variable() {
     let mut engine = Engine::new();

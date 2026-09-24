@@ -329,6 +329,7 @@ fn should_create_a_user_task_assigned_when_assignee_expression_is_a_string() {
     );
 }
 
+// zeebe-cells: element:UserTask
 #[test]
 fn should_link_a_user_task_to_its_deployed_form_key() {
     use crate::command::FormResource;

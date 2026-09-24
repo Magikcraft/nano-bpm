@@ -1,6 +1,7 @@
 //! `call_activity` engine tests (slice 7 of #1201), extracted verbatim.
 use super::*;
 
+// zeebe-cells: event:end:terminate
 #[test]
 fn subprocess_terminate_end_terminates_a_call_activity_child_in_its_scope() {
     // A terminate end inside a sub-process must also reap a call-activity CHILD
@@ -705,6 +706,7 @@ fn inline_call_activities_rejects_unknown_and_cyclic_callees() {
         .contains("cycle"));
 }
 
+// zeebe-cells: element:CallActivity
 #[test]
 fn a_call_activity_spawns_a_distinct_child_process_instance_with_parent_linkage() {
     // Native execution (Zeebe parity): a call activity does NOT inline the

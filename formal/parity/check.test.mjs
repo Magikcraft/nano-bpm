@@ -9,7 +9,7 @@ import { CORPUS, evaluate, globToRegExp, markdownReport, shrinkGaps, tally } fro
 
 const RS = 'engine-core/src/engine/tests/lifecycle.rs';
 const FILES = {
-  [RS]: '#[test]\nfn runs_a_task() {}\n\nfn helper() {}\n',
+  [RS]: '// zeebe-cells: element:Task\n#[test]\nfn runs_a_task() {}\n\n#[test]\n#[ignore]\n// zeebe-cells: element:Gone\nfn stale() {}\n\n#[test]\nfn bare() {}\n\n// zeebe-cells: element:Task\nfn helper() {}\n',
   [`${CORPUS}reject-x.bpmn`]: '<!-- verdict: reject | category: X -->\n<!-- zeebe-cells: validation:V:m -->\n<definitions/>',
   [`${CORPUS}reject-z.bpmn`]: '<!-- verdict: reject | category: Z -->\n<definitions/>',
   [`${CORPUS}reject-stale.bpmn`]: '<!-- verdict: reject | category: Z -->\n<!-- zeebe-cells: validation:V:m validation:V:gone -->',
@@ -55,6 +55,23 @@ test('nano-tested evidence must name an existing #[test] fn', () => {
   assert.match(check(['element:Task'], [{ match: 'element:Task', status: 'nano-tested' }])[0], /needs evidence/);
 });
 
+test('nano-tested tests must declare every cell the rule claims, and only real cells', () => {
+  const rule = (fn, match = 'element:Task') => [{ match, status: 'nano-tested', evidence: [`${RS}::${fn}`] }];
+  assert.deepEqual(check(['element:Task'], rule('runs_a_task')), []);
+  assert.deepEqual(check(['element:Task', 'element:Other'], rule('runs_a_task', 'element:*')), [
+    'rule "element:*": no evidence declares element:Other',
+  ]);
+  assert.deepEqual(check(['element:Task'], rule('bare')), [
+    `rule "element:Task": ${RS}::bare declares no zeebe-cells`,
+    'rule "element:Task": no evidence declares element:Task',
+  ]);
+  // The declaration is read from the test's own attribute block, past other attributes.
+  assert.deepEqual(check(['element:Task'], rule('stale')), [
+    `${RS}::stale declares a cell not in zeebe-surface.json: element:Gone`,
+    'rule "element:Task": no evidence declares element:Task',
+  ]);
+});
+
 test('parity evidence must be a corpus fixture with a Zeebe verdict', () => {
   const rule = (ref) => [{ match: 'validation:V:m', status: 'parity', evidence: [ref] }];
   assert.deepEqual(check(['validation:V:m'], rule(`${CORPUS}reject-x.bpmn`)), []);
@@ -66,7 +83,7 @@ test('parity evidence must be a corpus fixture with a Zeebe verdict', () => {
 test('parity fixtures must declare every cell the rule claims, and only real cells', () => {
   const rule = (match, ref) => [{ match, status: 'parity', evidence: [ref] }];
   assert.deepEqual(check(['validation:V:m', 'validation:V:n'], rule('validation:V:*', `${CORPUS}reject-x.bpmn`)), [
-    'rule "validation:V:*": no evidence fixture declares validation:V:n',
+    'rule "validation:V:*": no evidence declares validation:V:n',
   ]);
   assert.match(check(['validation:V:m'], rule('validation:V:m', `${CORPUS}reject-z.bpmn`))[0], /declares no zeebe-cells/);
   assert.deepEqual(check(['validation:V:m'], rule('validation:V:m', `${CORPUS}reject-stale.bpmn`)), [

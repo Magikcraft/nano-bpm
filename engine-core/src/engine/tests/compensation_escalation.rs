@@ -1,6 +1,7 @@
 //! `compensation_escalation` engine tests (slice 7 of #1201), extracted verbatim.
 use super::*;
 
+// zeebe-cells: event:boundary:compensation event:intermediate-throw:compensation
 #[test]
 fn should_run_the_compensation_handler_when_a_compensation_throw_event_fires() {
     let mut engine = Engine::new();
@@ -218,6 +219,7 @@ fn should_spawn_a_parallel_token_via_a_non_interrupting_escalation_boundary() {
     assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
 }
 
+// zeebe-cells: event:boundary:escalation
 #[test]
 fn should_interrupt_a_subprocess_via_an_interrupting_escalation_boundary() {
     let mut engine = Engine::new();
@@ -499,6 +501,7 @@ fn should_ignore_an_uncaught_escalation() {
     assert!(engine.is_completed(instance_key));
 }
 
+// zeebe-cells: event:end:escalation
 #[test]
 fn should_raise_an_escalation_via_an_escalation_end_event() {
     // An escalation END event (an escalation throw carrier with no outgoing
@@ -549,6 +552,7 @@ fn should_raise_an_escalation_via_an_escalation_end_event() {
     assert!(engine.is_completed(instance_key));
 }
 
+// zeebe-cells: event:intermediate-throw:escalation
 #[test]
 fn should_raise_an_escalation_only_after_a_throws_end_listener_drains() {
     // Regression (#1173): an escalation throw with an *end execution listener*

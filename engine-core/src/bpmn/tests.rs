@@ -620,6 +620,7 @@ fn should_parse_iso8601_durations() {
     assert_eq!(parse_iso8601_duration("PT5"), None);
 }
 
+// zeebe-cells: element:ManualTask element:Task
 #[test]
 fn should_parse_abstract_task_and_manual_task_as_pass_through() {
     // An abstract `bpmn:task` (and `manualTask`) has no execution semantics;
@@ -679,6 +680,7 @@ fn should_parse_a_linear_process_with_a_service_task() {
     assert_eq!(def.element("start").unwrap().outgoing[0].to, "charge");
 }
 
+// zeebe-cells: element:SendTask
 #[test]
 fn should_parse_a_send_task_as_a_job_based_service_task() {
     // A `sendTask` with a `zeebe:taskDefinition` is executed by a job worker

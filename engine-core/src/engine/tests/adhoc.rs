@@ -1322,6 +1322,7 @@ fn adhoc_tools_run_under_a_dedicated_inner_instance_element() {
 /// a real user task, the container keeps looping, and the human's completion
 /// output flows through the container's `outputElement` exactly like a
 /// service-task tool's job output.
+// zeebe-cells: element:AdHocSubProcess
 #[test]
 fn adhoc_agent_activates_a_user_task_tool_and_parks_until_completed() {
     let mut engine = Engine::new();

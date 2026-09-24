@@ -600,6 +600,9 @@ jobs:
           key: zeebe-${{ hashFiles('formal/parity/zeebe-pin.json') }}
       - name: Parity matrix is derived from the pinned Zeebe
         run: |
+          # The derived artifacts must be committed: extraction would recreate a
+          # deleted surface as an untracked file, which `git diff` cannot see.
+          git ls-files --error-unmatch formal/parity/zeebe-surface.json formal/parity/gaps.json
           node formal/parity/extract.mjs "$(formal/parity/fetch-zeebe.sh)"
           git diff --exit-code -- formal/parity/zeebe-surface.json
       - name: Parity matrix tests

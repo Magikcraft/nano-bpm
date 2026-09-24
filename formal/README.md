@@ -200,7 +200,7 @@ one status:
 | Status | Required | Meaning |
 |---|---|---|
 | `parity` | `evidence`: fixtures in `engine-core/tests/conformance/corpus/` | Nano's verdict is asserted equal to a Zeebe verdict captured in the fixture (`accept` or `reject`; a `diverge` fixture is not parity). Every claimed cell must be listed in one of the fixtures' `<!-- zeebe-cells: … -->` comment |
-| `nano-tested` | `evidence`: `path::test_fn` | a Nano `#[test]` exercises the behaviour, but not against a Zeebe oracle |
+| `nano-tested` | `evidence`: `path::test_fn` | a Nano `#[test]` exercises the behaviour, but not against a Zeebe oracle. Every claimed cell must be listed in a `// zeebe-cells: …` line among the comments and attributes directly above the test fn |
 | `gap` | `issue`, `note` | no evidence yet; the issue closes it. Only cells in the `gaps.json` baseline may be gaps (see below) |
 | `out-of-scope` | `issue`, `note` | the cell has no Nano meaning (for example, partition-internal records). Use sparingly |
 
@@ -209,7 +209,7 @@ one status:
 - an unmapped cell, including new cells from a Zeebe bump
 - a rule that claims no cell
 - evidence that does not resolve (a renamed test, a missing fixture, a
-  `parity` fixture that does not declare the cell, or one that declares a cell
+  fixture or test that does not declare the cell, or one that declares a cell
   not in the surface)
 - a malformed rule
 - a surface extracted at a different commit than the pin
@@ -235,7 +235,8 @@ node --test formal/parity/*.test.mjs         # extractor and guard tests
 ```
 
 CI regenerates `zeebe-surface.json` from the pinned sources and fails if the
-result differs from the committed file.
+result differs from the committed file, or if the surface or `gaps.json` is not
+tracked.
 
 ### Bumping the Zeebe pin
 
