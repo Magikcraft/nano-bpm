@@ -128,10 +128,14 @@ jobs:
             dapadapter:
               - 'dap-adapter/**'
               - '.github/workflows/ci.yml'
-            # TLA+ models of engine semantics (formal/README.md). TLC needs only a
-            # JVM, and the whole suite checks in seconds.
+            # TLA+ models of engine semantics and the Zeebe parity coverage
+            # matrix (formal/README.md). TLC needs only a JVM, and the whole suite
+            # checks in seconds. The matrix cites engine-core tests and corpus
+            # fixtures as evidence, so renaming one must re-run the guard.
             formal:
               - 'formal/**'
+              - 'engine-core/src/**'
+              - 'engine-core/tests/**'
               - '.github/workflows/ci.yml'
             # True unless EVERY changed file is pure presentation/frontend — the
             # marketing website (`website/**`), the console landing page HTML
@@ -568,7 +572,8 @@ jobs:
     runs-on: ubuntu-24.04
     # Model-checks the TLA+ specs in formal/tla against the expected outcome per
     # model recorded in formal/tla/check.sh. That includes known-defect
-    # ratchets, which fail once the defect stops reproducing.
+    # ratchets, which fail once the defect stops reproducing. Also guards the
+    # Zeebe parity coverage matrix in formal/parity (#1245).
     needs: changes
     if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.formal == 'true' }}
     steps:
@@ -586,6 +591,36 @@ jobs:
           key: tla2tools-${{ steps.tla.outputs.version }}
       - name: Model-check
         run: formal/tla/check.sh
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nanobpm-parity
+          key: zeebe-${{ hashFiles('formal/parity/zeebe-pin.json') }}
+      - name: Parity matrix is derived from the pinned Zeebe
+        run: |
+          # The derived artifacts must be committed: extraction would recreate a
+          # deleted surface as an untracked file, which `git diff` cannot see.
+          git ls-files --error-unmatch formal/parity/zeebe-surface.json formal/parity/gaps.json
+          node formal/parity/extract.mjs "$(formal/parity/fetch-zeebe.sh)"
+          git diff --exit-code -- formal/parity/zeebe-surface.json
+      - name: Parity matrix tests
+        run: node --test formal/parity/*.test.mjs
+      - name: Parity coverage guard
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: |
+          # The gap baseline may only shrink: compare it with the target
+          # branch's copy (absent until the matrix first lands there).
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          if git cat-file -e FETCH_HEAD:formal/parity/gaps.json 2>/dev/null; then
+            git show FETCH_HEAD:formal/parity/gaps.json > "$RUNNER_TEMP/base-gaps.json"
+            node formal/parity/check.mjs --base-gaps "$RUNNER_TEMP/base-gaps.json"
+          else
+            echo "::notice::no formal/parity/gaps.json on $BASE_REF yet; baseline growth not checked"
+            node formal/parity/check.mjs
+          fi
 
   processos:
     name: processos (clippy + test)

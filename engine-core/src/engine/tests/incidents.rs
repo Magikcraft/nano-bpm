@@ -653,6 +653,7 @@ fn should_raise_an_expression_incident_when_a_condition_cannot_evaluate() {
     assert!(!engine.is_completed(instance_key));
 }
 
+// zeebe-cells: incident:CONDITION_ERROR
 #[test]
 fn should_raise_incident_when_no_exclusive_flow_matches() {
     // Both flows are conditional; neither matches -> incident, token parked.
@@ -682,6 +683,7 @@ fn should_raise_incident_when_no_exclusive_flow_matches() {
     assert_eq!(engine.instance(instance_key).unwrap().incidents.len(), 1);
 }
 
+// zeebe-cells: incident:JOB_NO_RETRIES
 #[test]
 fn should_raise_an_incident_when_a_job_fails_with_no_retries_left() {
     // given an activated job
@@ -1003,6 +1005,7 @@ fn should_retain_a_resolved_incident_as_an_audit_record() {
     ));
 }
 
+// zeebe-cells: incident:UNHANDLED_ERROR_EVENT
 #[test]
 fn should_raise_an_incident_when_a_thrown_error_is_unhandled() {
     let mut engine = Engine::new();
@@ -1159,6 +1162,7 @@ fn a_failing_called_element_expression_raises_an_expression_evaluation_incident(
         .all(|i| i.parent_process_instance_key != Some(parent_key)));
 }
 
+// zeebe-cells: incident:CALLED_ELEMENT_ERROR
 #[test]
 fn an_unknown_called_process_raises_a_called_element_incident_not_expression_eval() {
     // A call activity whose (literal) `calledElement` process id is not deployed
@@ -1339,6 +1343,7 @@ fn output_mapping_eval_failure_raises_incident_and_does_not_complete() {
     );
 }
 
+// zeebe-cells: incident:IO_MAPPING_ERROR
 #[test]
 fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
     // Regression: an OUTPUT `zeebe:ioMapping` failure on a message intermediate
@@ -1745,6 +1750,7 @@ fn bare_missing_var_input_mapping_assigns_null_without_incident() {
     );
 }
 
+// zeebe-cells: incident:CALLED_DECISION_ERROR
 #[test]
 fn business_rule_task_unknown_decision_raises_incident() {
     let mut engine = Engine::new();
@@ -1773,6 +1779,7 @@ fn business_rule_task_unknown_decision_raises_incident() {
     );
 }
 
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
 #[test]
 fn adhoc_output_collection_non_array_target_raises_extract_value_incident() {
     // Zeebe (AdHocSubProcessOutputCollectionBehavior.appendToOutputCollection)

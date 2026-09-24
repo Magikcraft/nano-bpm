@@ -65,7 +65,18 @@ The harness is **hermetic**: it reads the checked-in corpus off disk
    - on `diverge`, Nano still **rejects** (Zeebe would accept), the actual
      category equals the declared `category`, and that category is present in the
      Nano-only divergence table.
-3. Run `cargo test -p nanobpmn-engine-core --test conformance`. If you added a
+3. If the entry is evidence for Zeebe parity coverage matrix cells
+   (`formal/README.md#zeebe-parity-coverage-matrix`), list those cell ids,
+   separated by whitespace, in a `zeebe-cells:` comment:
+
+   ```xml
+   <!-- zeebe-cells: validation:EndEventValidator:end-events-must-not-have-outgoing-sequence-flows-to-other-elements -->
+   ```
+
+   `formal/parity/check.mjs` only accepts a `parity` claim for a cell that an
+   `accept`/`reject` fixture declares here. It also rejects a declared id that
+   is not in `zeebe-surface.json`. This harness ignores the comment.
+4. Run `cargo test -p nanobpmn-engine-core --test conformance`. If you added a
    new reject category, the coverage ratchet requires a REJECT entry for it (and
    a `ParseError` variant that maps to a Zeebe class — see below); a new
    divergence category likewise requires a DIVERGE entry.

@@ -1,4 +1,5 @@
 <!-- verdict: reject | category: InvalidGateway -->
+<!-- zeebe-cells: validation:SequenceFlowValidator:must-have-a-condition-or-be-default-flow -->
 <!-- oracle: SequenceFlowValidator — an exclusive gateway's non-default branch must have a condition (#854). -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
   <bpmn:process id="reject_gateway_missing_condition" isExecutable="true">

@@ -1,4 +1,5 @@
 <!-- verdict: reject | category: DuplicateStartEvent -->
+<!-- zeebe-cells: validation:ProcessValidator:via-verifynoduplicatemessagestartevents -->
 <!-- oracle: ModelUtil.verifyNoDuplicateMessageStartEvents — two starts correlating on one message (#856). -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
   <bpmn:message id="Msg" name="order-placed" />

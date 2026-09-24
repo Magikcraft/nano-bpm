@@ -1,4 +1,5 @@
 <!-- verdict: reject | category: NoProcess -->
+<!-- zeebe-cells: validation:DefinitionsValidator:must-contain-at-least-one-executable-process -->
 <!-- oracle: a deployment must contain at least one process; Zeebe rejects a resource with none. -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
   <bpmn:message id="Msg" name="lonely" />

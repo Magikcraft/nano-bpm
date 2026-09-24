@@ -883,6 +883,7 @@ fn xml_declared_start_event_end_listener_fires_end_to_end() {
     assert!(engine.is_completed(inst));
 }
 
+// zeebe-cells: element:ReceiveTask
 #[test]
 fn xml_declared_receive_task_end_listener_fires_end_to_end() {
     // #1197: a `receiveTask` is modelled as a pass-through, and an `end`

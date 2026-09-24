@@ -1,4 +1,5 @@
 <!-- verdict: reject | category: InvalidStartEvents -->
+<!-- zeebe-cells: validation:ProcessValidator:multiple-none-start-events-are-not-allowed -->
 <!-- oracle: ProcessValidator — multiple none start events are not allowed (#855). -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
   <bpmn:process id="reject_multiple_none_starts" isExecutable="true">

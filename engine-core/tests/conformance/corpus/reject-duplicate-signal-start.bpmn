@@ -1,4 +1,5 @@
 <!-- verdict: reject | category: DuplicateStartEvent -->
+<!-- zeebe-cells: validation:ProcessValidator:via-verifynoduplicatesignalstartevents -->
 <!-- oracle: ModelUtil.verifyNoDuplicateSignalStartEvents — two starts correlating on one signal (#856). -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
   <bpmn:signal id="Sig" name="cancel-all" />

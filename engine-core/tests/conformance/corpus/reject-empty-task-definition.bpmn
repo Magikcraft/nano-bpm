@@ -1,4 +1,5 @@
 <!-- verdict: reject | category: InvalidTaskDefinition -->
+<!-- zeebe-cells: validation:ZeebeElementValidator:attribute-must-be-present-and-not-empty -->
 <!-- oracle: ZeebeElementValidator hasNonEmptyAttribute — zeebe:taskDefinition type must be non-empty (#856). -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">

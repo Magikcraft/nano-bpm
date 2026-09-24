@@ -42,6 +42,7 @@ fn variable_spill_excludes_instances_with_an_armed_boundary_timer() {
     assert_eq!(engine.resident_spillable_count(), 0);
 }
 
+// zeebe-cells: element:BoundaryEvent event:boundary:timer
 #[test]
 fn should_fire_an_interrupting_timer_boundary_and_cancel_the_job() {
     let mut engine = Engine::new();
@@ -141,6 +142,7 @@ fn should_recover_an_armed_boundary_timer_via_replay() {
     assert_eq!(job.state, state::JobState::Canceled);
 }
 
+// zeebe-cells: event:boundary:signal
 #[test]
 fn should_interrupt_an_activity_via_a_signal_boundary() {
     let def = ProcessBuilder::new("guarded")
@@ -175,6 +177,7 @@ fn should_interrupt_an_activity_via_a_signal_boundary() {
     assert!(engine.is_completed(instance_key));
 }
 
+// zeebe-cells: event:boundary:message
 #[test]
 fn should_fire_an_interrupting_message_boundary_and_cancel_the_job() {
     let mut engine = Engine::new();
@@ -351,6 +354,7 @@ fn should_fire_a_non_interrupting_message_boundary_for_every_matching_message() 
     );
 }
 
+// zeebe-cells: element:InclusiveGateway
 #[test]
 fn inclusive_join_waits_while_a_boundary_that_reaches_it_is_still_armed() {
     // #1168 regression (boundary-event reachability). An inclusive join `j` is
@@ -791,6 +795,7 @@ fn normal_multi_instance_completion_disarms_the_body_boundary() {
     );
 }
 
+// zeebe-cells: event:boundary:error
 #[test]
 fn should_route_to_an_error_boundary_when_a_job_throws_a_matching_error() {
     let mut engine = Engine::new();
@@ -831,6 +836,7 @@ fn should_route_to_an_error_boundary_when_a_job_throws_a_matching_error() {
     assert_eq!(err, EngineError::JobNotActive { job_key });
 }
 
+// zeebe-cells: element:SubProcess
 #[test]
 fn should_interrupt_an_embedded_subprocess_via_its_error_boundary() {
     let mut engine = Engine::new();
@@ -1138,6 +1144,7 @@ fn feel_boundary_timer_evaluates_variable() {
     assert_eq!(timers[0].due_at, 6_000);
 }
 
+// zeebe-cells: event:boundary:conditional
 #[test]
 fn should_fire_an_interrupting_conditional_boundary_on_a_variable_change() {
     let mut engine = Engine::new();

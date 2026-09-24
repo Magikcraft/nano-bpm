@@ -1,4 +1,5 @@
 <!-- verdict: reject | category: InvalidAgentDefinition -->
+<!-- zeebe-cells: validation:AgentDefinitionValidator:agenttype-aiagentsubprocess-is-only-allowed-on-an-ad-hoc-sub-process -->
 <!-- oracle: AgentDefinitionValidator — agentType="aiAgentSubProcess" is only valid on a bpmn:adHocSubProcess, not a serviceTask (agent-instance-parity S1). -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">

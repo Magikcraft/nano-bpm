@@ -96,6 +96,7 @@ fn suspend_resume_lifecycle_gates_jobs_and_timers() {
     assert!(engine.is_completed(key));
 }
 
+// zeebe-cells: element:IntermediateCatchEvent event:intermediate-catch:timer
 #[test]
 fn should_park_on_timer_then_fire_when_due() {
     // start -> charge (service task) -> wait (timer PT5S) -> end
@@ -186,6 +187,7 @@ fn should_recover_parked_timer_via_replay() {
     assert!(recovered.is_completed(instance_key));
 }
 
+// zeebe-cells: event:intermediate-catch:signal
 #[test]
 fn should_park_on_signal_catch_then_broadcast() {
     let mut engine = Engine::new();
@@ -233,6 +235,7 @@ fn should_park_on_signal_catch_then_broadcast() {
         .any(|e| matches!(e, Event::SignalCorrelated { .. })));
 }
 
+// zeebe-cells: event:intermediate-catch:message
 #[test]
 fn should_park_on_message_catch_then_correlate() {
     let mut engine = Engine::new();
@@ -1253,6 +1256,7 @@ fn feel_date_timer_fires_at_absolute_instant() {
     assert_eq!(timers[0].due_at, 1_893_456_000_000);
 }
 
+// zeebe-cells: event:intermediate-catch:conditional
 #[test]
 fn should_park_on_a_conditional_catch_until_a_variable_change_satisfies_it() {
     let mut engine = Engine::new();
@@ -1325,6 +1329,7 @@ fn should_pass_a_conditional_catch_immediately_when_already_true_on_arrival() {
     assert!(engine.conditional_subscriptions().is_empty());
 }
 
+// zeebe-cells: element:EventBasedGateway
 #[test]
 fn event_based_gateway_arms_all_catch_events_then_timer_wins() {
     let mut engine = Engine::new();
@@ -1485,6 +1490,7 @@ fn event_based_gateway_never_force_completes_non_catch_sibling() {
 /// Regression (#1157): a link throw hands its token to the matching link catch;
 /// the second half of the model (everything downstream of the catch) must
 /// actually run, not silently vanish while the instance reports success.
+// zeebe-cells: event:intermediate-catch:link
 #[test]
 fn link_events_hand_the_token_from_throw_to_catch() {
     let xml = r#"
