@@ -172,7 +172,7 @@ Zeebe declares, one **cell** per behaviour, in `zeebe-surface.json`:
 |---|---|---|
 | `element:<Class>` | supported BPMN element | `FlowElementValidator.SUPPORTED_ELEMENT_TYPES` |
 | `event:<position>:<definition>` | supported event definition per position | `SUPPORTED_*` lists in the boundary, intermediate-catch and sub-process validators; `*Behavior` classes in the end and intermediate-throw event processors |
-| `lifecycle:<BpmnElementType>:<command>` | each lifecycle command (activate, complete, terminate, continue-terminating, complete-execution-listener), plus any `child-*` hook the processor implements | commands from `BpmnStreamProcessor.processEvent`; element types from `BpmnElementProcessors`; hooks from the processor interfaces, following each processor's `extends` chain |
+| `lifecycle:<BpmnElementType>:<command>` | each lifecycle command (activate, complete, terminate, continue-terminating, complete-execution-listener), plus any `child-*` hook the processor implements | commands from `BpmnStreamProcessor.processEvent`; element types from `BpmnElementProcessors`; hooks from the processor interfaces (and the interfaces they extend), following each processor's `extends` chain |
 | `guard:<method>:<message>` | rejection branch of the state-transition guard | `Either.left` in `ProcessInstanceStateTransitionGuard` |
 | `incident:<ErrorType>` | incident type | `ErrorType` |
 | `intent:<Record>:<INTENT>` | record intent | every `*Intent` enum in `protocol/record/intent` |

@@ -395,13 +395,22 @@ function supportedDefinitions(s, rel, constant) {
 /** Inner `*Behavior` variants of an event processor, one per event definition. */
 function behaviorVariants(s, rel, iface, strip) {
   const src = s.read(rel);
-  const re = new RegExp(`class\\s+(\\w+)\\s+implements\\s+${iface}\\b`, 'g');
   const out = [];
-  for (let m; (m = re.exec(src)); ) {
+  // Read every class header, so `extends Base implements A, <iface>` still counts.
+  for (const m of src.matchAll(/\bclass\s+(\w+)\b([^{;]*)\{/g)) {
+    let header = m[2];
+    for (let prev; prev !== header; ) {
+      prev = header;
+      header = header.replace(/<[^<>]*>/g, '');
+    }
+    const impl = /\bimplements\b([\s\S]*)$/.exec(header);
+    if (!impl || !impl[1].split(',').some((t) => t.trim().split('.').pop() === iface)) continue;
     const variant = m[1].replace(strip, '').replace(/Behaviou?r$/, '').toLowerCase();
     if (!variant) fail(`${rel}: cannot derive a variant from ${m[1]}`);
     out.push({ variant, source: at(rel, src, m.index) });
   }
+  const anon = new RegExp(`\\bnew\\s+${iface}\\s*\\(`).exec(src);
+  if (anon) fail(`${at(rel, src, anon.index)}: anonymous ${iface} implementation has no variant name`);
   if (out.length === 0) fail(`${rel}: no ${iface} implementations`);
   return out;
 }
@@ -685,19 +694,29 @@ function extractIncidents(s, cells) {
   for (const c of enumConstants(src, 'ErrorType')) cells.add(`incident:${c}`, rel);
 }
 
+/** `*Intent.java` files that are base interfaces, not intent enums. */
+export const NON_ENUM_INTENTS = new Set(['Intent', 'ProcessInstanceRelatedIntent']);
+
 /** `intent:<Enum>:<VALUE>` — every record intent in the protocol. */
 function extractIntents(s, cells) {
   const files = s.list(`${PROTOCOL}/intent`).filter((p) => /Intent\.java$/.test(p));
+  const seen = new Set();
   let n = 0;
   for (const rel of files) {
     const src = s.read(rel);
     const name = basename(rel, '.java');
-    if (!new RegExp(`\\benum\\s+${name}\\b`).test(src)) continue;
+    if (NON_ENUM_INTENTS.has(name)) {
+      if (!new RegExp(`\\binterface\\s+${name}\\b`).test(src)) fail(`${rel}: NON_ENUM_INTENTS.${name} is no longer an interface`);
+      seen.add(name);
+      continue;
+    }
+    if (!new RegExp(`\\benum\\s+${name}\\b`).test(src)) fail(`${rel}: ${name} is not an enum (add it to NON_ENUM_INTENTS only if it is a base interface)`);
     for (const c of enumConstants(src, name)) {
       cells.add(`intent:${name.replace(/Intent$/, '')}:${c}`, rel);
       n++;
     }
   }
+  for (const name of NON_ENUM_INTENTS) if (!seen.has(name)) fail(`${PROTOCOL}/intent: NON_ENUM_INTENTS.${name} no longer exists`);
   if (n === 0) fail(`${PROTOCOL}/intent: no intent enums`);
 }
 

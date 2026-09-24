@@ -264,6 +264,12 @@ test('event lists fail on an entry they cannot read', () => {
       'class P { class NoneIntermediateThrowEventBehavior implements IntermediateThrowEventBehavior {} }',
   });
   assert.equal(run('event', files('TimerEventDefinition.class, LinkEventDefinition.class')).length, 6);
+  const end = `${BPMN}/event/EndEventProcessor.java`;
+  const extended = files('TimerEventDefinition.class');
+  extended[end] = 'class P { class NoneEndEventBehavior implements EndEventBehavior {}\n  final class ErrorEndEventBehavior extends Base<X> implements Other, pkg.EndEventBehavior {} }';
+  assert.deepEqual(run('event', extended).filter((c) => c.id.startsWith('event:end:')).map((c) => c.id), ['event:end:error', 'event:end:none']);
+  extended[end] = extended[end].replace(' }', ' final EndEventBehavior b = new EndEventBehavior() {}; }');
+  assert.throws(() => run('event', extended), /anonymous EndEventBehavior implementation/);
   assert.throws(() => run('event', files('TimerEventDefinition.class, EXTRA_DEFINITIONS')), /unrecognised SUPPORTED_EVENTS entry/);
   const read = files('TimerEventDefinition.class');
   const rel = `${VALIDATION}/IntermediateCatchEventValidator.java`;
@@ -303,16 +309,24 @@ test('validation fails on an unrecognised collector or a stale non-collector ent
   assert.throws(() => run('validation', { [y]: 'class Y {}', [rel]: mixed }), /NON_COLLECTOR_ACCEPTS\.expressionVerification no longer occurs/);
 });
 
-test('intent family walks sub-packages and skips non-enum files', () => {
-  const cells = run('intent', {
+test('intent family walks sub-packages, skips only allowlisted base interfaces', () => {
+  const files = {
     [`${INTENT}/JobIntent.java`]: 'public enum JobIntent implements Intent { CREATED((short) 0), COMPLETED((short) 1); }',
     [`${INTENT}/Intent.java`]: 'public interface Intent { short value(); }',
+    [`${INTENT}/ProcessInstanceRelatedIntent.java`]: 'public interface ProcessInstanceRelatedIntent extends Intent {}',
     [`${INTENT}/scaling/ScaleIntent.java`]: 'public enum ScaleIntent { SCALE_UP; }',
-  });
+  };
+  const cells = run('intent', files);
   assert.deepEqual(
     cells.map((c) => c.id),
     ['intent:Job:COMPLETED', 'intent:Job:CREATED', 'intent:Scale:SCALE_UP'],
   );
+  const changed = { ...files, [`${INTENT}/JobIntent.java`]: 'public final class JobIntent implements Intent {}' };
+  assert.throws(() => run('intent', changed), /JobIntent is not an enum/);
+  const { [`${INTENT}/ProcessInstanceRelatedIntent.java`]: _, ...stale } = files;
+  assert.throws(() => run('intent', stale), /NON_ENUM_INTENTS\.ProcessInstanceRelatedIntent no longer exists/);
+  const retyped = { ...files, [`${INTENT}/Intent.java`]: 'public enum Intent { X; }' };
+  assert.throws(() => run('intent', retyped), /NON_ENUM_INTENTS\.Intent is no longer an interface/);
 });
 
 test('rejection family validates against the SBE enum and skips its sentinels', () => {
