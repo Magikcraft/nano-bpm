@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { CORPUS, evaluate, globToRegExp, markdownReport, shrinkGaps, tally } from './check.mjs';
+import { CORPUS, baselineGrowth, evaluate, globToRegExp, markdownReport, shrinkGaps, tally } from './check.mjs';
 
 const RS = 'engine-core/src/engine/tests/lifecycle.rs';
 const FILES = {
@@ -165,4 +165,12 @@ test('the committed coverage.json maps the committed surface', () => {
   const repo = { exists: (p) => existsSync(join(root, p)), read: (p) => readFileSync(join(root, p), 'utf8') };
   const { errors } = evaluate(load('zeebe-surface.json'), load('coverage.json'), repo, load('gaps.json').cells, load('zeebe-pin.json'));
   assert.deepEqual(errors, []);
+});
+
+test('the baseline may only shrink against the target branch', () => {
+  assert.deepEqual(baselineGrowth(['a', 'b'], ['a']), []);
+  assert.deepEqual(baselineGrowth(['a'], ['a', 'c']), [
+    "gaps.json adds c, which the target branch's baseline does not list: the baseline may only shrink",
+  ]);
+  assert.deepEqual(baselineGrowth(undefined, ['a']), ['base gaps.json must have a cells array']);
 });

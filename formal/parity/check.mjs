@@ -23,7 +23,7 @@
 // Prints per-family counts, and appends a Markdown table to
 // $GITHUB_STEP_SUMMARY when set.
 //
-// Usage: node formal/parity/check.mjs [--update-gaps]
+// Usage: node formal/parity/check.mjs [--update-gaps | --base-gaps <target-branch gaps.json>]
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -206,6 +206,15 @@ export function gapProblems(assignments, gaps) {
   return errors;
 }
 
+/** Ids the head baseline adds over the target branch's: the ratchet may only shrink. */
+export function baselineGrowth(base, head) {
+  if (!Array.isArray(base)) return ['base gaps.json must have a cells array'];
+  const before = new Set(base);
+  return head
+    .filter((id) => !before.has(id))
+    .map((id) => `gaps.json adds ${id}, which the target branch's baseline does not list: the baseline may only shrink`);
+}
+
 /** The shrunk baseline: current gap cells that were already in it. */
 export function shrinkGaps(assignments, gaps) {
   const baseline = new Set(gaps);
@@ -261,6 +270,12 @@ function main() {
     return;
   }
   const { errors, assignments } = evaluate(surface, coverage, fs, gapsFile.cells, load('zeebe-pin.json'));
+  const baseArg = process.argv.indexOf('--base-gaps');
+  if (baseArg !== -1) {
+    const basePath = process.argv[baseArg + 1];
+    if (!basePath) throw new Error('--base-gaps needs a file path');
+    errors.push(...baselineGrowth(JSON.parse(readFileSync(basePath, 'utf8')).cells, gapsFile.cells));
+  }
   const report = markdownReport(tally(assignments), surface);
   process.stdout.write(report);
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, report);

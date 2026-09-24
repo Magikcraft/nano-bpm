@@ -223,7 +223,9 @@ one status:
 landed, so a broad `gap` rule such as `intent:*` cannot absorb a cell that a
 Zeebe bump adds: that cell needs evidence or an `out-of-scope` rule. When cells
 gain evidence, `node formal/parity/check.mjs --update-gaps` drops them from the
-baseline. It only ever removes entries, so the baseline shrinks toward empty.
+baseline. It only ever removes entries, and CI runs the guard with
+`--base-gaps` against the target branch's `gaps.json`, rejecting any id the PR
+adds, so the baseline shrinks toward empty.
 
 It prints the per-family counts and, in CI, adds them to the job summary.
 Moving cells up the ladder, from `gap` to `nano-tested` to `parity`, is the

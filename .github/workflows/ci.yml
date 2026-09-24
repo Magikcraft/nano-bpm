@@ -608,7 +608,19 @@ jobs:
       - name: Parity matrix tests
         run: node --test formal/parity/*.test.mjs
       - name: Parity coverage guard
-        run: node formal/parity/check.mjs
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: |
+          # The gap baseline may only shrink: compare it with the target
+          # branch's copy (absent until the matrix first lands there).
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          if git cat-file -e FETCH_HEAD:formal/parity/gaps.json 2>/dev/null; then
+            git show FETCH_HEAD:formal/parity/gaps.json > "$RUNNER_TEMP/base-gaps.json"
+            node formal/parity/check.mjs --base-gaps "$RUNNER_TEMP/base-gaps.json"
+          else
+            echo "::notice::no formal/parity/gaps.json on $BASE_REF yet; baseline growth not checked"
+            node formal/parity/check.mjs
+          fi
 
   processos:
     name: processos (clippy + test)
