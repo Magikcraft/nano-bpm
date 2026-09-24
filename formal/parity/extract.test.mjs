@@ -213,6 +213,12 @@ test('lifecycle fails on an unmapped or stale hook, or an unread registration', 
   assert.throws(() => run('lifecycle', helper), /registration\(s\) in an unrecognised form/);
   const noTerminate = { ...PROCESSORS, [STREAM]: STREAM_SRC.replace('case TERMINATE_ELEMENT:', 'case OTHER:') };
   assert.throws(() => run('lifecycle', noTerminate), /no longer dispatches terminate/);
+  const arrow = { ...PROCESSORS, [STREAM]: STREAM_SRC.replace('case CONTINUE_TERMINATING_ELEMENT:\n        break;', 'case CONTINUE_TERMINATING_ELEMENT, MIGRATE_ELEMENT -> c();') };
+  const ids = run('lifecycle', arrow).map((c) => c.id);
+  assert.ok(ids.includes('lifecycle:TASK:continue-terminating') && ids.includes('lifecycle:TASK:migrate'));
+  assert.ok(!ids.includes('lifecycle:TASK:element-activating'), 'nested switch arms are not commands');
+  const odd = { ...PROCESSORS, [STREAM]: STREAM_SRC.replace('case COMPLETE_ELEMENT:', 'case Intent.COMPLETE_ELEMENT:') };
+  assert.throws(() => run('lifecycle', odd), /unrecognised switch arm: case Intent\.COMPLETE_ELEMENT/);
   const { [STREAM]: _, ...noStream } = PROCESSORS;
   assert.throws(() => run('lifecycle', noStream), /missing Zeebe source/);
 });
@@ -247,13 +253,24 @@ test('guard fails on a rejection outside a recognised method', () => {
 
 test('two different messages normalising to one cell id stop extraction', () => {
   const rel = `${VALIDATION}/XValidator.java`;
-  const engine = { [`${PROCESSING}/deployment/model/validation/Y.java`]: 'class Y {}' };
+  const engine = { [`${PROCESSING}/deployment/model/validation/Y.java`]: 'class Y { void f() { expressionVerification.accept(v); } }' };
   assert.throws(
     () => run('validation', { ...engine, [rel]: 'class X { void v() { c.addError(0, "expected %s"); c.addError(0, "expected %d"); } }' }),
     /derives from two different messages/,
   );
   assert.equal(run('validation', { ...engine, [rel]: 'class X { void v() { c.addError(0, "same"); c.addError(0, "same"); } }' }).length, 1);
   assert.throws(() => run('validation', { [rel]: 'class X {}' }), /missing Zeebe source directory/);
+});
+
+test('validation fails on an unrecognised collector or a stale non-collector entry', () => {
+  const rel = `${VALIDATION}/XValidator.java`;
+  const y = `${PROCESSING}/deployment/model/validation/Y.java`;
+  const engine = { [y]: 'class Y { void f() { expressionVerification.accept(v); } }' };
+  const mixed = 'class X { void v() { c.addError(0, "kept"); errorCollector.accept("also kept"); } }';
+  assert.equal(run('validation', { ...engine, [rel]: mixed }).length, 2);
+  const renamed = mixed.replace('errorCollector.accept', 'problems.accept');
+  assert.throws(() => run('validation', { ...engine, [rel]: renamed }), /unrecognised validation collector problems\.accept\(/);
+  assert.throws(() => run('validation', { [y]: 'class Y {}', [rel]: mixed }), /NON_COLLECTOR_ACCEPTS\.expressionVerification no longer occurs/);
 });
 
 test('intent family walks sub-packages and skips non-enum files', () => {

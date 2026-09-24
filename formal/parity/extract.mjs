@@ -557,10 +557,25 @@ export function elementCommands(s) {
   const sw = /\bswitch\s*\(\s*intent\s*\)\s*\{/.exec(body);
   if (!sw) fail(`${rel}: processEvent has no switch (intent)`);
   const arms = body.slice(sw.index + sw[0].length, blockEnd(body, sw.index));
-  // Only the outer switch's arms: nested switches use `case X ->`.
-  const out = [...arms.matchAll(/\bcase\s+([A-Z_]+)\s*:/g)].map((m) =>
-    m[1].replace(/_ELEMENT$/, '').toLowerCase().replace(/_/g, '-'),
-  );
+  // Only the outer switch's own arms (brace depth 0), in either `case X:` or
+  // `case X ->` form; a nested switch sits inside a brace block.
+  const labels = [];
+  let depth = 0;
+  for (let i = 0; i < arms.length; i++) {
+    const c = arms[i];
+    if (c === '"') {
+      i++;
+      while (i < arms.length && arms[i] !== '"') i += arms[i] === '\\' ? 2 : 1;
+    } else if (c === '{') depth++;
+    else if (c === '}') depth--;
+    else if (depth === 0 && /^\bcase\b/.test(arms.slice(i, i + 5)) && !/\w/.test(arms[i - 1] ?? ' ')) {
+      const m = /^case\s+([A-Z_]+(?:\s*,\s*[A-Z_]+)*)\s*(?::|->)/.exec(arms.slice(i));
+      if (!m) fail(`${rel}: processEvent has an unrecognised switch arm: ${arms.slice(i, i + 60).split('\n')[0]}`);
+      labels.push(...m[1].split(',').map((l) => l.trim()));
+      i += m[0].length - 1;
+    }
+  }
+  const out = labels.map((l) => l.replace(/_ELEMENT$/, '').toLowerCase().replace(/_/g, '-'));
   for (const t of ['activate', 'complete', 'terminate']) {
     if (!out.includes(t)) fail(`${rel}: processEvent no longer dispatches ${t}`);
   }
@@ -647,15 +662,32 @@ function extractIntents(s, cells) {
   if (n === 0) fail(`${PROTOCOL}/intent: no intent enums`);
 }
 
+/**
+ * `.accept(` receivers in the validation trees that are not error collectors,
+ * with why. Any other non-`error…` receiver fails extraction, as does an entry
+ * here that no longer occurs.
+ */
+const NON_COLLECTOR_ACCEPTS = {
+  expressionVerification: 'Consumer<ExpressionVerification> callback; its body reports through addError',
+};
+
 /** `validation:<Validator>:<message>` — every deploy-time rejection message. */
 function extractValidation(s, cells) {
   let n = 0;
+  const seen = new Set();
   for (const dir of [VALIDATION, DEPLOY_VALIDATION]) {
     for (const rel of s.list(dir)) {
       const src = s.read(rel);
       const validator = basename(rel, '.java');
-      for (const m of src.matchAll(/\b(?:addError|errorCollector\.accept|\.accept)\(/g)) {
-        if (m[0] === '.accept(' && !/[eE]rror\w*\.accept\($/.test(src.slice(m.index - 30, m.index + 8))) continue;
+      for (const m of src.matchAll(/\b(?:addError|(\w+)(?:\(\))?\.accept)\(/g)) {
+        const receiver = m[1];
+        if (receiver !== undefined && !/^[eE]rror\w*$/.test(receiver)) {
+          if (!Object.hasOwn(NON_COLLECTOR_ACCEPTS, receiver)) {
+            fail(`${at(rel, src, m.index)}: unrecognised validation collector ${receiver}.accept(`);
+          }
+          seen.add(receiver);
+          continue;
+        }
         const args = /^\s*(?:\d+\s*,)?/.exec(src.slice(m.index + m[0].length))[0];
         const where = at(rel, src, m.index);
         for (const msg of validationMessages(src, m.index + m[0].length + args.length, where)) {
@@ -666,6 +698,9 @@ function extractValidation(s, cells) {
     }
   }
   if (n === 0) fail('no deploy-time validation messages');
+  for (const r of Object.keys(NON_COLLECTOR_ACCEPTS)) {
+    if (!seen.has(r)) fail(`NON_COLLECTOR_ACCEPTS.${r} no longer occurs; remove it`);
+  }
 }
 
 /**
