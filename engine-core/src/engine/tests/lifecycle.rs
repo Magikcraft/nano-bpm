@@ -6559,6 +6559,51 @@ fn inclusive_join_consumes_before_its_incident_like_zeebe() {
 }
 
 #[test]
+fn inclusive_join_late_arrival_while_an_incident_is_pending_activates_again_like_zeebe() {
+    // The join is accepted when `t` arrives and parks on an incident after
+    // consuming. `y`'s later token is a fresh arrival: Zeebe's guard excludes
+    // the gateway's own instance from the live-path sources, so it accepts a
+    // second gateway instance, which raises its own incident. Confirmed on
+    // c8run 8.8.8 (order x, t, y): two ACTIVE join instances, two
+    // CONDITION_ERROR incidents (#1241).
+    let def = inclusive_multi_arrival_builder()
+        .connect_when("join", "e", "go")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "inclusive_multi_arrival",
+            HashMap::from([("go".to_string(), Value::Bool(false))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    complete_one(&mut engine, "jx");
+    complete_one(&mut engine, "jt");
+    assert_eq!(engine.active_incidents().len(), 1);
+    complete_one(&mut engine, "jy");
+
+    assert_eq!(
+        engine.active_incidents().len(),
+        2,
+        "the late arrival activates the join again"
+    );
+    let instance = engine.instance(instance_key).unwrap();
+    assert_eq!(
+        instance
+            .active
+            .values()
+            .filter(|id| id.as_str() == "join")
+            .count(),
+        2,
+        "both accepted join instances wait on their incidents"
+    );
+    assert!(!instance.join_instances.contains_key("join"));
+    assert!(!instance.join_flow_arrivals.contains_key("join"));
+}
+
+#[test]
 fn inclusive_join_end_listener_runs_once_per_accepted_activation() {
     // The join is accepted once, when `t` arrives, and rests in COMPLETING
     // behind its `end` listener. Draining the chain routes once. The surplus
@@ -6634,4 +6679,83 @@ fn inclusive_join_waits_for_a_sibling_token_still_in_transit() {
     assert_eq!(join_fire_count(&events, "join"), 1, "the join fires once");
     assert_eq!(join_routed_to_end(&events), 1, "the join routes once");
     assert!(engine.is_completed(instance_key));
+}
+
+/// A sub-process whose inner split takes a flow into the parallel join `pj`
+/// in the same drain as a terminate end that tears the sub-process down, so
+/// the join's activation is still queued when its scope dies. `via_gateway`
+/// routes the join's flow through a pass-through gateway, which shifts the
+/// take one step later in the queue.
+fn scoped_terminate_with_queued_join_arrival(via_gateway: bool) -> ProcessDefinition {
+    let mut b = ProcessBuilder::new("term-queued-join")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .terminate_end_event("stop")
+        .contained_in("stop", "sub")
+        .service_task("b", "jb")
+        .contained_in("b", "sub")
+        .parallel_gateway("pj")
+        .contained_in("pj", "sub")
+        .end_event("inner_end")
+        .contained_in("inner_end", "sub")
+        .service_task("after", "jafter")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split");
+    b = if via_gateway {
+        b.exclusive_gateway("g")
+            .contained_in("g", "sub")
+            .connect("split", "g")
+            .connect("split", "stop")
+            .connect("g", "pj")
+    } else {
+        b.connect("split", "stop").connect("split", "pj")
+    };
+    b.connect("split", "b")
+        .connect("b", "pj")
+        .connect("pj", "inner_end")
+        .connect("sub", "after")
+        .connect("after", "done")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn scoped_terminate_drops_a_join_arrival_whose_activation_was_still_queued() {
+    // A flow into a join is counted when it is taken (#1241), before the
+    // join's activation runs. If a scoped teardown kills the scope in between,
+    // the queued activation is dropped, so its counted arrival must go too:
+    // otherwise it survives as a phantom token that a re-entered scope would
+    // fire against. In Zeebe the count lives on the flow-scope instance and
+    // dies with it.
+    for via_gateway in [false, true] {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(
+                scoped_terminate_with_queued_join_arrival(via_gateway),
+            ))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("term-queued-join"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let instance = engine.instance(instance_key).unwrap();
+        assert!(
+            instance.active.values().any(|id| id == "after"),
+            "the terminate ends the sub-process only (via_gateway={via_gateway})"
+        );
+        assert!(
+            instance.join_flow_arrivals.is_empty()
+                && instance.join_counts.is_empty()
+                && instance.join_instances.is_empty(),
+            "no join bookkeeping survives the scope (via_gateway={via_gateway}): {:?} {:?} {:?}",
+            instance.join_flow_arrivals,
+            instance.join_counts,
+            instance.join_instances
+        );
+    }
 }

@@ -4487,6 +4487,7 @@ impl Engine {
                 queue.extend(followups);
                 continue;
             }
+            self.debug_assert_join_bookkeeping_coherent(log);
             return None;
         }
     }
@@ -5223,6 +5224,69 @@ impl Engine {
         false
     }
 
+    /// A flow into a join is counted when it is taken ([`Engine::take_flow`]),
+    /// so a join activation the terminal-scope guard drops has already been
+    /// counted. If no join instance is open to hold it, that arrival belongs to
+    /// the dead scope and would otherwise survive as a phantom token a
+    /// re-entered scope fires against: reset the join, as Zeebe's count dies
+    /// with its flow-scope instance. An open join instance in the dead scope is
+    /// already reset by [`scope_teardown_events`](Self::scope_teardown_events).
+    fn revoke_dropped_join_arrival(&self, step: &Step) -> Vec<Event> {
+        let Step::Activate {
+            instance_key,
+            element_id,
+            via: Some(_),
+            ..
+        } = step
+        else {
+            return Vec::new();
+        };
+        let holds_tokens = self.state.instances.get(instance_key).is_some_and(|i| {
+            i.join_flow_arrivals.contains_key(element_id) || i.join_counts.contains_key(element_id)
+        });
+        if holds_tokens
+            && self.join_kind(*instance_key, element_id).is_some()
+            && self.join_eik(*instance_key, element_id).is_none()
+        {
+            vec![Event::ParallelJoinReset {
+                instance_key: *instance_key,
+                element_id: element_id.clone(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Debug-build guard for the join-bookkeeping defect class: once a drain
+    /// quiesces nothing is in transit, so every join still holding tokens must
+    /// have an open join instance holding them (the TLA+ `TokenFlow`
+    /// `JoinBookkeepingCoherent` invariant with no activation queued). A token
+    /// with no open instance is a phantom a later arrival would fire against.
+    fn debug_assert_join_bookkeeping_coherent(&self, log: &[Event]) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let touched: HashSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
+        for key in touched {
+            let Some(instance) = self.state.instances.get(&key) else {
+                continue;
+            };
+            if instance.state != ProcessInstanceState::Active {
+                continue;
+            }
+            for join in instance
+                .join_flow_arrivals
+                .keys()
+                .chain(instance.join_counts.keys())
+            {
+                debug_assert!(
+                    instance.join_instances.contains_key(join),
+                    "instance {key}: join `{join}` holds tokens but no open join instance"
+                );
+            }
+        }
+    }
+
     /// The processor: decides the events and follow-up work for one lifecycle
     /// step. Reads state, mints keys, but never mutates [`State`]. `pending` is
     /// the rest of the step queue: the flows taken but not yet activated, which
@@ -5241,7 +5305,7 @@ impl Engine {
         // own listeners) is deliberately NOT guarded — it must run its remaining
         // steps to finish.
         if self.step_targets_dead_scope(&step) {
-            return (Vec::new(), Vec::new());
+            return (self.revoke_dropped_join_arrival(&step), Vec::new());
         }
         match step {
             Step::Activate {
