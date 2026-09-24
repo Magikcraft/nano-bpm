@@ -1456,12 +1456,13 @@ fn should_take_inclusive_split_default_when_no_condition_matches() {
 fn chained_inclusive_joins_do_not_fire_downstream_join_prematurely() {
     // #1168 regression (queued-activation reachability). Two inclusive joins in a
     // chain, `j1 -> j2`, where `j2` also has an independent incoming branch `c`.
-    // When both joins are open at quiescence, firing `j1` only *queues* its token
-    // toward `j2` (state.active is not yet updated). If the sweep continued to
-    // evaluate `j2` in the same pass, `j2` would see no live token reaching it and
-    // fire prematurely on an incomplete set (just `c`), then reopen when the queued
-    // `j1` token finally arrives. Firing at most one join per sweep (and re-draining
-    // in between) prevents that; the instance must complete cleanly, once.
+    // Firing `j1` only *queues* its token toward `j2` (state.active is not yet
+    // updated). If `j2`'s guard ignored queued activations it would see no live
+    // token reaching it and fire prematurely on an incomplete set (just `c`),
+    // then reopen when the queued `j1` token arrives. Zeebe counts in-transit
+    // flows as active paths (`activeSequenceFlowIds`); `has_active_path_to`
+    // counts queued `Step::Activate`s the same way (#1241). The instance must
+    // complete cleanly, once.
     let def = ProcessBuilder::new("inc-chain")
         .start_event("s")
         .parallel_gateway("psplit")
@@ -1491,7 +1492,7 @@ fn chained_inclusive_joins_do_not_fire_downstream_join_prematurely() {
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
     assert_eq!(engine.pending_jobs().len(), 3);
 
-    // Complete all three tasks; the last one drives both joins to quiescence.
+    // Complete all three tasks; the last one drives both joins to fire.
     let mut all_events = Vec::new();
     all_events.extend(complete_one(&mut engine, "ja"));
     all_events.extend(complete_one(&mut engine, "jb"));
@@ -1530,7 +1531,7 @@ fn inclusive_join_waits_while_a_link_throw_that_reaches_it_is_pending() {
     // a token parked on `b` (upstream of the throw) is NOT a sequence-flow
     // predecessor of `j` — only the link edge makes `b` reach `j`. When `a`
     // arrives at the open join while `b` is still parked on its job, the
-    // quiescence sweep must NOT fire `j`: the pending link hop could yet route a
+    // join's guard must NOT fire `j`: the pending link hop could yet route a
     // token in, and firing early would then create a second, late arrival at `j`.
     let def = ProcessBuilder::new("inc-link")
         .start_event("s")
@@ -6316,29 +6317,156 @@ fn run_inclusive_multi_arrival(order: [&str; 3]) -> (Engine, Key, Vec<usize>) {
     (engine, instance_key, fires)
 }
 
-#[test]
-fn inclusive_join_keeps_surplus_token_like_zeebe() {
-    // Both `merge -> join` tokens arrive before `t`. Zeebe consumes one token
-    // per incoming flow when an inclusive join activates and keeps the rest
-    // ("Tetris" principle, `ProcessInstanceElementActivatingV3Applier`), so the
-    // second `merge -> join` token is not swallowed by the first firing. Once
-    // nothing can still reach the join, the surplus fires it again (#1237).
-    let (engine, instance_key, fires) = run_inclusive_multi_arrival(["jx", "jy", "jt"]);
-    assert_eq!(fires, vec![0, 0, 2], "one firing per token set, none early");
-    assert!(engine.is_completed(instance_key));
-    let instance = engine.instance(instance_key).unwrap();
-    assert!(instance.join_flow_arrivals.is_empty());
-    assert!(instance.join_instances.is_empty());
+/// The `merge -> join` incoming flow of `inclusive_multi_arrival_process`.
+fn merge_to_join() -> IncomingFlow {
+    IncomingFlow {
+        from: "merge".into(),
+        ordinal: 0,
+    }
 }
 
 #[test]
-fn inclusive_join_surplus_arriving_last_fires_again() {
-    // `t` and the first `merge -> join` token arrive while `y` can still reach
-    // the join, so it waits. `y`'s token then fires it once for the complete
-    // set and once more for the surplus — the order Zeebe also fires twice in.
+fn inclusive_join_strands_a_surplus_that_arrives_first_like_zeebe() {
+    // Zeebe evaluates an inclusive join only when a token arrives
+    // (`ProcessInstanceStateTransitionGuard.canActivateInclusiveGateway`), and
+    // its path search skips paths that end on an already-taken incoming flow
+    // (`BpmnInclusiveGatewayBehavior.visitElement`). Both `merge -> join` tokens
+    // arrive while `t` can still reach the join, so both are rejected. `t`
+    // then completes the set: the join fires once and consumes one token per
+    // flow (Tetris). Nothing arrives afterwards, so the surplus `merge -> join`
+    // token is stranded and the instance never completes (#1241).
+    let (engine, instance_key, fires) = run_inclusive_multi_arrival(["jx", "jy", "jt"]);
+    assert_eq!(fires, vec![0, 0, 1], "fires once, when `t` arrives");
+    assert!(
+        !engine.is_completed(instance_key),
+        "the surplus is stranded"
+    );
+    let instance = engine.instance(instance_key).unwrap();
+    assert_eq!(
+        instance.join_flow_arrivals["join"].count(&merge_to_join()),
+        1
+    );
+    assert!(instance.join_instances.contains_key("join"));
+}
+
+#[test]
+fn inclusive_join_fires_on_arrival_when_the_remaining_path_ends_on_a_taken_flow() {
+    // `t` arrives after the first `merge -> join` token. `y` is still live, but
+    // its only path to the join ends on `merge -> join`, which is already
+    // taken, so Zeebe's path search prunes it and the join fires on `t`'s
+    // arrival. `y`'s token then arrives with no live path left and fires the
+    // join again (#1241).
     let (engine, instance_key, fires) = run_inclusive_multi_arrival(["jx", "jt", "jy"]);
-    assert_eq!(fires, vec![0, 0, 2]);
+    assert_eq!(fires, vec![0, 1, 1]);
     assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn inclusive_join_waits_for_a_live_path_over_an_untaken_flow() {
+    // `t` arrives first, while `x` and `y` can still reach the join over the
+    // untaken `merge -> join` flow, so it waits. The first `merge -> join`
+    // token completes the set; the second finds no live path and fires alone.
+    let (engine, instance_key, fires) = run_inclusive_multi_arrival(["jt", "jx", "jy"]);
+    assert_eq!(fires, vec![0, 1, 1]);
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn inclusive_join_is_not_reevaluated_when_a_competing_path_diverges_like_zeebe() {
+    // `a` arrives while `b` can still reach the join through `g`, so Zeebe
+    // rejects the activation. `b` then routes to `eb` instead. Zeebe only
+    // re-evaluates the join when another token arrives at it, and none does,
+    // so the join never fires and the instance stays active (#1241).
+    let def = ProcessBuilder::new("inc-diverge")
+        .start_event("s")
+        .inclusive_gateway("isplit")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .exclusive_gateway("g")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .end_event("eb")
+        .connect("s", "isplit")
+        .connect("isplit", "a")
+        .connect("isplit", "b")
+        .connect("a", "join")
+        .connect("b", "g")
+        .connect_when("g", "join", "go")
+        .connect_default("g", "eb")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "inc-diverge",
+            HashMap::from([("go".to_string(), Value::Bool(false))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let after_a = complete_one(&mut engine, "ja");
+    let after_b = complete_one(&mut engine, "jb");
+
+    assert_eq!(join_fire_count(&after_a, "join"), 0);
+    assert_eq!(join_fire_count(&after_b, "join"), 0);
+    assert!(!engine.is_completed(instance_key));
+    let a_to_join = IncomingFlow {
+        from: "a".into(),
+        ordinal: 0,
+    };
+    let instance = engine.instance(instance_key).unwrap();
+    assert_eq!(instance.join_flow_arrivals["join"].count(&a_to_join), 1);
+    assert!(instance.join_instances.contains_key("join"));
+}
+
+#[test]
+fn joins_count_a_flow_when_it_is_taken_like_zeebe() {
+    // Zeebe counts a join's incoming flow when the flow is taken
+    // (`ProcessInstanceSequenceFlowTakenApplier`), before the join's ACTIVATE
+    // command is processed. Both flows into each join are taken before either
+    // activation runs, so the first activation already sees the full set and
+    // fires; no placeholder join instance is ever opened (#1241).
+    for (id, join) in [("par-take", "parallel"), ("inc-take", "inclusive")] {
+        let builder = ProcessBuilder::new(id)
+            .start_event("s")
+            .parallel_gateway("fork")
+            .exclusive_gateway("p")
+            .exclusive_gateway("q");
+        let builder = if join == "parallel" {
+            builder.parallel_gateway("join")
+        } else {
+            builder.inclusive_gateway("join")
+        };
+        let def = builder
+            .end_event("e")
+            .connect("s", "fork")
+            .connect("fork", "p")
+            .connect("fork", "q")
+            .connect("p", "join")
+            .connect("q", "join")
+            .connect("join", "e")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let events = engine.apply_command(Command::create_instance(id)).unwrap();
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        assert!(engine.is_completed(instance_key), "{join} join completes");
+        assert_eq!(
+            join_fire_count(&events, "join"),
+            1,
+            "{join} join fires once"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ParallelJoinOpened { .. })),
+            "{join} join fires on its first activation"
+        );
+    }
 }
 
 #[test]
@@ -6354,11 +6482,10 @@ fn inclusive_join_records_the_flow_each_token_arrived_over() {
     complete_one(&mut engine, "jx");
     complete_one(&mut engine, "jy");
     let instance = engine.instance(instance_key).unwrap();
-    let merge = IncomingFlow {
-        from: "merge".into(),
-        ordinal: 0,
-    };
-    assert_eq!(instance.join_flow_arrivals["join"].count(&merge), 2);
+    assert_eq!(
+        instance.join_flow_arrivals["join"].count(&merge_to_join()),
+        2
+    );
     assert!(!instance.join_counts.contains_key("join"));
 }
 
@@ -6371,11 +6498,13 @@ fn join_routed_to_end(events: &[Event]) -> usize {
 }
 
 #[test]
-fn inclusive_join_surplus_survives_incident_redrive() {
-    // The ready join parks on a `NoMatchingSequenceFlow` incident (go=false).
-    // Resolving it re-drives completion through `complete_inclusive_gateway`,
-    // which must consume one token per flow like the sweep does, so the surplus
-    // `merge -> join` token still fires the join a second time (#1237).
+fn inclusive_join_consumes_before_its_incident_like_zeebe() {
+    // Zeebe consumes the join's tokens when the activation is accepted
+    // (`ProcessInstanceElementActivatingV3Applier`), before
+    // `InclusiveGatewayProcessor.finalizeActivation` evaluates the outgoing
+    // conditions. With go=false no flow matches, so the accepted join parks
+    // on an incident after consuming one token per flow. Resolving it routes
+    // once. The surplus `merge -> join` token stays stranded (#1241).
     let def = inclusive_multi_arrival_builder()
         .connect_when("join", "e", "go")
         .build()
@@ -6393,8 +6522,18 @@ fn inclusive_join_surplus_survives_incident_redrive() {
         complete_one(&mut engine, job);
     }
     let incidents = engine.active_incidents();
-    assert_eq!(incidents.len(), 1, "the ready join parks on one incident");
+    assert_eq!(
+        incidents.len(),
+        1,
+        "the accepted join parks on one incident"
+    );
     let incident_key = incidents[0].key;
+    let instance = engine.instance(instance_key).unwrap();
+    assert_eq!(
+        instance.join_flow_arrivals["join"].count(&merge_to_join()),
+        1,
+        "the incident parks after the consumption"
+    );
 
     engine
         .apply_command(Command::set_variables(
@@ -6406,23 +6545,25 @@ fn inclusive_join_surplus_survives_incident_redrive() {
         .apply_command(Command::resolve_incident(incident_key))
         .unwrap();
 
-    assert_eq!(
-        join_routed_to_end(&resolved),
-        2,
-        "the redriven firing keeps the surplus, which fires the join again"
-    );
-    assert!(engine.is_completed(instance_key));
+    assert_eq!(join_routed_to_end(&resolved), 1, "the redrive routes once");
     assert!(engine.active_incidents().is_empty());
+    assert!(
+        !engine.is_completed(instance_key),
+        "the surplus is stranded"
+    );
     let instance = engine.instance(instance_key).unwrap();
-    assert!(instance.join_flow_arrivals.is_empty());
-    assert!(instance.join_instances.is_empty());
+    assert_eq!(
+        instance.join_flow_arrivals["join"].count(&merge_to_join()),
+        1
+    );
 }
 
 #[test]
-fn inclusive_join_surplus_survives_end_listener_redrive() {
-    // With an `end` listener the ready join rests in COMPLETING and fires from
-    // `finalize_inclusive_gateway` when the chain drains. That firing must keep
-    // the surplus too, so the join runs its listener and routes twice (#1237).
+fn inclusive_join_end_listener_runs_once_per_accepted_activation() {
+    // The join is accepted once, when `t` arrives, and rests in COMPLETING
+    // behind its `end` listener. Draining the chain routes once. The surplus
+    // `merge -> join` token is stranded, so no second listener job is created
+    // (#1241).
     let def = inclusive_multi_arrival_builder()
         .connect("join", "e")
         .with_listeners(
@@ -6442,18 +6583,55 @@ fn inclusive_join_surplus_survives_end_listener_redrive() {
         complete_one(&mut engine, job);
     }
 
-    let mut routed = 0;
-    for firing in 1..=2 {
-        let audit = engine.activate_jobs("join-audit", "W", 10, 60_000, 0);
-        assert_eq!(audit.len(), 1, "firing {firing} runs one end-listener job");
-        let done = engine
-            .apply_command(Command::complete_job(audit[0].key))
-            .unwrap();
-        routed += join_routed_to_end(&done);
-    }
-    assert_eq!(routed, 2, "one routing per firing");
+    let audit = engine.activate_jobs("join-audit", "W", 10, 60_000, 0);
+    assert_eq!(
+        audit.len(),
+        1,
+        "one end-listener job for the one activation"
+    );
+    let done = engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    assert_eq!(join_routed_to_end(&done), 1);
     assert!(engine
         .activate_jobs("join-audit", "W", 10, 60_000, 0)
         .is_empty());
+    assert!(
+        !engine.is_completed(instance_key),
+        "the surplus is stranded"
+    );
+}
+
+/// Two tokens head for an inclusive join in one command: `i` routes one
+/// straight to `join` and one through the exclusive gateway `x`. The first
+/// arrival must count the token still queued through `x` as a live path, like
+/// Zeebe's `activeSequenceFlowIds`, so `join` fires once, on both tokens (#1241).
+/// Formal counterpart: `formal/tla/MCInclusiveInTransit.tla`.
+#[test]
+fn inclusive_join_waits_for_a_sibling_token_still_in_transit() {
+    let def = ProcessBuilder::new("inc-in-transit")
+        .start_event("s")
+        .inclusive_gateway("i")
+        .exclusive_gateway("x")
+        .service_task("t", "jt")
+        .inclusive_gateway("join")
+        .end_event("e")
+        .connect("s", "i")
+        .connect("i", "join")
+        .connect("i", "x")
+        .connect_when("i", "t", "=false")
+        .connect("x", "join")
+        .connect("t", "join")
+        .connect("join", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("inc-in-transit"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(join_fire_count(&events, "join"), 1, "the join fires once");
+    assert_eq!(join_routed_to_end(&events), 1, "the join routes once");
     assert!(engine.is_completed(instance_key));
 }

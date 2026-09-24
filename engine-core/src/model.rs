@@ -562,13 +562,12 @@ pub enum ElementKind {
     /// condition holds — an unconditional (non-default) flow is always taken —
     /// falling back to the explicit `default` flow only when no conditional flow
     /// matches (a no-matching-flow incident when there is no default). As a join
-    /// (more than one incoming flow) it synchronises: it waits until no token
-    /// still in the instance could reach it (every branch that will arrive has
-    /// arrived) and then produces its outgoing token(s). A gateway that is both a
-    /// join and a split first synchronises, then re-evaluates its outgoing
-    /// conditions. Join readiness is evaluated at token quiescence — when no work
-    /// is in flight — so an in-transit sibling token is never mistaken for a
-    /// branch that will not arrive.
+    /// (more than one incoming flow) it synchronises exactly as Zeebe does
+    /// (#1241): each arriving token re-evaluates readiness, and the join fires
+    /// once every incoming flow has been taken, or once no active element or
+    /// in-transit token of its scope can still reach it over an untaken flow. It
+    /// is never re-evaluated otherwise. A gateway that is both a join and a split
+    /// first synchronises, then evaluates its outgoing conditions.
     InclusiveGateway,
     /// An event-based gateway: a *deferred choice* over the intermediate catch
     /// events (timer/message/signal/conditional) that immediately follow it.
@@ -960,6 +959,47 @@ impl ElementKind {
                 | ElementKind::MessageStartEvent { .. }
                 | ElementKind::TimerStartEvent { .. }
         )
+    }
+
+    /// The activity a boundary event is attached to, or `None` if this kind is
+    /// not a boundary event. Exhaustive so a new boundary kind is caught at
+    /// compile time.
+    pub fn attached_to(&self) -> Option<&str> {
+        match self {
+            ElementKind::ErrorBoundaryEvent { attached_to, .. }
+            | ElementKind::TimerBoundaryEvent { attached_to, .. }
+            | ElementKind::MessageBoundaryEvent { attached_to, .. }
+            | ElementKind::SignalBoundaryEvent { attached_to, .. }
+            | ElementKind::ConditionalBoundaryEvent { attached_to, .. }
+            | ElementKind::EscalationBoundaryEvent { attached_to, .. }
+            | ElementKind::CompensationBoundaryEvent { attached_to, .. } => Some(attached_to),
+            ElementKind::StartEvent
+            | ElementKind::EndEvent
+            | ElementKind::TerminateEndEvent
+            | ElementKind::ServiceTask { .. }
+            | ElementKind::BusinessRuleTask { .. }
+            | ElementKind::UserTask(_)
+            | ElementKind::ExclusiveGateway
+            | ElementKind::ParallelGateway
+            | ElementKind::InclusiveGateway
+            | ElementKind::EventBasedGateway
+            | ElementKind::TimerIntermediateCatchEvent { .. }
+            | ElementKind::MessageIntermediateCatchEvent { .. }
+            | ElementKind::MessageStartEvent { .. }
+            | ElementKind::TimerStartEvent { .. }
+            | ElementKind::SubProcess { .. }
+            | ElementKind::IntermediateThrowEvent
+            | ElementKind::EscalationThrowEvent { .. }
+            | ElementKind::CompensationThrowEvent
+            | ElementKind::Task
+            | ElementKind::ScriptTask { .. }
+            | ElementKind::CallActivity { .. }
+            | ElementKind::SignalIntermediateCatchEvent { .. }
+            | ElementKind::LinkIntermediateThrowEvent { .. }
+            | ElementKind::LinkIntermediateCatchEvent { .. }
+            | ElementKind::ConditionalIntermediateCatchEvent { .. }
+            | ElementKind::AgentTask { .. } => None,
+        }
     }
 
     /// Whether this element is an *activity* (task / sub-process / call

@@ -220,8 +220,8 @@ const NANO_ONLY_DIVERGENCES: &[Divergence] = &[
                     end-listener chain (both phases dead), an inclusive join's \
                     `start` listener never fires (the join short-circuits the \
                     activation body — but its `end` listener IS supported and is \
-                    accepted, since the quiescence sweep defers the join behind the \
-                    end-listener chain), a compensation boundary is a passive marker \
+                    accepted, since an accepted join runs the end-listener chain \
+                    before routing), a compensation boundary is a passive marker \
                     never entered by token flow, a terminate end event's `end` \
                     listener never fires (its scope-wide teardown emits completion \
                     directly, bypassing the end-listener chain — its `start` \

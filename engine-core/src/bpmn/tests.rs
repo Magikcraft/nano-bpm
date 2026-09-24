@@ -4971,7 +4971,7 @@ fn listener_on_parallel_join_is_rejected_at_deploy() {
 #[test]
 fn end_listener_on_parallel_join_is_rejected_at_deploy() {
     // #1197: unlike an inclusive join, a parallel join completes without
-    // running the end-listener chain (`arrive_at_parallel_join` emits
+    // running the end-listener chain (`activate_join` emits
     // `ElementCompleting` → `ElementCompleted` directly), so even an `end`
     // listener on it can never fire — reject both phases.
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -5009,8 +5009,8 @@ fn end_listener_on_parallel_join_is_rejected_at_deploy() {
 
 #[test]
 fn listener_on_inclusive_join_is_rejected_at_deploy() {
-    // #1197: a multi-incoming inclusive gateway fires at token quiescence and
-    // short-circuits the listener-aware activation body, so its `start`
+    // #1197: a multi-incoming inclusive gateway is synchronised by its
+    // activation guard and short-circuits the listener-aware activation body, so its `start`
     // listener can never fire — reject at deploy. (Its `end` listener IS
     // supported and must NOT be rejected — see
     // `end_listener_on_inclusive_join_is_supported`.)
@@ -5049,8 +5049,8 @@ fn listener_on_inclusive_join_is_rejected_at_deploy() {
 
 #[test]
 fn end_listener_on_inclusive_join_is_supported() {
-    // #1197: the inclusive-join quiescence sweep (`fire_ready_inclusive_joins`)
-    // DOES defer the join behind its end-listener chain
+    // #1197: an accepted inclusive join (`route_inclusive_gateway`)
+    // DOES defer its routing behind its end-listener chain
     // (`begin_end_listener_chain`), so an `end` listener on a multi-incoming
     // inclusive join fires and must be ACCEPTED at deploy — the same model
     // built through `ProcessBuilder` deploys and runs

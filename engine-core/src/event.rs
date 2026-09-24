@@ -302,7 +302,8 @@ pub enum Event {
         element_id: ElementId,
     },
     /// A join fired: a parallel join because every incoming flow has been taken,
-    /// an inclusive join because no live token can still reach it. It consumes
+    /// an inclusive join because every incoming flow has been taken or no active
+    /// path can still reach it over an untaken flow (#1241). It consumes
     /// ONE arrival per incoming flow and keeps any surplus for the next
     /// activation (Zeebe's "Tetris principle",
     /// `ProcessInstanceElementActivatingV3Applier`, #1233, #1237).

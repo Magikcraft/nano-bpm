@@ -325,9 +325,12 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > every incoming flow has delivered a token, consuming one per flow and keeping
 > any surplus for a later firing),
 > **inclusive (OR) gateways** (split takes every outgoing flow whose FEEL
-> condition holds, falling back to the default flow; the join waits at token
-> quiescence until no still-in-flight token could reach it, then consumes one
-> token per incoming flow and keeps any surplus for a later firing), **timer intermediate
+> condition holds, falling back to the default flow; as in Zeebe, the join is
+> evaluated when a token arrives: it fires once every incoming flow has been
+> taken, or when no active element or in-transit token can still reach it over
+> an untaken flow, then consumes one token per taken flow and keeps any surplus
+> for a later firing; it is never re-evaluated otherwise, so a join whose
+> remaining path diverges elsewhere waits, exactly as in Zeebe), **timer intermediate
 > catch events** (a token parks until its `timeDuration` elapses, fired by a
 > host clock tick) and **message events** — **message intermediate catch events**
 > (a token parks until a matching message is correlated) and **interrupting

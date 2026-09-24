@@ -90,10 +90,10 @@ pub enum ParseError {
     ///   and completes without running the listener-aware activation body or the
     ///   end-listener chain, so neither a `start` nor an `end` listener fires.
     /// * the **`start` listener of a multi-incoming inclusive gateway** (a join):
-    ///   the join fires at quiescence and short-circuits the activation body, so
-    ///   its `start` listener never fires. An inclusive-join **`end`** listener IS
-    ///   supported (the quiescence sweep defers the join behind the end-listener
-    ///   chain) and is not rejected.
+    ///   the join is synchronised on activation and short-circuits the activation
+    ///   body, so its `start` listener never fires. An inclusive-join **`end`**
+    ///   listener IS supported (an accepted join runs the end-listener chain
+    ///   before routing) and is not rejected.
     /// * Single-incoming parallel/inclusive gateways (splits) and exclusive merges
     ///   run the normal activation body, so their listeners fire and are fine.
     /// * a **compensation boundary event**: a passive structural marker, armed

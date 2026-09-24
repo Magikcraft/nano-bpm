@@ -578,14 +578,14 @@ impl ProcessAcc {
         // it is not a user-facing deploy surface.
         //
         // * A **multi-incoming parallel gateway** is a *join*:
-        //   `arrive_at_parallel_join` synchronises tokens and, once the threshold
-        //   is met, emits `ElementCompleting` → `ElementCompleted` directly —
+        //   `activate_join` synchronises tokens and, once every incoming flow
+        //   has been taken, emits `ElementCompleting` → `ElementCompleted` directly —
         //   running neither the listener-aware activation body (`start`) nor the
         //   end-listener chain (`end`), so *neither* phase of a listener on it can
         //   fire.
-        // * A **multi-incoming inclusive gateway** is a *join* too, but it fires
-        //   at token quiescence in `fire_ready_inclusive_joins`, which DOES defer
-        //   the join behind its end-listener chain (`begin_end_listener_chain`) —
+        // * A **multi-incoming inclusive gateway** is a *join* too, but an
+        //   accepted join routes via `route_inclusive_gateway`, which DOES defer
+        //   the routing behind its end-listener chain (`begin_end_listener_chain`) —
         //   so an `end` listener on an inclusive join fires and is supported. Only
         //   its `start` listener never fires (the join short-circuits the
         //   activation body), so we reject `start` alone.
@@ -626,12 +626,12 @@ impl ProcessAcc {
                         return Err(ParseError::UnsupportedExecutionListener {
                             process_id: self.id.clone(),
                             element_id: node.id.clone(),
-                            reason: "a multi-incoming inclusive gateway (a join) fires at \
-                                     token quiescence and never runs the listener-aware \
+                            reason: "a multi-incoming inclusive gateway (a join) is \
+                                     synchronised on activation and never runs the listener-aware \
                                      activation body, so a `start` execution listener on it \
-                                     would never fire (its `end` listener IS supported — the \
-                                     quiescence sweep defers the join behind the end-listener \
-                                     chain; a listener on a single-incoming split is supported)"
+                                     would never fire (its `end` listener IS supported — an \
+                                     accepted join runs the end-listener chain before \
+                                     routing; a listener on a single-incoming split is supported)"
                                 .to_string(),
                         });
                     }

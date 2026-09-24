@@ -76,22 +76,8 @@ fn kind_label(kind: &ElementKind) -> &'static str {
     }
 }
 
-/// The activity a boundary event is attached to, if this kind is a boundary event.
-fn attached_to(kind: &ElementKind) -> Option<&str> {
-    match kind {
-        ElementKind::ErrorBoundaryEvent { attached_to, .. }
-        | ElementKind::TimerBoundaryEvent { attached_to, .. }
-        | ElementKind::SignalBoundaryEvent { attached_to, .. }
-        | ElementKind::ConditionalBoundaryEvent { attached_to, .. }
-        | ElementKind::CompensationBoundaryEvent { attached_to, .. }
-        | ElementKind::EscalationBoundaryEvent { attached_to, .. }
-        | ElementKind::MessageBoundaryEvent { attached_to, .. } => Some(attached_to.as_str()),
-        _ => None,
-    }
-}
-
 fn is_boundary(kind: &ElementKind) -> bool {
-    attached_to(kind).is_some()
+    kind.attached_to().is_some()
 }
 
 fn is_gateway(kind: &ElementKind) -> bool {
@@ -503,7 +489,7 @@ fn adjacency(def: &ProcessDefinition) -> HashMap<String, Vec<String>> {
     }
     // Boundary events have no incoming flow; they become reachable through their host.
     for (id, el) in &def.elements {
-        if let Some(host) = attached_to(&el.kind) {
+        if let Some(host) = el.kind.attached_to() {
             adj.entry(host.to_string()).or_default().push(id.clone());
         }
     }
@@ -965,7 +951,7 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
             // A condition-routed split (XOR or OR) with every branch guarded: if no
             // condition matches and there is no default flow, the token has nowhere
             // to go (an exclusive gateway gets stuck; an inclusive gateway raises a
-            // `NoMatchingSequenceFlow` incident at quiescence). Same defect, so one
+            // `NoMatchingSequenceFlow` incident). Same defect, so one
             // gateway-neutral advisory covers both condition-routed kinds.
             ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway
                 if el.outgoing.len() > 1 =>
@@ -990,7 +976,7 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
             // incident with no modelled recovery path.
             ElementKind::ServiceTask { job_type, .. } => {
                 let guarded = def.elements.values().any(|b| {
-                    attached_to(&b.kind) == Some(id.as_str())
+                    b.kind.attached_to() == Some(id.as_str())
                         && matches!(
                             b.kind,
                             ElementKind::ErrorBoundaryEvent { .. }
@@ -3577,7 +3563,7 @@ fn append_diagram(
     let mut rank: HashMap<String, usize> = ids.iter().map(|s| (s.clone(), 0usize)).collect();
     for _ in 0..(n + 2) {
         for id in &ids {
-            if let Some(host) = attached_to(&def.elements[id].kind) {
+            if let Some(host) = def.elements[id].kind.attached_to() {
                 if let Some(&hr) = rank.get(host) {
                     rank.insert(id.clone(), hr);
                 }
@@ -3659,7 +3645,7 @@ fn append_diagram(
     // Boundary events straddle the bottom edge of their host (3/4 along its width).
     for id in &ids {
         let kind = &def.elements[id].kind;
-        if let Some(host) = attached_to(kind) {
+        if let Some(host) = kind.attached_to() {
             if let Some(hb) = rects.get(host).copied() {
                 let (w, h) = node_dims(kind);
                 let cx = hb.x + hb.w * 0.75;
@@ -4001,7 +3987,7 @@ fn apply_edit_op(
             let orphaned: Vec<String> = def
                 .elements
                 .iter()
-                .filter(|(_, e)| attached_to(&e.kind) == Some(id))
+                .filter(|(_, e)| e.kind.attached_to() == Some(id))
                 .map(|(bid, _)| bid.clone())
                 .collect();
             for bid in &orphaned {
@@ -4378,7 +4364,7 @@ mod tests {
         // Both a condition-routed exclusive (XOR) and inclusive (OR) split with
         // every outgoing flow guarded and no default flow trip the gateway-neutral
         // `gateway-no-default` advisory: if no condition holds the token is stuck
-        // (XOR) or the OR join raises a no-matching-flow incident at quiescence.
+        // (XOR) or the OR gateway raises a no-matching-flow incident.
         for (kw, gw_id) in [("exclusiveGateway", "X"), ("inclusiveGateway", "O")] {
             let bpmn = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>

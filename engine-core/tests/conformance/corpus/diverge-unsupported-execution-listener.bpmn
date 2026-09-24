@@ -5,8 +5,8 @@
      activation body or the end-listener chain, so such a listener could never
      fire, and Nano rejects the deploy loudly rather than silently store a dead
      listener (#1197). (An inclusive join's `end` listener IS supported and is not
-     a divergence — the quiescence sweep defers the join behind its end-listener
-     chain; only the inclusive-join `start` listener and both parallel-join phases
+     a divergence — an accepted join runs its end-listener chain before
+     routing; only the inclusive-join `start` listener and both parallel-join phases
      are rejected. This fixture exercises a parallel-join `start` listener.)
      Tagged `diverge` (not `reject`) so the conformance oracle never falsely claims
      Zeebe rejected a model it accepts. -->

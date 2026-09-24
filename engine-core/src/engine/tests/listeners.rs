@@ -3,9 +3,9 @@ use super::*;
 
 #[test]
 fn end_listener_fires_on_a_multi_incoming_inclusive_join() {
-    // #1168 regression: an inclusive gateway acting as a JOIN fires via the
-    // quiescence sweep (`fire_ready_inclusive_joins`), NOT the split-completion
-    // path (`complete_inclusive_gateway`). That sweep must still honour the
+    // #1168 regression: an inclusive gateway acting as a JOIN fires via its
+    // activation guard (`activate_join`, #1241), NOT the split-completion
+    // path (`complete_inclusive_gateway`). That path must still honour the
     // element's `end` execution-listener gate (ADR 0037): the join rests in
     // COMPLETING while the listener runs, and its outgoing flow is only taken
     // once the chain drains. Without the gate a multi-incoming inclusive join
@@ -38,8 +38,8 @@ fn end_listener_fires_on_a_multi_incoming_inclusive_join() {
         .unwrap();
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
 
-    // Drive both split branches to the join; the second arrival makes the join
-    // ready at quiescence.
+    // Drive both split branches to the join; the second arrival takes the last
+    // incoming flow and makes the join ready.
     complete_one(&mut engine, "ja");
     let arrive = complete_one(&mut engine, "jb");
 

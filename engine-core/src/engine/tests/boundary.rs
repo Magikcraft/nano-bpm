@@ -358,10 +358,12 @@ fn inclusive_join_waits_while_a_boundary_that_reaches_it_is_still_armed() {
     // boundary `be` (`be -> j`). Crucially, `b`'s *own* completion flows elsewhere
     // (`b -> eb`), so `b` is not a sequence-flow predecessor of `j` — only its
     // armed boundary is. When `a` arrives at the open join while `b` is still
-    // parked on its job (boundary armed), the quiescence sweep must NOT fire `j`:
+    // parked on its job (boundary armed), the join's guard must NOT fire `j`:
     // the still-armed boundary could yet route a token in, and firing early would
-    // then mis-route that later boundary token. Only once `b` resolves (its job
-    // completes, disarming the boundary) may `j` fire, with the single `a` token.
+    // then mis-route that later boundary token. When `b` resolves instead (its
+    // job completes, disarming the boundary), Zeebe does not re-evaluate `j`:
+    // it only evaluates an inclusive join when a token arrives at it, and none
+    // does, so `j` holds `a`'s token and the instance stays active (#1241).
     let def = ProcessBuilder::new("inc-boundary")
         .start_event("s")
         .inclusive_gateway("isplit")
@@ -403,22 +405,18 @@ fn inclusive_join_waits_while_a_boundary_that_reaches_it_is_still_armed() {
         "the instance must still be running with `b` parked and the join held open"
     );
 
-    // Complete branch `b`; the boundary disarms, `b` flows to its own end, and now
-    // no live token can reach `j` — it fires once, with the single `a` token.
+    // Complete branch `b`; the boundary disarms and `b` flows to its own end.
+    // Nothing arrives at `j`, so Zeebe never re-evaluates it.
     let after_b = complete_one(&mut engine, "jb");
     assert!(
-        engine.is_completed(instance_key),
-        "once `b` resolves, the join fires and the instance completes"
-    );
-    assert_eq!(
-        after_b
+        !after_b
             .iter()
-            .filter(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "e"))
-            .count(),
-        1,
-        "the join routes to the end exactly once (no premature fire, no duplicate)"
+            .any(|e| matches!(e, Event::SequenceFlowTaken { to, .. } if to == "e")),
+        "the join is only evaluated when a token arrives at it"
     );
-    assert!(engine.active_incidents().is_empty());
+    assert!(!engine.is_completed(instance_key));
+    let instance = engine.instance(instance_key).unwrap();
+    assert!(instance.join_instances.contains_key("j"));
 }
 
 /// Issue #1170 — regression guard, service-task multi-instance child.

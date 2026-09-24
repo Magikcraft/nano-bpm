@@ -43,15 +43,14 @@ single process instance in a single scope:
 |---|---|
 | `pending` (a bag of flows being taken) | the `Step::Activate` queue, drained to empty per command |
 | `waiting` | tokens parked on wait-state tasks (job completion is `CompleteTask`) |
-| `ArriveParallelJoin` | `arrive_at_parallel_join` (`ParallelJoinOpened` / `TokenArrived` / `Fired`) |
+| `TakeFlows` | `take_flow`: a flow into a join is counted when it is taken (`ParallelJoinTokenArrived`), as in Zeebe |
 | `joinTokens` | `join_flow_arrivals` (per incoming flow, parallel and inclusive) |
-| `ArriveInclusiveJoin`, `FireInclusiveJoin` | `arrive_at_inclusive_join`, `fire_ready_inclusive_joins` |
-| `Reaching` | `elements_reaching` |
+| `ArriveJoin` | `activate_join`, the guard for both join kinds (`ParallelJoinOpened` / `Fired`) |
+| `HasActivePathTo`, `LiveSources`, `PathReaches` | `has_active_path_to`, `path_reaches_join` (Zeebe's `hasActivePathToTheGateway`) |
 | `CompleteInstance` | `complete_finished_instances` |
 
 The model deliberately covers more behaviours than the engine can produce. It
-drains the queue in any order, fires any ready inclusive join, and picks gateway
-branches freely instead of evaluating conditions. Each *safety* property (the
+drains the queue in any order and picks gateway branches freely instead of evaluating conditions. Each *safety* property (the
 invariants and deadlock freedom) checked against this superset therefore also
 holds for the engine's deterministic choices. `Termination` does not transfer
 that way: it assumes fair routing choices, and real condition data can keep
@@ -60,9 +59,10 @@ finish", not "the engine always finishes".
 
 The properties checked:
 
-- `JoinBookkeepingCoherent`: a join is open iff it holds tokens, tokens sit
-  only on its own incoming flows, and a parallel join never rests with every
-  incoming flow fed. This is the class behind the
+- `JoinBookkeepingCoherent`: an open join holds tokens, a join holding tokens
+  is open unless an activation into it is still queued, tokens sit only on its
+  own incoming flows, and a parallel join never has every incoming flow fed
+  without an activation on its way to fire it. This is the class behind the
   missing-`ParallelJoinReset` bugs.
 - `ParallelJoinWaitsForEveryFlow`: a parallel join fires only after every
   incoming flow has delivered, matching BPMN and Zeebe.
@@ -77,8 +77,8 @@ The properties checked:
   tokens onto a join's inputs (not 1-safe, a BPMN lack-of-synchronization)
   also violates it, and that is intended: it is a finding about the model.
 - `Termination`: every instance eventually completes, under the fairness
-  in `TokenFlow.tla`'s `Fairness`. Every drain and inclusive-join-fire action
-  is strongly fair *per routing choice*, so a gateway reached infinitely often
+  in `TokenFlow.tla`'s `Fairness`. Every drain action is strongly fair *per
+  routing choice*, so a gateway reached infinitely often
   eventually takes each branch. That is the "fair data" assumption of
   workflow-net soundness. Task completion is strongly fair too, because a task
   can only complete in a settled state, which is intermittent. Instance
@@ -113,10 +113,14 @@ violations in (a stuck state still shows up, as `NoStuckInstance` and
   `ParallelJoinWaitsForEveryFlow`. `MCParallelJoinSurplus` takes every
   incoming flow twice; the join keeps the surplus between firings (Zeebe's
   "Tetris" principle), fires twice (`JoinFiresAtMostOnce`), and the instance
-  completes. `MCInclusiveJoinSurplus` is the inclusive-join version: the join
-  fires once nothing can reach it, consuming one token per flow, and fires
-  again on the surplus (`JoinFiresAtMostOnce`). Before #1237 the first firing
-  discarded the surplus, and the model passed.
+  completes. `MCInclusiveJoinSurplus` is the inclusive-join version. As in
+  Zeebe, an inclusive join is only evaluated when a token arrives (#1241): when
+  the surplus arrives last it fires the join again (`JoinFiresAtMostOnce`), but
+  when it arrives first it waits forever (`NoStuckInstance,Termination`).
+  `MCInclusiveDivergentPath` is the same verdict for a sound-looking graph: the
+  competing branch leaves through an exclusive gateway, so the join is never
+  re-evaluated and waits, as in Zeebe. Before #1241 a quiescence sweep
+  re-evaluated waiting joins, and both models completed.
 
 TLC cannot see the Rust code, so nothing yet forces the spec update when the
 engine changes. Until trace validation (#1226) links the two, that step is a
@@ -144,5 +148,5 @@ Rust test before recording it. The model may simply be wrong.
 The spec is hand-written, so it can drift from the Rust code. Tying the two
 together through trace validation is tracked in #1226: replay TLC-generated
 behaviours against `Engine::apply_command`. Until that lands, any change to
-the drain loop, the join functions or `elements_reaching` should update
+the drain loop, the join functions or `path_reaches_join` should update
 `TokenFlow.tla` in the same PR.

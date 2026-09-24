@@ -276,9 +276,9 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
   that synchronises tokens and completes without running the activation body or the
   end-listener chain — so *neither* phase fires; a single-incoming split is
   supported), the **`start` listener of a multi-incoming inclusive gateway** (the
-  join fires at quiescence and short-circuits the activation body — but its **`end`
-  listener IS supported**, since the quiescence sweep defers the join behind the
-  end-listener chain, so an inclusive-join `end` listener is *not* rejected), a
+  join is synchronised on activation and short-circuits the activation body — but
+  its **`end` listener IS supported**, since an accepted join runs the end-listener
+  chain before routing, so an inclusive-join `end` listener is *not* rejected), a
   **compensation boundary event** (a passive structural marker never entered by
   token flow), a **tool of an ad-hoc sub-process** (a leaf tool is pruned into the
   non-executable catalog and a retained embedded tool is activated/completed with

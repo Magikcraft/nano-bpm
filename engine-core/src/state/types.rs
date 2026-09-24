@@ -557,8 +557,8 @@ pub struct ProcessInstance {
     /// For each open join: how many tokens have arrived over an *unidentified*
     /// flow (see [`Event::ParallelJoinTokenArrived`](crate::Event)'s `flow`):
     /// arrivals journaled before #1233 (#1237 for inclusive joins) and
-    /// activations that did not come over a flow. A parallel join counts each
-    /// of these as one taken incoming flow; a firing clears them all.
+    /// activations that did not come over a flow. A join counts each of these
+    /// as one taken incoming flow; a firing clears them all.
     pub join_counts: HashMap<ElementId, usize>,
     /// For each open parallel- or inclusive-gateway join: arrivals per
     /// identified incoming flow (Zeebe's "number of taken sequence flows",

@@ -912,7 +912,7 @@ impl<'a> Parser<'a> {
             ));
         }
         for el in elements.values() {
-            if let Some(target) = attached_to(&el.kind) {
+            if let Some(target) = el.kind.attached_to() {
                 if !elements.contains_key(target) {
                     return Err(format!(
                         "boundary event '{}' is attached to unknown element '{target}'",
@@ -1287,46 +1287,6 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
         other => return Err(format!("unknown element kind '{other}'")),
     };
     Ok(kind)
-}
-
-/// The activity a boundary event is attached to, if this kind is a boundary event. Used to validate
-/// `attachedTo` references resolve. Exhaustive so a new boundary kind is caught at compile time.
-fn attached_to(kind: &ElementKind) -> Option<&str> {
-    match kind {
-        ElementKind::ErrorBoundaryEvent { attached_to, .. }
-        | ElementKind::TimerBoundaryEvent { attached_to, .. }
-        | ElementKind::MessageBoundaryEvent { attached_to, .. }
-        | ElementKind::SignalBoundaryEvent { attached_to, .. }
-        | ElementKind::ConditionalBoundaryEvent { attached_to, .. }
-        | ElementKind::EscalationBoundaryEvent { attached_to, .. }
-        | ElementKind::CompensationBoundaryEvent { attached_to, .. } => Some(attached_to),
-        ElementKind::StartEvent
-        | ElementKind::EndEvent
-        | ElementKind::TerminateEndEvent
-        | ElementKind::ServiceTask { .. }
-        | ElementKind::BusinessRuleTask { .. }
-        | ElementKind::UserTask(_)
-        | ElementKind::ExclusiveGateway
-        | ElementKind::ParallelGateway
-        | ElementKind::InclusiveGateway
-        | ElementKind::EventBasedGateway
-        | ElementKind::TimerIntermediateCatchEvent { .. }
-        | ElementKind::MessageIntermediateCatchEvent { .. }
-        | ElementKind::MessageStartEvent { .. }
-        | ElementKind::TimerStartEvent { .. }
-        | ElementKind::SubProcess { .. }
-        | ElementKind::IntermediateThrowEvent
-        | ElementKind::EscalationThrowEvent { .. }
-        | ElementKind::CompensationThrowEvent
-        | ElementKind::Task
-        | ElementKind::ScriptTask { .. }
-        | ElementKind::CallActivity { .. }
-        | ElementKind::SignalIntermediateCatchEvent { .. }
-        | ElementKind::LinkIntermediateThrowEvent { .. }
-        | ElementKind::LinkIntermediateCatchEvent { .. }
-        | ElementKind::ConditionalIntermediateCatchEvent { .. }
-        | ElementKind::AgentTask { .. } => None,
-    }
 }
 
 // -------------------------------------------------------------------------------------------------

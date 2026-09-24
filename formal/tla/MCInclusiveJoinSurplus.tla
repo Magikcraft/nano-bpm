@@ -1,9 +1,11 @@
 ------------------------------ MODULE MCInclusiveJoinSurplus ------------------------------
 (* One incoming flow of an inclusive join is taken twice:
    S -> F -> {PA, B};  PA -> {A1, A2} -> XA (xor merge) -> J;  B -> J;  J -> E
-   J is an inclusive join. It fires once the three tokens have arrived, consuming
-   one per flow, and the surplus on XA -> J reopens it, so it fires again at the
-   next quiescence and the instance completes ("Tetris" principle, #1237). *)
+   J is an inclusive join, evaluated only when a token arrives (#1241). When B's
+   token is not last, J fires on it, consuming one token per flow ("Tetris"
+   principle, #1237), and the last XA token fires it again: the instance
+   completes. When both XA tokens arrive first, J fires on B's token and the
+   surplus on XA -> J waits forever for a partner, as in Zeebe. *)
 EXTENDS TokenFlow
 
 MCNodes == {"S", "F", "PA", "A1", "A2", "B", "XA", "J", "E"}
