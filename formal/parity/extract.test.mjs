@@ -198,6 +198,10 @@ test('lifecycle hooks are inherited through extends, and an unreadable parent fa
   };
   const override = run('lifecycle', overridden).find((c) => c.id === 'lifecycle:TASK:terminate');
   assert.deepEqual(override.detail.hooks, ['onTerminateInternal']);
+  const qualified = { ...inherited, [task]: 'public class TaskProcessor extends io.camunda.task.BaseProcessor<X> {\n}' };
+  assert.deepEqual(run('lifecycle', qualified).find((c) => c.id === 'lifecycle:TASK:terminate').detail.hooks, ['onTerminateInternal']);
+  const farAway = { ...PROCESSORS, [task]: 'public class TaskProcessor extends io.elsewhere.OtherProcessor<X> {\n}' };
+  assert.throws(() => run('lifecycle', farAway), /extends io\.elsewhere\.OtherProcessor, which is not under/);
   const external = { ...PROCESSORS, [task]: 'public class TaskProcessor extends ElsewhereProcessor<X> {\n}' };
   assert.throws(() => run('lifecycle', external), /extends ElsewhereProcessor, which is not under/);
 });
@@ -211,6 +215,12 @@ test('lifecycle fails on an unmapped or stale hook, or an unread registration', 
   const reg = `${BPMN}/BpmnElementProcessors.java`;
   const helper = { ...PROCESSORS, [reg]: PROCESSORS[reg].replace('} }', 'processors.put(BpmnElementType.X, processorFor(y)); } }') };
   assert.throws(() => run('lifecycle', helper), /registration\(s\) in an unrecognised form/);
+  for (const form of ['processors.putAll(more);', 'processors.putIfAbsent(BpmnElementType.X, new XProcessor(a));', 'register(processors);']) {
+    const other = { ...PROCESSORS, [reg]: PROCESSORS[reg].replace('} }', `${form} } }`) };
+    assert.throws(() => run('lifecycle', other), /unrecognised use of the processor registry/, form);
+  }
+  const reads = { ...PROCESSORS, [reg]: PROCESSORS[reg].replace('} }', '} Object g(T t) { return processors.get(t); } private final Map<T, P> processors = new EnumMap<>(T.class); }') };
+  assert.equal(run('lifecycle', reads).length, run('lifecycle', PROCESSORS).length);
   const noTerminate = { ...PROCESSORS, [STREAM]: STREAM_SRC.replace('case TERMINATE_ELEMENT:', 'case OTHER:') };
   assert.throws(() => run('lifecycle', noTerminate), /no longer dispatches terminate/);
   const arrow = { ...PROCESSORS, [STREAM]: STREAM_SRC.replace('case CONTINUE_TERMINATING_ELEMENT:\n        break;', 'case CONTINUE_TERMINATING_ELEMENT, MIGRATE_ELEMENT -> c();') };

@@ -510,12 +510,14 @@ function processorHooks(s, api, index, cls, seen = new Set()) {
   const end = blockEnd(src, decl.index);
   const body = src.slice(decl.index, end);
   const hooks = new Map();
-  const parent = /^class\s+\w+(?:<[^{]*?>)?\s+extends\s+(\w+)/.exec(body);
-  if (parent && !index.has(parent[1])) {
-    fail(`${rel}: ${cls} extends ${parent[1]}, which is not under ${BPMN}, so its inherited hooks cannot be read`);
+  // The superclass may be package-qualified; resolve it by simple name.
+  const ext = /^class\s+\w+(?:<[^{]*?>)?\s+extends\s+([\w.]+)/.exec(body);
+  const parent = ext?.[1].split('.').pop();
+  if (parent && !index.has(parent)) {
+    fail(`${rel}: ${cls} extends ${ext[1]}, which is not under ${BPMN}, so its inherited hooks cannot be read`);
   }
   if (parent) {
-    for (const [t, where] of processorHooks(s, api, index, parent[1], seen)) hooks.set(t, [...where]);
+    for (const [t, where] of processorHooks(s, api, index, parent, seen)) hooks.set(t, [...where]);
   }
   // Only the class's own methods (depth 1), not those of inner behaviour classes.
   let depth = 0;
@@ -592,7 +594,15 @@ function extractLifecycle(s, cells) {
   const api = processorApi(s);
   const commands = elementCommands(s);
   const re = /processors\.put\(\s*BpmnElementType\.(\w+)\s*,\s*new\s+(\w+)\s*[(<]/g;
-  const puts = [...src.matchAll(/\bprocessors\.put\(/g)].length;
+  // Every other touch of the map must be the declaration or a read, so a
+  // registration through putAll/putIfAbsent/a helper cannot slip past.
+  const code = stripComments(src);
+  const puts = [...code.matchAll(/\bprocessors\.put\(/g)].length;
+  for (const m of code.matchAll(/\bprocessors\b(?!\.put\()/g)) {
+    const around = code.slice(m.index, m.index + 40);
+    if (/^processors\s*=/.test(around) || /^processors\.get\(/.test(around)) continue;
+    fail(`${rel}: unrecognised use of the processor registry: ${around.split('\n')[0]}`);
+  }
   let n = 0;
   for (let m; (m = re.exec(src)); n++) {
     const [, type, cls] = m;
