@@ -515,7 +515,7 @@ function processorHooks(s, api, index, cls, seen = new Set()) {
     fail(`${rel}: ${cls} extends ${parent[1]}, which is not under ${BPMN}, so its inherited hooks cannot be read`);
   }
   if (parent) {
-    for (const [t, where] of processorHooks(s, api, index, parent[1], seen)) hooks.set(t, where);
+    for (const [t, where] of processorHooks(s, api, index, parent[1], seen)) hooks.set(t, [...where]);
   }
   // Only the class's own methods (depth 1), not those of inner behaviour classes.
   let depth = 0;
@@ -532,8 +532,8 @@ function processorHooks(s, api, index, cls, seen = new Set()) {
         const t = hookTransition(api, m[1]);
         if (t) {
           const where = `${rel}:${lineAt(src, decl.index + i)}`;
-          if (!hooks.has(t)) hooks.set(t, []);
-          hooks.get(t).push(`${m[1]}@${where}`);
+          // An override replaces the inherited method rather than adding to it.
+          hooks.set(t, [...(hooks.get(t) ?? []).filter((h) => !h.startsWith(`${m[1]}@`)), `${m[1]}@${where}`]);
         }
         i += m[0].length - 1;
       }

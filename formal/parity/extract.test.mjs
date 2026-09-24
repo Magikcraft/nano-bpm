@@ -192,6 +192,12 @@ test('lifecycle hooks are inherited through extends, and an unreadable parent fa
     processor: 'TaskProcessor',
     hooks: ['onTerminateInternal'],
   });
+  const overridden = {
+    ...inherited,
+    [task]: 'public class TaskProcessor extends BaseProcessor<X> {\n  protected Either<Failure, ?> onTerminateInternal(final X e, final C c) { return null; }\n}',
+  };
+  const override = run('lifecycle', overridden).find((c) => c.id === 'lifecycle:TASK:terminate');
+  assert.deepEqual(override.detail.hooks, ['onTerminateInternal']);
   const external = { ...PROCESSORS, [task]: 'public class TaskProcessor extends ElsewhereProcessor<X> {\n}' };
   assert.throws(() => run('lifecycle', external), /extends ElsewhereProcessor, which is not under/);
 });

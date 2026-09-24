@@ -3036,8 +3036,6 @@
           "finalizeActivation",
           "onActivate",
           "onActivateInternal",
-          "onActivateInternal",
-          "onFinalizeActivationInternal",
           "onFinalizeActivationInternal"
         ]
       }
@@ -3053,8 +3051,6 @@
           "finalizeCompletion",
           "onComplete",
           "onCompleteInternal",
-          "onCompleteInternal",
-          "onFinalizeCompletionInternal",
           "onFinalizeCompletionInternal"
         ]
       }
@@ -3088,10 +3084,8 @@
         "processor": "BusinessRuleTaskProcessor",
         "hooks": [
           "finalizeTermination",
-          "finalizeTermination",
           "onFinalizeTerminationInternal",
           "onTerminate",
-          "onTerminateInternal",
           "onTerminateInternal"
         ]
       }
@@ -3971,8 +3965,6 @@
           "finalizeActivation",
           "onActivate",
           "onActivateInternal",
-          "onActivateInternal",
-          "onFinalizeActivationInternal",
           "onFinalizeActivationInternal"
         ]
       }
@@ -3988,8 +3980,6 @@
           "finalizeCompletion",
           "onComplete",
           "onCompleteInternal",
-          "onCompleteInternal",
-          "onFinalizeCompletionInternal",
           "onFinalizeCompletionInternal"
         ]
       }
@@ -4023,10 +4013,8 @@
         "processor": "ScriptTaskProcessor",
         "hooks": [
           "finalizeTermination",
-          "finalizeTermination",
           "onFinalizeTerminationInternal",
           "onTerminate",
-          "onTerminateInternal",
           "onTerminateInternal"
         ]
       }
@@ -4042,8 +4030,6 @@
           "finalizeActivation",
           "onActivate",
           "onActivateInternal",
-          "onActivateInternal",
-          "onFinalizeActivationInternal",
           "onFinalizeActivationInternal"
         ]
       }
@@ -4059,8 +4045,6 @@
           "finalizeCompletion",
           "onComplete",
           "onCompleteInternal",
-          "onCompleteInternal",
-          "onFinalizeCompletionInternal",
           "onFinalizeCompletionInternal"
         ]
       }
@@ -4095,9 +4079,7 @@
         "hooks": [
           "finalizeTermination",
           "onFinalizeTerminationInternal",
-          "onFinalizeTerminationInternal",
           "onTerminate",
-          "onTerminateInternal",
           "onTerminateInternal"
         ]
       }
@@ -4370,8 +4352,6 @@
           "finalizeActivation",
           "onActivate",
           "onActivateInternal",
-          "onActivateInternal",
-          "onFinalizeActivationInternal",
           "onFinalizeActivationInternal"
         ]
       }
@@ -4387,8 +4367,6 @@
           "finalizeCompletion",
           "onComplete",
           "onCompleteInternal",
-          "onCompleteInternal",
-          "onFinalizeCompletionInternal",
           "onFinalizeCompletionInternal"
         ]
       }
@@ -4423,9 +4401,7 @@
         "hooks": [
           "finalizeTermination",
           "onFinalizeTerminationInternal",
-          "onFinalizeTerminationInternal",
           "onTerminate",
-          "onTerminateInternal",
           "onTerminateInternal"
         ]
       }
