@@ -1,4 +1,5 @@
 <!-- verdict: accept -->
+<!-- zeebe-cells: validation:SequenceFlowValidator:must-have-a-condition-or-be-default-flow -->
 <!-- oracle: SequenceFlowValidator — a conditionless branch is legal when it is the gateway default (#854). -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
   <bpmn:process id="accept_gateway_condition_or_default" isExecutable="true">

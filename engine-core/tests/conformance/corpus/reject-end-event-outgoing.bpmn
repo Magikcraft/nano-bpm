@@ -1,4 +1,5 @@
 <!-- verdict: reject | category: InvalidEndEvent -->
+<!-- zeebe-cells: validation:EndEventValidator:end-events-must-not-have-outgoing-sequence-flows-to-other-elements -->
 <!-- oracle: EndEventValidator — an end event must have no outgoing sequence flow (#856). -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
   <bpmn:process id="reject_end_event_outgoing" isExecutable="true">

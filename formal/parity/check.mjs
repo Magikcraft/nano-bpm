@@ -6,6 +6,7 @@
 //
 //   parity       evidence: conformance-corpus fixtures carrying a captured
 //                Zeebe verdict (accept/reject — a `diverge` fixture is not parity)
+//                that declare each claimed cell in `<!-- zeebe-cells: … -->`
 //   nano-tested  evidence: `path::test_fn`, the test must exist in that file
 //   gap          issue: the tracking issue that closes the gap
 //   out-of-scope issue + note: why the cell has no Nano meaning
@@ -32,6 +33,12 @@ export function globToRegExp(glob) {
     .map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
     .join('.*');
   return new RegExp(`^${body}$`);
+}
+
+/** The cell ids a corpus fixture declares it exercises (`<!-- zeebe-cells: … -->`). */
+export function fixtureCells(text) {
+  const m = /<!--\s*zeebe-cells:\s*([\s\S]*?)\s*-->/.exec(text);
+  return m ? m[1].split(/\s+/).filter(Boolean) : [];
 }
 
 /** Problems with one evidence reference, given repo-file access `fs`. */
@@ -92,14 +99,17 @@ export function ruleProblems(rule, fs) {
  */
 export function evaluate(surface, coverage, fs, pin) {
   const errors = [];
-  if (pin && surface?.zeebe?.sha !== pin.sha) {
-    errors.push(`zeebe-surface.json was extracted from ${surface?.zeebe?.sha}, but zeebe-pin.json pins ${pin.sha}: regenerate it`);
+  if (pin) {
+    const id = (z) => `${z?.repository}@${z?.ref}(${z?.sha})`;
+    if (['repository', 'ref', 'sha'].some((k) => surface?.zeebe?.[k] !== pin[k])) {
+      errors.push(`zeebe-surface.json was extracted from ${id(surface?.zeebe)}, but zeebe-pin.json pins ${id(pin)}: regenerate it`);
+    }
   }
   const rules = Array.isArray(coverage?.rules) ? coverage.rules : [];
   if (!Array.isArray(coverage?.rules)) errors.push('coverage.json must have a rules array');
   const matchers = rules.map((r) => (typeof r?.match === 'string' ? globToRegExp(r.match) : null));
   for (const r of rules) errors.push(...ruleProblems(r, fs));
-  const claims = rules.map(() => 0);
+  const claims = rules.map(() => []);
   const assignments = new Map();
   for (const { id } of surface.cells) {
     const k = matchers.findIndex((m) => m !== null && m.test(id));
@@ -107,11 +117,28 @@ export function evaluate(surface, coverage, fs, pin) {
       errors.push(`unmapped cell: ${id}`);
       continue;
     }
-    claims[k]++;
+    claims[k].push(id);
     assignments.set(id, rules[k].status);
   }
+  const known = new Set(surface.cells.map((c) => c.id));
   rules.forEach((r, k) => {
-    if (matchers[k] !== null && claims[k] === 0) errors.push(`dead rule (claims no cell): ${r.match}`);
+    if (matchers[k] !== null && claims[k].length === 0) errors.push(`dead rule (claims no cell): ${r.match}`);
+    // A parity claim is only as good as its fixtures: each claimed cell must be
+    // one a fixture declares it exercises, and a fixture may only declare real cells.
+    if (r?.status !== 'parity' || !Array.isArray(r.evidence)) return;
+    const declared = new Set();
+    for (const ref of r.evidence) {
+      if (typeof ref !== 'string' || !fs.exists(ref)) continue;
+      const cells = fixtureCells(fs.read(ref));
+      if (cells.length === 0) errors.push(`rule ${JSON.stringify(r.match)}: ${ref} declares no zeebe-cells`);
+      for (const c of cells) {
+        if (!known.has(c)) errors.push(`${ref} declares a cell not in zeebe-surface.json: ${c}`);
+        declared.add(c);
+      }
+    }
+    for (const c of claims[k]) {
+      if (!declared.has(c)) errors.push(`rule ${JSON.stringify(r.match)}: no evidence fixture declares ${c}`);
+    }
   });
   return { errors, assignments };
 }

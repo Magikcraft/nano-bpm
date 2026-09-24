@@ -12,8 +12,10 @@ import {
   Cells,
   ExtractError,
   FAMILIES,
+  HOOK_TRANSITIONS,
   Source,
   enumConstants,
+  interfaceMethods,
   lineAt,
   messageAt,
   messageExpr,
@@ -112,6 +114,96 @@ test('element family reads SUPPORTED_ELEMENT_TYPES and fails loud when it moves'
   assert.equal(cells[1].sources[0], `${rel}:2`);
   assert.throws(() => run('element', { [rel]: 'class V { Set<Class<?>> TYPES = Set.of(); }' }), ExtractError);
   assert.throws(() => run('element', {}), ExtractError);
+});
+
+test('element family fails on any SUPPORTED_ELEMENT_TYPES form it does not read', () => {
+  const rel = `${VALIDATION}/FlowElementValidator.java`;
+  const decl = 'static final Set<Class<?>> SUPPORTED_ELEMENT_TYPES = new HashSet<>();\n';
+  assert.equal(run('element', { [rel]: `${decl}static { SUPPORTED_ELEMENT_TYPES.add(Task.class); }` }).length, 1);
+  assert.throws(
+    () => run('element', { [rel]: `${decl}static { SUPPORTED_ELEMENT_TYPES.add(Task.class); SUPPORTED_ELEMENT_TYPES.addAll(MORE); }` }),
+    /unrecognised use of SUPPORTED_ELEMENT_TYPES/,
+  );
+  assert.throws(
+    () => run('element', { [rel]: 'static final Set<Class<?>> SUPPORTED_ELEMENT_TYPES = Set.of(Task.class);\nstatic { SUPPORTED_ELEMENT_TYPES.add(A.class); }' }),
+    /unrecognised use/,
+  );
+});
+
+const BPMN = `${PROCESSING}/bpmn`;
+const API = {
+  [`${BPMN}/BpmnElementProcessor.java`]:
+    'public interface BpmnElementProcessor<T> {\n  Class<T> getType();\n' +
+    Object.keys(HOOK_TRANSITIONS)
+      .filter((h) => !/Child|ExecutionPath/.test(h))
+      .map((h) => `  default Either<Failure, ?> ${h}(final T element, final BpmnElementContext context) { return null; }\n`)
+      .join('') +
+    '}',
+  [`${BPMN}/BpmnElementContainerProcessor.java`]:
+    'public interface BpmnElementContainerProcessor<T> extends BpmnElementProcessor<T> {\n' +
+    Object.keys(HOOK_TRANSITIONS)
+      .filter((h) => /Child|ExecutionPath/.test(h))
+      .map((h) => `  default void ${h}(final T element, final BpmnElementContext a, final BpmnElementContext b) {}\n`)
+      .join('') +
+    '}',
+};
+const PROCESSORS = {
+  ...API,
+  [`${BPMN}/BpmnElementProcessors.java`]: 'class BpmnElementProcessors { void f() { processors.put(BpmnElementType.TASK, new TaskProcessor(a)); } }',
+  [`${BPMN}/task/TaskProcessor.java`]:
+    'public class TaskProcessor implements BpmnElementProcessor<X> {\n  public Either<Failure, ?> onActivate(final X e, final C c) { return null; }\n' +
+    '  public void onChildCompleting(final X e, final C a, final C b) {}\n}',
+};
+
+test('lifecycle hooks come from the processor interfaces', () => {
+  assert.deepEqual(interfaceMethods(API[`${BPMN}/BpmnElementProcessor.java`], 'BpmnElementProcessor').slice(0, 2), [
+    'getType',
+    'onActivate',
+  ]);
+  const cells = run('lifecycle', PROCESSORS);
+  assert.deepEqual(cells.map((c) => c.id), [
+    'lifecycle:TASK:activate',
+    'lifecycle:TASK:child-completing',
+    'lifecycle:TASK:complete',
+    'lifecycle:TASK:terminate',
+  ]);
+  assert.deepEqual(cells[0].detail, { processor: 'TaskProcessor', hooks: ['onActivate'] });
+});
+
+test('lifecycle fails on an unmapped or stale hook, or an unread registration', () => {
+  const api = `${BPMN}/BpmnElementProcessor.java`;
+  const added = { ...PROCESSORS, [api]: PROCESSORS[api].replace('Class<T> getType();', 'Class<T> getType();\n  default void onMigrate(final T e) {}') };
+  assert.throws(() => run('lifecycle', added), /processor hook onMigrate has no lifecycle transition/);
+  const removed = { ...PROCESSORS, [api]: PROCESSORS[api].replace(/\n  default [^\n]*finalizeTermination[^\n]*/, '') };
+  assert.throws(() => run('lifecycle', removed), /HOOK_TRANSITIONS.finalizeTermination is not declared/);
+  const reg = `${BPMN}/BpmnElementProcessors.java`;
+  const helper = { ...PROCESSORS, [reg]: PROCESSORS[reg].replace('} }', 'processors.put(BpmnElementType.X, processorFor(y)); } }') };
+  assert.throws(() => run('lifecycle', helper), /registration\(s\) in an unrecognised form/);
+});
+
+test('event lists fail on an entry they cannot read', () => {
+  const list = (rel, constant, body) => ({ [`${VALIDATION}/${rel}`]: `class V { static final List<X> ${constant} = Arrays.asList(${body}); }` });
+  const files = (catchBody) => ({
+    ...list('BoundaryEventValidator.java', 'SUPPORTED_EVENT_DEFINITIONS', 'TimerEventDefinition.class'),
+    ...list('IntermediateCatchEventValidator.java', 'SUPPORTED_EVENTS', catchBody),
+    ...list('SubProcessValidator.java', 'SUPPORTED_START_TYPES', 'MessageEventDefinition.class'),
+    [`${BPMN}/event/EndEventProcessor.java`]: 'class P { class NoneEndEventBehavior implements EndEventBehavior {} }',
+    [`${BPMN}/event/IntermediateThrowEventProcessor.java`]:
+      'class P { class NoneIntermediateThrowEventBehavior implements IntermediateThrowEventBehavior {} }',
+  });
+  assert.equal(run('event', files('TimerEventDefinition.class, LinkEventDefinition.class')).length, 6);
+  assert.throws(() => run('event', files('TimerEventDefinition.class, EXTRA_DEFINITIONS')), /unrecognised SUPPORTED_EVENTS entry/);
+});
+
+test('two different messages normalising to one cell id stop extraction', () => {
+  const rel = `${VALIDATION}/XValidator.java`;
+  const engine = { [`${PROCESSING}/deployment/model/validation/Y.java`]: 'class Y {}' };
+  assert.throws(
+    () => run('validation', { ...engine, [rel]: 'class X { void v() { c.addError(0, "expected %s"); c.addError(0, "expected %d"); } }' }),
+    /derives from two different messages/,
+  );
+  assert.equal(run('validation', { ...engine, [rel]: 'class X { void v() { c.addError(0, "same"); c.addError(0, "same"); } }' }).length, 1);
+  assert.throws(() => run('validation', { [rel]: 'class X {}' }), /missing Zeebe source directory/);
 });
 
 test('intent family walks sub-packages and skips non-enum files', () => {

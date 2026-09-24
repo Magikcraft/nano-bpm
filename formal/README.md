@@ -179,8 +179,12 @@ Zeebe declares, one **cell** per behaviour, in `zeebe-surface.json`:
 | `rejection:<Processor>:<RejectionType>` | command rejection a processor emits | `RejectionType.X` uses under `engine/processing`, checked against the SBE schema |
 
 Each cell records the source lines it was read from. The extractor fails
-loudly when an anchor it relies on moves or changes shape. An upstream
-refactor therefore stops extraction; it never silently shrinks the matrix.
+loudly when an anchor it relies on moves or changes shape. It also fails when
+an anchor appears in a form it does not read (for example
+`SUPPORTED_ELEMENT_TYPES.addAll`, or a processor hook missing from
+`HOOK_TRANSITIONS`), and when two different messages would collapse into one
+cell id. An upstream refactor therefore stops extraction; it never silently
+shrinks the matrix.
 
 Known extraction gap: Zeebe declares no list of supported process-level start
 event types (`StartEventValidator` only checks their count and form), so those
@@ -194,7 +198,7 @@ one status:
 
 | Status | Required | Meaning |
 |---|---|---|
-| `parity` | `evidence`: fixtures in `engine-core/tests/conformance/corpus/` | Nano's verdict is asserted equal to a Zeebe verdict captured in the fixture (`accept` or `reject`; a `diverge` fixture is not parity) |
+| `parity` | `evidence`: fixtures in `engine-core/tests/conformance/corpus/` | Nano's verdict is asserted equal to a Zeebe verdict captured in the fixture (`accept` or `reject`; a `diverge` fixture is not parity). Every claimed cell must be listed in one of the fixtures' `<!-- zeebe-cells: … -->` comment |
 | `nano-tested` | `evidence`: `path::test_fn` | a Nano `#[test]` exercises the behaviour, but not against a Zeebe oracle |
 | `gap` | `issue`, `note` | no evidence yet; the issue closes it |
 | `out-of-scope` | `issue`, `note` | the cell has no Nano meaning (for example, partition-internal records). Use sparingly |
@@ -203,7 +207,9 @@ one status:
 
 - an unmapped cell, including new cells from a Zeebe bump
 - a rule that claims no cell
-- evidence that does not resolve (a renamed test, a missing fixture)
+- evidence that does not resolve (a renamed test, a missing fixture, a
+  `parity` fixture that does not declare the cell, or one that declares a cell
+  not in the surface)
 - a malformed rule
 - a surface extracted at a different commit than the pin
 

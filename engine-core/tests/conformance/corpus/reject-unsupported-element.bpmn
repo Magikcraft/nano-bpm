@@ -1,4 +1,5 @@
 <!-- verdict: reject | category: UnsupportedElement -->
+<!-- zeebe-cells: validation:FlowElementValidator:elements-of-type-are-currently-not-supported-please-refer-to-the-documentation-for-a-list-of-supported-elements-https-docs-camunda-io-docs-components-modeler-bpmn-bpmn-coverage -->
 <!-- oracle: Zeebe only transforms known element types; an unmodelled complexGateway is rejected at deploy (#853). -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
   <bpmn:process id="reject_unsupported_element" isExecutable="true">

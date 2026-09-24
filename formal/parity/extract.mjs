@@ -297,15 +297,34 @@ export class Source {
     return this.cache.get(rel);
   }
   list(dir) {
-    return listJava(join(this.root, dir)).map((p) => relative(this.root, p));
+    let files;
+    try {
+      files = listJava(join(this.root, dir));
+    } catch {
+      fail(`missing Zeebe source directory ${dir}`);
+    }
+    return files.map((p) => relative(this.root, p));
   }
 }
 
 export class Cells {
   constructor() {
     this.map = new Map();
+    this.messages = new Map();
   }
-  add(id, source, detail) {
+  /**
+   * Add a cell. `message` is the raw text a slugged id was derived from: two
+   * different messages normalising to one id would merge distinct behaviours,
+   * so that stops extraction (disambiguate the slug) instead.
+   */
+  add(id, source, detail, message) {
+    if (message !== undefined) {
+      const seen = this.messages.get(id);
+      if (seen !== undefined && seen.message !== message) {
+        fail(`cell ${id} derives from two different messages: ${JSON.stringify(seen.message)} (${seen.source}) and ${JSON.stringify(message)} (${source})`);
+      }
+      this.messages.set(id, { message, source });
+    }
     const existing = this.map.get(id);
     if (existing) {
       if (!existing.sources.includes(source)) existing.sources.push(source);
@@ -328,9 +347,24 @@ const at = (rel, src, index) => `${rel}:${lineAt(src, index)}`;
 function extractElements(s, cells) {
   const rel = `${VALIDATION}/FlowElementValidator.java`;
   const src = s.read(rel);
-  const re = /SUPPORTED_ELEMENT_TYPES\.add\(\s*(\w+)\.class\s*\)/g;
+  // Every use must be a form read here: an empty declaration, `.add(X.class)`,
+  // or a `.contains(` lookup. Any other shape (an initializer, `addAll`, a
+  // helper) could add elements this would miss, so it stops extraction.
+  const forms = [
+    /^SUPPORTED_ELEMENT_TYPES\s*=\s*new\s+HashSet<>\(\s*\)\s*;/,
+    /^SUPPORTED_ELEMENT_TYPES\.add\(\s*(\w+)\.class\s*\)\s*;/,
+    /^SUPPORTED_ELEMENT_TYPES\.contains\(/,
+  ];
   let n = 0;
-  for (let m; (m = re.exec(src)); n++) cells.add(`element:${m[1]}`, at(rel, src, m.index));
+  for (const use of src.matchAll(/\bSUPPORTED_ELEMENT_TYPES\b/g)) {
+    const rest = src.slice(use.index, use.index + 200);
+    const form = forms.findIndex((f) => f.test(rest));
+    if (form < 0) fail(`${at(rel, src, use.index)}: unrecognised use of SUPPORTED_ELEMENT_TYPES`);
+    if (form === 1) {
+      cells.add(`element:${forms[1].exec(rest)[1]}`, at(rel, src, use.index));
+      n++;
+    }
+  }
   if (n === 0) fail(`${rel}: no SUPPORTED_ELEMENT_TYPES entries`);
 }
 
@@ -341,9 +375,12 @@ function supportedDefinitions(s, rel, constant) {
   if (!decl) fail(`${rel}: ${constant} not found`);
   const close = src.indexOf(')', decl.index + decl[0].length);
   const body = src.slice(decl.index + decl[0].length, src.indexOf(';', close));
-  const defs = [...body.matchAll(/(\w+)EventDefinition\.class/g)].map((m) =>
-    m[1] === 'Compensate' ? 'compensation' : m[1].toLowerCase(),
-  );
+  const entries = body.replace(/\)\s*\)?\s*$/, '').split(',').map((e) => e.trim()).filter(Boolean);
+  const defs = entries.map((e) => {
+    const m = /^(\w+)EventDefinition\.class$/.exec(e);
+    if (!m) fail(`${rel}: unrecognised ${constant} entry ${JSON.stringify(e)}`);
+    return m[1] === 'Compensate' ? 'compensation' : m[1].toLowerCase();
+  });
   if (defs.length === 0) fail(`${rel}: ${constant} is empty`);
   return { defs, source: at(rel, src, decl.index) };
 }
@@ -389,7 +426,13 @@ function extractEvents(s, cells) {
   }
 }
 
-const HOOKS = {
+/**
+ * The lifecycle transition each processor-API hook belongs to. The hook set
+ * itself is read from the processor interfaces (`processorApi`), and every
+ * interface method must appear here (or in `NON_HOOKS`), so a hook Zeebe adds
+ * or renames stops extraction instead of being dropped.
+ */
+export const HOOK_TRANSITIONS = {
   onActivate: 'activate',
   finalizeActivation: 'activate',
   onComplete: 'complete',
@@ -397,19 +440,60 @@ const HOOKS = {
   onTerminate: 'terminate',
   finalizeTermination: 'terminate',
   onChildActivating: 'child-activating',
-  onChildCompleted: 'child-completed',
+  onChildCompleting: 'child-completing',
   beforeExecutionPathCompleted: 'child-completed',
   afterExecutionPathCompleted: 'child-completed',
   onChildTerminated: 'child-terminated',
 };
+const NON_HOOKS = new Set(['getType']);
+const PROCESSOR_INTERFACES = ['BpmnElementProcessor', 'BpmnElementContainerProcessor'];
 
-function hookTransition(method) {
-  const base = method.replace(/Internal$/, '').replace(/^onFinalize/, 'finalize');
-  return HOOKS[base];
+/** Method names an interface declares. */
+export function interfaceMethods(src, name) {
+  const decl = new RegExp(`\\binterface\\s+${name}\\b[^{]*\\{`).exec(src);
+  if (!decl) fail(`interface ${name} not found`);
+  const body = src.slice(decl.index + decl[0].length, blockEnd(src, decl.index));
+  const out = [];
+  let depth = 0;
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c === '{') depth++;
+    else if (c === '}') depth--;
+    else if (depth === 0 && (i === 0 || /[;}\s]/.test(body[i - 1]))) {
+      const m = /^(?:default\s+|public\s+|static\s+)*(?:<[^>]*>\s*)?[\w<>?, .[\]]+?\s+(\w+)\s*\(/.exec(body.slice(i, i + 300));
+      if (m) {
+        out.push(m[1]);
+        i += m[0].length - 1;
+      }
+    }
+  }
+  return out;
+}
+
+/** Hook name -> transition, from the processor interfaces, checked against `HOOK_TRANSITIONS`. */
+export function processorApi(s) {
+  const hooks = new Map();
+  for (const name of PROCESSOR_INTERFACES) {
+    const rel = `${BPMN}/${name}.java`;
+    for (const m of interfaceMethods(s.read(rel), name)) {
+      if (NON_HOOKS.has(m)) continue;
+      const t = HOOK_TRANSITIONS[m];
+      if (!t) fail(`${rel}: processor hook ${m} has no lifecycle transition in HOOK_TRANSITIONS`);
+      hooks.set(m, t);
+    }
+  }
+  for (const m of Object.keys(HOOK_TRANSITIONS)) {
+    if (!hooks.has(m)) fail(`HOOK_TRANSITIONS.${m} is not declared by ${PROCESSOR_INTERFACES.join(' / ')}`);
+  }
+  return hooks;
+}
+
+function hookTransition(api, method) {
+  return api.get(method.replace(/Internal$/, '').replace(/^onFinalize/, 'finalize'));
 }
 
 /** Lifecycle hooks a processor class overrides, following `extends` within the bpmn package. */
-function processorHooks(s, index, cls, seen = new Set()) {
+function processorHooks(s, api, index, cls, seen = new Set()) {
   if (seen.has(cls)) return new Map();
   seen.add(cls);
   const rel = index.get(cls);
@@ -421,7 +505,7 @@ function processorHooks(s, index, cls, seen = new Set()) {
   const hooks = new Map();
   const parent = /^class\s+\w+(?:<[^{]*?>)?\s+extends\s+(\w+)/.exec(body);
   if (parent && index.has(parent[1])) {
-    for (const [t, where] of processorHooks(s, index, parent[1], seen)) hooks.set(t, where);
+    for (const [t, where] of processorHooks(s, api, index, parent[1], seen)) hooks.set(t, where);
   }
   // Only the class's own methods (depth 1), not those of inner behaviour classes.
   let depth = 0;
@@ -435,7 +519,7 @@ function processorHooks(s, index, cls, seen = new Set()) {
     else if (depth === 1 && /\s/.test(body[i - 1] ?? ' ')) {
       const m = /^(?:public|protected)\s+[\w<>?, ]+?\s+(\w+)\s*\(/.exec(body.slice(i, i + 200));
       if (m) {
-        const t = hookTransition(m[1]);
+        const t = hookTransition(api, m[1]);
         if (t) {
           const where = `${rel}:${lineAt(src, decl.index + i)}`;
           if (!hooks.has(t)) hooks.set(t, []);
@@ -455,11 +539,13 @@ function extractLifecycle(s, cells) {
   const index = new Map(
     s.list(BPMN).map((p) => [basename(p, '.java'), p]),
   );
+  const api = processorApi(s);
   const re = /processors\.put\(\s*BpmnElementType\.(\w+)\s*,\s*new\s+(\w+)\s*[(<]/g;
+  const puts = [...src.matchAll(/\bprocessors\.put\(/g)].length;
   let n = 0;
   for (let m; (m = re.exec(src)); n++) {
     const [, type, cls] = m;
-    const hooks = processorHooks(s, index, cls);
+    const hooks = processorHooks(s, api, index, cls);
     const source = at(rel, src, m.index);
     for (const t of ['activate', 'complete', 'terminate']) {
       cells.add(`lifecycle:${type}:${t}`, source, {
@@ -477,6 +563,7 @@ function extractLifecycle(s, cells) {
     }
   }
   if (n === 0) fail(`${rel}: no processors.put(...) registrations`);
+  if (n !== puts) fail(`${rel}: ${puts - n} processors.put(...) registration(s) in an unrecognised form`);
 }
 
 /** `guard:<method>:<rejection>` — each rejection branch of the state-transition guard. */
@@ -492,7 +579,7 @@ function extractGuard(s, cells) {
     for (const m of body.matchAll(/Either\.left\(/g)) {
       const text = messageExpr(body, m.index + m[0].length);
       if (text === null) fail(`${at(rel, src, start + m.index)}: unreadable Either.left message`);
-      cells.add(`guard:${methods[k][1]}:${slug(text)}`, at(rel, src, start + m.index));
+      cells.add(`guard:${methods[k][1]}:${slug(text)}`, at(rel, src, start + m.index), undefined, text);
       n++;
     }
   }
@@ -534,7 +621,7 @@ function extractValidation(s, cells) {
         const args = /^\s*(?:\d+\s*,)?/.exec(src.slice(m.index + m[0].length))[0];
         const where = at(rel, src, m.index);
         for (const msg of validationMessages(src, m.index + m[0].length + args.length, where)) {
-          cells.add(`validation:${validator}:${slug(msg)}`, where);
+          cells.add(`validation:${validator}:${slug(msg)}`, where, undefined, msg);
           n++;
         }
       }
