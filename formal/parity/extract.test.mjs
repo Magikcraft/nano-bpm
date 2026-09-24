@@ -16,6 +16,7 @@ import {
   Source,
   enumConstants,
   interfaceMethods,
+  interfaceParents,
   lineAt,
   messageAt,
   messageExpr,
@@ -204,6 +205,25 @@ test('lifecycle hooks are inherited through extends, and an unreadable parent fa
   assert.throws(() => run('lifecycle', farAway), /extends io\.elsewhere\.OtherProcessor, which is not under/);
   const external = { ...PROCESSORS, [task]: 'public class TaskProcessor extends ElsewhereProcessor<X> {\n}' };
   assert.throws(() => run('lifecycle', external), /extends ElsewhereProcessor, which is not under/);
+});
+
+test('processor hooks are read through the interface extends chain', () => {
+  const base = `${BPMN}/BpmnElementProcessor.java`;
+  assert.deepEqual(interfaceParents('public interface A<T extends X<Y>> extends B<T>, pkg.C {}', 'A'), ['B', 'C']);
+  assert.deepEqual(interfaceParents('public interface A<T extends X> {}', 'A'), []);
+  const moved = {
+    ...PROCESSORS,
+    [base]: PROCESSORS[base]
+      .replace('public interface BpmnElementProcessor<T> {', 'public interface BpmnElementProcessor<T extends E> extends TerminationHooks<T> {')
+      .replace(/\n  default [^\n]*finalizeTermination[^\n]*/, ''),
+    [`${BPMN}/TerminationHooks.java`]:
+      'public interface TerminationHooks<T> {\n  default Either<Failure, ?> finalizeTermination(final T e, final C c) { return null; }\n}',
+  };
+  assert.equal(run('lifecycle', moved).length, run('lifecycle', PROCESSORS).length);
+  const { [`${BPMN}/TerminationHooks.java`]: _, ...unreadable } = moved;
+  assert.throws(() => run('lifecycle', unreadable), /processor interface TerminationHooks not found/);
+  const extra = { ...moved, [`${BPMN}/TerminationHooks.java`]: moved[`${BPMN}/TerminationHooks.java`].replace('}\n}', '}\n  default void onSuspend(final T e) {}\n}') };
+  assert.throws(() => run('lifecycle', extra), /processor hook onSuspend has no lifecycle transition/);
 });
 
 test('lifecycle fails on an unmapped or stale hook, or an unread registration', () => {

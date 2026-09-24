@@ -478,11 +478,40 @@ export function interfaceMethods(src, name) {
 }
 
 /** Hook name -> transition, from the processor interfaces, checked against `HOOK_TRANSITIONS`. */
+/** Simple names of the interfaces `name` extends (generic parameters skipped). */
+export function interfaceParents(src, name) {
+  const decl = new RegExp(`\\binterface\\s+${name}\\b`).exec(src);
+  if (!decl) fail(`interface ${name} not found`);
+  let header = src.slice(decl.index + decl[0].length, src.indexOf('{', decl.index));
+  // Drop generic parameter lists (whose bounds also say `extends`).
+  for (let prev; prev !== header; ) {
+    prev = header;
+    header = header.replace(/<[^<>]*>/g, '');
+  }
+  const ext = /^\s*extends\s+([\s\S]*)$/.exec(header);
+  if (!ext) {
+    if (header.trim() !== '') fail(`interface ${name}: unrecognised header ${JSON.stringify(header.trim())}`);
+    return [];
+  }
+  return ext[1].split(',').map((p) => p.trim().split('.').pop()).filter(Boolean);
+}
+
 export function processorApi(s) {
   const hooks = new Map();
-  for (const name of PROCESSOR_INTERFACES) {
-    const rel = `${BPMN}/${name}.java`;
-    for (const m of interfaceMethods(s.read(rel), name)) {
+  const index = new Map(s.list(BPMN).map((p) => [basename(p, '.java'), p]));
+  // Follow each interface's `extends` chain, so a hook moved into a parent
+  // interface is still read; an unreadable parent stops extraction.
+  const queue = [...PROCESSOR_INTERFACES];
+  const seen = new Set();
+  while (queue.length > 0) {
+    const name = queue.shift();
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const rel = index.get(name);
+    if (!rel) fail(`processor interface ${name} not found under ${BPMN}, so its hooks cannot be read`);
+    const src = s.read(rel);
+    queue.push(...interfaceParents(src, name));
+    for (const m of interfaceMethods(src, name)) {
       if (NON_HOOKS.has(m)) continue;
       const t = HOOK_TRANSITIONS[m];
       if (!t) fail(`${rel}: processor hook ${m} has no lifecycle transition in HOOK_TRANSITIONS`);
