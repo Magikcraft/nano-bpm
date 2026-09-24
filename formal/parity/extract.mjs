@@ -382,6 +382,13 @@ function supportedDefinitions(s, rel, constant) {
     return m[1] === 'Compensate' ? 'compensation' : m[1].toLowerCase();
   });
   if (defs.length === 0) fail(`${rel}: ${constant} is empty`);
+  // Anything but a read (`.stream()` / `.contains(`) could add definitions.
+  for (const use of src.matchAll(new RegExp(`\\b${constant}\\b`, 'g'))) {
+    if (use.index === decl.index) continue;
+    if (!/^\w+\s*\.\s*(?:stream\(\s*\)|contains\()/.test(src.slice(use.index, use.index + 100))) {
+      fail(`${at(rel, src, use.index)}: unrecognised use of ${constant}`);
+    }
+  }
   return { defs, source: at(rel, src, decl.index) };
 }
 
@@ -532,7 +539,32 @@ function processorHooks(s, api, index, cls, seen = new Set()) {
   return hooks;
 }
 
-/** `lifecycle:<BpmnElementType>:<transition>` — every element type the engine processes. */
+/**
+ * The lifecycle commands every element processor is driven through: the
+ * `ProcessInstanceIntent` cases `BpmnStreamProcessor.processEvent` dispatches
+ * (`ACTIVATE_ELEMENT` -> `activate`, `CONTINUE_TERMINATING_ELEMENT` ->
+ * `continue-terminating`, …).
+ */
+export function elementCommands(s) {
+  const rel = `${BPMN}/BpmnStreamProcessor.java`;
+  const src = s.read(rel);
+  const decl = /\bvoid\s+processEvent\s*\(/.exec(src);
+  if (!decl) fail(`${rel}: processEvent not found`);
+  const body = src.slice(decl.index, blockEnd(src, decl.index));
+  const sw = /\bswitch\s*\(\s*intent\s*\)\s*\{/.exec(body);
+  if (!sw) fail(`${rel}: processEvent has no switch (intent)`);
+  const arms = body.slice(sw.index + sw[0].length, blockEnd(body, sw.index));
+  // Only the outer switch's arms: nested switches use `case X ->`.
+  const out = [...arms.matchAll(/\bcase\s+([A-Z_]+)\s*:/g)].map((m) =>
+    m[1].replace(/_ELEMENT$/, '').toLowerCase().replace(/_/g, '-'),
+  );
+  for (const t of ['activate', 'complete', 'terminate']) {
+    if (!out.includes(t)) fail(`${rel}: processEvent no longer dispatches ${t}`);
+  }
+  return out;
+}
+
+/** `lifecycle:<BpmnElementType>:<command>` — every element type the engine processes. */
 function extractLifecycle(s, cells) {
   const rel = `${BPMN}/BpmnElementProcessors.java`;
   const src = s.read(rel);
@@ -540,6 +572,7 @@ function extractLifecycle(s, cells) {
     s.list(BPMN).map((p) => [basename(p, '.java'), p]),
   );
   const api = processorApi(s);
+  const commands = elementCommands(s);
   const re = /processors\.put\(\s*BpmnElementType\.(\w+)\s*,\s*new\s+(\w+)\s*[(<]/g;
   const puts = [...src.matchAll(/\bprocessors\.put\(/g)].length;
   let n = 0;
@@ -547,14 +580,14 @@ function extractLifecycle(s, cells) {
     const [, type, cls] = m;
     const hooks = processorHooks(s, api, index, cls);
     const source = at(rel, src, m.index);
-    for (const t of ['activate', 'complete', 'terminate']) {
+    for (const t of commands) {
       cells.add(`lifecycle:${type}:${t}`, source, {
         processor: cls,
         hooks: (hooks.get(t) ?? []).map((h) => h.split('@')[0]).sort(),
       });
     }
     for (const [t, where] of hooks) {
-      if (!['activate', 'complete', 'terminate'].includes(t)) {
+      if (!commands.includes(t)) {
         cells.add(`lifecycle:${type}:${t}`, source, {
           processor: cls,
           hooks: where.map((h) => h.split('@')[0]).sort(),
@@ -584,6 +617,8 @@ function extractGuard(s, cells) {
     }
   }
   if (n === 0) fail(`${rel}: no Either.left rejections`);
+  const total = [...src.matchAll(/Either\.left\(/g)].length;
+  if (total !== n) fail(`${rel}: ${total - n} Either.left rejection(s) outside a recognised method`);
 }
 
 /** `incident:<ErrorType>`. */

@@ -2855,6 +2855,26 @@
       }
     },
     {
+      "id": "lifecycle:AD_HOC_SUB_PROCESS:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:116"
+      ],
+      "detail": {
+        "processor": "AdHocSubProcessProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:AD_HOC_SUB_PROCESS:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:116"
+      ],
+      "detail": {
+        "processor": "AdHocSubProcessProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:AD_HOC_SUB_PROCESS:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:116"
@@ -2916,6 +2936,26 @@
       }
     },
     {
+      "id": "lifecycle:AD_HOC_SUB_PROCESS_INNER_INSTANCE:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:119"
+      ],
+      "detail": {
+        "processor": "AdHocSubProcessInnerInstanceProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:AD_HOC_SUB_PROCESS_INNER_INSTANCE:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:119"
+      ],
+      "detail": {
+        "processor": "AdHocSubProcessInnerInstanceProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:AD_HOC_SUB_PROCESS_INNER_INSTANCE:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:119"
@@ -2950,6 +2990,26 @@
           "finalizeCompletion",
           "onComplete"
         ]
+      }
+    },
+    {
+      "id": "lifecycle:BOUNDARY_EVENT:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:135"
+      ],
+      "detail": {
+        "processor": "BoundaryEventProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:BOUNDARY_EVENT:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:135"
+      ],
+      "detail": {
+        "processor": "BoundaryEventProcessor",
+        "hooks": []
       }
     },
     {
@@ -2997,6 +3057,26 @@
           "onFinalizeCompletionInternal",
           "onFinalizeCompletionInternal"
         ]
+      }
+    },
+    {
+      "id": "lifecycle:BUSINESS_RULE_TASK:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:61"
+      ],
+      "detail": {
+        "processor": "BusinessRuleTaskProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:BUSINESS_RULE_TASK:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:61"
+      ],
+      "detail": {
+        "processor": "BusinessRuleTaskProcessor",
+        "hooks": []
       }
     },
     {
@@ -3067,6 +3147,26 @@
       }
     },
     {
+      "id": "lifecycle:CALL_ACTIVITY:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:112"
+      ],
+      "detail": {
+        "processor": "CallActivityProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:CALL_ACTIVITY:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:112"
+      ],
+      "detail": {
+        "processor": "CallActivityProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:CALL_ACTIVITY:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:112"
@@ -3106,6 +3206,26 @@
       }
     },
     {
+      "id": "lifecycle:END_EVENT:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:133"
+      ],
+      "detail": {
+        "processor": "EndEventProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:END_EVENT:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:133"
+      ],
+      "detail": {
+        "processor": "EndEventProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:END_EVENT:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:133"
@@ -3141,6 +3261,26 @@
           "finalizeCompletion",
           "onComplete"
         ]
+      }
+    },
+    {
+      "id": "lifecycle:EVENT_BASED_GATEWAY:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:87"
+      ],
+      "detail": {
+        "processor": "EventBasedGatewayProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:EVENT_BASED_GATEWAY:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:87"
+      ],
+      "detail": {
+        "processor": "EventBasedGatewayProcessor",
+        "hooks": []
       }
     },
     {
@@ -3207,6 +3347,26 @@
       }
     },
     {
+      "id": "lifecycle:EVENT_SUB_PROCESS:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:106"
+      ],
+      "detail": {
+        "processor": "EventSubProcessProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:EVENT_SUB_PROCESS:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:106"
+      ],
+      "detail": {
+        "processor": "EventSubProcessProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:EVENT_SUB_PROCESS:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:106"
@@ -3244,6 +3404,26 @@
       }
     },
     {
+      "id": "lifecycle:EXCLUSIVE_GATEWAY:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:81"
+      ],
+      "detail": {
+        "processor": "ExclusiveGatewayProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:EXCLUSIVE_GATEWAY:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:81"
+      ],
+      "detail": {
+        "processor": "ExclusiveGatewayProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:EXCLUSIVE_GATEWAY:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:81"
@@ -3278,6 +3458,26 @@
         "hooks": [
           "finalizeCompletion"
         ]
+      }
+    },
+    {
+      "id": "lifecycle:INCLUSIVE_GATEWAY:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:90"
+      ],
+      "detail": {
+        "processor": "InclusiveGatewayProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:INCLUSIVE_GATEWAY:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:90"
+      ],
+      "detail": {
+        "processor": "InclusiveGatewayProcessor",
+        "hooks": []
       }
     },
     {
@@ -3320,6 +3520,26 @@
       }
     },
     {
+      "id": "lifecycle:INTERMEDIATE_CATCH_EVENT:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:127"
+      ],
+      "detail": {
+        "processor": "IntermediateCatchEventProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:INTERMEDIATE_CATCH_EVENT:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:127"
+      ],
+      "detail": {
+        "processor": "IntermediateCatchEventProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:INTERMEDIATE_CATCH_EVENT:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:127"
@@ -3359,6 +3579,26 @@
       }
     },
     {
+      "id": "lifecycle:INTERMEDIATE_THROW_EVENT:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:130"
+      ],
+      "detail": {
+        "processor": "IntermediateThrowEventProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:INTERMEDIATE_THROW_EVENT:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:130"
+      ],
+      "detail": {
+        "processor": "IntermediateThrowEventProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:INTERMEDIATE_THROW_EVENT:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:130"
@@ -3393,6 +3633,26 @@
         "hooks": [
           "finalizeCompletion"
         ]
+      }
+    },
+    {
+      "id": "lifecycle:MANUAL_TASK:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:74"
+      ],
+      "detail": {
+        "processor": "ManualTaskProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:MANUAL_TASK:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:74"
+      ],
+      "detail": {
+        "processor": "ManualTaskProcessor",
+        "hooks": []
       }
     },
     {
@@ -3470,6 +3730,26 @@
       }
     },
     {
+      "id": "lifecycle:MULTI_INSTANCE_BODY:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:109"
+      ],
+      "detail": {
+        "processor": "MultiInstanceBodyProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:MULTI_INSTANCE_BODY:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:109"
+      ],
+      "detail": {
+        "processor": "MultiInstanceBodyProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:MULTI_INSTANCE_BODY:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:109"
@@ -3504,6 +3784,26 @@
         "hooks": [
           "finalizeCompletion"
         ]
+      }
+    },
+    {
+      "id": "lifecycle:PARALLEL_GATEWAY:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:84"
+      ],
+      "detail": {
+        "processor": "ParallelGatewayProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:PARALLEL_GATEWAY:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:84"
+      ],
+      "detail": {
+        "processor": "ParallelGatewayProcessor",
+        "hooks": []
       }
     },
     {
@@ -3569,6 +3869,26 @@
       }
     },
     {
+      "id": "lifecycle:PROCESS:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:95"
+      ],
+      "detail": {
+        "processor": "ProcessProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:PROCESS:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:95"
+      ],
+      "detail": {
+        "processor": "ProcessProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:PROCESS:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:95"
@@ -3605,6 +3925,26 @@
           "finalizeCompletion",
           "onComplete"
         ]
+      }
+    },
+    {
+      "id": "lifecycle:RECEIVE_TASK:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:71"
+      ],
+      "detail": {
+        "processor": "ReceiveTaskProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:RECEIVE_TASK:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:71"
+      ],
+      "detail": {
+        "processor": "ReceiveTaskProcessor",
+        "hooks": []
       }
     },
     {
@@ -3652,6 +3992,26 @@
           "onFinalizeCompletionInternal",
           "onFinalizeCompletionInternal"
         ]
+      }
+    },
+    {
+      "id": "lifecycle:SCRIPT_TASK:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:64"
+      ],
+      "detail": {
+        "processor": "ScriptTaskProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:SCRIPT_TASK:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:64"
+      ],
+      "detail": {
+        "processor": "ScriptTaskProcessor",
+        "hooks": []
       }
     },
     {
@@ -3706,6 +4066,26 @@
       }
     },
     {
+      "id": "lifecycle:SEND_TASK:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:67"
+      ],
+      "detail": {
+        "processor": "SendTaskProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:SEND_TASK:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:67"
+      ],
+      "detail": {
+        "processor": "SendTaskProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:SEND_TASK:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:67"
@@ -3749,6 +4129,26 @@
       }
     },
     {
+      "id": "lifecycle:SERVICE_TASK:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:58"
+      ],
+      "detail": {
+        "processor": "JobWorkerTaskProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:SERVICE_TASK:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:58"
+      ],
+      "detail": {
+        "processor": "JobWorkerTaskProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:SERVICE_TASK:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:58"
@@ -3784,6 +4184,26 @@
           "finalizeCompletion",
           "onComplete"
         ]
+      }
+    },
+    {
+      "id": "lifecycle:START_EVENT:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:124"
+      ],
+      "detail": {
+        "processor": "StartEventProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:START_EVENT:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:124"
+      ],
+      "detail": {
+        "processor": "StartEventProcessor",
+        "hooks": []
       }
     },
     {
@@ -3850,6 +4270,26 @@
       }
     },
     {
+      "id": "lifecycle:SUB_PROCESS:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:103"
+      ],
+      "detail": {
+        "processor": "SubProcessProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:SUB_PROCESS:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:103"
+      ],
+      "detail": {
+        "processor": "SubProcessProcessor",
+        "hooks": []
+      }
+    },
+    {
       "id": "lifecycle:SUB_PROCESS:terminate",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:103"
@@ -3884,6 +4324,26 @@
         "hooks": [
           "finalizeCompletion"
         ]
+      }
+    },
+    {
+      "id": "lifecycle:TASK:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:77"
+      ],
+      "detail": {
+        "processor": "UndefinedTaskProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:TASK:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:77"
+      ],
+      "detail": {
+        "processor": "UndefinedTaskProcessor",
+        "hooks": []
       }
     },
     {
@@ -3931,6 +4391,26 @@
           "onFinalizeCompletionInternal",
           "onFinalizeCompletionInternal"
         ]
+      }
+    },
+    {
+      "id": "lifecycle:USER_TASK:complete-execution-listener",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:69"
+      ],
+      "detail": {
+        "processor": "UserTaskProcessor",
+        "hooks": []
+      }
+    },
+    {
+      "id": "lifecycle:USER_TASK:continue-terminating",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnElementProcessors.java:69"
+      ],
+      "detail": {
+        "processor": "UserTaskProcessor",
+        "hooks": []
       }
     },
     {

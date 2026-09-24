@@ -147,15 +147,22 @@ const API = {
       .join('') +
     '}',
 };
+const STREAM = `${BPMN}/BpmnStreamProcessor.java`;
+const STREAM_SRC =
+  'class BpmnStreamProcessor {\n  private void processEvent(final ProcessInstanceIntent intent, final P p, final E e) {\n' +
+  '    switch (intent) {\n      case ACTIVATE_ELEMENT:\n        a();\n        break;\n      case COMPLETE_ELEMENT:\n        break;\n' +
+  '      case TERMINATE_ELEMENT:\n        break;\n      case COMPLETE_EXECUTION_LISTENER:\n        switch (s) {\n          case ELEMENT_ACTIVATING -> x();\n        }\n        break;\n' +
+  '      case CONTINUE_TERMINATING_ELEMENT:\n        break;\n      default:\n        throw new X();\n    }\n  }\n}';
 const PROCESSORS = {
   ...API,
+  [STREAM]: STREAM_SRC,
   [`${BPMN}/BpmnElementProcessors.java`]: 'class BpmnElementProcessors { void f() { processors.put(BpmnElementType.TASK, new TaskProcessor(a)); } }',
   [`${BPMN}/task/TaskProcessor.java`]:
     'public class TaskProcessor implements BpmnElementProcessor<X> {\n  public Either<Failure, ?> onActivate(final X e, final C c) { return null; }\n' +
     '  public void onChildCompleting(final X e, final C a, final C b) {}\n}',
 };
 
-test('lifecycle hooks come from the processor interfaces', () => {
+test('lifecycle commands come from processEvent and hooks from the processor interfaces', () => {
   assert.deepEqual(interfaceMethods(API[`${BPMN}/BpmnElementProcessor.java`], 'BpmnElementProcessor').slice(0, 2), [
     'getType',
     'onActivate',
@@ -165,6 +172,8 @@ test('lifecycle hooks come from the processor interfaces', () => {
     'lifecycle:TASK:activate',
     'lifecycle:TASK:child-completing',
     'lifecycle:TASK:complete',
+    'lifecycle:TASK:complete-execution-listener',
+    'lifecycle:TASK:continue-terminating',
     'lifecycle:TASK:terminate',
   ]);
   assert.deepEqual(cells[0].detail, { processor: 'TaskProcessor', hooks: ['onActivate'] });
@@ -179,6 +188,10 @@ test('lifecycle fails on an unmapped or stale hook, or an unread registration', 
   const reg = `${BPMN}/BpmnElementProcessors.java`;
   const helper = { ...PROCESSORS, [reg]: PROCESSORS[reg].replace('} }', 'processors.put(BpmnElementType.X, processorFor(y)); } }') };
   assert.throws(() => run('lifecycle', helper), /registration\(s\) in an unrecognised form/);
+  const noTerminate = { ...PROCESSORS, [STREAM]: STREAM_SRC.replace('case TERMINATE_ELEMENT:', 'case OTHER:') };
+  assert.throws(() => run('lifecycle', noTerminate), /no longer dispatches terminate/);
+  const { [STREAM]: _, ...noStream } = PROCESSORS;
+  assert.throws(() => run('lifecycle', noStream), /missing Zeebe source/);
 });
 
 test('event lists fail on an entry they cannot read', () => {
@@ -193,6 +206,20 @@ test('event lists fail on an entry they cannot read', () => {
   });
   assert.equal(run('event', files('TimerEventDefinition.class, LinkEventDefinition.class')).length, 6);
   assert.throws(() => run('event', files('TimerEventDefinition.class, EXTRA_DEFINITIONS')), /unrecognised SUPPORTED_EVENTS entry/);
+  const read = files('TimerEventDefinition.class');
+  const rel = `${VALIDATION}/IntermediateCatchEventValidator.java`;
+  read[rel] = read[rel].replace(' }', ' boolean ok(X t) { return SUPPORTED_EVENTS.stream().anyMatch(t::is); } }');
+  assert.equal(run('event', read).length, 5);
+  read[rel] = read[rel].replace(' }', ' static { SUPPORTED_EVENTS.addAll(MORE); } }');
+  assert.throws(() => run('event', read), /unrecognised use of SUPPORTED_EVENTS/);
+});
+
+test('guard fails on a rejection outside a recognised method', () => {
+  const rel = `${BPMN}/ProcessInstanceStateTransitionGuard.java`;
+  const method = '\n  private Either<String, ?> check(final C c) {\n    return Either.left("Expected x");\n  }\n';
+  assert.deepEqual(run('guard', { [rel]: `class G {${method}}` }).map((c) => c.id), ['guard:check:expected-x']);
+  const hidden = `class G {${method}\n  @Override Either<String, ?> other(final C c) { return Either.left("Expected y"); }\n}`;
+  assert.throws(() => run('guard', { [rel]: hidden }), /1 Either.left rejection\(s\) outside a recognised method/);
 });
 
 test('two different messages normalising to one cell id stop extraction', () => {

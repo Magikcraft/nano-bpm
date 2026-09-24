@@ -13,7 +13,8 @@
 //
 // Fails on an unmapped cell, a dead rule (claims no cell), unverifiable
 // evidence, a malformed rule, or a surface extracted from a different Zeebe
-// revision than `zeebe-pin.json`. Prints per-family counts, and appends a
+// revision than `zeebe-pin.json`, or a `coverage.json` not yet reviewed at that
+// revision (`reviewedAt`). Prints per-family counts, and appends a
 // Markdown table to $GITHUB_STEP_SUMMARY when set.
 //
 // Usage: node formal/parity/check.mjs
@@ -104,6 +105,11 @@ export function evaluate(surface, coverage, fs, pin) {
     if (['repository', 'ref', 'sha'].some((k) => surface?.zeebe?.[k] !== pin[k])) {
       errors.push(`zeebe-surface.json was extracted from ${id(surface?.zeebe)}, but zeebe-pin.json pins ${id(pin)}: regenerate it`);
     }
+  }
+  // Broad `gap` rules would silently absorb the cells a pin bump adds; this
+  // makes every bump an explicit review of the new cells.
+  if (pin && coverage?.reviewedAt !== pin.sha) {
+    errors.push(`coverage.json was reviewed at ${coverage?.reviewedAt}, but zeebe-pin.json pins ${pin.sha}: review the new cells in the zeebe-surface.json diff, map them, then set reviewedAt`);
   }
   const rules = Array.isArray(coverage?.rules) ? coverage.rules : [];
   if (!Array.isArray(coverage?.rules)) errors.push('coverage.json must have a rules array');

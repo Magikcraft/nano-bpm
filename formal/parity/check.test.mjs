@@ -18,7 +18,7 @@ const FILES = {
 const fs = { exists: (p) => p in FILES, read: (p) => FILES[p] };
 const PIN = { repository: 'r', ref: 'stable/x', sha: 'abc' };
 const surface = (...ids) => ({ zeebe: { ...PIN }, cells: ids.map((id) => ({ id, sources: ['s'] })) });
-const check = (ids, rules) => evaluate(surface(...ids), { rules }, fs, PIN).errors;
+const check = (ids, rules) => evaluate(surface(...ids), { reviewedAt: 'abc', rules }, fs, PIN).errors;
 
 const tested = { status: 'nano-tested', evidence: [`${RS}::runs_a_task`] };
 const gap = { status: 'gap', issue: 1249, note: 'later' };
@@ -39,7 +39,7 @@ test('an unmapped cell fails — including one a Zeebe bump adds', () => {
 test('a dead rule fails, and the first matching rule wins', () => {
   const errors = check(['element:Task'], [{ match: 'element:*', ...gap }, { match: 'element:Task', ...tested }]);
   assert.deepEqual(errors, ['dead rule (claims no cell): element:Task']);
-  const { assignments } = evaluate(surface('element:Task'), { rules: [{ match: 'element:*', ...gap }] }, fs, PIN);
+  const { assignments } = evaluate(surface('element:Task'), { rules: [{ match: 'element:*', ...gap }] }, fs);
   assert.equal(assignments.get('element:Task'), 'gap');
 });
 
@@ -82,14 +82,24 @@ test('gap and out-of-scope need an issue and a note, and take no evidence', () =
 test('malformed rules fail', () => {
   assert.match(check(['element:Task'], [{ match: 'element:Task', ...tested, why: 'x' }])[0], /unknown key 'why'/);
   assert.match(check(['element:Task'], [{ match: 'element:Task', status: 'done' }])[0], /status must be one of/);
-  assert.deepEqual(evaluate(surface('element:Task'), {}, fs, PIN).errors.slice(0, 1), ['coverage.json must have a rules array']);
+  assert.deepEqual(evaluate(surface('element:Task'), {}, fs).errors, ['coverage.json must have a rules array', 'unmapped cell: element:Task']);
 });
 
 test('a surface extracted from another Zeebe repository, ref or revision fails', () => {
   for (const k of ['repository', 'ref', 'sha']) {
-    const errors = evaluate(surface('element:Task'), { rules: [{ match: '*', ...gap }] }, fs, { ...PIN, [k]: 'other' }).errors;
+    const errors = evaluate(surface('element:Task'), { reviewedAt: 'abc', rules: [{ match: '*', ...gap }] }, fs, { ...PIN, [k]: 'other' }).errors;
     assert.match(errors[0], /regenerate it$/, k);
   }
+});
+
+test('a pin bump fails until coverage.json is reviewed at the new pin, even when wildcards map every new cell', () => {
+  const rules = [{ match: 'intent:*', ...gap }];
+  const bumped = { ...PIN, sha: 'new' };
+  const s = { zeebe: bumped, cells: [{ id: 'intent:Job:CREATED', sources: ['s'] }, { id: 'intent:Job:NEW', sources: ['s'] }] };
+  const errors = evaluate(s, { reviewedAt: 'abc', rules }, fs, bumped).errors;
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /reviewed at abc, but zeebe-pin.json pins new/);
+  assert.deepEqual(evaluate(s, { reviewedAt: 'new', rules }, fs, bumped).errors, []);
 });
 
 test('globs treat only * as a wildcard', () => {
@@ -102,7 +112,6 @@ test('the report tallies statuses per family', () => {
     surface('element:Task', 'intent:Job:CREATED', 'intent:Job:COMPLETED'),
     { rules: [{ match: 'element:*', ...tested }, { match: 'intent:*', ...gap }] },
     fs,
-    PIN,
   );
   const counts = tally(assignments);
   assert.deepEqual(counts.intent, { parity: 0, 'nano-tested': 0, gap: 2, 'out-of-scope': 0 });

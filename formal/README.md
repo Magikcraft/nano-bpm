@@ -171,7 +171,7 @@ Zeebe declares, one **cell** per behaviour, in `zeebe-surface.json`:
 |---|---|---|
 | `element:<Class>` | supported BPMN element | `FlowElementValidator.SUPPORTED_ELEMENT_TYPES` |
 | `event:<position>:<definition>` | supported event definition per position | `SUPPORTED_*` lists in the boundary, intermediate-catch and sub-process validators; `*Behavior` classes in the end and intermediate-throw event processors |
-| `lifecycle:<BpmnElementType>:<transition>` | activate / complete / terminate, plus any `child-*` hook the processor implements | `BpmnElementProcessors` registrations, following each processor's `extends` chain |
+| `lifecycle:<BpmnElementType>:<command>` | each lifecycle command (activate, complete, terminate, continue-terminating, complete-execution-listener), plus any `child-*` hook the processor implements | commands from `BpmnStreamProcessor.processEvent`; element types from `BpmnElementProcessors`; hooks from the processor interfaces, following each processor's `extends` chain |
 | `guard:<method>:<message>` | rejection branch of the state-transition guard | `Either.left` in `ProcessInstanceStateTransitionGuard` |
 | `incident:<ErrorType>` | incident type | `ErrorType` |
 | `intent:<Record>:<INTENT>` | record intent | every `*Intent` enum in `protocol/record/intent` |
@@ -212,6 +212,9 @@ one status:
   not in the surface)
 - a malformed rule
 - a surface extracted at a different commit than the pin
+- a `coverage.json` whose `reviewedAt` is not the pinned commit. Broad `gap`
+  rules such as `intent:*` would otherwise absorb every cell a bump adds
+  without anyone looking at it
 
 It prints the per-family counts and, in CI, adds them to the job summary.
 Moving cells up the ladder, from `gap` to `nano-tested` to `parity`, is the
@@ -233,7 +236,9 @@ result differs from the committed file.
    extractor refuses to run on a checkout that is not at the pinned commit.
 3. If extraction fails, a Zeebe refactor moved an anchor. Update
    `extract.mjs` and its tests.
-4. `node formal/parity/check.mjs`, then map every new cell it reports, and
-   delete any rule it reports as dead.
+4. `node formal/parity/check.mjs`. Map every unmapped cell it reports and
+   delete any rule it reports as dead. Review the cells the bump added, even
+   those a wildcard already claims, then set `reviewedAt` in `coverage.json`
+   to the new commit.
 5. Review the `zeebe-surface.json` diff. Removed or renamed cells are Zeebe
    behaviour changes that Nano may need to follow.
