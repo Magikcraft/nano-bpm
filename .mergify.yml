@@ -60,7 +60,8 @@ queue_rules:
 # share the `code` filter (`*code_gate`), `processos (clippy + test)` has its own
 # `processos` filter (skipped for PRs that don't touch `processos/**`,
 # `engine-core/**`, or `.github/workflows/ci.yml`), `formal (tlc)` has its own
-# `formal` filter (`formal/**` or `.github/workflows/ci.yml`), and the two console jobs
+# `formal` filter (`formal/**`, `engine-core/src/**`, `engine-core/tests/**` or
+# `.github/workflows/ci.yml`), and the two console jobs
 # (`console (typecheck + test)` and `console (journey e2e)`) are gated by the
 # `console` filter (inputs `console/**`, `spec-console/**`, `spec-app/**`,
 # `.github/workflows/ci.yml`, AGENTS.md and .mergify.yml for the merge-gate guard;
@@ -102,7 +103,8 @@ merge_protections:
           - check-success=processos (clippy + test)
           - check-skipped=processos (clippy + test)
       # The TLA+ model checks (formal/README.md), including the known-defect
-      # ratchets. Change-gated on the `formal` filter, so accept skipped too.
+      # ratchets and the Zeebe parity coverage guard (formal/parity). Change-gated
+      # on the `formal` filter, so accept skipped too.
       - or:
           - check-success=formal (tlc)
           - check-skipped=formal (tlc)
