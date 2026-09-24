@@ -6,10 +6,16 @@ about pure semantics (both land slice by slice).
 
 ```
 formal/
-└── tla/
-    ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
-    ├── MC*.tla               # concrete process graphs to model-check
-    └── check.sh              # generates each TLC config, runs TLC, compares with EXPECTED
+├── tla/
+│   ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
+│   ├── MC*.tla               # concrete process graphs to model-check
+│   └── check.sh              # generates each TLC config, runs TLC, compares with EXPECTED
+└── parity/                   # Zeebe parity coverage matrix (see below)
+    ├── zeebe-pin.json        # the Zeebe commit the matrix is derived from
+    ├── fetch-zeebe.sh        # sparse-fetches the pinned sources
+    ├── extract.mjs           # Zeebe sources -> zeebe-surface.json (derived, never hand-edited)
+    ├── coverage.json         # maps every cell to Nano evidence, a gap, or out-of-scope
+    └── check.mjs             # the CI guard + coverage report
 ```
 
 ## Running
@@ -23,7 +29,9 @@ formal/tla/check.sh                      # every model (a few seconds)
 formal/tla/check.sh MCChainedInclusive   # one model
 ```
 
-CI runs the `formal (tlc)` job whenever `formal/**` changes.
+CI runs the `formal (tlc)` job whenever `formal/**`, `engine-core/src/**` or
+`engine-core/tests/**` changes. The job also runs the parity matrix steps
+described below.
 
 To read a counterexample trace, keep the logs:
 
@@ -150,3 +158,76 @@ together through trace validation is tracked in #1226: replay TLC-generated
 behaviours against `Engine::apply_command`. Until that lands, any change to
 the drain loop, the join functions or `path_reaches_join` should update
 `TokenFlow.tla` in the same PR.
+
+## Zeebe parity coverage matrix
+
+Nano must behave exactly like Camunda 8 wherever Camunda defines behaviour.
+The parity suite (#1240) needs a definition of "complete" that nobody writes
+by hand. This matrix provides it (#1245). `extract.mjs` reads the Zeebe
+sources at the commit pinned in `zeebe-pin.json` and lists every behaviour
+Zeebe declares, one **cell** per behaviour, in `zeebe-surface.json`:
+
+| Family | One cell per | Read from |
+|---|---|---|
+| `element:<Class>` | supported BPMN element | `FlowElementValidator.SUPPORTED_ELEMENT_TYPES` |
+| `event:<position>:<definition>` | supported event definition per position | `SUPPORTED_*` lists in the boundary, intermediate-catch and sub-process validators; `*Behavior` classes in the end and intermediate-throw event processors |
+| `lifecycle:<BpmnElementType>:<transition>` | activate / complete / terminate, plus any `child-*` hook the processor implements | `BpmnElementProcessors` registrations, following each processor's `extends` chain |
+| `guard:<method>:<message>` | rejection branch of the state-transition guard | `Either.left` in `ProcessInstanceStateTransitionGuard` |
+| `incident:<ErrorType>` | incident type | `ErrorType` |
+| `intent:<Record>:<INTENT>` | record intent | every `*Intent` enum in `protocol/record/intent` |
+| `validation:<Validator>:<message>` | deploy-time rejection message | `addError` calls in the bpmn-model and engine deployment validators |
+| `rejection:<Processor>:<RejectionType>` | command rejection a processor emits | `RejectionType.X` uses under `engine/processing`, checked against the SBE schema |
+
+Each cell records the source lines it was read from. The extractor fails
+loudly when an anchor it relies on moves or changes shape. An upstream
+refactor therefore stops extraction; it never silently shrinks the matrix.
+
+Known extraction gap: Zeebe declares no list of supported process-level start
+event types (`StartEventValidator` only checks their count and form), so those
+have no cells yet.
+
+### Mapping cells to evidence
+
+`coverage.json` holds ordered rules. The first rule whose `match` fits a cell
+claims it, and `*` in a `match` matches any run of characters. Each rule has
+one status:
+
+| Status | Required | Meaning |
+|---|---|---|
+| `parity` | `evidence`: fixtures in `engine-core/tests/conformance/corpus/` | Nano's verdict is asserted equal to a Zeebe verdict captured in the fixture (`accept` or `reject`; a `diverge` fixture is not parity) |
+| `nano-tested` | `evidence`: `path::test_fn` | a Nano `#[test]` exercises the behaviour, but not against a Zeebe oracle |
+| `gap` | `issue`, `note` | no evidence yet; the issue closes it |
+| `out-of-scope` | `issue`, `note` | the cell has no Nano meaning (for example, partition-internal records). Use sparingly |
+
+`check.mjs` fails on any of these:
+
+- an unmapped cell, including new cells from a Zeebe bump
+- a rule that claims no cell
+- evidence that does not resolve (a renamed test, a missing fixture)
+- a malformed rule
+- a surface extracted at a different commit than the pin
+
+It prints the per-family counts and, in CI, adds them to the job summary.
+Moving cells up the ladder, from `gap` to `nano-tested` to `parity`, is the
+work of the parity suite.
+
+```bash
+node formal/parity/check.mjs                 # guard + report
+node --test formal/parity/*.test.mjs         # extractor and guard tests
+```
+
+CI regenerates `zeebe-surface.json` from the pinned sources and fails if the
+result differs from the committed file.
+
+### Bumping the Zeebe pin
+
+1. Update `ref` and `sha` in `zeebe-pin.json`. Also update `paths` if the
+   sources moved.
+2. `node formal/parity/extract.mjs "$(formal/parity/fetch-zeebe.sh)"`. The
+   extractor refuses to run on a checkout that is not at the pinned commit.
+3. If extraction fails, a Zeebe refactor moved an anchor. Update
+   `extract.mjs` and its tests.
+4. `node formal/parity/check.mjs`, then map every new cell it reports, and
+   delete any rule it reports as dead.
+5. Review the `zeebe-surface.json` diff. Removed or renamed cells are Zeebe
+   behaviour changes that Nano may need to follow.

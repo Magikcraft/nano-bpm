@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/camunda/camunda",
+  "ref": "stable/8.10",
+  "sha": "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf",
+  "paths": [
+    "zeebe/protocol/src/main/java/io/camunda/zeebe/protocol/record",
+    "zeebe/protocol/src/main/resources/protocol.xml",
+    "zeebe/bpmn-model/src/main/java/io/camunda/zeebe/model/bpmn/validation",
+    "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing"
+  ]
+}

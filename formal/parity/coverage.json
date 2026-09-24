@@ -1,0 +1,482 @@
+{
+  "$comment": "Maps every cell of zeebe-surface.json to Nano evidence. Ordered rules; the first match wins; `*` matches any run of characters. Checked by check.mjs \u2014 see formal/README.md#zeebe-parity-coverage-matrix.",
+  "rules": [
+    {
+      "match": "element:AdHocSubProcess",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/adhoc.rs::adhoc_agent_activates_a_user_task_tool_and_parks_until_completed"
+      ]
+    },
+    {
+      "match": "element:BoundaryEvent",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/boundary.rs::should_fire_an_interrupting_timer_boundary_and_cancel_the_job"
+      ]
+    },
+    {
+      "match": "element:BusinessRuleTask",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/jobs.rs::business_rule_task_evaluates_decision_and_binds_result_variable"
+      ]
+    },
+    {
+      "match": "element:CallActivity",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/call_activity.rs::a_call_activity_spawns_a_distinct_child_process_instance_with_parent_linkage"
+      ]
+    },
+    {
+      "match": "element:EndEvent",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/lifecycle.rs::should_complete_immediately_when_no_task"
+      ]
+    },
+    {
+      "match": "element:EventBasedGateway",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/timers_catch.rs::event_based_gateway_arms_all_catch_events_then_timer_wins"
+      ]
+    },
+    {
+      "match": "element:ExclusiveGateway",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/lifecycle.rs::should_route_exclusive_gateway_by_variable"
+      ]
+    },
+    {
+      "match": "element:InclusiveGateway",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/boundary.rs::inclusive_join_waits_while_a_boundary_that_reaches_it_is_still_armed"
+      ]
+    },
+    {
+      "match": "element:IntermediateCatchEvent",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/timers_catch.rs::should_park_on_timer_then_fire_when_due"
+      ]
+    },
+    {
+      "match": "element:IntermediateThrowEvent",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/lifecycle.rs::link_events_route_by_matching_name"
+      ]
+    },
+    {
+      "match": "element:ManualTask",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/bpmn/tests.rs::should_parse_abstract_task_and_manual_task_as_pass_through"
+      ]
+    },
+    {
+      "match": "element:ParallelGateway",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/lifecycle.rs::should_run_parallel_split_and_join"
+      ]
+    },
+    {
+      "match": "element:ReceiveTask",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/listeners.rs::xml_declared_receive_task_end_listener_fires_end_to_end"
+      ]
+    },
+    {
+      "match": "element:ScriptTask",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/lifecycle.rs::inline_script_task_evaluates_feel_and_writes_result_variable"
+      ]
+    },
+    {
+      "match": "element:SendTask",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/bpmn/tests.rs::should_parse_a_send_task_as_a_job_based_service_task"
+      ]
+    },
+    {
+      "match": "element:SequenceFlow",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/lifecycle.rs::should_route_exclusive_gateway_by_variable"
+      ]
+    },
+    {
+      "match": "element:ServiceTask",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/jobs.rs::should_park_on_service_task_then_complete_on_job"
+      ]
+    },
+    {
+      "match": "element:StartEvent",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/lifecycle.rs::should_complete_immediately_when_no_task"
+      ]
+    },
+    {
+      "match": "element:SubProcess",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/boundary.rs::should_interrupt_an_embedded_subprocess_via_its_error_boundary"
+      ]
+    },
+    {
+      "match": "element:Task",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/bpmn/tests.rs::should_parse_abstract_task_and_manual_task_as_pass_through"
+      ]
+    },
+    {
+      "match": "element:UserTask",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/user_task.rs::should_link_a_user_task_to_its_deployed_form_key"
+      ]
+    },
+    {
+      "match": "event:boundary:compensation",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/compensation_escalation.rs::should_run_the_compensation_handler_when_a_compensation_throw_event_fires"
+      ]
+    },
+    {
+      "match": "event:boundary:conditional",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/boundary.rs::should_fire_an_interrupting_conditional_boundary_on_a_variable_change"
+      ]
+    },
+    {
+      "match": "event:boundary:error",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/boundary.rs::should_route_to_an_error_boundary_when_a_job_throws_a_matching_error"
+      ]
+    },
+    {
+      "match": "event:boundary:escalation",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/compensation_escalation.rs::should_interrupt_a_subprocess_via_an_interrupting_escalation_boundary"
+      ]
+    },
+    {
+      "match": "event:boundary:message",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/boundary.rs::should_fire_an_interrupting_message_boundary_and_cancel_the_job"
+      ]
+    },
+    {
+      "match": "event:boundary:signal",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/boundary.rs::should_interrupt_an_activity_via_a_signal_boundary"
+      ]
+    },
+    {
+      "match": "event:boundary:timer",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/boundary.rs::should_fire_an_interrupting_timer_boundary_and_cancel_the_job"
+      ]
+    },
+    {
+      "match": "event:end:escalation",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/compensation_escalation.rs::should_raise_an_escalation_via_an_escalation_end_event"
+      ]
+    },
+    {
+      "match": "event:end:none",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/lifecycle.rs::should_complete_immediately_when_no_task"
+      ]
+    },
+    {
+      "match": "event:end:terminate",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/call_activity.rs::subprocess_terminate_end_terminates_a_call_activity_child_in_its_scope"
+      ]
+    },
+    {
+      "match": "event:intermediate-catch:conditional",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/timers_catch.rs::should_park_on_a_conditional_catch_until_a_variable_change_satisfies_it"
+      ]
+    },
+    {
+      "match": "event:intermediate-catch:link",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/timers_catch.rs::link_events_hand_the_token_from_throw_to_catch"
+      ]
+    },
+    {
+      "match": "event:intermediate-catch:message",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/timers_catch.rs::should_park_on_message_catch_then_correlate"
+      ]
+    },
+    {
+      "match": "event:intermediate-catch:signal",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/timers_catch.rs::should_park_on_signal_catch_then_broadcast"
+      ]
+    },
+    {
+      "match": "event:intermediate-catch:timer",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/timers_catch.rs::should_park_on_timer_then_fire_when_due"
+      ]
+    },
+    {
+      "match": "event:intermediate-throw:compensation",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/compensation_escalation.rs::should_run_the_compensation_handler_when_a_compensation_throw_event_fires"
+      ]
+    },
+    {
+      "match": "event:intermediate-throw:escalation",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/compensation_escalation.rs::should_raise_an_escalation_only_after_a_throws_end_listener_drains"
+      ]
+    },
+    {
+      "match": "event:intermediate-throw:link",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/lifecycle.rs::link_events_route_by_matching_name"
+      ]
+    },
+    {
+      "match": "event:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "No Nano test exercises this event position/definition yet (event sub-process starts, message/signal throws, error/compensation end); harvested Zeebe scenarios close it."
+    },
+    {
+      "match": "incident:CALLED_DECISION_ERROR",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/incidents.rs::business_rule_task_unknown_decision_raises_incident"
+      ]
+    },
+    {
+      "match": "incident:CALLED_ELEMENT_ERROR",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/incidents.rs::an_unknown_called_process_raises_a_called_element_incident_not_expression_eval"
+      ]
+    },
+    {
+      "match": "incident:CONDITION_ERROR",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/incidents.rs::should_raise_incident_when_no_exclusive_flow_matches"
+      ]
+    },
+    {
+      "match": "incident:EXTRACT_VALUE_ERROR",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/incidents.rs::adhoc_output_collection_non_array_target_raises_extract_value_incident"
+      ]
+    },
+    {
+      "match": "incident:IO_MAPPING_ERROR",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/incidents.rs::message_catch_output_mapping_incident_resolves_via_complete_not_reopen"
+      ]
+    },
+    {
+      "match": "incident:JOB_NO_RETRIES",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/incidents.rs::should_raise_an_incident_when_a_job_fails_with_no_retries_left"
+      ]
+    },
+    {
+      "match": "incident:UNHANDLED_ERROR_EVENT",
+      "status": "nano-tested",
+      "evidence": [
+        "engine-core/src/engine/tests/incidents.rs::should_raise_an_incident_when_a_thrown_error_is_unhandled"
+      ]
+    },
+    {
+      "match": "incident:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "No Nano test raises this Zeebe incident type yet."
+    },
+    {
+      "match": "lifecycle:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "Per-element lifecycle hooks need differential scenario evidence (activate/complete/terminate record streams against Zeebe)."
+    },
+    {
+      "match": "guard:*",
+      "status": "gap",
+      "issue": 1246,
+      "note": "State-transition guard branches are to be driven by the bounded-exhaustive model generator."
+    },
+    {
+      "match": "validation:AgentDefinitionValidator:agenttype-aiagentsubprocess-is-only-allowed-on-an-ad-hoc-sub-process",
+      "status": "parity",
+      "evidence": [
+        "engine-core/tests/conformance/corpus/reject-agent-definition-placement.bpmn"
+      ]
+    },
+    {
+      "match": "validation:DefinitionsValidator:must-contain-at-least-one-executable-process",
+      "status": "parity",
+      "evidence": [
+        "engine-core/tests/conformance/corpus/reject-no-process.bpmn"
+      ]
+    },
+    {
+      "match": "validation:EndEventValidator:end-events-must-not-have-outgoing-sequence-flows-to-other-elements",
+      "status": "parity",
+      "evidence": [
+        "engine-core/tests/conformance/corpus/reject-end-event-outgoing.bpmn"
+      ]
+    },
+    {
+      "match": "validation:FlowElementValidator:*",
+      "status": "parity",
+      "evidence": [
+        "engine-core/tests/conformance/corpus/reject-unsupported-element.bpmn"
+      ]
+    },
+    {
+      "match": "validation:ProcessValidator:multiple-none-start-events-are-not-allowed",
+      "status": "parity",
+      "evidence": [
+        "engine-core/tests/conformance/corpus/reject-multiple-none-starts.bpmn"
+      ]
+    },
+    {
+      "match": "validation:ProcessValidator:must-have-at-least-one-start-event",
+      "status": "parity",
+      "evidence": [
+        "engine-core/tests/conformance/corpus/reject-no-start-event.bpmn"
+      ]
+    },
+    {
+      "match": "validation:ProcessValidator:via-verifynoduplicatemessagestartevents",
+      "status": "parity",
+      "evidence": [
+        "engine-core/tests/conformance/corpus/reject-duplicate-message-start.bpmn"
+      ]
+    },
+    {
+      "match": "validation:ProcessValidator:via-verifynoduplicatesignalstartevents",
+      "status": "parity",
+      "evidence": [
+        "engine-core/tests/conformance/corpus/reject-duplicate-signal-start.bpmn"
+      ]
+    },
+    {
+      "match": "validation:SequenceFlowValidator:must-have-a-condition-or-be-default-flow",
+      "status": "parity",
+      "evidence": [
+        "engine-core/tests/conformance/corpus/reject-gateway-missing-condition.bpmn",
+        "engine-core/tests/conformance/corpus/accept-gateway-condition-or-default.bpmn"
+      ]
+    },
+    {
+      "match": "validation:ZeebeElementValidator:attribute-must-be-present-and-not-empty",
+      "status": "parity",
+      "evidence": [
+        "engine-core/tests/conformance/corpus/reject-empty-task-definition.bpmn"
+      ]
+    },
+    {
+      "match": "validation:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "No conformance-corpus fixture with a captured Zeebe verdict exercises this validation yet."
+    },
+    {
+      "match": "intent:Checkpoint:*",
+      "status": "out-of-scope",
+      "issue": 1240,
+      "note": "Cluster-internal backup checkpoints: no client-observable process semantics in a single-node engine."
+    },
+    {
+      "match": "intent:Scale:*",
+      "status": "out-of-scope",
+      "issue": 1240,
+      "note": "Cluster-internal partition scaling: no client-observable process semantics in a single-node engine."
+    },
+    {
+      "match": "intent:CommandDistribution:*",
+      "status": "out-of-scope",
+      "issue": 1240,
+      "note": "Cluster-internal inter-partition command distribution: no client-observable process semantics in a single-node engine."
+    },
+    {
+      "match": "intent:DeploymentDistribution:*",
+      "status": "out-of-scope",
+      "issue": 1240,
+      "note": "Cluster-internal inter-partition deployment distribution: no client-observable process semantics in a single-node engine."
+    },
+    {
+      "match": "intent:ResourceReexport:*",
+      "status": "out-of-scope",
+      "issue": 1240,
+      "note": "Cluster-internal exporter re-export: no client-observable process semantics in a single-node engine."
+    },
+    {
+      "match": "intent:UsageMetric:*",
+      "status": "out-of-scope",
+      "issue": 1240,
+      "note": "Cluster-internal usage-metric export: no client-observable process semantics in a single-node engine."
+    },
+    {
+      "match": "intent:JobMetricsBatch:*",
+      "status": "out-of-scope",
+      "issue": 1240,
+      "note": "Cluster-internal job-metric export: no client-observable process semantics in a single-node engine."
+    },
+    {
+      "match": "intent:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "Record intents need differential record-stream evidence against Zeebe."
+    },
+    {
+      "match": "rejection:*",
+      "status": "gap",
+      "issue": 1249,
+      "note": "Command rejection paths need differential scenario evidence against Zeebe."
+    }
+  ]
+}

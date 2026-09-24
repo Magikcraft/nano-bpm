@@ -1,0 +1,169 @@
+#!/usr/bin/env node
+// Guard + report for the Zeebe parity coverage matrix (#1245).
+//
+// Every cell of the derived `zeebe-surface.json` must be claimed by a rule in
+// `coverage.json`, and every claim must be checkable:
+//
+//   parity       evidence: conformance-corpus fixtures carrying a captured
+//                Zeebe verdict (accept/reject — a `diverge` fixture is not parity)
+//   nano-tested  evidence: `path::test_fn`, the test must exist in that file
+//   gap          issue: the tracking issue that closes the gap
+//   out-of-scope issue + note: why the cell has no Nano meaning
+//
+// Fails on an unmapped cell, a dead rule (claims no cell), unverifiable
+// evidence, a malformed rule, or a surface extracted from a different Zeebe
+// revision than `zeebe-pin.json`. Prints per-family counts, and appends a
+// Markdown table to $GITHUB_STEP_SUMMARY when set.
+//
+// Usage: node formal/parity/check.mjs
+
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+export const STATUSES = ['parity', 'nano-tested', 'gap', 'out-of-scope'];
+export const CORPUS = 'engine-core/tests/conformance/corpus/';
+const RULE_KEYS = new Set(['match', 'status', 'evidence', 'issue', 'note']);
+
+/** `*` matches any run of characters; everything else is literal. */
+export function globToRegExp(glob) {
+  const body = glob
+    .split('*')
+    .map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
+    .join('.*');
+  return new RegExp(`^${body}$`);
+}
+
+/** Problems with one evidence reference, given repo-file access `fs`. */
+export function evidenceProblems(status, ref, fs) {
+  if (typeof ref !== 'string' || ref.length === 0) return ['evidence must be a non-empty string'];
+  if (status === 'parity') {
+    if (!ref.startsWith(CORPUS) || !ref.endsWith('.bpmn')) {
+      return [`parity evidence must be a ${CORPUS}*.bpmn fixture: ${ref}`];
+    }
+    if (!fs.exists(ref)) return [`missing fixture: ${ref}`];
+    const verdict = /<!--\s*verdict:\s*(\w+)/.exec(fs.read(ref));
+    if (!verdict) return [`fixture has no verdict header: ${ref}`];
+    if (!['accept', 'reject'].includes(verdict[1])) {
+      return [`fixture verdict '${verdict[1]}' is not Zeebe parity: ${ref}`];
+    }
+    return [];
+  }
+  const sep = ref.indexOf('::');
+  if (sep < 0) return [`nano-tested evidence must be path::test_fn: ${ref}`];
+  const [path, name] = [ref.slice(0, sep), ref.slice(sep + 2)];
+  if (!/^[a-z_][a-z0-9_]*$/.test(name)) return [`bad test name in ${ref}`];
+  if (!fs.exists(path)) return [`missing file: ${path}`];
+  const test = new RegExp(`#\\[test\\][^;{]*?\\bfn\\s+${name}\\s*\\(`);
+  if (!test.test(fs.read(path))) return [`no #[test] fn ${name} in ${path}`];
+  return [];
+}
+
+/** Problems with the shape of one rule (independent of the surface). */
+export function ruleProblems(rule, fs) {
+  const where = `rule ${JSON.stringify(rule?.match)}`;
+  if (rule === null || typeof rule !== 'object') return [`${where}: not an object`];
+  const out = [];
+  for (const k of Object.keys(rule)) if (!RULE_KEYS.has(k)) out.push(`${where}: unknown key '${k}'`);
+  if (typeof rule.match !== 'string' || rule.match.length === 0) out.push(`${where}: match must be a non-empty string`);
+  if (!STATUSES.includes(rule.status)) {
+    out.push(`${where}: status must be one of ${STATUSES.join(', ')}`);
+    return out;
+  }
+  const evidenced = rule.status === 'parity' || rule.status === 'nano-tested';
+  if (evidenced) {
+    if (!Array.isArray(rule.evidence) || rule.evidence.length === 0) out.push(`${where}: ${rule.status} needs evidence`);
+    else for (const ref of rule.evidence) for (const p of evidenceProblems(rule.status, ref, fs)) out.push(`${where}: ${p}`);
+  } else {
+    if (rule.evidence !== undefined) out.push(`${where}: ${rule.status} takes no evidence`);
+    if (!Number.isInteger(rule.issue) || rule.issue <= 0) out.push(`${where}: ${rule.status} needs an issue number`);
+    if (typeof rule.note !== 'string' || rule.note.trim().length === 0) out.push(`${where}: ${rule.status} needs a note`);
+  }
+  if (evidenced && rule.issue !== undefined && (!Number.isInteger(rule.issue) || rule.issue <= 0)) {
+    out.push(`${where}: issue must be a positive integer`);
+  }
+  return out;
+}
+
+/**
+ * Check `coverage` against `surface` (and, when given, the `pin`).
+ * Returns `{ errors, assignments }`, where `assignments` maps each cell id to
+ * the status of the first rule claiming it.
+ */
+export function evaluate(surface, coverage, fs, pin) {
+  const errors = [];
+  if (pin && surface?.zeebe?.sha !== pin.sha) {
+    errors.push(`zeebe-surface.json was extracted from ${surface?.zeebe?.sha}, but zeebe-pin.json pins ${pin.sha}: regenerate it`);
+  }
+  const rules = Array.isArray(coverage?.rules) ? coverage.rules : [];
+  if (!Array.isArray(coverage?.rules)) errors.push('coverage.json must have a rules array');
+  const matchers = rules.map((r) => (typeof r?.match === 'string' ? globToRegExp(r.match) : null));
+  for (const r of rules) errors.push(...ruleProblems(r, fs));
+  const claims = rules.map(() => 0);
+  const assignments = new Map();
+  for (const { id } of surface.cells) {
+    const k = matchers.findIndex((m) => m !== null && m.test(id));
+    if (k < 0) {
+      errors.push(`unmapped cell: ${id}`);
+      continue;
+    }
+    claims[k]++;
+    assignments.set(id, rules[k].status);
+  }
+  rules.forEach((r, k) => {
+    if (matchers[k] !== null && claims[k] === 0) errors.push(`dead rule (claims no cell): ${r.match}`);
+  });
+  return { errors, assignments };
+}
+
+/** Per-family status counts: `{ family: { status: n } }`. */
+export function tally(assignments) {
+  const out = {};
+  for (const [id, status] of assignments) {
+    const family = id.slice(0, id.indexOf(':'));
+    out[family] ??= Object.fromEntries(STATUSES.map((s) => [s, 0]));
+    out[family][status]++;
+  }
+  return out;
+}
+
+export function markdownReport(counts, surface) {
+  const lines = [
+    `### Zeebe parity coverage — ${surface.zeebe.ref} @ \`${surface.zeebe.sha.slice(0, 12)}\``,
+    '',
+    `| family | ${STATUSES.join(' | ')} | total |`,
+    `|---|${STATUSES.map(() => '---:').join('|')}|---:|`,
+  ];
+  const total = Object.fromEntries(STATUSES.map((s) => [s, 0]));
+  for (const family of Object.keys(counts).sort()) {
+    const row = counts[family];
+    const n = STATUSES.reduce((a, s) => a + row[s], 0);
+    for (const s of STATUSES) total[s] += row[s];
+    lines.push(`| ${family} | ${STATUSES.map((s) => row[s]).join(' | ')} | ${n} |`);
+  }
+  const all = STATUSES.reduce((a, s) => a + total[s], 0);
+  lines.push(`| **all** | ${STATUSES.map((s) => `**${total[s]}**`).join(' | ')} | **${all}** |`);
+  return `${lines.join('\n')}\n`;
+}
+
+function main() {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const root = join(here, '..', '..');
+  const load = (f) => JSON.parse(readFileSync(join(here, f), 'utf8'));
+  const fs = {
+    exists: (p) => existsSync(join(root, p)),
+    read: (p) => readFileSync(join(root, p), 'utf8'),
+  };
+  const surface = load('zeebe-surface.json');
+  const { errors, assignments } = evaluate(surface, load('coverage.json'), fs, load('zeebe-pin.json'));
+  const report = markdownReport(tally(assignments), surface);
+  process.stdout.write(report);
+  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, report);
+  if (errors.length > 0) {
+    for (const e of errors) console.error(`check: ${e}`);
+    console.error(`check: ${errors.length} problem(s)`);
+    process.exit(1);
+  }
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) main();
