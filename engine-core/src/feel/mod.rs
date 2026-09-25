@@ -438,11 +438,17 @@ mod tests {
             Ok(Value::Str("VALUE-FROM-LLM".into()))
         );
         assert_eq!(
+            eval(r#"fromAi(toolCall.foo, "desc", "string", {})"#, &c),
+            Ok(Value::Str("VALUE-FROM-LLM".into()))
+        );
+        assert_eq!(
             eval(r#"fromAi(toolCall.foo, "desc", "string", {}, {})"#, &c),
             Ok(Value::Str("VALUE-FROM-LLM".into()))
         );
         // A missing value slot resolves to null rather than raising an incident.
         assert_eq!(eval(r#"fromAi(toolCall.missing)"#, &c), Ok(Value::Null));
+        // A bare `fromAi()` with no value argument also resolves to null.
+        assert_eq!(eval(r#"fromAi()"#, &c), Ok(Value::Null));
         // Named arguments are supported, e.g. fromAi(value: ..., type: ...).
         assert_eq!(
             eval(r#"fromAi(value: toolCall.foo, type: "number")"#, &c),
