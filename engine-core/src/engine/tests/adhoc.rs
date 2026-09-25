@@ -659,6 +659,66 @@ fn adhoc_tool_input_mapping_failure_raises_io_mapping_and_reactivates() {
     assert_eq!(tool_jobs[0].variables.get("weighted"), Some(&Value::Int(6)));
 }
 
+/// Regression for nanobpm/nano-bpm#1200: a tool input `zeebe:ioMapping` authored
+/// the standard Camunda agentic way — `=fromAi(toolCall.foo, "desc", "string")`
+/// — must evaluate (returning the LLM-supplied value unchanged) instead of
+/// raising an `IO_MAPPING_ERROR` incident. `fromAi` is a Camunda FEEL built-in
+/// the engine previously lacked, so calling it produced `cannot call a null
+/// value`. The activation carries `toolCall.foo`; the mapped `mapped` target
+/// must receive that value and no incident must be raised.
+#[test]
+fn adhoc_tool_fromai_input_mapping_returns_llm_value_without_incident() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_with_fromai_tool_input_mapping(),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+
+    // Activate the tool with the LLM's answer arriving as `toolCall.foo`.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element_with(
+                    "toolA",
+                    &[(
+                        "toolCall",
+                        Value::Map(std::collections::BTreeMap::from([(
+                            "foo".to_string(),
+                            Value::Str("VALUE-FROM-LLM".into()),
+                        )])),
+                    )],
+                )],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    assert!(
+        engine.active_incidents().is_empty(),
+        "fromAi(...) must evaluate — no IO_MAPPING_ERROR incident: {:?}",
+        engine.active_incidents()
+    );
+    assert!(engine.instance(inst).unwrap().incidents.is_empty());
+
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(tool_jobs.len(), 1, "the tool job is minted");
+    assert_eq!(
+        tool_jobs[0].variables.get("mapped"),
+        Some(&Value::Str("VALUE-FROM-LLM".into())),
+        "fromAi returns its first argument unchanged"
+    );
+}
+
 /// Regression for Magikcraft/nano-bpm#605: an agent's
 /// `activateElements[{ elementId, variables }]` must scope those `variables`
 /// into the activated tool's OWN job — including tools that declare no
