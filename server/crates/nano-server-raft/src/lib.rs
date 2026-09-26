@@ -25,6 +25,7 @@
 pub(crate) use nano_server_runtime::{cluster, cmd_profile, deepthi};
 pub(crate) use nano_server_storage::{journal, metrics};
 
+pub mod fence;
 pub mod peer;
 pub mod raft;
 pub mod raft_logstore;

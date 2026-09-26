@@ -9,6 +9,9 @@ formal/
 ├── tla/
 │   ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
 │   ├── MC*.tla               # concrete process graphs to model-check
+│   ├── raft/                 # RaftHandoff spec family (#1228): leadership handoff + reclaim
+│   │   ├── RaftHandoff.tla   # fence-epoch register (ADR 0019), anchored to nano-server-raft::fence
+│   │   └── RH*.tla           # models: fenced pass + a no-fencing split-brain violation
 │   ├── snapshot/             # SnapshotReplay family: snapshot/compaction/replay-migration recovery
 │   │   ├── SnapshotReplay.tla  # durable-world model of recovery (NoSilentRewind + FailClosed, #1229)
 │   │   └── MCSnapReplay*.tla   # the shipped fail-closed recovery vs. the historical naive one
