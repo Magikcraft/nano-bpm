@@ -1,0 +1,12 @@
+{
+  "spec": "JobLease",
+  "model": "complete-after-expiry",
+  "note": "JobLease.tla activation-latch (finding #1257): Activate(j1,w1) at now=0 (deadline 1000); Expire(j1) at now=1000 reclaims the past-deadline lock (JobLockExpired resets the job to activatable but LEAVES Job::activated set); Complete(j1) STILL succeeds without re-activation, because CompleteJob gates on the persistent `activated` latch, not a live or recorded lock. This is the engine-valid trace the model must admit: an expired lease costs at most a redelivery, never a lost job.",
+  "timeout": 1000,
+  "jobs": ["j1"],
+  "steps": [
+    { "action": "activate", "job": "j1", "worker": "w1", "now": 0, "expect_leased": true },
+    { "action": "expire", "now": 1000, "expect_expired": ["j1"] },
+    { "action": "complete", "job": "j1" }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "spec": "JobLease",
+  "model": "activate-complete",
+  "note": "JobLease.tla behaviour: Init -> Activate(j1,w1) -> Complete(j1). The no-expiry lifecycle: a job is leased once and completed. Anchors that a created job activates to exactly one holder and completes by key.",
+  "timeout": 1000,
+  "jobs": ["j1"],
+  "steps": [
+    { "action": "activate", "job": "j1", "worker": "w1", "now": 0, "expect_leased": true },
+    { "action": "complete", "job": "j1" }
+  ]
+}
