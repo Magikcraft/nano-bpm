@@ -42,7 +42,7 @@
 (* Scope. This models the *lease-deadline* mechanism of the standard         *)
 (* activation path: a lock carrying a `deadline`, its expiry/reclaim, and    *)
 (* completion by key. It does NOT model the `with_lease = true` worker mode  *)
-(* (`Engine::activate_jobs`' opaque per-activation lease *token*), which adds *)
+(* (`Engine::activate_jobs`' opaque per-activation lease token), which adds  *)
 (* token fencing — an expired leased job cannot be re-activated by an        *)
 (* unfenced worker, and completion is fenced on the matching token. Those    *)
 (* are additional *preconditions*, so the fenced engine's behaviours are a   *)
