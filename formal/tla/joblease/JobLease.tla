@@ -38,6 +38,17 @@
 (* lets time advance, leases expire and jobs be re-activated by any worker   *)
 (* in any order. Each safety property checked against this superset          *)
 (* therefore also holds for the engine's deterministic single-writer order.  *)
+(*                                                                           *)
+(* Scope. This models the *lease-deadline* mechanism of the standard         *)
+(* activation path: a lock carrying a `deadline`, its expiry/reclaim, and    *)
+(* completion by key. It does NOT model the `with_lease = true` worker mode  *)
+(* (`Engine::activate_jobs`' opaque per-activation lease *token*), which adds *)
+(* token fencing — an expired leased job cannot be re-activated by an        *)
+(* unfenced worker, and completion is fenced on the matching token. Those    *)
+(* are additional *preconditions*, so the fenced engine's behaviours are a   *)
+(* subset of this unfenced model's; every safety property proved here        *)
+(* therefore also holds under `with_lease`. Token-fencing safety is out of   *)
+(* scope for this spec and belongs to a dedicated lease-token model.         *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -91,17 +102,25 @@ Init ==
 \* `ActivateJobs` / `Engine::activate_jobs`: worker `w` acquires the lease on an
 \* activatable job (created or reclaimed after expiry) and holds it until
 \* `clock + Timeout`. The guard `~HasLiveLock(j)` is the engine's exclusive-lease
-\* rule (`select_activatable_job_keys` skips a job with a live lock). Reclaiming
-\* an expired/lost lease is simply this action firing again once the old lock is
-\* no longer live. The engine records a *single* current lock (`job.deadline` is
-\* replaced on `JobActivated`), so a direct reactivation at `clock >= deadline`
-\* — which `job_activatable` permits without a preceding `ExpireJobs` — drops the
-\* stale expired lock rather than retaining it. Modelling that with
-\* `LiveLocks(j) \cup {new}` (not `locks[j] \cup {new}`) keeps this faithful:
-\* under the guard `LiveLocks(j) = {}`, so the result is the singleton `{new}`,
-\* yet the union still yields two *live* locks (tripping `AtMostOneLiveHolder`)
-\* if a weaker guard ever admitted a concurrent holder — the reason locks are a
-\* set at all.
+\* rule (`select_activatable_job_keys` only ever yields a job with no live lock).
+\* This guard is a deliberate *over-approximation* of the engine's re-activation
+\* path: the engine does not re-select an expired-but-`Activated` job directly.
+\* `resync_job_index` drops an `Activated` job from the `activatable_jobs` index,
+\* and only the `ExpireJobs` sweep (`JobLockExpired`) returns it to `Created` and
+\* hence back into that index; `job_activatable`'s `Activated => deadline <= now`
+\* arm is a defensive guard the ordinary pull path never reaches. This model
+\* folds that `ExpireJobs -> Created -> re-activate` transition into a single
+\* `Activate` firing, enabled the instant the lock stops being live, so the
+\* model's reachable states are a *superset* of the engine's and every safety
+\* property checked here also holds for the narrower engine order (an explicit
+\* `Expire` may still fire first — the JSON fixtures exercise both paths). When
+\* the engine does re-activate it records a *single* current lock (`job.deadline`
+\* is replaced on `JobActivated`), dropping the stale expired lock rather than
+\* retaining it. Modelling the effect with `LiveLocks(j) \cup {new}` (not
+\* `locks[j] \cup {new}`) keeps that faithful: under the guard `LiveLocks(j) =
+\* {}`, so the result is the singleton `{new}`, yet the union still yields two
+\* *live* locks (tripping `AtMostOneLiveHolder`) if a weaker guard ever admitted
+\* a concurrent holder — the reason locks are a set at all.
 Activate(j, w) ==
     /\ ~done[j]
     /\ ~HasLiveLock(j)

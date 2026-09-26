@@ -112,7 +112,14 @@ mod spec_model {
 
         /// Advance the logical clock to `now` via `Tick`s. `Tick` only ever moves
         /// the clock forward, so a fixture whose timed steps go backwards is not
-        /// an admitted behaviour.
+        /// an admitted behaviour. This enforces the `Tick` *semantic* (monotone
+        /// advance), which is the real engine/spec constraint, but deliberately
+        /// does not enforce `JobLease.tla`'s `clock \in 0..MaxClock` bound:
+        /// `MaxClock` is only a TLC state-enumeration bound (the checked MC models
+        /// use a tiny value, 2), not a semantic limit, and the fixtures
+        /// intentionally run at a far larger clock (1000). Carrying it here would
+        /// reject every real fixture, so admissibility is checked against the
+        /// unbounded transition relation, not the finite model-checking cap.
         fn tick_to(&mut self, now: u64, ctx: &dyn Fn(String) -> String) -> Result<(), String> {
             if now < self.clock {
                 return Err(ctx(format!(
@@ -125,8 +132,14 @@ mod spec_model {
         }
 
         /// `AtMostOneLiveHolder`, `DoneIsTerminal`, and `CompletedWasActivated` —
-        /// the state invariants checked after every step, exactly as the `.tla`
-        /// invariants.
+        /// the three *state* invariants checked after every step, matching those
+        /// `.tla` invariants. `JobLease.tla`'s fourth registered invariant,
+        /// `ExpiredIsReclaimable`, is not a post-step state predicate but an
+        /// *enabledness* property (`~done[j] /\ ~HasLiveLock(j) => \E w :
+        /// ENABLED Activate(j, w)`); this mirror holds it *by construction*,
+        /// because its `Activate` guard is exactly `~done /\ ~has_live_lock`, so a
+        /// non-done job with no live lock is always re-activatable. It is
+        /// therefore guaranteed structurally rather than asserted here.
         fn assert_invariants(&self, ctx: &dyn Fn(String) -> String) -> Result<(), String> {
             for j in self.locks.keys() {
                 if self.live_locks(j).len() > 1 {
