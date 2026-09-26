@@ -10,7 +10,7 @@
     <bpmn:startEvent id="S">
       <bpmn:outgoing>f1</bpmn:outgoing>
     </bpmn:startEvent>
-    <bpmn:inclusiveGateway id="I" default="f2">
+    <bpmn:inclusiveGateway id="I">
       <bpmn:incoming>f1</bpmn:incoming>
       <bpmn:outgoing>f2</bpmn:outgoing>
       <bpmn:outgoing>f3</bpmn:outgoing>
@@ -37,7 +37,9 @@
       <bpmn:incoming>f7</bpmn:incoming>
     </bpmn:endEvent>
     <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="I"/>
-    <bpmn:sequenceFlow id="f2" sourceRef="I" targetRef="J"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="I" targetRef="J">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f3" sourceRef="I" targetRef="X">
       <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>

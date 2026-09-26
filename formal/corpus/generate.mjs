@@ -188,7 +188,13 @@ export function bpmnFor (graph) {
     const kind = graph.nodes[id]
     const el = KIND[kind].el
     const attrs = [`id="${xmlEscape(id)}"`]
-    if (isSplit(id)) attrs.push(`default="${xmlEscape(outFlows[id][0].id)}"`)
+    // Only an EXCLUSIVE split names a default flow: exactly one branch runs and
+    // the default is the fallback when no condition matches. An INCLUSIVE (`or`)
+    // split takes EVERY matching non-default flow, so a default would make its
+    // first branch unreachable (it fires only when none match) — the scenario
+    // schedules that branch's task, so encode "all branches" by giving every
+    // inclusive flow a `=true` condition and no default.
+    if (isSplit(id) && kind === 'xor') attrs.push(`default="${xmlEscape(outFlows[id][0].id)}"`)
     const kids = []
     for (const e of inFlows[id] ?? []) kids.push(`      <bpmn:incoming>${xmlEscape(e.id)}</bpmn:incoming>`)
     for (const e of outFlows[id] ?? []) kids.push(`      <bpmn:outgoing>${xmlEscape(e.id)}</bpmn:outgoing>`)
@@ -208,7 +214,12 @@ export function bpmnFor (graph) {
   }
 
   for (const e of graph.edges) {
-    const conditional = isSplit(e.from) && outFlows[e.from][0].id !== e.id
+    // An exclusive split conditions every branch except its default (the first
+    // outgoing flow); an inclusive split conditions ALL branches (no default),
+    // so every branch is taken and matches the scenario's scheduled tasks.
+    const fromKind = graph.nodes[e.from]
+    const conditional = isSplit(e.from) &&
+      (fromKind !== 'xor' || outFlows[e.from][0].id !== e.id)
     if (conditional) {
       L.push(`    <bpmn:sequenceFlow id="${xmlEscape(e.id)}" sourceRef="${xmlEscape(e.from)}" targetRef="${xmlEscape(e.to)}">`)
       L.push('      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=true</bpmn:conditionExpression>')
@@ -309,6 +320,22 @@ function main () {
       if (!fs.existsSync(d)) continue
       for (const f of fs.readdirSync(d)) {
         const p = path.join(d, f)
+        if (!expected.has(p)) {
+          console.error(`FAIL corpus drift: ${path.relative(path.join(here, '..', '..'), p)} has no graph source (delete it)`)
+          drift = true
+        }
+      }
+    }
+    // The generated MC*/ZMC* models are written straight into formal/tla beside
+    // the hand-written base modules (TokenFlow.tla, ZeebeTokenFlow.tla), so scan
+    // them too — otherwise removing/renaming a graph leaves a stale model in the
+    // descriptor glob while --check reports clean. Exclude the base modules (the
+    // families' EXTENDS targets) and never recurse into sibling spec dirs.
+    const baseModules = new Set(Object.values(FAMILIES).map((f) => `${f.base}.tla`))
+    if (fs.existsSync(repoTla)) {
+      for (const ent of fs.readdirSync(repoTla, { withFileTypes: true })) {
+        if (!ent.isFile() || !ent.name.endsWith('.tla') || baseModules.has(ent.name)) continue
+        const p = path.join(repoTla, ent.name)
         if (!expected.has(p)) {
           console.error(`FAIL corpus drift: ${path.relative(path.join(here, '..', '..'), p)} has no graph source (delete it)`)
           drift = true

@@ -3,6 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadGraphs, tlaFor, bpmnFor, scenarioFor, FAMILIES } from './generate.mjs'
@@ -98,4 +99,55 @@ test('scenario lists a job per task, an ordering, and message/timer slots', () =
 test('--check passes on the committed artifacts (no drift)', () => {
   // The generator is the source of truth: the committed artifacts must match.
   execFileSync('node', [path.join(here, 'generate.mjs'), '--check'], { stdio: 'pipe' })
+})
+
+test('inclusive splits take every branch; exclusive splits keep a default', () => {
+  // Regression (#1258 review): an inclusive (`or`) split activates every
+  // matching non-default flow, so marking a branch `default` makes it
+  // unreachable — yet the scenario schedules that branch's task. So an
+  // inclusive split must carry NO default and give every outgoing flow a
+  // condition; an exclusive (`xor`) split keeps exactly one default.
+  const outFlowsOf = (g, id) => g.edges.filter((e) => e.from === id)
+  const flowConditioned = (xml, id) =>
+    new RegExp(`<bpmn:sequenceFlow id="${id}"[^>]*>[\\s\\S]*?conditionExpression`).test(xml)
+  let sawInclusive = false; let sawExclusive = false
+  for (const g of graphs) {
+    const xml = bpmnFor(g)
+    for (const [id, kind] of Object.entries(g.nodes)) {
+      if (!['or', 'xor'].includes(kind)) continue
+      const outs = outFlowsOf(g, id)
+      if (outs.length <= 1) continue // not a split
+      const gw = new RegExp(`<bpmn:${kind === 'or' ? 'inclusive' : 'exclusive'}Gateway id="${id}"([^>]*)>`)
+      const m = xml.match(gw)
+      assert.ok(m, `${g.id}: gateway ${id} present`)
+      const hasDefault = /default="/.test(m[1])
+      if (kind === 'or') {
+        sawInclusive = true
+        assert.ok(!hasDefault, `${g.id}: inclusive split ${id} must not declare a default`)
+        for (const e of outs) {
+          assert.ok(flowConditioned(xml, e.id), `${g.id}: inclusive flow ${e.id} needs a condition`)
+        }
+      } else {
+        sawExclusive = true
+        assert.ok(hasDefault, `${g.id}: exclusive split ${id} must declare a default`)
+      }
+    }
+  }
+  assert.ok(sawInclusive, 'corpus exercises an inclusive split')
+  assert.ok(sawExclusive, 'corpus exercises an exclusive split')
+})
+
+test('--check flags a stray generated TLA model with no graph source', () => {
+  // Regression (#1258 review): the orphan scan must cover the generated
+  // MC*/ZMC* models in formal/tla, not just bpmn/scenarios — a removed graph
+  // otherwise leaves a stale model that --check would miss.
+  const stray = path.join(here, '..', 'tla', 'MCStrayNoGraphSource.tla')
+  fs.writeFileSync(stray, '---- MODULE MCStrayNoGraphSource ----\n====\n')
+  try {
+    assert.throws(
+      () => execFileSync('node', [path.join(here, 'generate.mjs'), '--check'], { stdio: 'pipe' }),
+      /MCStrayNoGraphSource\.tla has no graph source/)
+  } finally {
+    fs.rmSync(stray, { force: true })
+  }
 })

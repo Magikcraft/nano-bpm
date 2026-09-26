@@ -22,7 +22,7 @@
       <bpmn:incoming>f2</bpmn:incoming>
       <bpmn:outgoing>f4</bpmn:outgoing>
     </bpmn:serviceTask>
-    <bpmn:inclusiveGateway id="I1" default="f5">
+    <bpmn:inclusiveGateway id="I1">
       <bpmn:incoming>f4</bpmn:incoming>
       <bpmn:outgoing>f5</bpmn:outgoing>
       <bpmn:outgoing>f6</bpmn:outgoing>
@@ -65,7 +65,9 @@
     <bpmn:sequenceFlow id="f2" sourceRef="P1" targetRef="X"/>
     <bpmn:sequenceFlow id="f3" sourceRef="P1" targetRef="B"/>
     <bpmn:sequenceFlow id="f4" sourceRef="X" targetRef="I1"/>
-    <bpmn:sequenceFlow id="f5" sourceRef="I1" targetRef="A1"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="I1" targetRef="A1">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f6" sourceRef="I1" targetRef="A2">
       <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
