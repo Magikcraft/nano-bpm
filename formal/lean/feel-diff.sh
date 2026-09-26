@@ -15,6 +15,19 @@ cases="${1:-${FEEL_FUZZ_CASES:-3000}}"
 corpus="$(mktemp -t feel-corpus.XXXXXX.tsv)"
 trap 'rm -f "$corpus"' EXIT
 
+# The repo-wide .cargo/config.toml forces `-fuse-ld=mold` on the Linux target to
+# speed up local links, but mold is not preinstalled on every CI runner (the
+# formal job builds engine-core here without it). When mold is absent the link
+# dies with `collect2: fatal error: cannot find 'ld'`, so drop that flag for this
+# build and use rustc's bundled, self-contained lld (its default linker on
+# x86_64-linux) instead — no system-linker dependency. A non-empty RUSTFLAGS
+# outranks and fully replaces the target-scoped config rustflags (an empty value
+# is ignored by cargo, so it must carry the lld flag). Only done on Linux without
+# mold, so dev machines and the mold-provisioned Rust CI jobs keep the speedup.
+if [ "$(uname -s)" = "Linux" ] && ! command -v mold >/dev/null 2>&1; then
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-fuse-ld=lld"
+fi
+
 echo "==> lake build (all Lean targets)"
 ( cd "$here" && lake build )
 
