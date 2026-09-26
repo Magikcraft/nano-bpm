@@ -1,0 +1,101 @@
+// Tests for the single-source corpus generator (#1258). Structural + drift
+// checks that do not need a JVM (the TLA+ verdicts are covered by check.sh).
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { loadGraphs, tlaFor, bpmnFor, scenarioFor, FAMILIES } from './generate.mjs'
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+const graphs = loadGraphs()
+
+test('every graph has a well-formed structure', () => {
+  assert.ok(graphs.length > 0)
+  for (const g of graphs) {
+    assert.equal(typeof g.id, 'string')
+    assert.ok(g.nodes[g.start], `${g.id}: start ${g.start} is a node`)
+    const ids = new Set()
+    for (const e of g.edges) {
+      assert.ok(!ids.has(e.id), `${g.id}: duplicate flow id ${e.id}`)
+      ids.add(e.id)
+      assert.ok(g.nodes[e.from], `${g.id}: edge ${e.id} from unknown ${e.from}`)
+      assert.ok(g.nodes[e.to], `${g.id}: edge ${e.id} to unknown ${e.to}`)
+    }
+    for (const kind of Object.values(g.nodes)) {
+      assert.ok(['start', 'end', 'task', 'and', 'or', 'xor'].includes(kind))
+    }
+    assert.ok(Object.keys(g.families).length > 0)
+    for (const fam of Object.keys(g.families)) assert.ok(FAMILIES[fam], `${g.id}: unknown family ${fam}`)
+  }
+})
+
+test('TokenFlow models are named MC*, ZeebeTokenFlow models ZMC*', () => {
+  for (const g of graphs) {
+    for (const [fam, meta] of Object.entries(g.families)) {
+      if (fam === 'TokenFlow') assert.match(meta.module, /^MC/)
+      if (fam === 'ZeebeTokenFlow') assert.match(meta.module, /^ZMC/)
+    }
+  }
+})
+
+test('generated .tla EXTENDS the family base and defines the model vocabulary', () => {
+  for (const g of graphs) {
+    for (const [fam, meta] of Object.entries(g.families)) {
+      const tla = tlaFor(g, fam)
+      assert.match(tla, new RegExp(`MODULE ${meta.module} `))
+      assert.match(tla, new RegExp(`EXTENDS ${FAMILIES[fam].base}`))
+      for (const decl of ['MCNodes', 'MCKind', 'MCStart', 'MCEdges', 'MCFlows', 'MCSrc', 'MCTgt']) {
+        assert.match(tla, new RegExp(`${decl}\\s`), `${meta.module} declares ${decl}`)
+      }
+      // every node and every flow id appears in the model
+      for (const n of Object.keys(g.nodes)) assert.ok(tla.includes(`"${n}"`))
+      for (const e of g.edges) assert.ok(tla.includes(`${e.id} |->`))
+    }
+  }
+})
+
+test('a graph shared by both families emits one BPMN, one scenario, two .tla', () => {
+  const shared = graphs.find((g) => Object.keys(g.families).length === 2)
+  assert.ok(shared, 'expected at least one MC/ZMC shared graph')
+  const modules = Object.values(shared.families).map((f) => f.module)
+  assert.equal(new Set(modules).size, 2)
+  // The single BPMN/scenario is driven off the graph id, not a family.
+  assert.ok(bpmnFor(shared).includes(`id="${shared.id}"`))
+  assert.ok(JSON.parse(scenarioFor(shared)).process === shared.id)
+})
+
+test('BPMN carries DI (a shape per node, an edge per flow) and is executable', () => {
+  for (const g of graphs) {
+    const xml = bpmnFor(g)
+    assert.match(xml, /isExecutable="true"/)
+    assert.match(xml, /<bpmndi:BPMNDiagram/)
+    for (const n of Object.keys(g.nodes)) {
+      assert.ok(xml.includes(`bpmnElement="${n}"`), `${g.id}: DI shape for ${n}`)
+    }
+    for (const e of g.edges) {
+      assert.ok(xml.includes(`bpmnElement="${e.id}"`), `${g.id}: DI edge for ${e.id}`)
+      assert.ok(xml.includes('<di:waypoint'), `${g.id}: waypoints present`)
+    }
+    // every serviceTask has a job definition
+    for (const [n, k] of Object.entries(g.nodes)) {
+      if (k === 'task') assert.ok(xml.includes(`type="${n}"`), `${g.id}: job def for ${n}`)
+    }
+  }
+})
+
+test('scenario lists a job per task, an ordering, and message/timer slots', () => {
+  for (const g of graphs) {
+    const s = JSON.parse(scenarioFor(g))
+    const tasks = Object.entries(g.nodes).filter(([, k]) => k === 'task').map(([n]) => n)
+    assert.deepEqual(s.jobs.map((j) => j.element).sort(), [...tasks].sort())
+    assert.deepEqual([...s.jobCompletionOrder].sort(), [...tasks].sort())
+    assert.ok(Array.isArray(s.messageCorrelation))
+    assert.ok(Array.isArray(s.timerTicks))
+  }
+})
+
+test('--check passes on the committed artifacts (no drift)', () => {
+  // The generator is the source of truth: the committed artifacts must match.
+  execFileSync('node', [path.join(here, 'generate.mjs'), '--check'], { stdio: 'pipe' })
+})
