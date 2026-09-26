@@ -87,11 +87,40 @@ def genLeaf (r : Rng) : Expr × Rng :=
   | 4 => let (j, r) := r.upto varNames.length; (.var (pick varNames "v0" j), r)
   | _ => (.var "u0", r)   -- deliberately unbound
 
-/-- A number literal `q*d / d` etc. divisor, kept ≥ 1. -/
+/-- The largest integer magnitude at which exact `Int` arithmetic and IEEE `f64`
+arithmetic still agree bit-for-bit (`2^53`). The Rust engine evaluates FEEL
+numbers as doubles, so a generated expression whose value — *or any intermediate
+the Rust engine recomputes* — exceeds this bound would diverge from the
+reference's exact `Int` result on float rounding alone, not on a real FEEL
+semantic difference. Generated numeric magnitudes are kept within the bound so
+`Int` and `f64` coincide. -/
+def f64ExactBound : Nat := 9007199254740992  -- 2^53
+
+/-- True iff every numeric sub-result of `e` under `ctx` stays within the
+`f64`-exact range. Because the Rust engine evaluates each sub-expression as an
+`f64`, *any* intermediate exceeding `2^53` (not just the final value) can drift;
+we reject such candidates before they reach the corpus. Structurally recursive
+so it also guards the intermediates of `neg`, `not`, `if` and every binop. -/
+partial def f64Safe (ctx : Ctx) : Expr → Bool
+  | e =>
+    let here :=
+      match eval ctx e with
+      | .ok (.num n) => n.natAbs ≤ f64ExactBound
+      | _ => true
+    here &&
+      (match e with
+       | .neg a => f64Safe ctx a
+       | .lnot a => f64Safe ctx a
+       | .cond c t el => f64Safe ctx c && f64Safe ctx t && f64Safe ctx el
+       | .bin _ l r => f64Safe ctx l && f64Safe ctx r
+       | _ => true)
+
+/-- An exact-or-zero division `(q*d) / d`: for `d ≥ 1` the quotient is exactly
+`q`, and for `d = 0` this is `0 / 0`, exercising the documented
+divide-by-zero → `null` path (which both the reference and the engine take). -/
 private def genExactDiv (r : Rng) : Expr × Rng :=
   let (q, r) := r.upto 7
-  let (d0, r) := r.upto 6
-  let d := d0 + 1
+  let (d, r) := r.upto 7   -- includes 0, so the zero-divisor → null path is covered
   (.bin .div (.numLit (q * d)) (.numLit d), r)
 
 /- Generators are **type-directed**: `genNum`/`genStr`/`genBool` build
@@ -175,10 +204,18 @@ mutual
 end
 
 /-- One corpus row: the printed FEEL expression, the context encoding, and the
-reference outcome, tab-separated. -/
+reference outcome, tab-separated. The expression is drawn so that every numeric
+intermediate stays within the `f64`-exact range (`f64Safe`): unsafe candidates
+are rejected and re-drawn (advancing the PRNG) up to a small fuel bound, after
+which a trivially-safe literal is used so generation always terminates. -/
 def genRow (r : Rng) : String × Rng :=
   let (ctx, enc, r) := genCtx r
-  let (e, r) := genAny r 4
+  let rec drawSafe (r : Rng) : Nat → Expr × Rng
+    | 0 => (.numLit 0, r)   -- fuel exhausted: fall back to a guaranteed-safe expression
+    | fuel + 1 =>
+      let (e, r) := genAny r 4
+      if f64Safe ctx e then (e, r) else drawSafe r fuel
+  let (e, r) := drawSafe r 16
   let outcome := eval ctx e
   (s!"{e.pretty}\t{enc}\t{outcome.canon}", r)
 
