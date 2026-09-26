@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { loadGraphs, tlaFor, bpmnFor, scenarioFor, FAMILIES, takenFlows, reachableNodes } from './generate.mjs'
+import { loadGraphs, tlaFor, bpmnFor, scenarioFor, FAMILIES, takenFlows, reachableNodes, validateGraphs, SAFE_ID } from './generate.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const graphs = loadGraphs()
@@ -204,4 +204,50 @@ test('--check flags a stray generated TLA model with no graph source', () => {
   } finally {
     fs.rmSync(stray, { force: true })
   }
+})
+
+test('the committed corpus passes validation (safe ids, unique ids/modules)', () => {
+  // loadGraphs() already runs validateGraphs(); make the guarantee explicit so a
+  // future graph that breaks the grammar or collides is caught here too.
+  assert.doesNotThrow(() => validateGraphs(loadGraphs()))
+  assert.match('MC1_Ok', SAFE_ID)
+  assert.doesNotMatch('1bad', SAFE_ID)
+  assert.doesNotMatch('a b', SAFE_ID)
+})
+
+test('validateGraphs rejects duplicate graph ids and duplicate family modules', () => {
+  // Regression (#1258 review): artifacts() keys outputs by graph id + family
+  // module and --check dedups the expected path set, so a duplicate id/module
+  // silently overwrites one graph while --check still reports clean. Reject it.
+  const mk = (id, module) => ({
+    id, start: 'S', nodes: { S: 'start', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'E' }],
+    families: { TokenFlow: { module, comment: [] } }
+  })
+  assert.throws(() => validateGraphs([mk('Dup', 'MCa'), mk('Dup', 'MCb')]), /duplicate graph id/)
+  assert.throws(() => validateGraphs([mk('A', 'MCsame'), mk('B', 'MCsame')]), /duplicate module/)
+  assert.doesNotThrow(() => validateGraphs([mk('A', 'MCa'), mk('B', 'MCb')]))
+})
+
+test('validateGraphs rejects ids that would break generated TLA+/BPMN', () => {
+  // Regression (#1258 review): node/flow ids and endpoints are interpolated into
+  // TLA+ (flow ids as BARE record fields, nodes as string literals). An id with
+  // `"`, `\` or a newline yields invalid TLA+. Reject out-of-grammar ids so a
+  // valid graph source cannot produce an unusable generated model.
+  const base = () => ({
+    id: 'Ok', start: 'S', nodes: { S: 'start', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'E' }],
+    families: { TokenFlow: { module: 'MCOk', comment: [] } }
+  })
+  const withNode = (bad) => { const g = base(); g.nodes = { S: 'start', [bad]: 'end' }; g.start = 'S'; g.edges = [{ id: 'f1', from: 'S', to: bad }]; return g }
+  assert.throws(() => validateGraphs([withNode('E"vil')]), /not a safe identifier/)
+  assert.throws(() => validateGraphs([withNode('E\\x')]), /not a safe identifier/)
+  assert.throws(() => validateGraphs([withNode('E\nx')]), /not a safe identifier/)
+  const badFlow = base(); badFlow.edges = [{ id: 'f 1', from: 'S', to: 'E' }]
+  assert.throws(() => validateGraphs([badFlow]), /flow id .* not a safe identifier/)
+  const badModule = base(); badModule.families = { TokenFlow: { module: 'MC Ok', comment: [] } }
+  assert.throws(() => validateGraphs([badModule]), /module .* not a safe identifier/)
+  const dupFlow = base(); dupFlow.nodes = { S: 'start', A: 'task', E: 'end' }
+  dupFlow.edges = [{ id: 'f1', from: 'S', to: 'A' }, { id: 'f1', from: 'A', to: 'E' }]
+  assert.throws(() => validateGraphs([dupFlow]), /duplicate flow id/)
 })

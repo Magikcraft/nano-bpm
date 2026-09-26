@@ -52,12 +52,67 @@ const KIND = {
 // CASE arm order for MCKind; `task` is the OTHER fallback.
 const KIND_ORDER = ['start', 'end', 'and', 'or', 'xor']
 
+// The one grammar every corpus identifier must obey. Graph ids, family module
+// names, node ids and flow (edge) ids all flow verbatim into generated
+// artifacts, so a hostile character breaks a downstream model:
+//   - flow ids are emitted as BARE TLA+ record fields (MCEdges == [f1 |-> ..]),
+//     and node ids / endpoints as TLA+ string literals — a `"`, `\` or newline
+//     produces invalid TLA+ while the BPMN side (xmlEscape) would silently
+//     diverge. Escaping the string literals could not rescue the bare-field
+//     case, so we REJECT out-of-grammar ids rather than escape (#1258 review).
+//   - graph ids and module names are also used as file-name components and
+//     TLA+/BPMN identifiers.
+// This grammar is a valid TLA+ identifier, an XML NCName, and a safe filename
+// component, so a graph that passes here generates a well-formed model.
+export const SAFE_ID = /^[A-Za-z][A-Za-z0-9_]*$/
+
+// Reject a corpus that would generate colliding or malformed artifacts BEFORE
+// anything is emitted. `artifacts()` keys outputs by graph id + family module,
+// and `--check` builds a DEDUPLICATED expected-path set, so a duplicate id or
+// module would let one graph silently overwrite another while --check still
+// reports clean (#1258 review). Duplicate flow ids within a graph collapse the
+// same way in the TLA+ MCEdges record. Fail loudly on any of these.
+export function validateGraphs (graphs) {
+  const bad = (msg) => { throw new Error(`corpus graph invalid: ${msg}`) }
+  const checkId = (label, value) => {
+    if (typeof value !== 'string' || !SAFE_ID.test(value)) {
+      bad(`${label} ${JSON.stringify(value)} is not a safe identifier (must match ${SAFE_ID})`)
+    }
+  }
+  const seenIds = new Map()
+  const seenModules = new Map()
+  for (const g of graphs) {
+    checkId('graph id', g.id)
+    if (seenIds.has(g.id)) bad(`duplicate graph id ${JSON.stringify(g.id)}`)
+    seenIds.set(g.id, true)
+    for (const [fam, spec] of Object.entries(g.families ?? {})) {
+      checkId(`graph ${g.id} family ${fam} module`, spec.module)
+      if (seenModules.has(spec.module)) {
+        bad(`duplicate module ${JSON.stringify(spec.module)} (graphs ${seenModules.get(spec.module)} and ${g.id})`)
+      }
+      seenModules.set(spec.module, g.id)
+    }
+    for (const n of Object.keys(g.nodes)) checkId(`graph ${g.id} node id`, n)
+    checkId(`graph ${g.id} start node`, g.start)
+    const seenEdgeIds = new Set()
+    for (const e of g.edges) {
+      checkId(`graph ${g.id} flow id`, e.id)
+      if (seenEdgeIds.has(e.id)) bad(`graph ${g.id} has duplicate flow id ${JSON.stringify(e.id)}`)
+      seenEdgeIds.add(e.id)
+      checkId(`graph ${g.id} flow ${e.id} source`, e.from)
+      checkId(`graph ${g.id} flow ${e.id} target`, e.to)
+    }
+  }
+  return graphs
+}
+
 export function loadGraphs () {
   const dir = path.join(here, 'graphs')
-  return fs.readdirSync(dir)
+  const graphs = fs.readdirSync(dir)
     .filter((f) => f.endsWith('.json'))
     .sort()
     .map((f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')))
+  return validateGraphs(graphs)
 }
 
 // ---------------------------------------------------------------------------
