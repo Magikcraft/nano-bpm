@@ -9,7 +9,12 @@ formal/
 ├── tla/
 │   ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
 │   ├── MC*.tla               # concrete process graphs to model-check
-│   └── check.sh              # generates each TLC config, runs TLC, compares with EXPECTED
+│   ├── specs/                # one <Name>.spec descriptor per spec family (the registry)
+│   │   └── TokenFlow.spec    # TokenFlow's constants/invariants/properties/expected/trace models
+│   ├── check.sh              # discovers specs/*.spec, runs TLC per model, compares with each spec's EXPECTED
+│   ├── gen-traces.sh         # dumps TLC behaviours of the trace models to committed JSON fixtures
+│   ├── trace/parse.mjs       # TLC -tool output -> trace fixture JSON
+│   └── traces/<Spec>/*.json  # committed trace fixtures (replayed by engine-core/tests/trace_validation)
 └── parity/                   # Zeebe parity coverage matrix (see below)
     ├── zeebe-pin.json        # the Zeebe commit the matrix is derived from
     ├── fetch-zeebe.sh        # sparse-fetches the pinned sources
@@ -100,7 +105,8 @@ future extension of this spec.
 
 ## Expected outcomes and known defects
 
-The `EXPECTED` table in `check.sh` records the expected outcome for each model:
+The `SPEC_EXPECTED` table in a spec's descriptor (`formal/tla/specs/<Name>.spec`)
+records the expected outcome for each model:
 `pass`, or `violates:<P1>,<P2>,...`, the **exact** set of invariants and
 properties TLC must report as violated. Every property not listed is thereby
 proven to hold for that model. A `violates:` model runs with TLC's `-continue
@@ -131,34 +137,121 @@ violations in (a stuck state still shows up, as `NoStuckInstance` and
   re-evaluated and waits, as in Zeebe. Before #1241 a quiescence sweep
   re-evaluated waiting joins, and both models completed.
 
-TLC cannot see the Rust code, so nothing yet forces the spec update when the
-engine changes. Until trace validation (#1226) links the two, that step is a
-review responsibility.
+TLC cannot see the Rust code by itself. Trace validation (#1226) now links the
+two for the parallel-only corpus: TLC-generated behaviours are replayed against
+`Engine::apply_command` in `engine-core/tests/trace_validation` (see [Trace
+validation](#trace-validation) below). For the model families it does not yet
+anchor (condition-routed graphs, and the specs still to land), forcing the spec
+update when the engine changes stays a review responsibility.
 
-`check.sh` also fails if a `MC*.tla` has no table entry, if an entry has no
-model, or if TLC prints a warning.
+`check.sh` also fails if a model file matched by a spec's `SPEC_MODELS_GLOB` has
+no `SPEC_EXPECTED` entry, if an entry has no model, if a model is claimed by more
+than one spec, if a committed `*.tla` that `EXTENDS` a registered spec base is
+claimed by none, or if TLC prints a warning.
 
-## Adding a model
+## Adding a spec family
+
+Each spec family (TokenFlow, and the future JobLease, RaftHandoff,
+SnapshotReplay, ZeebeTokenFlow) registers itself through a self-contained
+descriptor, so a new spec is added by **creating files in its own path** — never
+by editing `check.sh` or another spec's descriptor.
+
+1. Write the base module `formal/tla/<Name>.tla` (or under a subdirectory of
+   your choosing) and its concrete model files.
+2. Create `formal/tla/specs/<Name>.spec` — a shell fragment `check.sh` sources
+   in a fresh subshell, so its `SPEC_*` variables are private to your spec. Set:
+   `SPEC_NAME` (the base module every model `EXTENDS`), `SPEC_MODELS_DIR`
+   (directory of the models, relative to `formal/tla`, `.` for the root),
+   `SPEC_MODELS_GLOB` (glob selecting your models — must not overlap another
+   spec's), `SPEC_CONSTANTS` (the `.cfg` CONSTANTS lines), `SPEC_INVARIANTS`,
+   `SPEC_PROPERTIES`, and `SPEC_EXPECTED` (one `"<Model> pass"` /
+   `"<Model> violates:<P1>,..."` row per model). Copy `TokenFlow.spec` as the
+   reference. Optionally set `SPEC_TRACE_MODELS` (see below).
+3. Run `formal/tla/check.sh` — your spec is discovered and checked with its own
+   constants/invariants/properties; the drift guard is scoped to your spec, so
+   it never forces your models into TokenFlow's table or vice versa.
+
+`check.sh MCFoo` still runs a single model by name across all specs.
+
+## Trace validation
+
+Trace validation anchors a spec to the real engine (#1226, the epic's anti-drift
+rule): TLC emits a spec behaviour, and a Rust test replays it against
+`Engine::apply_command`, failing on any divergence.
+
+- `formal/tla/gen-traces.sh` runs TLC over each model listed in a descriptor's
+  `SPEC_TRACE_MODELS`, dumping the shortest completing behaviour (a witness
+  invariant `~(SPEC_TRACE_DONE)` forces TLC to emit it) plus the TLC-evaluated
+  process graph (`SPEC_TRACE_GRAPH`, in the spec's own graph vocabulary) to a
+  committed fixture `formal/tla/traces/<Spec>/<Model>.json`. `SPEC_TRACE_DONE`
+  and `SPEC_TRACE_GRAPH` are descriptor-supplied (required whenever
+  `SPEC_TRACE_MODELS` is non-empty), so the generator is spec-agnostic — a
+  sibling family with different state/graph vocabulary supplies its own. The
+  fixtures are a derived artifact: `gen-traces.sh --check` regenerates them and
+  fails on drift, and `check.sh` runs it on a full model-check (when node is
+  available) so the `formal (tlc)` CI job enforces it.
+- `engine-core/tests/trace_validation.rs` reads those fixtures, rebuilds each
+  model as a real engine process, drives it to quiescence, and asserts the
+  engine's observable **milestone multiset** (tokens on flows, task wait states,
+  join firings, completion) equals the spec's. A divergence fails the test — no
+  tolerated mismatch, no retries. The corpus is restricted to parallel-only,
+  routing-deterministic models whose milestone multiset is invariant under
+  interleaving, so multiset equality is an exact check. Models with two distinct
+  flows sharing endpoints (`MCParallelDuplicateFlows`) are model-checked but
+  excluded from the anchored corpus: the engine's `SequenceFlowTaken` event has
+  no per-flow identity, so their milestone multiset cannot distinguish the two
+  same-endpoint flows and the anchor would be unsound.
+
+**Reuse entry point (for sibling specs #1227, #1240, …).** The replay driver is
+spec-agnostic and lives in `engine-core/tests/trace_validation/harness.rs`. A
+new spec anchors its own models by implementing the `TraceMapping` trait and
+calling `harness::validate`:
+
+```rust
+#[path = "trace_validation/harness.rs"]
+mod harness;
+use harness::{Fixture, Milestone, TraceMapping, validate};
+
+// build the engine process from the spec graph; project engine Events onto
+// the shared Milestone vocabulary:
+pub trait TraceMapping {
+    fn process_id(&self, fixture: &Fixture) -> String;
+    fn build_process(&self, fixture: &Fixture) -> ProcessDefinition;
+    fn engine_milestones(&self, events: &[Event]) -> Vec<Milestone>;
+}
+// validate(&mapping, &fixture) -> Result<(), String>   // Err on divergence
+```
+
+`engine-core/tests/trace_validation/token_flow.rs` is the reference
+`TraceMapping` implementation.
+
+## Adding a model to TokenFlow
 
 1. Add `MCFoo.tla` (`EXTENDS TokenFlow`) and define `MCNodes`, `MCKind`,
    `MCStart` and `MCEdges` (a record from flow id to `<<source, target>>`),
    plus the derived `MCFlows`, `MCSrc` and `MCTgt` (copy these from an
    existing model). Flows have their own ids, as in the engine, so two
-   distinct flows may share endpoints (`MCParallelDuplicateFlows`).
-2. Add a row to `EXPECTED` in `check.sh` with its expected outcome. There are
-   no hand-written `.cfg` files. `check.sh` generates the same config, with
-   every property, for every model, so no model can skip a property.
+   distinct flows may share endpoints (`MCParallelDuplicateFlows`). Such a
+   duplicate-endpoint model is model-checked but **not** trace-anchored: the
+   engine's `SequenceFlowTaken` event carries no per-flow identity, so its
+   observable milestone multiset cannot distinguish the two same-endpoint
+   flows (see `SPEC_TRACE_MODELS` in `TokenFlow.spec`).
+2. Add a row to `SPEC_EXPECTED` in `formal/tla/specs/TokenFlow.spec` with its
+   expected outcome. There are no hand-written `.cfg` files. `check.sh`
+   generates the same config, with every property, for every model, so no model
+   can skip a property.
 
 If the model finds a violation, confirm it against the real engine with a red
 Rust test before recording it. The model may simply be wrong.
 
 ## Keeping the spec honest
 
-The spec is hand-written, so it can drift from the Rust code. Tying the two
-together through trace validation is tracked in #1226: replay TLC-generated
-behaviours against `Engine::apply_command`. Until that lands, any change to
-the drain loop, the join functions or `path_reaches_join` should update
-`TokenFlow.tla` in the same PR.
+The spec is hand-written, so it can drift from the Rust code. Trace validation
+(#1226) ties the two together for the parallel-only corpus by replaying
+TLC-generated behaviours against `Engine::apply_command` (see [Trace
+validation](#trace-validation)). Where a model is not yet trace-anchored, any
+change to the drain loop, the join functions or `path_reaches_join` should
+update `TokenFlow.tla` in the same PR.
 
 ## Zeebe parity coverage matrix
 
