@@ -234,17 +234,25 @@ mod spec_model {
                         // stale expired lock, keep any live one (there is none
                         // under the guard), add the new lease. Set the persistent
                         // `activated` latch (`activated' = [.. EXCEPT ![j] = TRUE]`).
+                        // `JobLease.tla` computes the deadline as `clock +
+                        // Timeout` in unbounded `Nat` arithmetic, so it never
+                        // saturates. Clamping a u64 `now + timeout` at `u64::MAX`
+                        // would silently diverge from the spec at the boundary: a
+                        // saturated `u64::MAX` deadline admits an `Expire` at an
+                        // instant the spec's strictly larger deadline forbids.
+                        // Refuse to anchor such a fixture rather than validate the
+                        // engine against a deadline this validator cannot
+                        // faithfully represent (finding #1257).
+                        let deadline = now.checked_add(st.timeout).ok_or_else(|| {
+                            ctx(format!(
+                                "deadline now ({now}) + timeout ({}) overflows u64; \
+                                 JobLease.tla uses unbounded Nat arithmetic, so this \
+                                 validator cannot faithfully anchor the boundary",
+                                st.timeout
+                            ))
+                        })?;
                         let mut next = st.live_locks(&job);
-                        next.insert(Lock {
-                            // Mirror the engine's saturating deadline
-                            // (`engine-core/src/engine/mod.rs` uses
-                            // `saturating_add`) so the validator is total over
-                            // the u64 input domain: a `now`/`timeout` near
-                            // `u64::MAX` saturates rather than overflowing
-                            // (panic in debug, wrap in release) (finding #1257).
-                            deadline: now.saturating_add(st.timeout),
-                            worker,
-                        });
+                        next.insert(Lock { deadline, worker });
                         st.locks.insert(job.clone(), next);
                         st.activated.insert(job);
                     }
@@ -855,5 +863,32 @@ fn replay_detects_lease_divergence() {
     assert!(
         result.unwrap_err().contains("to lease"),
         "the divergence report should name the exclusivity mismatch"
+    );
+}
+
+/// The spec-side validator must reject a fixture whose deadline arithmetic
+/// overflows u64: `JobLease.tla` evaluates `clock + Timeout` in unbounded `Nat`
+/// arithmetic, so saturating (or wrapping) a u64 `now + timeout` near the top of
+/// the domain would silently diverge from the spec at the boundary. Rather than
+/// anchor the engine against a deadline it cannot faithfully represent, the
+/// validator must refuse the fixture (finding #1257). Red/Green: prove the
+/// overflow check actually fires.
+#[test]
+fn spec_model_rejects_deadline_overflow() {
+    let (_, mut fixture) = load_lease_fixtures()
+        .into_iter()
+        .find(|(_, v)| v.get("model").and_then(Value::as_str) == Some("activate-complete"))
+        .expect("the activate-complete behaviour is committed");
+    // `now = u64::MAX` with a positive timeout makes `now + timeout` overflow at
+    // the first (enabled) Activate step.
+    fixture["steps"][0]["now"] = Value::from(u64::MAX);
+    let result = spec_model::assert_admitted(&fixture);
+    assert!(
+        result.is_err(),
+        "the spec-side validator must reject a fixture whose now + timeout overflows u64"
+    );
+    assert!(
+        result.unwrap_err().contains("overflows u64"),
+        "the report should name the deadline overflow"
     );
 }
