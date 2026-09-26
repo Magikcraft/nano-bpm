@@ -180,10 +180,19 @@ theorem deserialize_serialize (e : Engine σ) (total : Nat) :
     deserialize (serialize e total) = e := rfl
 
 /-- The snapshot taken at the prefix boundary after `k` events: the compaction
-point whose surviving tail is `evs.drop k`. -/
+point whose surviving tail is `evs.drop k`.
+
+The certified `totalEvents` is the **actual** covered-prefix length
+`(evs.take k).length`, not `k` itself: when `k ≤ evs.length` these coincide
+(the intended case), but when `k > evs.length` the prefix is only `evs.length`
+events, so recording `k` would overstate coverage for events that were never
+replayed. Storing the real prefix length keeps `totalEvents` an honest witness
+of what the snapshot certifies. This does not affect the determinism theorems,
+which pair the snapshot with `evs.drop k` and never read `totalEvents`
+(`recover` ignores it — see below). -/
 def snapshotAt (pid : Nat) (apply : σ → Event → σ) (init : σ)
     (evs : List Event) (k : Nat) : Snapshot σ :=
-  serialize (replay pid apply init (evs.take k)) k
+  serialize (replay pid apply init (evs.take k)) (evs.take k).length
 
 /-- Recovery: restore a snapshot and replay the surviving tail on top of it.
 Mirrors `seglog.rs` `recover`/`recover_multi` rebuilding from the compacted
