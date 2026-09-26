@@ -149,6 +149,20 @@ HasActivePathTo(j, arr) ==
     LET blocked == {g \in In(j) : arr[g] > 0}
     IN  \E m \in LiveSources \ {j} : PathReaches(m, j, blocked)
 
+\* The single canonical Nano join-firing guard, as a function of a join `j` and
+\* its per-flow arrivals `arr`. `ArriveJoin` fires exactly on this predicate and
+\* `RefinesZeebe` compares exactly this predicate to Zeebe: routing both the
+\* action guard and the refinement obligation through ONE definition is what
+\* makes `RefinesZeebe` a genuine constraint on the action — an edit to the guard
+\* changes both sides at once, so the invariant cannot silently pass over drift.
+\* A parallel join fires once every incoming flow holds a token; an inclusive
+\* join also fires when some flow holds a token and no live source can reach it.
+JoinFires(j, arr) ==
+    LET allTaken == \A g \in In(j) : arr[g] >= 1
+    IN  IF j \in ParJoins THEN allTaken
+        ELSE \/ allTaken
+             \/ (\E g \in In(j) : arr[g] > 0) /\ ~HasActivePathTo(j, arr)
+
 \* Taking flows `S` (`take_flow`): each is queued, and a flow into a join is
 \* counted on it at once, as Zeebe counts a taken sequence flow (#1241).
 TakeFlows(jt, S) ==
@@ -185,10 +199,7 @@ ActivateEnd(f) ==
 ArriveJoin(f, S) ==
     LET j        == Target(f)
         arr      == joinTokens[j]
-        allTaken == \A g \in In(j) : arr[g] >= 1
-        fires    == IF j \in ParJoins THEN allTaken
-                    ELSE \/ allTaken
-                         \/ (\E g \in In(j) : arr[g] > 0) /\ ~HasActivePathTo(j, arr)
+        fires    == JoinFires(j, arr)
         rest     == [g \in Flows |-> IF arr[g] > 0 THEN arr[g] - 1 ELSE 0]
     IN  /\ IF fires
              THEN /\ pending'    = Add(Take(pending, f), S)
@@ -352,13 +363,12 @@ ZeebeRef == INSTANCE ZeebeTokenFlow WITH
     earlyPar <- premature,
     done     <- completed
 
-\* This spec's own join-firing decision, at a join's current arrivals — exactly
-\* the `fires` predicate inside `ArriveJoin`, lifted to a state predicate.
-NanoJoinReady(j) ==
-    LET arr == joinTokens[j] IN
-    IF j \in ParJoins THEN \A g \in In(j) : arr[g] >= 1
-    ELSE \/ (\A g \in In(j) : arr[g] >= 1)
-         \/ (\E g \in In(j) : arr[g] > 0) /\ ~HasActivePathTo(j, arr)
+\* This spec's own join-firing decision at a join's current arrivals — the SAME
+\* canonical `JoinFires` guard that `ArriveJoin` fires on, lifted to a state
+\* predicate. Sharing the definition is deliberate: it is what makes the
+\* equality below a real refinement obligation on the action, not a check of a
+\* parallel re-derivation that could drift from the guard it claims to mirror.
+NanoJoinReady(j) == JoinFires(j, joinTokens[j])
 
 RefinesZeebe ==
     \A j \in ParJoins \cup IncJoins :
