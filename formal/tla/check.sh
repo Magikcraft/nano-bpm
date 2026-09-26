@@ -184,9 +184,14 @@ run_spec() { # spec_file [model...]
   }
 
   # Per-spec, two-way drift guard between the model files and the EXPECTED table.
-  local st=0 m
+  # `globbed` is the set of model basenames SPEC_MODELS_GLOB actually selects —
+  # the same set the global cross-spec `claimed` registry is built from — so it,
+  # not mere file existence, is the authority on which models belong to this
+  # spec's registered scope.
+  local st=0 m globbed=" "
   while IFS= read -r m; do
     [[ -n "$m" ]] || continue
+    globbed="$globbed$m "
     [[ -n "$(expected_outcome "$m")" ]] || { echo "error: ${SPEC_NAME}: $m.tla has no entry in EXPECTED" >&2; st=1; }
   done < <( cd "$modeldir"; shopt -s nullglob; for f in $SPEC_MODELS_GLOB; do echo "${f%.tla}"; done )
   local seen=" " row outcome p
@@ -194,7 +199,18 @@ run_spec() { # spec_file [model...]
     read -r m _ <<<"$row"
     if [[ "$seen" == *" $m "* ]]; then echo "error: ${SPEC_NAME}: EXPECTED lists $m more than once" >&2; st=1; fi
     seen="$seen$m "
-    [[ -f "$modeldir/$m.tla" ]] || { echo "error: ${SPEC_NAME}: EXPECTED lists $m but $m.tla does not exist" >&2; st=1; }
+    # An EXPECTED model must be selected by SPEC_MODELS_GLOB, not merely exist on
+    # disk: a file present but outside the glob is absent from `claimed`, cannot
+    # be picked by the model-filter path, yet the full-run loop below would still
+    # run it — silently checking a model outside this spec's registered scope.
+    if [[ "$globbed" != *" $m "* ]]; then
+      if [[ -f "$modeldir/$m.tla" ]]; then
+        echo "error: ${SPEC_NAME}: EXPECTED lists $m but $m.tla is not selected by SPEC_MODELS_GLOB ($SPEC_MODELS_GLOB); it would run outside the spec's registered scope" >&2
+      else
+        echo "error: ${SPEC_NAME}: EXPECTED lists $m but $m.tla does not exist" >&2
+      fi
+      st=1
+    fi
     outcome="$(expected_outcome "$m")"
     if [[ "$outcome" == violates:* ]]; then
       for p in $(tr ',' ' ' <<<"${outcome#violates:}"); do

@@ -186,14 +186,19 @@ pub fn run_to_quiescence(
     // completing an unactivated job); activation itself emits no token-flow
     // milestone, so it does not perturb the observed multiset. Bounded: a
     // completing model has finitely many jobs, each key completed at most once.
-    for _ in 0..10_000 {
+    const MAX_ITERS: usize = 10_000;
+    let mut quiesced = false;
+    for _ in 0..MAX_ITERS {
         let pending: Option<(u64, String)> = events.iter().find_map(|e| match e {
             Event::JobCreated { job_key, job_type, .. } if !completed.contains(job_key) => {
                 Some((*job_key, job_type.clone()))
             }
             _ => None,
         });
-        let Some((_, job_type)) = pending else { break };
+        let Some((_, job_type)) = pending else {
+            quiesced = true;
+            break;
+        };
         let activated =
             engine.activate_jobs(job_type.clone(), "trace-validation", usize::MAX, 60_000, 0);
         if activated.is_empty() {
@@ -208,6 +213,14 @@ pub fn run_to_quiescence(
                 .map_err(|e| format!("complete job {}: {e:?}", job.key))?;
             events.extend(more);
         }
+    }
+    if !quiesced {
+        return Err(format!(
+            "run_to_quiescence exhausted its {MAX_ITERS}-iteration bound without the \
+             instance quiescing (a job mapping that never completes, or a model with \
+             more than {MAX_ITERS} job completions); the replay is partial and cannot \
+             be compared against the spec"
+        ));
     }
     Ok(events)
 }

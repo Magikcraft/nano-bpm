@@ -27,6 +27,15 @@
 #                    committed trace fixtures and replayed against the Rust
 #                    engine by the trace-validation harness (Deliverable B,
 #                    #1226). Only completing (`pass`) models belong here.
+#   SPEC_TRACE_DONE  (required iff SPEC_TRACE_MODELS is non-empty) the TLA+
+#                    completion predicate for this spec's state. gen-traces.sh
+#                    checks the witness invariant `~(SPEC_TRACE_DONE)`, so TLC
+#                    emits the shortest behaviour that reaches completion.
+#   SPEC_TRACE_GRAPH (required iff SPEC_TRACE_MODELS is non-empty) the TLA+
+#                    record expression, in this spec's own graph vocabulary,
+#                    that gen-traces.sh dumps as GRAPHJSON for the fixture. Must
+#                    yield the keys the trace parser expects (nodes/kind/edges/
+#                    start).
 
 SPEC_NAME="TokenFlow"
 SPEC_MODELS_DIR="."
@@ -78,3 +87,10 @@ SPEC_EXPECTED=(
 # branches nondeterministically in the spec and by FEEL data in the engine, so
 # they are model-checked but not (yet) trace-anchored. See formal/README.md.
 SPEC_TRACE_MODELS=(MCParallelDiamond MCParallelDuplicateFlows)
+
+# The completion predicate and process-graph record the trace generator dumps,
+# in TokenFlow's own vocabulary (see SPEC_TRACE_DONE / SPEC_TRACE_GRAPH above).
+# These make gen-traces.sh spec-agnostic: a sibling family supplies its own.
+SPEC_TRACE_DONE="completed"
+SPEC_TRACE_GRAPH="[nodes |-> MCNodes, kind |-> [n \in MCNodes |-> MCKind[n]],
+     edges |-> MCEdges, start |-> MCStart]"

@@ -181,8 +181,12 @@ rule): TLC emits a spec behaviour, and a Rust test replays it against
 
 - `formal/tla/gen-traces.sh` runs TLC over each model listed in a descriptor's
   `SPEC_TRACE_MODELS`, dumping the shortest completing behaviour (a witness
-  invariant `~completed` forces TLC to emit it) plus the TLC-evaluated process
-  graph to a committed fixture `formal/tla/traces/<Spec>/<Model>.json`. The
+  invariant `~(SPEC_TRACE_DONE)` forces TLC to emit it) plus the TLC-evaluated
+  process graph (`SPEC_TRACE_GRAPH`, in the spec's own graph vocabulary) to a
+  committed fixture `formal/tla/traces/<Spec>/<Model>.json`. `SPEC_TRACE_DONE`
+  and `SPEC_TRACE_GRAPH` are descriptor-supplied (required whenever
+  `SPEC_TRACE_MODELS` is non-empty), so the generator is spec-agnostic — a
+  sibling family with different state/graph vocabulary supplies its own. The
   fixtures are a derived artifact: `gen-traces.sh --check` regenerates them and
   fails on drift, and `check.sh` runs it on a full model-check (when node is
   available) so the `formal (tlc)` CI job enforces it.

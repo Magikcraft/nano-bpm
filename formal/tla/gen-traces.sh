@@ -56,13 +56,18 @@ gen_one() { # spec_name models_dir model out_json
   # Copy the model, its spec base module and anything they need (flat corpus).
   cp "$here/$mdir"/*.tla "$work/" 2>/dev/null || true
   local wit="${model}_trace"
+  # The completion predicate and process-graph record are supplied by the
+  # descriptor (SPEC_TRACE_DONE / SPEC_TRACE_GRAPH), not hard-coded here: the
+  # witness invariant `~(<done>)` forces TLC to emit the shortest behaviour that
+  # reaches the spec's completion state, and the GRAPHJSON record is the spec's
+  # own graph vocabulary. This keeps the trace seam reusable across spec families
+  # whose state/graph vocabulary differs from TokenFlow's (validated in run_spec).
   cat >"$work/$wit.tla" <<EOF
 ---- MODULE $wit ----
 EXTENDS $model, TLC
-Witness_NotDone == ~completed
+Witness_NotDone == ~($SPEC_TRACE_DONE)
 ASSUME PrintT(<<"GRAPHJSON",
-    [nodes |-> MCNodes, kind |-> [n \\in MCNodes |-> MCKind[n]],
-     edges |-> MCEdges, start |-> MCStart]>>)
+    $SPEC_TRACE_GRAPH>>)
 ====
 EOF
   {
@@ -82,6 +87,7 @@ EOF
 run_spec() { # spec_file
   set -euo pipefail
   SPEC_NAME="" SPEC_MODELS_DIR="." SPEC_CONSTANTS=() SPEC_TRACE_MODELS=()
+  SPEC_TRACE_DONE="" SPEC_TRACE_GRAPH=""
   # shellcheck disable=SC1090
   source "$1"
   local dest="$outroot/$SPEC_NAME"
@@ -109,6 +115,14 @@ run_spec() { # spec_file
   fi
 
   [[ ${#SPEC_TRACE_MODELS[@]} -gt 0 ]] || return 0
+  # A descriptor that anchors trace fixtures must supply its own completion
+  # predicate and process-graph record — the generator is spec-agnostic and must
+  # not fall back to TokenFlow's vocabulary. Fail loudly rather than emit an
+  # invalid witness for a spec whose state/graph differs.
+  [[ -n "$SPEC_TRACE_DONE" ]] || {
+    echo "error: $SPEC_NAME declares SPEC_TRACE_MODELS but not SPEC_TRACE_DONE (the completion predicate for the trace witness)" >&2; return 1; }
+  [[ -n "$SPEC_TRACE_GRAPH" ]] || {
+    echo "error: $SPEC_NAME declares SPEC_TRACE_MODELS but not SPEC_TRACE_GRAPH (the GRAPHJSON process-graph record for the trace witness)" >&2; return 1; }
   local m out
   for m in "${SPEC_TRACE_MODELS[@]}"; do
     if [[ "$mode" == "write" ]]; then
