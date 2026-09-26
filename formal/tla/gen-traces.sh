@@ -84,8 +84,31 @@ run_spec() { # spec_file
   SPEC_NAME="" SPEC_MODELS_DIR="." SPEC_CONSTANTS=() SPEC_TRACE_MODELS=()
   # shellcheck disable=SC1090
   source "$1"
-  [[ ${#SPEC_TRACE_MODELS[@]} -gt 0 ]] || return 0
   local dest="$outroot/$SPEC_NAME"
+
+  # Reverse drift guard (check mode): a committed fixture whose model is no
+  # longer declared in SPEC_TRACE_MODELS (a model removed from or renamed in the
+  # descriptor) leaves its stale JSON under traces/<Spec>/. The forward loop
+  # below only visits declared models, so `--check` would still pass while the
+  # Rust trace-validation harness keeps loading the orphaned fixture. Reject any
+  # committed fixture the descriptor does not declare. Runs even when
+  # SPEC_TRACE_MODELS is empty (a descriptor that dropped trace validation
+  # entirely must not leave fixtures behind).
+  if [[ "$mode" == "check" && -d "$dest" ]]; then
+    local declared=" ${SPEC_TRACE_MODELS[*]:-} " rc=0 f base
+    shopt -s nullglob
+    for f in "$dest"/*.json; do
+      base="$(basename "${f%.json}")"
+      if [[ "$declared" != *" $base "* ]]; then
+        echo "FAIL trace fixture undeclared: $SPEC_NAME/$base (remove $f or add $base to SPEC_TRACE_MODELS)" >&2
+        rc=1
+      fi
+    done
+    shopt -u nullglob
+    [[ $rc -eq 0 ]] || return 1
+  fi
+
+  [[ ${#SPEC_TRACE_MODELS[@]} -gt 0 ]] || return 0
   local m out
   for m in "${SPEC_TRACE_MODELS[@]}"; do
     if [[ "$mode" == "write" ]]; then

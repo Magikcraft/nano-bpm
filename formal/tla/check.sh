@@ -282,8 +282,25 @@ run_spec() { # spec_file [model...]
 full_run=true
 [[ $# -eq 0 ]] || full_run=false
 
+# Global filter validation: a requested model that belongs to NO spec descriptor
+# is an error, not a silent no-op. Without this, `check.sh DoesNotExist` returns
+# 0 (every run_spec skips it), so a typo looks like a verified model. `claimed`
+# holds every model basename registered by any descriptor (built above).
+if [[ "$full_run" != true ]]; then
+  for arg in "$@"; do
+    if [[ "$claimed" != *" $arg "* ]]; then
+      echo "error: no registered spec descriptor declares model '$arg'" >&2
+      status=1
+    fi
+  done
+  [[ $status -eq 0 ]] || exit $status
+fi
+
 for s in "${specs[@]}"; do
-  run_spec "$s" "$@" || status=1
+  # Each spec runs in a fresh subshell (matching run_spec's isolation contract
+  # and gen-traces.sh) so a descriptor's sourced fragment cannot leak `cd`, shell
+  # options, functions, or traps into a later spec's run.
+  ( run_spec "$s" "$@" ) || status=1
 done
 
 # Trace-validation fixture drift guard (#1226, Deliverable B). The committed
