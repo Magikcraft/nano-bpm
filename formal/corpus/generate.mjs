@@ -66,6 +66,20 @@ const KIND_ORDER = ['start', 'end', 'and', 'or', 'xor']
 // component, so a graph that passes here generates a well-formed model.
 export const SAFE_ID = /^[A-Za-z][A-Za-z0-9_]*$/
 
+// SAFE_ID matches the TLA+ *lexical* identifier grammar, but the TLA+ keywords
+// are a reserved subset a graph must still not use: a reserved word emitted as a
+// BARE flow-id record field (MCEdges == [MODULE |-> ..]) or as a family module
+// name (---- MODULE MODULE ----) is a syntax error even though it matches
+// SAFE_ID (#1258 review). Reject the full reserved set on every checked id so a
+// valid graph source can never generate unparsable TLA+.
+export const TLA_RESERVED = new Set([
+  'ASSUME', 'ASSUMPTION', 'AXIOM', 'BOOLEAN', 'CASE', 'CHOOSE', 'CONSTANT',
+  'CONSTANTS', 'DOMAIN', 'ELSE', 'ENABLED', 'EXCEPT', 'EXTENDS', 'FALSE', 'IF',
+  'IN', 'INSTANCE', 'LET', 'LOCAL', 'MODULE', 'OTHER', 'SF_', 'STRING',
+  'SUBSET', 'THEN', 'THEOREM', 'TRUE', 'UNCHANGED', 'UNION', 'VARIABLE',
+  'VARIABLES', 'WF_', 'WITH'
+])
+
 // Reject a corpus that would generate colliding or malformed artifacts BEFORE
 // anything is emitted. `artifacts()` keys outputs by graph id + family module,
 // and `--check` builds a DEDUPLICATED expected-path set, so a duplicate id or
@@ -77,6 +91,9 @@ export function validateGraphs (graphs) {
   const checkId = (label, value) => {
     if (typeof value !== 'string' || !SAFE_ID.test(value)) {
       bad(`${label} ${JSON.stringify(value)} is not a safe identifier (must match ${SAFE_ID})`)
+    }
+    if (TLA_RESERVED.has(value)) {
+      bad(`${label} ${JSON.stringify(value)} is a TLA+ reserved word`)
     }
   }
   const seenIds = new Map()

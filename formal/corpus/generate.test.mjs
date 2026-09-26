@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { loadGraphs, tlaFor, bpmnFor, scenarioFor, FAMILIES, takenFlows, reachableNodes, validateGraphs, SAFE_ID } from './generate.mjs'
+import { loadGraphs, tlaFor, bpmnFor, scenarioFor, FAMILIES, takenFlows, reachableNodes, validateGraphs, SAFE_ID, TLA_RESERVED } from './generate.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const graphs = loadGraphs()
@@ -250,4 +250,24 @@ test('validateGraphs rejects ids that would break generated TLA+/BPMN', () => {
   const dupFlow = base(); dupFlow.nodes = { S: 'start', A: 'task', E: 'end' }
   dupFlow.edges = [{ id: 'f1', from: 'S', to: 'A' }, { id: 'f1', from: 'A', to: 'E' }]
   assert.throws(() => validateGraphs([dupFlow]), /duplicate flow id/)
+})
+
+test('validateGraphs rejects TLA+ reserved words as identifiers', () => {
+  // Regression (#1258 review): SAFE_ID matches the TLA+ identifier grammar but
+  // still admits reserved words like MODULE/TRUE/EXTENDS. A reserved word used
+  // as a BARE flow-id record field (MCEdges == [MODULE |-> ..]) or a family
+  // module name (---- MODULE MODULE ----) is invalid TLA+, so reject the whole
+  // reserved set on every checked id.
+  const base = () => ({
+    id: 'Ok', start: 'S', nodes: { S: 'start', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'E' }],
+    families: { TokenFlow: { module: 'MCOk', comment: [] } }
+  })
+  assert.ok(TLA_RESERVED.has('MODULE') && TLA_RESERVED.has('TRUE') && TLA_RESERVED.has('EXTENDS'))
+  const resFlow = base(); resFlow.edges = [{ id: 'MODULE', from: 'S', to: 'E' }]
+  assert.throws(() => validateGraphs([resFlow]), /flow id "MODULE" is a TLA\+ reserved word/)
+  const resModule = base(); resModule.families = { TokenFlow: { module: 'EXTENDS', comment: [] } }
+  assert.throws(() => validateGraphs([resModule]), /module "EXTENDS" is a TLA\+ reserved word/)
+  const resGraph = base(); resGraph.id = 'TRUE'
+  assert.throws(() => validateGraphs([resGraph]), /graph id "TRUE" is a TLA\+ reserved word/)
 })
