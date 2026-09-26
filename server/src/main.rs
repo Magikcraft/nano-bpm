@@ -15668,7 +15668,8 @@ impl ServerImpl {
         // real promotion at epoch >= 1 beats the implicit (0, _) incumbent state.
         let (adopt, i_lead_here) = {
             let mut map = self.promotion_epoch.lock().unwrap();
-            let (cur_epoch, cur_leader) = map.get(&p).copied().unwrap_or((0, crate::fence::NO_LEADER));
+            let (cur_epoch, cur_leader) =
+                map.get(&p).copied().unwrap_or((0, crate::fence::NO_LEADER));
             let wins = crate::fence::wins(cur_epoch, cur_leader, epoch, leader_node);
             if wins {
                 map.insert(p, (epoch, leader_node));

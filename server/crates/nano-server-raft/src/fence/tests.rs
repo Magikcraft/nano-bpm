@@ -24,8 +24,9 @@
 //!   that disabling the fencing step-down reproduces the `RHNoFencing2`
 //!   violation — so the anchor has teeth on both sides.
 
-use super::{NO_LEADER, next_epoch, wins};
 use std::collections::{BTreeSet, VecDeque};
+
+use super::{NO_LEADER, next_epoch, wins};
 
 // --- Direct truth-table anchors (ADR 0019 / main.rs doc comments) ------------
 
@@ -282,7 +283,10 @@ fn spec_scenarios() {
     for n in [2u64, 3] {
         let cur = s.reg[idx(n)];
         let e = next_epoch(cur.epoch, cur.leader, n);
-        s.reg[idx(n)] = Reg { epoch: e, leader: n };
+        s.reg[idx(n)] = Reg {
+            epoch: e,
+            leader: n,
+        };
         s.role[idx(n)] = Role::Leader;
     }
     assert_eq!(leaders(&s), vec![2, 3]); // transient split, not yet gossiped
@@ -315,7 +319,10 @@ fn spec_scenarios() {
 
     // A stale leader at a lower epoch steps down on learning the higher fence.
     let mut stale = init();
-    stale.reg[idx(3)] = Reg { epoch: 1, leader: 3 };
+    stale.reg[idx(3)] = Reg {
+        epoch: 1,
+        leader: 3,
+    };
     stale.role[idx(3)] = Role::Leader;
     let higher = Reg {
         epoch: e,

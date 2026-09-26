@@ -55,7 +55,11 @@ pub fn wins(cur_epoch: u64, cur_leader: u64, epoch: u64, leader: u64) -> bool {
 #[inline]
 #[must_use]
 pub fn next_epoch(cur_epoch: u64, cur_leader: u64, me: u64) -> u64 {
-    if cur_leader == me { cur_epoch } else { cur_epoch + 1 }
+    if cur_leader == me {
+        cur_epoch
+    } else {
+        cur_epoch + 1
+    }
 }
 
 #[cfg(test)]
