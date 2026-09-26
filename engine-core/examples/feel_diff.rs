@@ -144,9 +144,7 @@ fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| "-".to_string());
     let mut input = String::new();
     if path == "-" {
-        io::stdin()
-            .read_to_string(&mut input)
-            .expect("read stdin");
+        io::stdin().read_to_string(&mut input).expect("read stdin");
     } else {
         input = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     }
@@ -204,7 +202,10 @@ mod tests {
     #[test]
     fn malformed_row_fails() {
         let err = run("a\tb\tc\td").expect_err("row with too many fields must fail");
-        assert!(err.contains("divergence") || err.contains("over"), "unexpected message: {err}");
+        assert!(
+            err.contains("divergence") || err.contains("over"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
@@ -215,8 +216,14 @@ mod tests {
         let mut diags = String::new();
         let err = check_corpus("x\tv=bool:garbage\tok:bool:false", &mut diags)
             .expect_err("malformed bool must fail");
-        assert!(err.contains("divergence") || err.contains("over"), "unexpected message: {err}");
-        assert!(diags.contains("bad bool"), "unexpected diagnostics: {diags}");
+        assert!(
+            err.contains("divergence") || err.contains("over"),
+            "unexpected message: {err}"
+        );
+        assert!(
+            diags.contains("bad bool"),
+            "unexpected diagnostics: {diags}"
+        );
     }
 
     #[test]
