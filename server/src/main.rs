@@ -43,7 +43,7 @@ use http::StatusCode;
 // `crate::deepthi::…` / `crate::raft::…` path in this binary keeps resolving
 // unchanged. (The falcon wire frames live in `nano-falcon-protocol` and are
 // re-exported inside `falcon.rs` itself.)
-pub(crate) use nano_server_raft::{peer, raft, raft_logstore, raft_net};
+pub(crate) use nano_server_raft::{fence, peer, raft, raft_logstore, raft_net};
 pub(crate) use nano_server_runtime::{
     backpressure, cluster, cmd_profile, deepthi, drain_guard, partition, placement,
     recovery_throttle, runtime_config,
@@ -14875,7 +14875,7 @@ impl ServerImpl {
     fn next_promotion_epoch(&self, p: u64) -> u64 {
         let me = self.engine.topology().node_id as u64;
         let mut map = self.promotion_epoch.lock().unwrap();
-        let (cur_epoch, cur_leader) = map.get(&p).copied().unwrap_or((0, u64::MAX));
+        let (cur_epoch, cur_leader) = map.get(&p).copied().unwrap_or((0, crate::fence::NO_LEADER));
         // Idempotent for the incumbent-self: only step strictly PAST a *different*
         // leader's epoch (the fence overtake). If WE already hold `p` at
         // `cur_epoch`, re-assert the SAME epoch instead of climbing. The reclaim
@@ -14886,11 +14886,7 @@ impl ServerImpl {
         // climb, the load-sensitive `leader_reject` storm. Tying the increment to
         // "overtake a peer", not "promote again", makes the reclaim epoch
         // deterministic (`incumbent + 1`) regardless of scheduling jitter.
-        let next = if cur_leader == me {
-            cur_epoch
-        } else {
-            cur_epoch + 1
-        };
+        let next = crate::fence::next_epoch(cur_epoch, cur_leader, me);
         map.insert(p, (next, me));
         next
     }
@@ -15672,8 +15668,8 @@ impl ServerImpl {
         // real promotion at epoch >= 1 beats the implicit (0, _) incumbent state.
         let (adopt, i_lead_here) = {
             let mut map = self.promotion_epoch.lock().unwrap();
-            let (cur_epoch, cur_leader) = map.get(&p).copied().unwrap_or((0, u64::MAX));
-            let wins = epoch > cur_epoch || (epoch == cur_epoch && leader_node < cur_leader);
+            let (cur_epoch, cur_leader) = map.get(&p).copied().unwrap_or((0, crate::fence::NO_LEADER));
+            let wins = crate::fence::wins(cur_epoch, cur_leader, epoch, leader_node);
             if wins {
                 map.insert(p, (epoch, leader_node));
                 (true, false)
