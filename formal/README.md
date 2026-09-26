@@ -214,7 +214,9 @@ the reference is tied to the Rust implementation by a **differential fuzz**:
 
 - `Feel/Semantics.lean` is the reference evaluator, faithful to
   `engine-core/src/feel/eval.rs` (three-valued and/or with short-circuit,
-  null-propagating comparisons, `if` on a non-bool condition → null, etc.).
+  `=`/`!=` that always yield a boolean — cross-type is `false`, never null —
+  ordering (`<`/`<=`/`>`/`>=`) that is a type *error* on incomparable operands
+  (including `null`), `if` on a non-bool condition → null, etc.).
 - `Feel/Gen.lean` is a type-directed generator that emits FEEL expressions with
   bound contexts, keeping all numeric values exact integers within the
   f64-exact range so number formatting cannot drift.
