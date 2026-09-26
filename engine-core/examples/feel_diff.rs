@@ -62,7 +62,14 @@ fn parse_ctx(enc: &str) -> Result<HashMap<String, Value>, String> {
         let value = if rhs == "null" {
             Value::Null
         } else if let Some(b) = rhs.strip_prefix("bool:") {
-            Value::Bool(b == "true")
+            // Only the literal `true`/`false` are valid; any other suffix is a
+            // malformed row and must fail the gate, not be silently coerced to
+            // `false` (Copilot review of PR #1253).
+            match b {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                _ => return Err(format!("bad bool {b:?}")),
+            }
         } else if let Some(i) = rhs.strip_prefix("int:") {
             Value::Int(i.parse().map_err(|_| format!("bad int {i:?}"))?)
         } else if let Some(s) = rhs.strip_prefix("str:") {
@@ -198,5 +205,24 @@ mod tests {
     fn malformed_row_fails() {
         let err = run("a\tb\tc\td").expect_err("row with too many fields must fail");
         assert!(err.contains("divergence") || err.contains("over"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn malformed_bool_payload_is_rejected() {
+        // Regression: a `bool:` payload that is neither `true` nor `false` is a
+        // malformed row and must fail the gate, not be coerced to `false`
+        // (Copilot review of PR #1253).
+        let mut diags = String::new();
+        let err = check_corpus("x\tv=bool:garbage\tok:bool:false", &mut diags)
+            .expect_err("malformed bool must fail");
+        assert!(err.contains("divergence") || err.contains("over"), "unexpected message: {err}");
+        assert!(diags.contains("bad bool"), "unexpected diagnostics: {diags}");
+    }
+
+    #[test]
+    fn bool_false_payload_is_accepted() {
+        // `false` must still parse and drive an agreeing check.
+        let checked = run("v\tv=bool:false\tok:bool:false").expect("bool:false must parse");
+        assert_eq!(checked, 1);
     }
 }
