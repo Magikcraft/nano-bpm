@@ -138,6 +138,7 @@ jobs:
               - 'engine-core/tests/**'
               - 'engine-core/examples/**'
               - 'engine-core/Cargo.toml'
+              - 'engine-core/Cargo.lock'
               - '.github/workflows/ci.yml'
             # True unless EVERY changed file is pure presentation/frontend — the
             # marketing website (`website/**`), the console landing page HTML
@@ -609,6 +610,8 @@ jobs:
           git diff --exit-code -- formal/parity/zeebe-surface.json
       - name: Parity matrix tests
         run: node --test formal/parity/*.test.mjs
+      - name: Trace parser tests
+        run: node --test formal/tla/trace/*.test.mjs
       - name: Parity coverage guard
         env:
           BASE_REF: ${{ github.base_ref || 'main' }}
