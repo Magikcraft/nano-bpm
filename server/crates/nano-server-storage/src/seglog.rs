@@ -4934,4 +4934,214 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
     }
+
+    // ------------------------------------------------------------------------
+    // Formal-spec conformance anchor (#1229).
+    //
+    // These tests anchor the TLA+ model `formal/tla/snapshot/SnapshotReplay.tla`
+    // to the real recovery+migration path in THIS module, so the spec cannot
+    // silently drift from the implementation it claims to model. The spec models
+    // recovery as a pure function `RecoverOutcome` of the durable on-disk world
+    // and model-checks two safety invariants:
+    //
+    //   * NoSilentRewind (#1065) — whenever recovery SUCCEEDS it reconstructs the
+    //     FULL `[0, total_events)` history; it never silently rebuilds a
+    //     strictly-older (shorter) prefix (here: never loses a prior instance and
+    //     never rewinds the key generator).
+    //   * FailClosed (#1066) — when the full history genuinely cannot be
+    //     reconstructed (a pruned gap, or an unreadable / `UnknownVariant` frame
+    //     in a source it must read), recovery REJECTS with a typed error rather
+    //     than silently proceeding on a partial history.
+    //
+    // Every scenario below is one durable-world class the spec's `RecoverOutcome`
+    // maps to either `Rebuilt(total)` (Expect::ReconstructsFull) or `Reject`
+    // (Expect::Rejects). The `assert_recovery` helper enforces exactly the two
+    // invariants above against the real `Journal::open_segmented` → `recover`
+    // path. This mirrors the engine-core trace-validation pattern (#1226) for the
+    // storage subsystem, which that pattern does not cover.
+    mod snapshot_replay_conformance {
+        use std::{fs, io, path::Path};
+
+        use nanobpmn_engine_core::{local_of, Command};
+
+        use super::super::{cold_archive_span, deflate_all, list_cold, prune_cold_archive};
+        use super::{
+            bump_snapshot_to_future, compacted_dir_with_two_instances, snapshot_file,
+        };
+        use crate::journal::Journal;
+
+        /// The terminal outcome the spec's `RecoverOutcome` predicts for a world.
+        enum Expect {
+            /// `Rebuilt(total)` — the full history is reconstructed (NoSilentRewind).
+            ReconstructsFull,
+            /// `Reject` — recovery fails closed with a typed error (FailClosed).
+            Rejects,
+        }
+
+        /// Runs the REAL recovery path over `dir` and asserts the SnapshotReplay
+        /// spec's two safety invariants for the declared expected outcome.
+        fn assert_recovery(dir: &Path, priors: &[u64], expect: Expect) {
+            match Journal::open_segmented(dir) {
+                Ok((mut journal, recovery)) => {
+                    assert!(
+                        matches!(expect, Expect::ReconstructsFull),
+                        "FailClosed violated: recovery silently proceeded on a world the spec \
+                         rejects (dir {})",
+                        dir.display()
+                    );
+                    assert!(!recovery.fresh, "recovered durable state must not read as fresh");
+                    // NoSilentRewind: every prior instance survives (no strictly-older history).
+                    for &key in priors {
+                        assert!(
+                            journal.instance(key).is_some(),
+                            "NoSilentRewind violated: recovery lost prior instance {key}"
+                        );
+                    }
+                    // NoSilentRewind: the key generator is not rewound — a fresh instance
+                    // advances strictly past every prior key.
+                    let (events, _) = journal
+                        .apply_command(Command::create_instance("demo"))
+                        .expect("post-recovery instance creation");
+                    let fresh = events
+                        .iter()
+                        .find_map(|e| e.instance_key())
+                        .expect("a created instance has a key");
+                    let max_prior = priors.iter().map(|&k| local_of(k)).max().unwrap_or(0);
+                    assert!(
+                        local_of(fresh) > max_prior,
+                        "NoSilentRewind violated: key generator rewound (fresh {} <= max prior {})",
+                        local_of(fresh),
+                        max_prior
+                    );
+                }
+                Err(e) => {
+                    assert!(
+                        matches!(expect, Expect::Rejects),
+                        "recovery rejected a world the spec reconstructs (dir {}): {e}",
+                        dir.display()
+                    );
+                    // FailClosed is a typed, loud reject — never a silent success/rewind.
+                    assert_eq!(
+                        e.kind(),
+                        io::ErrorKind::InvalidData,
+                        "fail-closed recovery must surface a typed InvalidData reject: {e}"
+                    );
+                }
+            }
+        }
+
+        /// The cold-archive end (== compaction floor == snapshot `covered`) of a
+        /// `compacted_dir_with_two_instances` world.
+        fn covered(dir: &Path) -> u64 {
+            cold_archive_span(dir)
+                .expect("list cold archive")
+                .expect("a compacted world has a cold archive")
+                .1
+        }
+
+        /// Spec world: readable, non-stale snapshot present (`SnapReadable`).
+        /// `RecoverOutcome = Rebuilt(total)` via snapshot base + hot tail.
+        #[test]
+        fn readable_snapshot_reconstructs_full() {
+            let (dir, key1, key2) = compacted_dir_with_two_instances("conf-readable");
+            assert_recovery(&dir, &[key1, key2], Expect::ReconstructsFull);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Spec world: snapshot present but unreadable (a newer/incompatible
+        /// `format_version`), cold prefix meets the floor and decodes. The
+        /// migrator replays cold + hot: `RecoverOutcome = Rebuilt(total)` (#1071).
+        #[test]
+        fn unreadable_snapshot_migrates_from_cold() {
+            let (dir, key1, key2) = compacted_dir_with_two_instances("conf-migrate");
+            bump_snapshot_to_future(&dir, covered(&dir));
+            assert_recovery(&dir, &[key1, key2], Expect::ReconstructsFull);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Spec world: no snapshot (`~snapPresent`), floor > 0, cold prefix meets
+        /// the floor. The migrator reconstructs from cold + hot:
+        /// `RecoverOutcome = Rebuilt(total)`.
+        #[test]
+        fn lost_snapshot_reconstructs_from_cold() {
+            let (dir, key1, key2) = compacted_dir_with_two_instances("conf-lost-snap");
+            fs::remove_file(snapshot_file(&dir)).expect("drop the snapshot");
+            assert_recovery(&dir, &[key1, key2], Expect::ReconstructsFull);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Spec world: no snapshot AND the cold prefix pruned below the floor
+        /// (`coldEnd < firstIndex`) — a genuine gap in `[0, total)`.
+        /// `RecoverOutcome = Reject` (FailClosed, #1066).
+        #[test]
+        fn pruned_gap_no_snapshot_rejects() {
+            let (dir, _key1, _key2) = compacted_dir_with_two_instances("conf-gap-nosnap");
+            let c = covered(&dir);
+            fs::remove_file(snapshot_file(&dir)).expect("drop the snapshot");
+            assert_eq!(prune_cold_archive(&dir, c), 1, "the cold prefix is pruned away");
+            assert!(cold_archive_span(&dir).unwrap().is_none(), "the gap is real");
+            assert_recovery(&dir, &[], Expect::Rejects);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Spec world: snapshot unreadable AND the cold prefix pruned below the
+        /// floor — the compacted prefix survives only inside the unreadable
+        /// snapshot. `RecoverOutcome = Reject` (FailClosed, #1066).
+        #[test]
+        fn pruned_gap_unreadable_snapshot_rejects() {
+            let (dir, _key1, _key2) = compacted_dir_with_two_instances("conf-gap-badsnap");
+            let c = covered(&dir);
+            assert_eq!(prune_cold_archive(&dir, c), 1, "the cold prefix is pruned away");
+            bump_snapshot_to_future(&dir, c);
+            assert_recovery(&dir, &[], Expect::Rejects);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Spec world: snapshot unreadable, cold prefix meets the floor but no
+        /// longer decodes (an `UnknownVariant` frame — the #1070 discipline was
+        /// violated). The migrator replay hits the undecodable frame:
+        /// `RecoverOutcome = Reject` (FailClosed, #1066/#1070).
+        #[test]
+        fn unreadable_cold_frame_rejects() {
+            let (dir, _key1, _key2) = compacted_dir_with_two_instances("conf-badframe");
+            let c = covered(&dir);
+            // Corrupt the cold contents to an unknown event variant while keeping
+            // the file's [0, covered) range name (so the contiguity check passes
+            // and the replay is attempted, then hits the undecodable frame).
+            let (_, _, cold_path) = list_cold(&dir).unwrap().into_iter().next().unwrap();
+            let bad = deflate_all(b"{\"NosuchEvent\":{}}\n").unwrap();
+            fs::write(&cold_path, &bad).unwrap();
+            bump_snapshot_to_future(&dir, c);
+            assert_recovery(&dir, &[], Expect::Rejects);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Spec world: a readable snapshot that sits BELOW the compaction floor
+        /// (`SnapStale` — `snapCovered < firstIndex`). Trusting it would drop the
+        /// compacted window and rewind the key generator, so recovery rejects
+        /// loud: `RecoverOutcome = Reject` (FailClosed, #1065).
+        #[test]
+        fn stale_snapshot_below_floor_rejects() {
+            use super::super::PersistedSnapshot;
+            let (dir, _key1, _key2) = compacted_dir_with_two_instances("conf-stale");
+            // Rewrite the surviving snapshot so it still deserializes but reports a
+            // `covered_events` below the compaction floor (0 < first_index),
+            // preserving the envelope header so the stale-floor guard — not a
+            // decode failure — is what rejects it.
+            let path = snapshot_file(&dir);
+            let raw = fs::read(&path).unwrap();
+            let nl = raw
+                .iter()
+                .position(|&b| b == b'\n')
+                .expect("an enveloped snapshot carries a header line");
+            let mut snap: PersistedSnapshot = serde_json::from_slice(&raw[nl + 1..]).unwrap();
+            assert!(snap.covered_events > 0, "the floor must be nonzero to exercise the gap");
+            snap.covered_events = 0;
+            let mut out = raw[..=nl].to_vec();
+            out.extend_from_slice(&serde_json::to_vec(&snap).unwrap());
+            fs::write(&path, out).unwrap();
+            assert_recovery(&dir, &[], Expect::Rejects);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
 }

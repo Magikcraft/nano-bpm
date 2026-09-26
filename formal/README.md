@@ -9,8 +9,12 @@ formal/
 ├── tla/
 │   ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
 │   ├── MC*.tla               # concrete process graphs to model-check
+│   ├── snapshot/             # SnapshotReplay family: snapshot/compaction/replay-migration recovery
+│   │   ├── SnapshotReplay.tla  # durable-world model of recovery (NoSilentRewind + FailClosed, #1229)
+│   │   └── MCSnapReplay*.tla   # the shipped fail-closed recovery vs. the historical naive one
 │   ├── specs/                # one <Name>.spec descriptor per spec family (the registry)
-│   │   └── TokenFlow.spec    # TokenFlow's constants/invariants/properties/expected/trace models
+│   │   ├── TokenFlow.spec    # TokenFlow's constants/invariants/properties/expected/trace models
+│   │   └── SnapshotReplay.spec # SnapshotReplay's invariants + expected verdicts (models in snapshot/)
 │   ├── check.sh              # discovers specs/*.spec, runs TLC per model, compares with each spec's EXPECTED
 │   ├── gen-traces.sh         # dumps TLC behaviours of the trace models to committed JSON fixtures
 │   ├── trace/parse.mjs       # TLC -tool output -> trace fixture JSON
@@ -162,8 +166,8 @@ claimed by none, or if TLC prints a warning.
 
 ## Adding a spec family
 
-Each spec family (TokenFlow, and the future JobLease, RaftHandoff,
-SnapshotReplay, ZeebeTokenFlow) registers itself through a self-contained
+Each spec family (TokenFlow, SnapshotReplay, and the future JobLease,
+RaftHandoff, ZeebeTokenFlow) registers itself through a self-contained
 descriptor, so a new spec is added by **creating files in its own path** — never
 by editing `check.sh` or another spec's descriptor.
 
@@ -235,6 +239,23 @@ pub trait TraceMapping {
 
 `engine-core/tests/trace_validation/token_flow.rs` is the reference
 `TraceMapping` implementation.
+
+### Anchoring a non-engine subsystem (SnapshotReplay)
+
+Not every spec models the token engine. `SnapshotReplay` (#1229) models the
+durable snapshot / compaction / cold-archive + replay-migration recovery
+protocol behind incidents #1065–#1071, which lives in
+`server/crates/nano-server-storage/src/seglog.rs`, not in `Engine`. TLC trace
+fixtures replayed through `Engine::apply_command` cannot reach that subsystem, so
+this spec omits `SPEC_TRACE_MODELS` and anchors on the storage side instead: the
+`seglog::tests::snapshot_replay_conformance` module builds each durable-world
+class the spec's `RecoverOutcome` classifies and drives it through the real
+`Journal::open_segmented` → `recover` path, asserting exactly the spec's two
+safety invariants — `NoSilentRewind` (a successful recovery reconstructs the full
+`[0, total_events)` history: no lost instance, no rewound key generator) and
+`FailClosed` (a genuinely unreconstructable world — a pruned gap or an
+unreadable / `UnknownVariant` frame — rejects with a typed error). That test is
+the anti-drift anchor; keep it and `SnapshotReplay.tla` in sync in the same PR.
 
 ## Adding a model to TokenFlow
 
