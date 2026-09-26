@@ -416,6 +416,47 @@ mod tests {
     }
 
     #[test]
+    fn from_ai_returns_first_argument_unchanged() {
+        // The Camunda agentic `fromAi(value, description, type, ...)` built-in is a
+        // declaration, not a computation: the FEEL engine returns `value` verbatim
+        // and ignores the metadata arguments. See nanobpm/nano-bpm#1200.
+        let mut tool_call = BTreeMap::new();
+        tool_call.insert("foo".to_string(), Value::Str("VALUE-FROM-LLM".into()));
+        let c = ctx(&[("toolCall", Value::Map(tool_call))]);
+
+        // All documented overloads reduce to the value slot.
+        assert_eq!(
+            eval(r#"fromAi(toolCall.foo)"#, &c),
+            Ok(Value::Str("VALUE-FROM-LLM".into()))
+        );
+        assert_eq!(
+            eval(r#"fromAi(toolCall.foo, "desc")"#, &c),
+            Ok(Value::Str("VALUE-FROM-LLM".into()))
+        );
+        assert_eq!(
+            eval(r#"fromAi(toolCall.foo, "desc", "string")"#, &c),
+            Ok(Value::Str("VALUE-FROM-LLM".into()))
+        );
+        assert_eq!(
+            eval(r#"fromAi(toolCall.foo, "desc", "string", {})"#, &c),
+            Ok(Value::Str("VALUE-FROM-LLM".into()))
+        );
+        assert_eq!(
+            eval(r#"fromAi(toolCall.foo, "desc", "string", {}, {})"#, &c),
+            Ok(Value::Str("VALUE-FROM-LLM".into()))
+        );
+        // A missing value slot resolves to null rather than raising an incident.
+        assert_eq!(eval(r#"fromAi(toolCall.missing)"#, &c), Ok(Value::Null));
+        // A bare `fromAi()` with no value argument also resolves to null.
+        assert_eq!(eval(r#"fromAi()"#, &c), Ok(Value::Null));
+        // Named arguments are supported, e.g. fromAi(value: ..., type: ...).
+        assert_eq!(
+            eval(r#"fromAi(value: toolCall.foo, type: "number")"#, &c),
+            Ok(Value::Str("VALUE-FROM-LLM".into()))
+        );
+    }
+
+    #[test]
     fn named_arguments_and_lambdas() {
         let c = ctx(&[]);
         assert_eq!(

@@ -126,6 +126,10 @@ const BUILTINS: &[&str] = &[
     "coincides",
     // misc extensions
     "is blank",
+    // Camunda agentic extension — tags a value as AI-generated; the FEEL engine
+    // simply returns the value unchanged (the description/type/schema/options
+    // metadata is consumed by the connector/job worker, not here).
+    "fromAi",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -166,6 +170,7 @@ pub fn params(name: &str) -> Option<&'static [&'static str]> {
         "get value" => &["context", "key"],
         "get or else" => &["value", "default"],
         "round up" | "round down" | "round half up" | "round half down" => &["n", "scale"],
+        "fromAi" => &["value", "description", "type", "schema", "options"],
         _ => return None,
     })
 }
@@ -573,6 +578,13 @@ pub fn call(
         "before" | "after" | "meets" | "met by" | "overlaps" | "overlaps before"
         | "overlaps after" | "finishes" | "finished by" | "includes" | "during" | "starts"
         | "started by" | "coincides" => Ok(interval(name, &arg(&args, 0), &arg(&args, 1))),
+
+        // --- Camunda agentic extension ---
+        // `fromAi(value, description?, type?, schema?, options?)` tags a value as
+        // AI-generated. The FEEL engine returns the value unchanged; the remaining
+        // arguments are metadata the connector/job worker uses to build the tool
+        // schema advertised to the model.
+        "fromAi" => Ok(arg(&args, 0)),
 
         other => Err(FeelError(format!("unknown function '{other}'"))),
     }

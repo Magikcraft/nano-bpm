@@ -54,7 +54,12 @@ Builtins include the full Allen interval algebra (`before`, `after`, `meets`,
 (`all`, `any`, `count`, `sum`, `min`, `max`, `mean`, `median`, `stddev`,
 `mode`, `distinct values`, `flatten`, `sort`, `partition`, …), context ops
 (`context put`, `context merge`, `put`, `put all`, `get or else`, `is defined`),
-and conversions (`from json`, `to json`, `to/from base64`, `uuid`).
+and conversions (`from json`, `to json`, `to/from base64`, `uuid`). The Camunda
+agentic extension `fromAi(value, description?, type?, schema?, options?)` is also
+recognised: it returns `value` unchanged (the metadata arguments are consumed by
+the connector/job worker, not the FEEL engine), so a tool `ioMapping` authored
+the standard Camunda way evaluates instead of raising an `IO_MAPPING_ERROR`
+incident (`feel/builtins.rs`).
 
 ## How failures manifest
 

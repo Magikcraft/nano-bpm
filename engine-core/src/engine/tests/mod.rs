@@ -1143,6 +1143,39 @@ fn adhoc_agent_with_tool_input_mapping() -> ProcessDefinition {
     crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
 }
 
+fn adhoc_agent_with_fromai_tool_input_mapping() -> ProcessDefinition {
+    // The reproduction from nanobpm/nano-bpm#1200: a JOB_WORKER ad-hoc container
+    // whose `toolA` carries a tool input `zeebe:ioMapping` written the standard
+    // Camunda agentic way — `=fromAi(toolCall.foo, "desc", "string")`. The value
+    // the LLM supplies arrives as `toolCall.foo` in the activation variables;
+    // `fromAi` must return it unchanged (no `IO_MAPPING_ERROR` incident).
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=fromAi(toolCall.foo, &#34;desc&#34;, &#34;string&#34;)" target="mapped" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
 fn activate_element(id: &str) -> crate::model::AdHocActivateElement {
     activate_element_with(id, &[])
 }
