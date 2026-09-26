@@ -75,17 +75,14 @@ fn parse_ctx(enc: &str) -> Result<HashMap<String, Value>, String> {
     Ok(ctx)
 }
 
-fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "-".to_string());
-    let mut input = String::new();
-    if path == "-" {
-        io::stdin()
-            .read_to_string(&mut input)
-            .expect("read stdin");
-    } else {
-        input = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    }
-
+/// Checks every non-blank row of `input` against the Rust FEEL evaluator,
+/// writing any divergence diagnostics to `err`. Returns `Ok(checked)` with the
+/// number of cases verified, or `Err(message)` on any failure — a divergence, a
+/// malformed row, **or** a corpus that contained no cases at all. The
+/// zero-checked case is a failure on purpose: an empty or truncated corpus (a
+/// crashed `feelfuzz`, a short read) would otherwise leave `failures == 0` and
+/// pass the differential gate without verifying a single FEEL case.
+fn check_corpus(input: &str, mut err: impl std::fmt::Write) -> Result<usize, String> {
     let mut checked = 0usize;
     let mut failures = 0usize;
     for (lineno, line) in input.lines().enumerate() {
@@ -97,14 +94,14 @@ fn main() {
         let enc = fields.next().unwrap_or("");
         let expected = fields.next().unwrap_or("");
         if fields.next().is_some() {
-            eprintln!("line {}: too many fields", lineno + 1);
+            let _ = writeln!(err, "line {}: too many fields", lineno + 1);
             failures += 1;
             continue;
         }
         let ctx = match parse_ctx(enc) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("line {}: {e}", lineno + 1);
+                let _ = writeln!(err, "line {}: {e}", lineno + 1);
                 failures += 1;
                 continue;
             }
@@ -113,7 +110,8 @@ fn main() {
         checked += 1;
         if got != expected {
             failures += 1;
-            eprintln!(
+            let _ = writeln!(
+                err,
                 "DIVERGENCE line {}:\n  expr:     {expr}\n  context:  {enc}\n  expected (Lean): {expected}\n  got (Rust):      {got}",
                 lineno + 1
             );
@@ -121,8 +119,84 @@ fn main() {
     }
 
     if failures > 0 {
-        eprintln!("FAIL: {failures} divergence(s) over {checked} case(s)");
-        std::process::exit(1);
+        return Err(format!("{failures} divergence(s) over {checked} case(s)"));
     }
-    println!("ok: {checked} FEEL cases agree with the Lean reference");
+    // An empty or all-blank corpus must never pass as success: a broken
+    // `feelfuzz` executable or a truncated corpus would otherwise make the
+    // differential gate green without checking a single FEEL case.
+    if checked == 0 {
+        return Err(
+            "corpus contained no FEEL cases to check (empty or truncated) — refusing to pass the differential gate"
+                .to_string(),
+        );
+    }
+    Ok(checked)
+}
+
+fn main() {
+    let path = std::env::args().nth(1).unwrap_or_else(|| "-".to_string());
+    let mut input = String::new();
+    if path == "-" {
+        io::stdin()
+            .read_to_string(&mut input)
+            .expect("read stdin");
+    } else {
+        input = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    }
+
+    let mut diagnostics = String::new();
+    match check_corpus(&input, &mut diagnostics) {
+        Ok(checked) => {
+            eprint!("{diagnostics}");
+            println!("ok: {checked} FEEL cases agree with the Lean reference");
+        }
+        Err(message) => {
+            eprint!("{diagnostics}");
+            eprintln!("FAIL: {message}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_corpus;
+
+    fn run(input: &str) -> Result<usize, String> {
+        check_corpus(input, &mut String::new())
+    }
+
+    #[test]
+    fn empty_corpus_is_rejected() {
+        // Regression: an empty (or truncated) corpus must NOT pass the gate — a
+        // crashed `feelfuzz` would otherwise leave zero checked cases and a
+        // false green (Copilot review of PR #1253).
+        let err = run("").expect_err("empty corpus must fail");
+        assert!(err.contains("no FEEL cases"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn all_blank_corpus_is_rejected() {
+        let err = run("\n\n\n").expect_err("all-blank corpus must fail");
+        assert!(err.contains("no FEEL cases"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn agreeing_row_passes() {
+        // `1 + 1` evaluates to num:2 with an empty context.
+        let checked = run("1 + 1\t\tok:num:2").expect("agreeing row must pass");
+        assert_eq!(checked, 1);
+    }
+
+    #[test]
+    fn diverging_row_fails() {
+        let err = run("1 + 1\t\tok:num:3").expect_err("diverging row must fail");
+        assert!(err.contains("divergence"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn malformed_row_fails() {
+        let err = run("a\tb\tc\td").expect_err("row with too many fields must fail");
+        assert!(err.contains("divergence") || err.contains("over"), "unexpected message: {err}");
+    }
 }

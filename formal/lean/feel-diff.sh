@@ -21,5 +21,15 @@ echo "==> lake build (all Lean targets)"
 echo "==> generating $cases FEEL cases from the Lean reference"
 ( cd "$here" && lake exe feelfuzz "$cases" ) > "$corpus"
 
+# The generator emits exactly one row per requested case. A short (truncated) or
+# empty corpus means the generator crashed mid-stream or produced nothing — the
+# Rust checker would then silently pass over the rows it *did* see, so verify the
+# count here before handing it off to the differential gate.
+generated="$(grep -c . "$corpus" || true)"
+if [ "$generated" -ne "$cases" ]; then
+  echo "FAIL: expected $cases generated FEEL cases but the corpus has $generated" >&2
+  exit 1
+fi
+
 echo "==> checking Rust engine-core/src/feel against the Lean reference"
 ( cd "$repo_root/engine-core" && cargo run --quiet --example feel_diff -- "$corpus" )
