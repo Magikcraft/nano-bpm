@@ -136,6 +136,9 @@ jobs:
               - 'formal/**'
               - 'engine-core/src/**'
               - 'engine-core/tests/**'
+              - 'engine-core/examples/**'
+              - 'engine-core/Cargo.toml'
+              - 'engine-core/Cargo.lock'
               - '.github/workflows/ci.yml'
             # True unless EVERY changed file is pure presentation/frontend — the
             # marketing website (`website/**`), the console landing page HTML
@@ -607,6 +610,8 @@ jobs:
           git diff --exit-code -- formal/parity/zeebe-surface.json
       - name: Parity matrix tests
         run: node --test formal/parity/*.test.mjs
+      - name: Trace parser tests
+        run: node --test formal/tla/trace/*.test.mjs
       - name: Parity coverage guard
         env:
           BASE_REF: ${{ github.base_ref || 'main' }}
@@ -621,6 +626,33 @@ jobs:
             echo "::notice::no formal/parity/gaps.json on $BASE_REF yet; baseline growth not checked"
             node formal/parity/check.mjs
           fi
+
+      # Lean 4 formal layer (formal/lean): builds every Lean target and runs the
+      # FEEL differential fuzz — the Lean reference semantics (formal/lean/Feel)
+      # vs. the Rust evaluator (engine-core/src/feel). A divergence fails hard;
+      # there is no tolerated mismatch and no retry.
+      - name: Install Lean (elan)
+        run: |
+          # Pin the elan installer to a specific commit (v4.2.4) and verify its
+          # SHA-256 before executing it — never pipe an unpinned `master` script
+          # straight into a shell on CI.
+          ELAN_INIT_SHA256=a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53
+          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/227caca133724d5516bee25c2aeb3e609478f2d8/elan-init.sh -o "$RUNNER_TEMP/elan-init.sh"
+          echo "${ELAN_INIT_SHA256}  $RUNNER_TEMP/elan-init.sh" | sha256sum -c -
+          sh "$RUNNER_TEMP/elan-init.sh" -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@v4
+        with:
+          # elan installs the toolchain pinned in formal/lean/lean-toolchain on
+          # first `lake` invocation; cache it plus the Lake build outputs. Key on
+          # lake-manifest.json too so a resolved-dependency change busts the cache.
+          path: |
+            ~/.elan
+            formal/lean/.lake
+          key: lean-${{ hashFiles('formal/lean/lean-toolchain', 'formal/lean/lakefile.lean', 'formal/lean/lake-manifest.json') }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Lean build + FEEL differential fuzz
+        run: formal/lean/feel-diff.sh
 
   processos:
     name: processos (clippy + test)

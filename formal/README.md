@@ -8,8 +8,31 @@ about pure semantics (both land slice by slice).
 formal/
 ├── tla/
 │   ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
-│   ├── MC*.tla               # concrete process graphs to model-check
-│   └── check.sh              # generates each TLC config, runs TLC, compares with EXPECTED
+│   ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
+│   ├── ZeebeTokenFlow.tla    # Zeebe reference token flow (#1240): correct Camunda-8 gateway/join semantics
+│   ├── MC*.tla               # concrete process graphs for TokenFlow
+│   ├── ZMC*.tla              # concrete process graphs for ZeebeTokenFlow (the Zeebe reference corpus)
+│   ├── raft/                 # RaftHandoff spec family (#1228): leadership handoff + reclaim
+│   │   ├── RaftHandoff.tla   # fence-epoch register (ADR 0019), anchored to nano-server-raft::fence
+│   │   └── RH*.tla           # models: fenced pass + a no-fencing split-brain violation
+│   ├── snapshot/             # SnapshotReplay family: snapshot/compaction/replay-migration recovery
+│   │   ├── SnapshotReplay.tla  # durable-world model of recovery (NoSilentRewind + FailClosed, #1229)
+│   │   └── MCSnapReplay*.tla   # the shipped fail-closed recovery vs. the historical naive one
+│   ├── specs/                # one <Name>.spec descriptor per spec family (the registry)
+│   │   ├── TokenFlow.spec    # TokenFlow's constants/invariants/properties/expected/trace models
+│   │   ├── ZeebeTokenFlow.spec # the Zeebe reference spec's registration
+│   │   └── SnapshotReplay.spec # SnapshotReplay's invariants + expected verdicts (models in snapshot/)
+│   ├── check.sh              # discovers specs/*.spec, runs TLC per model, compares with each spec's EXPECTED
+│   ├── gen-traces.sh         # dumps TLC behaviours of the trace models to committed JSON fixtures
+│   ├── trace/parse.mjs       # TLC -tool output -> trace fixture JSON
+│   └── traces/<Spec>/*.json  # committed trace fixtures (replayed by engine-core/tests/trace_validation)
+├── lean/                     # Lean 4 reference semantics + differential fuzz (see below)
+│   ├── lean-toolchain        # pinned Lean version (elan reads this)
+│   ├── lakefile.lean         # Lake project: one lib target per slice + the feelfuzz exe
+│   ├── feel-diff.sh          # build Lean, generate a corpus, check Rust against it
+│   ├── Feel/                 # FEEL reference semantics + generator (this slice, #1230)
+│   ├── Replay/               # replay determinism (#1231) — adds files here only
+│   └── Roundtrip/            # processos IR ⇄ BPMN round-trip (#1232) — adds files here only
 └── parity/                   # Zeebe parity coverage matrix (see below)
     ├── zeebe-pin.json        # the Zeebe commit the matrix is derived from
     ├── fetch-zeebe.sh        # sparse-fetches the pinned sources
@@ -30,9 +53,13 @@ formal/tla/check.sh                      # every model (a few seconds)
 formal/tla/check.sh MCChainedInclusive   # one model
 ```
 
-CI runs the `formal (tlc)` job whenever `formal/**`, `engine-core/src/**` or
-`engine-core/tests/**` changes. The job also runs the parity matrix steps
-described below.
+CI runs the `formal (tlc)` job whenever `formal/**`, `engine-core/src/**`,
+`engine-core/tests/**`, `engine-core/examples/**` or `engine-core/Cargo.toml`
+changes. The job runs the
+TLA+ model check, the parity matrix steps described below, and the Lean build +
+FEEL differential fuzz described under "Lean 4 layer". The job is skip-tolerant:
+it is required only when it runs, so a PR that touches none of those paths skips
+it cleanly.
 
 To read a counterexample trace, keep the logs:
 
@@ -98,9 +125,62 @@ The following are out of scope for now: sub-process scopes, boundary and
 intermediate events, incidents, listeners and multi-instance. Each one is a
 future extension of this spec.
 
+## `ZeebeTokenFlow.tla` — the Camunda 8 reference, and the Nano ⇔ Zeebe refinement
+
+Nano is a **strict superset of Camunda 8**: everything Camunda supports must
+behave *exactly* as Zeebe does — on Camunda's surface there is no tolerated
+divergence, a difference is a Nano defect. `ZeebeTokenFlow.tla` (#1240) is the
+reference that pins that claim down. It re-derives the gateway/join token flow
+**directly from `zeebe/engine`**, not from Nano, so a Nano-vs-Zeebe divergence
+surfaces as a failed refinement rather than being defined away. Each rule cites
+its Zeebe source: `canActivateParallelGateway` (a parallel join waits for every
+*distinct* incoming flow, #1233), `canActivateInclusiveGateway` +
+`hasActivePathToTheGateway` (an inclusive join is evaluated only on arrival,
+#1241), `cleanupSequenceFlowsTaken` (one taken record consumed per incoming
+flow on firing, surplus kept — the "Tetris" principle). Its **observable
+projection** is drawn only from the shared vocabulary — each observable variable
+(`taken`, `active`, `done`) maps to a Zeebe exporter record (`SEQUENCE_FLOW_TAKEN`,
+`ELEMENT_ACTIVATED`, `ELEMENT_COMPLETED`), since Zeebe's internal bookkeeping is
+visible only through what it exports. Alongside these the module carries a small,
+explicitly marked set of **auxiliary** variables — control state derivable from
+those records (`queue`, `open`) and pure ghost bookkeeping (`fired`, `earlyPar`) —
+that exist only to drive the transition relation and state invariants and are
+**not** part of the observable projection (see the module's vocabulary-rule
+header for the per-variable justification).
+
+It registers through the multi-spec harness like any other family
+(`specs/ZeebeTokenFlow.spec`, model glob `ZMC*.tla`, its own
+invariants/properties/expected). The `ZMC*` corpus is a representative sample —
+parallel sync, inclusive sync, the arrival-time inclusive-join guard (#1241),
+and a not-1-safe surplus — that TLC confirms the reference reproduces with the
+same verdicts (and the same state counts) as the matching `MC*` models.
+
+**The refinement (slice 2).** `TokenFlow.tla` must be trace-equivalent to
+`ZeebeTokenFlow` on every Camunda-expressible model. Every action other than a
+join arrival (pass-through, task activation, end, split routing) is structurally
+identical between the two specs, so the join activation decision is the *sole*
+refinement obligation. `TokenFlow.tla` discharges it with the `RefinesZeebe`
+invariant, checked over the **whole `MC*` corpus**: at every reachable state it
+asserts this spec's join-firing decision equals the Zeebe reference decision,
+which it obtains by instancing `ZeebeTokenFlow`'s pure guard predicates
+(`ZeebeJoinReady`). Because the Zeebe guard lives *only* in `ZeebeTokenFlow.tla`,
+an edit that drifts `TokenFlow`'s guard away from Zeebe fails `RefinesZeebe`
+until the reference — and hence the parity claim — is updated too. Every
+historical divergence is a filed parity issue; the first, the arrival-time
+inclusive-join guard, is #1241 (closed). With it landed, `RefinesZeebe` holds on
+the entire corpus, so there is no open divergence to file.
+
+The differential *runtime* half of #1240 — a single-source corpus generator
+(graph → BPMN+DI + `MC*.tla` + scenario), a Zeebe-exporter trace normaliser,
+the one-driver/two-backend scenario runner (Camunda v2 REST against Nano and a
+live Camunda 8), and the executable differential oracle + extension register —
+extends this static formal proof to executable traces and lands in its own
+follow-up slices (it needs a Zeebe/Camunda-8 runtime this proof does not).
+
 ## Expected outcomes and known defects
 
-The `EXPECTED` table in `check.sh` records the expected outcome for each model:
+The `SPEC_EXPECTED` table in a spec's descriptor (`formal/tla/specs/<Name>.spec`)
+records the expected outcome for each model:
 `pass`, or `violates:<P1>,<P2>,...`, the **exact** set of invariants and
 properties TLC must report as violated. Every property not listed is thereby
 proven to hold for that model. A `violates:` model runs with TLC's `-continue
@@ -131,34 +211,210 @@ violations in (a stuck state still shows up, as `NoStuckInstance` and
   re-evaluated and waits, as in Zeebe. Before #1241 a quiescence sweep
   re-evaluated waiting joins, and both models completed.
 
-TLC cannot see the Rust code, so nothing yet forces the spec update when the
-engine changes. Until trace validation (#1226) links the two, that step is a
-review responsibility.
+TLC cannot see the Rust code by itself. Trace validation (#1226) now links the
+two for the parallel-only corpus: TLC-generated behaviours are replayed against
+`Engine::apply_command` in `engine-core/tests/trace_validation` (see [Trace
+validation](#trace-validation) below). For the model families it does not yet
+anchor (condition-routed graphs, and the specs still to land), forcing the spec
+update when the engine changes stays a review responsibility.
 
-`check.sh` also fails if a `MC*.tla` has no table entry, if an entry has no
-model, or if TLC prints a warning.
+`check.sh` also fails if a model file matched by a spec's `SPEC_MODELS_GLOB` has
+no `SPEC_EXPECTED` entry, if an entry has no model, if a model is claimed by more
+than one spec, if a committed `*.tla` that `EXTENDS` a registered spec base is
+claimed by none, or if TLC prints a warning.
 
-## Adding a model
+## Adding a spec family
+
+Each spec family (TokenFlow, ZeebeTokenFlow and SnapshotReplay, and the future
+JobLease and RaftHandoff) registers itself through a self-contained
+descriptor, so a new spec is added by **creating files in its own path** — never
+by editing `check.sh` or another spec's descriptor.
+
+1. Write the base module `formal/tla/<Name>.tla` (or under a subdirectory of
+   your choosing) and its concrete model files.
+2. Create `formal/tla/specs/<Name>.spec` — a shell fragment `check.sh` sources
+   in a fresh subshell, so its `SPEC_*` variables are private to your spec. Set:
+   `SPEC_NAME` (the base module every model `EXTENDS`), `SPEC_MODELS_DIR`
+   (directory of the models, relative to `formal/tla`, `.` for the root),
+   `SPEC_MODELS_GLOB` (glob selecting your models — must not overlap another
+   spec's), `SPEC_CONSTANTS` (the `.cfg` CONSTANTS lines), `SPEC_INVARIANTS`,
+   `SPEC_PROPERTIES`, and `SPEC_EXPECTED` (one `"<Model> pass"` /
+   `"<Model> violates:<P1>,..."` row per model). Copy `TokenFlow.spec` as the
+   reference. Optionally set `SPEC_TRACE_MODELS` (see below).
+3. Run `formal/tla/check.sh` — your spec is discovered and checked with its own
+   constants/invariants/properties; the drift guard is scoped to your spec, so
+   it never forces your models into TokenFlow's table or vice versa.
+
+`check.sh MCFoo` still runs a single model by name across all specs.
+
+## Trace validation
+
+Trace validation anchors a spec to the real engine (#1226, the epic's anti-drift
+rule): TLC emits a spec behaviour, and a Rust test replays it against
+`Engine::apply_command`, failing on any divergence.
+
+- `formal/tla/gen-traces.sh` runs TLC over each model listed in a descriptor's
+  `SPEC_TRACE_MODELS`, dumping the shortest completing behaviour (a witness
+  invariant `~(SPEC_TRACE_DONE)` forces TLC to emit it) plus the TLC-evaluated
+  process graph (`SPEC_TRACE_GRAPH`, in the spec's own graph vocabulary) to a
+  committed fixture `formal/tla/traces/<Spec>/<Model>.json`. `SPEC_TRACE_DONE`
+  and `SPEC_TRACE_GRAPH` are descriptor-supplied (required whenever
+  `SPEC_TRACE_MODELS` is non-empty), so the generator is spec-agnostic — a
+  sibling family with different state/graph vocabulary supplies its own. The
+  fixtures are a derived artifact: `gen-traces.sh --check` regenerates them and
+  fails on drift, and `check.sh` runs it on a full model-check (when node is
+  available) so the `formal (tlc)` CI job enforces it.
+- `engine-core/tests/trace_validation.rs` reads those fixtures, rebuilds each
+  model as a real engine process, drives it to quiescence, and asserts the
+  engine's observable **milestone multiset** (tokens on flows, task wait states,
+  join firings, completion) equals the spec's. A divergence fails the test — no
+  tolerated mismatch, no retries. The corpus is restricted to parallel-only,
+  routing-deterministic models whose milestone multiset is invariant under
+  interleaving, so multiset equality is an exact check. Models with two distinct
+  flows sharing endpoints (`MCParallelDuplicateFlows`) are model-checked but
+  excluded from the anchored corpus: the engine's `SequenceFlowTaken` event has
+  no per-flow identity, so their milestone multiset cannot distinguish the two
+  same-endpoint flows and the anchor would be unsound.
+
+**Reuse entry point (for sibling specs #1227, #1240, …).** The replay driver is
+spec-agnostic and lives in `engine-core/tests/trace_validation/harness.rs`. A
+new spec anchors its own models by implementing the `TraceMapping` trait and
+calling `harness::validate`:
+
+```rust
+#[path = "trace_validation/harness.rs"]
+mod harness;
+use harness::{Fixture, Milestone, TraceMapping, validate};
+
+// build the engine process from the spec graph; project engine Events onto
+// the shared Milestone vocabulary:
+pub trait TraceMapping {
+    fn process_id(&self, fixture: &Fixture) -> String;
+    fn build_process(&self, fixture: &Fixture) -> ProcessDefinition;
+    fn engine_milestones(&self, events: &[Event]) -> Vec<Milestone>;
+}
+// validate(&mapping, &fixture) -> Result<(), String>   // Err on divergence
+```
+
+`engine-core/tests/trace_validation/token_flow.rs` is the reference
+`TraceMapping` implementation.
+
+### Anchoring a non-engine subsystem (SnapshotReplay)
+
+Not every spec models the token engine. `SnapshotReplay` (#1229) models the
+durable snapshot / compaction / cold-archive + replay-migration recovery
+protocol behind incidents #1065–#1071, which lives in
+`server/crates/nano-server-storage/src/seglog.rs`, not in `Engine`. TLC trace
+fixtures replayed through `Engine::apply_command` cannot reach that subsystem, so
+this spec omits `SPEC_TRACE_MODELS` and anchors on the storage side instead: the
+`seglog::tests::snapshot_replay_conformance` module builds each durable-world
+class the spec's `RecoverOutcome` classifies and drives it through the real
+`Journal::open_segmented` → `recover` path, asserting exactly the spec's two
+safety invariants — `NoSilentRewind` (a successful recovery reconstructs the full
+`[0, total_events)` history: no lost instance, no rewound key generator) and
+`FailClosed` (a genuinely unreconstructable world — a pruned gap or an
+unreadable / `UnknownVariant` frame — rejects with a typed error). That test is
+the anti-drift anchor; keep it and `SnapshotReplay.tla` in sync in the same PR.
+
+## Adding a model to TokenFlow
 
 1. Add `MCFoo.tla` (`EXTENDS TokenFlow`) and define `MCNodes`, `MCKind`,
    `MCStart` and `MCEdges` (a record from flow id to `<<source, target>>`),
    plus the derived `MCFlows`, `MCSrc` and `MCTgt` (copy these from an
    existing model). Flows have their own ids, as in the engine, so two
-   distinct flows may share endpoints (`MCParallelDuplicateFlows`).
-2. Add a row to `EXPECTED` in `check.sh` with its expected outcome. There are
-   no hand-written `.cfg` files. `check.sh` generates the same config, with
-   every property, for every model, so no model can skip a property.
+   distinct flows may share endpoints (`MCParallelDuplicateFlows`). Such a
+   duplicate-endpoint model is model-checked but **not** trace-anchored: the
+   engine's `SequenceFlowTaken` event carries no per-flow identity, so its
+   observable milestone multiset cannot distinguish the two same-endpoint
+   flows (see `SPEC_TRACE_MODELS` in `TokenFlow.spec`).
+2. Add a row to `SPEC_EXPECTED` in `formal/tla/specs/TokenFlow.spec` with its
+   expected outcome. There are no hand-written `.cfg` files. `check.sh`
+   generates the same config, with every property, for every model, so no model
+   can skip a property.
 
 If the model finds a violation, confirm it against the real engine with a red
 Rust test before recording it. The model may simply be wrong.
 
 ## Keeping the spec honest
 
-The spec is hand-written, so it can drift from the Rust code. Tying the two
-together through trace validation is tracked in #1226: replay TLC-generated
-behaviours against `Engine::apply_command`. Until that lands, any change to
-the drain loop, the join functions or `path_reaches_join` should update
-`TokenFlow.tla` in the same PR.
+The spec is hand-written, so it can drift from the Rust code. Trace validation
+(#1226) ties the two together for the parallel-only corpus by replaying
+TLC-generated behaviours against `Engine::apply_command` (see [Trace
+validation](#trace-validation)). Where a model is not yet trace-anchored, any
+change to the drain loop, the join functions or `path_reaches_join` should
+update `TokenFlow.tla` in the same PR.
+
+## Lean 4 layer
+
+`formal/lean/` is a single [Lake](https://github.com/leanprover/lean4) project
+holding the Lean 4 reference semantics and proofs. It is the wave-0 seam for the
+Lean slices of epic #1224: the shared `lakefile.lean` and `lean-toolchain` are
+authored once (#1230) and **pre-declare one library target per slice**, so each
+sibling only ADDS files inside its own subdirectory and never edits the shared
+lakefile or a shared barrel file.
+
+| Lib target | Directory | Slice |
+|---|---|---|
+| `Feel` | `formal/lean/Feel/` | FEEL reference semantics + differential fuzz (#1230) |
+| `Replay` | `formal/lean/Replay/` | replay determinism (#1231) |
+| `Roundtrip` | `formal/lean/Roundtrip/` | processos IR ⇄ BPMN round-trip (#1232) |
+
+`lakefile.lean` also declares the `feelfuzz` executable (`Feel.Fuzz`). Every
+target is a `@[default_target]`, so `lake build` builds them all. The package
+sets `warningAsError := true`, so any Lean warning fails the build — keep new
+code warning-clean.
+
+**Per-slice convention.** Add your `.lean` files under your own directory
+(`Feel/`, `Replay/`, `Roundtrip/`); the matching lib target globs its
+submodules automatically. Do not edit `lakefile.lean`, `lean-toolchain`, or
+another slice's directory.
+
+### Running
+
+`elan` manages the Lean toolchain and installs the pinned version from
+`lean-toolchain` on first use:
+
+```bash
+# Pin the elan installer to a specific commit (v4.2.4) and verify its SHA-256
+# before executing it — never pipe an unpinned `master` script straight into a
+# shell (mirrors the CI installer in .github/workflows/ci.yml).
+ELAN_INIT_SHA256=a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53
+curl -fsSL https://raw.githubusercontent.com/leanprover/elan/227caca133724d5516bee25c2aeb3e609478f2d8/elan-init.sh -o /tmp/elan-init.sh
+echo "${ELAN_INIT_SHA256}  /tmp/elan-init.sh" | sha256sum -c -
+sh /tmp/elan-init.sh -y --default-toolchain none
+export PATH="$HOME/.elan/bin:$PATH"
+cd formal/lean && lake build          # build every Lean target
+```
+
+### FEEL differential fuzz (#1230)
+
+The FEEL slice (`formal/lean/Feel/`) is a total reference evaluator for the FEEL
+subset that `engine-core/src/feel` implements. Per the epic's anti-drift rule,
+the reference is tied to the Rust implementation by a **differential fuzz**:
+
+- `Feel/Semantics.lean` is the reference evaluator, faithful to
+  `engine-core/src/feel/eval.rs` (three-valued and/or with short-circuit,
+  `=`/`!=` that always yield a boolean — cross-type is `false`, never null —
+  ordering (`<`/`<=`/`>`/`>=`) that is a type *error* on incomparable operands
+  (including `null`), `if` on a non-bool condition → null, etc.).
+- `Feel/Gen.lean` is a type-directed generator that emits FEEL expressions with
+  bound contexts, keeping all numeric values exact integers within the
+  f64-exact range so number formatting cannot drift.
+- The `feelfuzz` exe prints a TSV corpus of `expr⇥ctx⇥reference-outcome`.
+- `engine-core/examples/feel_diff.rs` re-evaluates each row with the Rust
+  evaluator and asserts the canonical outcome is **byte-identical**. Any
+  divergence exits non-zero — there is no tolerated mismatch and no retry.
+
+Run the whole loop (build Lean → generate → check Rust) with the driver:
+
+```bash
+formal/lean/feel-diff.sh            # 3000 cases (override: FEEL_FUZZ_CASES or first arg)
+formal/lean/feel-diff.sh 20000      # more cases
+```
+
+To convince yourself the harness actually bites, perturb one arm of
+`Feel/Semantics.lean` (e.g. make `add` compute `a - b`), rerun `feel-diff.sh`,
+watch it fail with concrete diverging rows, then revert.
 
 ## Zeebe parity coverage matrix
 

@@ -1363,4 +1363,151 @@ mod tests {
              emit-gbnf --out processos/assets/ir.gbnf` and commit the regenerated file.",
         );
     }
+
+    /// The Lean formal round-trip proof (`formal/lean/Roundtrip/`, issue #1232) models the
+    /// supported element-kind set and proves the IR ⇄ BPMN conversion is identity on it. That
+    /// model is only trustworthy if its element registry is the SAME registry the engine actually
+    /// speaks — otherwise the proof is about a fiction. `formal/lean/Roundtrip/Registry.lean`
+    /// mirrors [`ELEMENT_KIND_SPECS`] as plain Lean data; this test is the drift guard that pins
+    /// the two together, keyword-for-keyword and attribute-for-attribute (key, `required`, type).
+    ///
+    /// It runs in the already-gated `processos (clippy + test)` job, so a change to the Rust
+    /// registry that forgets the Lean mirror fails here; the Lean side has its own `rfl` guards
+    /// (`keywords_match_registry`, `specs_match_registry`) that fail `lake build` if the mirror
+    /// and the executable Lean model diverge. If this fails, update
+    /// `formal/lean/Roundtrip/Registry.lean` to match `ELEMENT_KIND_SPECS`.
+    #[test]
+    fn lean_registry_matches_specs() {
+        // Embedded at compile time — no runtime path/CWD dependency. Relative to this source file
+        // (`processos/src/ir_spec.rs`): `../../` is the repository root.
+        const LEAN_REGISTRY: &str = include_str!("../../formal/lean/Roundtrip/Registry.lean");
+
+        fn attr_ty_lean(ty: AttrType) -> &'static str {
+            match ty {
+                AttrType::Str => "str",
+                AttrType::Id => "id",
+                AttrType::Duration => "duration",
+                AttrType::Bool => "bool",
+            }
+        }
+
+        // What the Rust source-of-truth declares.
+        let expected: Vec<LeanKindGroup> = ELEMENT_KIND_SPECS
+            .iter()
+            .map(|s| {
+                let attrs = s
+                    .attrs
+                    .iter()
+                    .map(|a| {
+                        (
+                            a.key.to_string(),
+                            a.required,
+                            attr_ty_lean(a.ty).to_string(),
+                        )
+                    })
+                    .collect();
+                (s.keyword.to_string(), attrs)
+            })
+            .collect();
+
+        let actual = parse_lean_registry(LEAN_REGISTRY);
+
+        assert_eq!(
+            actual, expected,
+            "formal/lean/Roundtrip/Registry.lean has drifted from ELEMENT_KIND_SPECS — update the \
+             Lean mirror to match (keyword, and each attr's key/required/type, in order).",
+        );
+    }
+
+    /// Read the trailing quoted string literal that follows position `from` in `src`.
+    /// Returns the unescaped-enough content (the registry uses no escapes) and the index just
+    /// past the closing quote.
+    fn read_quoted(src: &str, from: usize) -> (String, usize) {
+        let open = from + src[from..].find('"').expect("opening quote");
+        let rest = &src[open + 1..];
+        let len = rest.find('"').expect("closing quote");
+        (rest[..len].to_string(), open + 1 + len)
+    }
+
+    /// Read the bare identifier that follows the `.` after position `from` (`ty := .str`).
+    fn read_dotted_ident(src: &str, from: usize) -> String {
+        let dot = from + src[from..].find('.').expect("dotted ctor");
+        let rest = &src[dot + 1..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    /// Read the `true`/`false` literal that follows position `from`.
+    fn read_bool(src: &str, from: usize) -> bool {
+        let rest = &src[from..];
+        let t = rest.find("true").map(|i| (i, true));
+        let f = rest.find("false").map(|i| (i, false));
+        match (t, f) {
+            (Some((it, vt)), Some((ifa, vf))) => {
+                if it <= ifa {
+                    vt
+                } else {
+                    vf
+                }
+            }
+            (Some((_, v)), None) | (None, Some((_, v))) => v,
+            (None, None) => panic!("expected a bool literal"),
+        }
+    }
+
+    /// One element kind projected to `(keyword, [(attr-key, required, type)])` — the shape both
+    /// `ELEMENT_KIND_SPECS` and the Lean `registry` mirror flatten to for the drift comparison.
+    type LeanKindGroup = (String, Vec<(String, bool, String)>);
+
+    /// Parse `formal/lean/Roundtrip/Registry.lean`'s `registry` definition into the same shape
+    /// [`ELEMENT_KIND_SPECS`] projects to: an ordered list of `(keyword, [(key, required, ty)])`.
+    /// A tiny document-order scanner — the file is machine-authored plain data, so a full Lean
+    /// parser is overkill; a `keyword :=` opens a new group and each following `key :=` (with its
+    /// `required :=`/`ty := .`) appends an attribute to it.
+    fn parse_lean_registry(src: &str) -> Vec<LeanKindGroup> {
+        let start = src
+            .find("def registry : List KindSpec :=")
+            .expect("`def registry` not found in Registry.lean");
+        let after = &src[start..];
+        let end = after.find("\ndef registryKeywords").unwrap_or(after.len());
+        let body = &after[..end];
+
+        enum Event {
+            Keyword(String),
+            Attr(String, bool, String),
+        }
+        let mut events: Vec<(usize, Event)> = Vec::new();
+
+        for (pos, _) in body.match_indices("keyword :=") {
+            let (kw, _) = read_quoted(body, pos);
+            events.push((pos, Event::Keyword(kw)));
+        }
+        for (pos, _) in body.match_indices("key :=") {
+            // Skip the `keyword :=` matches, which also contain `key :=` — but "keyword :=" is a
+            // distinct string not matched by "key :=" (it is "keyword :="), so match_indices on
+            // "key :=" only hits attribute keys. Still, guard defensively.
+            let (key, after_key) = read_quoted(body, pos);
+            let required = read_bool(body, after_key);
+            let ty = read_dotted_ident(body, after_key);
+            events.push((pos, Event::Attr(key, required, ty)));
+        }
+        events.sort_by_key(|(pos, _)| *pos);
+
+        let mut groups: Vec<LeanKindGroup> = Vec::new();
+        for (_, ev) in events {
+            match ev {
+                Event::Keyword(kw) => groups.push((kw, Vec::new())),
+                Event::Attr(k, r, t) => {
+                    groups
+                        .last_mut()
+                        .expect("attribute before any keyword")
+                        .1
+                        .push((k, r, t));
+                }
+            }
+        }
+        groups
+    }
 }

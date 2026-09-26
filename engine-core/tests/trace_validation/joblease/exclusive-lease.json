@@ -1,0 +1,12 @@
+{
+  "spec": "JobLease",
+  "model": "exclusive-lease",
+  "note": "JobLease.tla AtMostOneLiveHolder: Activate(j1,w1); a second Activate(j1,w2) is disabled while w1 holds a live lock (the engine's select_activatable skips a job with deadline > now), so no two workers ever hold the job concurrently. w1 then completes.",
+  "timeout": 1000,
+  "jobs": ["j1"],
+  "steps": [
+    { "action": "activate", "job": "j1", "worker": "w1", "now": 0, "expect_leased": true },
+    { "action": "activate", "job": "j1", "worker": "w2", "now": 0, "expect_leased": false },
+    { "action": "complete", "job": "j1" }
+  ]
+}
