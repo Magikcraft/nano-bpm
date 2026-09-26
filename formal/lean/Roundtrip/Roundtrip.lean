@@ -14,6 +14,25 @@ across the mapping (its `id` and rendered `attrs`). The kind discriminator is
 the interesting part — it is re-encoded structurally in BPMN and must be
 recovered exactly (`Roundtrip.Bpmn.fromBpmn_toBpmn`); the payload is preserved by
 construction.
+
+## Scope of the payload claim
+
+The `attrs` payload is carried *verbatim* across both directions, so the
+round-trip is trivially identity on it. To make that more than a vacuous copy,
+this module also ties `attrs` to the kind's declared `Kind.schema` via an
+explicit `IrElement.WellFormed` invariant (every required attribute present with
+its declared type; every present attribute typed by a schema declaration) and
+proves the round-trip *preserves* it (`roundtrip_preserves_wellformed`) — so the
+theorem is not silently sound for a timer kind with missing or mistyped
+attributes: such an element is simply not `WellFormed`, and validity is what the
+round-trip is shown to preserve.
+
+What this module deliberately does **not** model is the attribute *encoder*
+correspondence — e.g. millisecond ↔ ISO-8601 duration rendering, or message /
+error *values* ↔ definition-reference resolution. Those transformations are the
+concern of `model_ir.rs` / `bpmn_model.rs`' attribute renderers, not the
+structural kind projection this slice proves; the claim here is the structural
+kind round-trip plus schema-validity preservation, not attribute transcoding.
 -/
 
 namespace Roundtrip
@@ -66,5 +85,37 @@ theorem irToBpmn_injective {e₁ e₂ : IrElement} (h : irToBpmn e₁ = irToBpmn
   have h₂ := roundtrip_ir_bpmn_ir e₂
   rw [h, h₂] at h₁
   exact (Option.some.inj h₁).symm
+
+/-- Does an attribute value inhabit a declared attribute type? Mirror of the
+`AttrType` ↔ `AttrVal` correspondence in `model_ir.rs`. -/
+def AttrVal.hasType : AttrVal → AttrTy → Bool
+  | .str _, .str => true
+  | .id _, .id => true
+  | .duration _, .duration => true
+  | .bool _, .bool => true
+  | _, _ => false
+
+/-- **An IR element is schema-well-formed** when its `attrs` conform to its
+kind's declared `Kind.schema`: every *required* declaration is present with a
+value of its declared type, and every present attribute is typed by some schema
+declaration. This is the invariant that makes the payload more than an
+unconstrained blob — the round-trip theorems below are stated to *preserve* it,
+so a kind carrying missing or mistyped attributes is simply not `WellFormed`
+rather than a silently "round-tripping" element. -/
+def IrElement.WellFormed (e : IrElement) : Prop :=
+  (∀ d ∈ e.kind.schema, d.required → ∃ v, (d.key, v) ∈ e.attrs ∧ v.hasType d.ty) ∧
+  (∀ kv ∈ e.attrs, ∃ d ∈ e.kind.schema, d.key = kv.1 ∧ kv.2.hasType d.ty)
+
+/-- **The round-trip preserves schema well-formedness.** IR → BPMN → IR recovers
+not just the element but its `WellFormed` status: the recovered element is
+`WellFormed` exactly when the original was. Because `attrs` (and the kind) are
+carried verbatim, validity cannot be manufactured or destroyed by the mapping —
+the round-trip is validity-preserving, not merely identity-on-bytes. -/
+theorem roundtrip_preserves_wellformed (e : IrElement) (h : e.WellFormed) :
+    ∀ e', bpmnToIr (irToBpmn e) = some e' → e'.WellFormed := by
+  intro e' he'
+  rw [roundtrip_ir_bpmn_ir] at he'
+  obtain rfl := Option.some.inj he'
+  exact h
 
 end Roundtrip

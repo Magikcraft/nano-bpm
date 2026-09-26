@@ -11,6 +11,14 @@ share one, e.g. every boundary event is `<boundaryEvent>`, every timed catch is
 (`<timerEventDefinition>`, `<errorEventDefinition>`, …) and a couple of
 degenerate cases (a terminate end is `<endEvent>` + `<terminateEventDefinition>`).
 
+Two kinds — `escalationThrowEvent` and `compensationThrowEvent` — have *two*
+supported BPMN shapes: an intermediate `<intermediateThrowEvent>` (when the
+element has an outgoing flow) and a terminal `<endEvent>` (when it does not).
+That intermediate/terminal flavour is not carried by the element kind; it is
+derived from the outgoing-flow layer. `toBpmn` therefore picks the intermediate
+shape as the single canonical projection, while `fromBpmn` accepts *both* shapes
+for those kinds — exactly mirroring the Rust parser/serializer.
+
 This module models that projection as `toBpmn : Kind → BpmnShape` and its
 inverse `fromBpmn : BpmnShape → Option Kind`, and proves the inverse *is* a left
 inverse on the supported set (`fromBpmn_toBpmn`). That theorem is the crux of the
@@ -135,6 +143,19 @@ def fromBpmn : BpmnShape → Option Kind
   | ⟨.intermediateThrowEvent, .escalation⟩ => some .escalationThrowEvent
   | ⟨.intermediateThrowEvent, .link⟩ => some .linkIntermediateThrowEvent
   | ⟨.intermediateThrowEvent, .compensate⟩ => some .compensationThrowEvent
+  -- Terminal (`<endEvent>`) flavour of the escalation/compensation throws. The
+  -- Rust parser (`bpmn.rs`) maps `<endEvent><escalationEventDefinition>` and
+  -- `<endEvent><compensateEventDefinition>` to the very same
+  -- `EscalationThrowEvent`/`CompensationThrowEvent` kinds as their
+  -- `<intermediateThrowEvent>` forms, and `bpmn_model.rs` re-emits the terminal
+  -- tag when the element has no outgoing flow. That intermediate/terminal
+  -- flavour is NOT part of the element kind — it is derived from the presence of
+  -- an outgoing sequence flow, which lives in the flow layer, outside this
+  -- element-kind projection. So BPMN → IR must accept BOTH shapes for these two
+  -- kinds; `toBpmn` picks the intermediate shape as the single canonical one
+  -- (the terminal flavour is reconstructed from the absent outgoing flow).
+  | ⟨.endEvent, .escalation⟩ => some .escalationThrowEvent
+  | ⟨.endEvent, .compensate⟩ => some .compensationThrowEvent
   | ⟨.subProcess, .none⟩ => some .subProcess
   | ⟨.task, .none⟩ => some .task
   | ⟨.scriptTask, .none⟩ => some .scriptTask
