@@ -105,6 +105,16 @@ fn check_corpus(input: &str, mut err: impl std::fmt::Write) -> Result<usize, Str
             failures += 1;
             continue;
         }
+        // A blank expression is a truncated/malformed row, not a real generated
+        // case: `feel::eval("")` returns `Err`, so a `\t\terr` row would match
+        // `expected == "err"`, increment `checked`, and satisfy the row-count
+        // gate without evaluating a single generated expression. Reject it
+        // before differential evaluation (Copilot review of PR #1253).
+        if expr.trim().is_empty() {
+            let _ = writeln!(err, "line {}: blank expression", lineno + 1);
+            failures += 1;
+            continue;
+        }
         let ctx = match parse_ctx(enc) {
             Ok(c) => c,
             Err(e) => {
@@ -231,5 +241,37 @@ mod tests {
         // `false` must still parse and drive an agreeing check.
         let checked = run("v\tv=bool:false\tok:bool:false").expect("bool:false must parse");
         assert_eq!(checked, 1);
+    }
+
+    #[test]
+    fn blank_expression_row_is_rejected() {
+        // Regression: a truncated/malformed row with a blank expression must NOT
+        // pass the gate. `feel::eval("")` returns `Err`, so a `\t\terr` row would
+        // otherwise match `expected == "err"`, increment `checked`, and satisfy
+        // the row-count gate without evaluating a generated expression (Copilot
+        // review of PR #1253).
+        let mut diags = String::new();
+        let err = check_corpus("\t\terr", &mut diags).expect_err("blank expression must fail");
+        assert!(
+            err.contains("over") || err.contains("no FEEL cases"),
+            "unexpected message: {err}"
+        );
+        assert!(
+            diags.contains("blank expression"),
+            "unexpected diagnostics: {diags}"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_expression_row_is_rejected() {
+        // A whitespace-only expression is likewise not a real generated case.
+        let mut diags = String::new();
+        let err =
+            check_corpus("   \t\terr", &mut diags).expect_err("whitespace expression must fail");
+        assert!(
+            diags.contains("blank expression"),
+            "unexpected diagnostics: {diags}"
+        );
+        let _ = err;
     }
 }
