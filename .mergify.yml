@@ -61,7 +61,7 @@ queue_rules:
 # `processos` filter (skipped for PRs that don't touch `processos/**`,
 # `engine-core/**`, or `.github/workflows/ci.yml`), `formal (tlc)` has its own
 # `formal` filter (`formal/**`, `engine-core/src/**`, `engine-core/tests/**`,
-# `engine-core/examples/**` or `.github/workflows/ci.yml`), and the two console jobs
+# `engine-core/examples/**`, `engine-core/Cargo.toml` or `.github/workflows/ci.yml`), and the two console jobs
 # (`console (typecheck + test)` and `console (journey e2e)`) are gated by the
 # `console` filter (inputs `console/**`, `spec-console/**`, `spec-app/**`,
 # `.github/workflows/ci.yml`, AGENTS.md and .mergify.yml for the merge-gate guard;
