@@ -175,7 +175,13 @@ The differential *runtime* half of #1240 — a single-source corpus generator
 the one-driver/two-backend scenario runner (Camunda v2 REST against Nano and a
 live Camunda 8), and the executable differential oracle + extension register —
 extends this static formal proof to executable traces and lands in its own
-follow-up slices (it needs a Zeebe/Camunda-8 runtime this proof does not).
+follow-up slices (it needs a Zeebe/Camunda-8 runtime this proof does not). The
+one-driver/two-backend scenario runner is the first of these to land, in
+[`parity/runtime`](parity/runtime/README.md) (#1260): a single scenario driver
+replayed against nano (the `engine-wasm` `TestEngine`) and, when a runtime is
+provisioned, a live Camunda 8 over v2 REST, with a change-gated, skip-tolerant,
+non-required CI job. Its seed corpus wires to the generator (#1258) once that
+lands.
 
 ## Expected outcomes and known defects
 
