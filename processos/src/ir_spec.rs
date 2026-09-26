@@ -1380,8 +1380,7 @@ mod tests {
     fn lean_registry_matches_specs() {
         // Embedded at compile time — no runtime path/CWD dependency. Relative to this source file
         // (`processos/src/ir_spec.rs`): `../../` is the repository root.
-        const LEAN_REGISTRY: &str =
-            include_str!("../../formal/lean/Roundtrip/Registry.lean");
+        const LEAN_REGISTRY: &str = include_str!("../../formal/lean/Roundtrip/Registry.lean");
 
         fn attr_ty_lean(ty: AttrType) -> &'static str {
             match ty {
@@ -1399,7 +1398,13 @@ mod tests {
                 let attrs = s
                     .attrs
                     .iter()
-                    .map(|a| (a.key.to_string(), a.required, attr_ty_lean(a.ty).to_string()))
+                    .map(|a| {
+                        (
+                            a.key.to_string(),
+                            a.required,
+                            attr_ty_lean(a.ty).to_string(),
+                        )
+                    })
                     .collect();
                 (s.keyword.to_string(), attrs)
             })
@@ -1466,9 +1471,7 @@ mod tests {
             .find("def registry : List KindSpec :=")
             .expect("`def registry` not found in Registry.lean");
         let after = &src[start..];
-        let end = after
-            .find("\ndef registryKeywords")
-            .unwrap_or(after.len());
+        let end = after.find("\ndef registryKeywords").unwrap_or(after.len());
         let body = &after[..end];
 
         enum Event {
