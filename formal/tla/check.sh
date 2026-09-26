@@ -131,7 +131,24 @@ done
 while IFS= read -r tla; do
   base="$(basename "${tla%.tla}")"
   [[ " $registered_names " == *" $base "* ]] && continue   # a spec base module
-  ext="$(sed -n 's/^[[:space:]]*EXTENDS[[:space:]]*//p' "$tla" | tr ',' ' ')"
+  # Collect the full EXTENDS clause, which TLA+ allows to span continuation
+  # lines (`EXTENDS` alone, or a trailing comma, continues onto the next line).
+  # A same-line-only match silently misses multiline declarations, letting an
+  # unclaimed model bypass the guard.
+  ext="$(awk '
+    collecting {
+      buf = buf " " $0
+      t = buf; sub(/[[:space:]]+$/, "", t)
+      if (t ~ /,$/) next
+      print buf; exit
+    }
+    /^[[:space:]]*EXTENDS([[:space:]]|,|$)/ {
+      line = $0; sub(/^[[:space:]]*EXTENDS/, "", line); buf = line
+      t = buf; sub(/[[:space:]]+$/, "", t)
+      if (t == "" || t ~ /,$/) { collecting = 1; next }
+      print buf; exit
+    }
+  ' "$tla" | tr ',' ' ')"
   for e in $ext; do
     if [[ "$registered_names" == *" $e "* ]]; then
       if [[ "$claimed" != *" $base "* ]]; then

@@ -10,9 +10,14 @@
 //     the per-state deltas of `pending` (flow taken), `waiting` (task
 //     activated), `fireCount` (join fired) and `completed` (instance completed).
 //
-// The fixture is spec-agnostic in shape; the Rust harness
-// (engine-core/tests/trace_validation) replays it against the real engine and
-// asserts the engine's observable milestone multiset equals the spec's.
+// The fixture is spec-agnostic in shape, but the milestone *extraction* above
+// reads a fixed observable state vocabulary (`pending`/`waiting`/`fireCount`/
+// `completed`) that is currently the TokenFlow family's; a sibling spec with a
+// different state vocabulary must extend `milestones()` (the guard
+// `assertObservableVocabulary` fails loudly rather than emit a sparse trace).
+// The Rust harness (engine-core/tests/trace_validation) replays the fixture
+// against the real engine and asserts the observable milestone multiset equals
+// the spec's.
 //
 // Usage: gen-traces.sh runs TLC and pipes its output here:
 //   parse.mjs --spec TokenFlow --model MCParallelDiamond < tlc.out > fixture.json
@@ -169,6 +174,31 @@ function extractStates (out) {
 
 function num (fn, key) { return (fn && key in fn) ? fn[key] : 0 }
 
+// The observable state vocabulary this extractor projects onto milestones. It is
+// currently the TokenFlow family's: `pending` (flow taken), `waiting` (task
+// activated), `fireCount` (join fired) and `completed` (instance completed). A
+// sibling spec whose TLA state uses different variable names would otherwise
+// yield a silently sparse/empty milestone trace here while the fixture still
+// looks well-formed. `assertObservableVocabulary` turns that silent drift into a
+// loud failure; a genuinely different sibling family must extend `milestones()`
+// with its own mapping (future work, #1227/#1240) rather than reuse this one.
+const REQUIRED_STATE_VARS = ['pending', 'waiting', 'fireCount', 'completed']
+
+function assertObservableVocabulary (spec, model, states) {
+  const defined = new Set()
+  for (const s of states) for (const k of Object.keys(s.vars)) defined.add(k)
+  const missing = REQUIRED_STATE_VARS.filter((v) => !defined.has(v))
+  if (missing.length) {
+    process.stderr.write(
+      `error: ${spec}/${model}: trace milestone extraction expects the TokenFlow-family ` +
+      `state vocabulary but the witnessed states do not define [${missing.join(', ')}]. A ` +
+      `sibling spec with a different state vocabulary must extend parse.mjs milestones() ` +
+      `with its own mapping (see formal/README.md, #1227/#1240) rather than silently ` +
+      `emitting a sparse trace.\n`)
+    process.exit(1)
+  }
+}
+
 // Milestones from the per-state deltas, spec vocabulary -> observable events.
 function milestones (graph, states) {
   const out = []
@@ -215,6 +245,10 @@ function main () {
   }
   const graph = extractGraph(out)
   const states = extractStates(out)
+  // Guard the observable-state-vocabulary contract loudly: a sibling spec whose
+  // TLA state does not use TokenFlow's variable names must extend milestones()
+  // rather than silently emit a sparse trace here.
+  assertObservableVocabulary(spec, model, states)
   // Sort the milestone multiset canonically: the engine replay compares
   // multisets, so a stable committed order keeps the fixture diff-free.
   const ms = milestones(graph, states).sort((x, y) => milestoneKey(x).localeCompare(milestoneKey(y)))

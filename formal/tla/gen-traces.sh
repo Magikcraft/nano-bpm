@@ -143,6 +143,22 @@ run_spec() { # spec_file
 }
 
 status=0
+# Cross-spec stale-directory guard (check mode): the per-spec reverse guard in
+# run_spec only visits registered descriptors, so a spec that was deleted or
+# renamed leaves an entire traces/<OldSpec>/ tree that no run_spec ever inspects
+# — `--check` would still pass while the Rust harness keeps loading the orphaned
+# fixtures. Reject any committed trace directory with no matching descriptor.
+if [[ "$mode" == "check" && -d "$outroot" ]]; then
+  shopt -s nullglob
+  for d in "$outroot"/*/; do
+    sname="$(basename "$d")"
+    if [[ ! -f "$here/specs/$sname.spec" ]]; then
+      echo "FAIL trace fixtures for unregistered spec: $sname (no formal/tla/specs/$sname.spec; remove $d)" >&2
+      status=1
+    fi
+  done
+  shopt -u nullglob
+fi
 for s in "$here"/specs/*.spec; do
   ( run_spec "$s" ) || status=1
 done

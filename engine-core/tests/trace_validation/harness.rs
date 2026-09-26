@@ -48,7 +48,10 @@ use std::collections::BTreeMap;
 pub enum Milestone {
     /// A token moved along a sequence flow (spec `pending[flow]` increment /
     /// engine `SequenceFlowTaken`). The `<create>` pseudo-flow into the start
-    /// event is not a milestone.
+    /// event is not a milestone. Only the endpoints `(from, to)` are observable:
+    /// the engine's `SequenceFlowTaken` carries no per-flow identity, so a model
+    /// with two distinct flows sharing endpoints is model-checked but not
+    /// trace-anchored (its milestone multiset could not tell the two apart).
     Flow { from: String, to: String },
     /// A task element reached its wait state (spec `waiting[node]` increment /
     /// engine `JobCreated`).

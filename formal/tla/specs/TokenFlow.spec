@@ -86,7 +86,16 @@ SPEC_EXPECTED=(
 # multiset must equal the spec's exactly. Condition-routed models (xor/or) pick
 # branches nondeterministically in the spec and by FEEL data in the engine, so
 # they are model-checked but not (yet) trace-anchored. See formal/README.md.
-SPEC_TRACE_MODELS=(MCParallelDiamond MCParallelDuplicateFlows)
+#
+# MCParallelDuplicateFlows is deliberately excluded here (it remains model-
+# checked in SPEC_EXPECTED): the observable milestone vocabulary records a taken
+# flow as (from, to), and the engine's `SequenceFlowTaken` event carries no
+# per-flow identity, so two distinct flows sharing endpoints collapse to
+# identical `Flow{from,to}` milestones. The multiset check then cannot tell a
+# correct engine (each duplicate flow taken once) from a wrong one (one taken
+# twice, the other never) — an unsound anchor. Re-anchor it once the engine
+# observes per-flow identity (#1227/#1240).
+SPEC_TRACE_MODELS=(MCParallelDiamond)
 
 # The completion predicate and process-graph record the trace generator dumps,
 # in TokenFlow's own vocabulary (see SPEC_TRACE_DONE / SPEC_TRACE_GRAPH above).

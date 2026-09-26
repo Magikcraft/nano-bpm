@@ -196,7 +196,11 @@ rule): TLC emits a spec behaviour, and a Rust test replays it against
   join firings, completion) equals the spec's. A divergence fails the test — no
   tolerated mismatch, no retries. The corpus is restricted to parallel-only,
   routing-deterministic models whose milestone multiset is invariant under
-  interleaving, so multiset equality is an exact check.
+  interleaving, so multiset equality is an exact check. Models with two distinct
+  flows sharing endpoints (`MCParallelDuplicateFlows`) are model-checked but
+  excluded from the anchored corpus: the engine's `SequenceFlowTaken` event has
+  no per-flow identity, so their milestone multiset cannot distinguish the two
+  same-endpoint flows and the anchor would be unsound.
 
 **Reuse entry point (for sibling specs #1227, #1240, …).** The replay driver is
 spec-agnostic and lives in `engine-core/tests/trace_validation/harness.rs`. A
@@ -227,7 +231,11 @@ pub trait TraceMapping {
    `MCStart` and `MCEdges` (a record from flow id to `<<source, target>>`),
    plus the derived `MCFlows`, `MCSrc` and `MCTgt` (copy these from an
    existing model). Flows have their own ids, as in the engine, so two
-   distinct flows may share endpoints (`MCParallelDuplicateFlows`).
+   distinct flows may share endpoints (`MCParallelDuplicateFlows`). Such a
+   duplicate-endpoint model is model-checked but **not** trace-anchored: the
+   engine's `SequenceFlowTaken` event carries no per-flow identity, so its
+   observable milestone multiset cannot distinguish the two same-endpoint
+   flows (see `SPEC_TRACE_MODELS` in `TokenFlow.spec`).
 2. Add a row to `SPEC_EXPECTED` in `formal/tla/specs/TokenFlow.spec` with its
    expected outcome. There are no hand-written `.cfg` files. `check.sh`
    generates the same config, with every property, for every model, so no model
