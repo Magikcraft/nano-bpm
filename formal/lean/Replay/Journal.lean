@@ -63,7 +63,21 @@ to exercise the model by computation.
 
 `PARTITION_BITS = 13`, `LOCAL_BITS = 51`; a `Key`'s high 13 bits are the minting
 partition and its low 51 bits are that partition's monotonic counter.
--/
+
+### Domain: `Key := Nat` is a deliberate over-approximation
+
+Rust's `Key` is a bounded `u64` (so `local_of < 2^51`, `partition_of ≤
+maxPartitionId = 2^13 - 1`, and `replay_partition` *rejects* an out-of-range
+partition id). This model uses unbounded `Nat` and does **not** constrain inputs
+to that valid domain — `maxPartitionId` is provided to *state* the bound (and for
+callers/`Replay.Examples` to assert validity) rather than to enforce it here. This
+is sound for what is proved: the determinism property is purely structural in the
+fold (see below), so it holds for **every** `Nat` key and therefore *a fortiori*
+on the valid bounded `u64` subset the Rust engine actually admits. The price is
+that this model is an over-approximation — it can *also* certify fold behaviour on
+keys the Rust implementation would reject up front; capturing that rejection is a
+domain-validity property distinct from the fold-determinism proved here, and is
+deliberately out of scope. -/
 
 namespace Replay
 
@@ -173,7 +187,19 @@ def snapshotAt (pid : Nat) (apply : σ → Event → σ) (init : σ)
 
 /-- Recovery: restore a snapshot and replay the surviving tail on top of it.
 Mirrors `seglog.rs` `recover`/`recover_multi` rebuilding from the compacted
-snapshot plus the hot tail. -/
+snapshot plus the hot tail.
+
+**Boundary invariant is an assumption, not a check.** This function ignores
+`snap.totalEvents` and replays *whatever* `tail` it is handed; the determinism
+theorem holds only because `snapshotAt` and the caller separately supply the
+matching boundary — a snapshot certifying `k` events (`snap.totalEvents = k`)
+paired with exactly `tail = evs.drop k`. Unlike `seglog.rs`, this model therefore
+does **not** represent a stale or missing snapshot, a coverage gap between
+`totalEvents` and the tail, or the tail-only #1065 rewind, and it has no
+fail-closed validation path. The `[snap.totalEvents, snap.totalEvents + tail]`
+contiguity is taken as a caller-guaranteed precondition; validating it (and the
+fail-closed behaviour when it is violated) is a separate property outside this
+model's scope. -/
 def recover (pid : Nat) (apply : σ → Event → σ) (snap : Snapshot σ)
     (tail : List Event) : Engine σ :=
   replayFrom pid apply (deserialize snap) tail
