@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { loadGraphs, tlaFor, bpmnFor, scenarioFor, FAMILIES } from './generate.mjs'
+import { loadGraphs, tlaFor, bpmnFor, scenarioFor, FAMILIES, takenFlows, reachableNodes } from './generate.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const graphs = loadGraphs()
@@ -85,15 +85,58 @@ test('BPMN carries DI (a shape per node, an edge per flow) and is executable', (
   }
 })
 
-test('scenario lists a job per task, an ordering, and message/timer slots', () => {
+test('scenario schedules exactly the REACHABLE tasks and stays executable with the BPMN', () => {
   for (const g of graphs) {
     const s = JSON.parse(scenarioFor(g))
-    const tasks = Object.entries(g.nodes).filter(([, k]) => k === 'task').map(([n]) => n)
-    assert.deepEqual(s.jobs.map((j) => j.element).sort(), [...tasks].sort())
-    assert.deepEqual([...s.jobCompletionOrder].sort(), [...tasks].sort())
+    const reach = reachableNodes(g)
+    const reachableTasks = Object.entries(g.nodes)
+      .filter(([n, k]) => k === 'task' && reach.has(n)).map(([n]) => n)
+    // The job set is exactly the tasks a token can reach under the deterministic
+    // route — no task behind a dead exclusive branch (#1258 review), or the
+    // runner would wait for a job the BPMN never creates.
+    assert.deepEqual(s.jobs.map((j) => j.element).sort(), [...reachableTasks].sort())
+    assert.deepEqual([...s.jobCompletionOrder].sort(), [...reachableTasks].sort())
+    // Executable-as-a-pair: every scheduled job element is reachable in the BPMN.
+    for (const j of s.jobs) assert.ok(reach.has(j.element), `${g.id}: scheduled ${j.element} is reachable`)
     assert.ok(Array.isArray(s.messageCorrelation))
     assert.ok(Array.isArray(s.timerTicks))
   }
+})
+
+test('an XOR split into task branches keeps the scenario and BPMN executable as a pair', () => {
+  // Regression (#1258 review): a `xor` split whose branches contain tasks must
+  // not schedule a job for the dead branch's task — the BPMN routes a token down
+  // exactly ONE branch, so a job on the other branch is never created and the
+  // runner would deadlock. Both artifacts derive from the same `takenFlows`.
+  const graph = {
+    id: 'XorTaskBranches',
+    start: 'S',
+    nodes: { S: 'start', X: 'xor', A: 'task', B: 'task', E: 'end' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'X' },
+      { id: 'f2', from: 'X', to: 'A' },
+      { id: 'f3', from: 'X', to: 'B' },
+      { id: 'f4', from: 'A', to: 'E' },
+      { id: 'f5', from: 'B', to: 'E' }
+    ],
+    families: { TokenFlow: { module: 'MCXorTaskBranches', comment: [] } }
+  }
+  const taken = takenFlows(graph)
+  // Exactly one of the two task branches is live; the other stays present but dead.
+  const live = ['f2', 'f3'].filter((f) => taken.has(f))
+  assert.equal(live.length, 1, 'exactly one xor task branch is taken')
+  const s = JSON.parse(scenarioFor(graph))
+  const reach = reachableNodes(graph)
+  // Only the reachable task is scheduled — not both.
+  assert.equal(s.jobs.length, 1, 'only the reachable task is scheduled')
+  for (const j of s.jobs) assert.ok(reach.has(j.element), `scheduled ${j.element} must be reachable`)
+  const deadTask = s.jobs[0].element === 'A' ? 'B' : 'A'
+  assert.ok(!reach.has(deadTask), 'the dead branch task is not reachable and not scheduled')
+  // The BPMN still emits both branches (one `=true`, one `=false`) and no default.
+  const xml = bpmnFor(graph)
+  assert.match(xml, /<bpmn:conditionExpression[^>]*>=true<\/bpmn:conditionExpression>/)
+  assert.match(xml, /<bpmn:conditionExpression[^>]*>=false<\/bpmn:conditionExpression>/)
+  assert.ok(!/<bpmn:exclusiveGateway id="X"[^>]*default="/.test(xml), 'no default flow')
 })
 
 test('--check passes on the committed artifacts (no drift)', () => {

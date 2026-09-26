@@ -163,6 +163,47 @@ const xmlEscape = (s) => String(s)
   .replaceAll('"', '&quot;')
 
 // ---------------------------------------------------------------------------
+// Deterministic routing — the SINGLE source both the BPMN conditions and the
+// scenario job order derive from, so the two artifacts stay executable as a
+// pair (#1258 review). If they disagreed, the scenario could schedule a job for
+// a task on a dead exclusive branch — one the BPMN never routes a token to — and
+// the runner would wait for a job that is never created. A diverging INCLUSIVE
+// (`or`) split takes EVERY outgoing flow; an EXCLUSIVE (`xor`) split takes
+// exactly ONE selected branch, leaving the rest as faithfully-present dead
+// flows. Returns the set of taken flow ids.
+export function takenFlows (graph) {
+  const outFlows = {}
+  for (const e of graph.edges) (outFlows[e.from] ??= []).push(e)
+  const taken = new Set()
+  for (const [from, outs] of Object.entries(outFlows)) {
+    if (graph.nodes[from] === 'xor' && outs.length > 1) {
+      taken.add(outs[1].id) // exclusive split: one selected branch is live
+    } else {
+      for (const e of outs) taken.add(e.id) // every other flow carries a token
+    }
+  }
+  return taken
+}
+
+// Nodes a token can actually reach under `takenFlows` — the set the scenario may
+// schedule jobs for. A task behind a dead exclusive branch is unreachable, so
+// scheduling its job would deadlock the runner (the job is never created).
+export function reachableNodes (graph) {
+  const taken = takenFlows(graph)
+  const outFlows = {}
+  for (const e of graph.edges) (outFlows[e.from] ??= []).push(e)
+  const seen = new Set([graph.start])
+  const stack = [graph.start]
+  while (stack.length) {
+    const id = stack.pop()
+    for (const e of outFlows[id] ?? []) {
+      if (taken.has(e.id) && !seen.has(e.to)) { seen.add(e.to); stack.push(e.to) }
+    }
+  }
+  return seen
+}
+
+// ---------------------------------------------------------------------------
 // BPMN 2.0 XML + BPMNDI
 export function bpmnFor (graph) {
   const nodes = Object.keys(graph.nodes)
@@ -172,6 +213,7 @@ export function bpmnFor (graph) {
     ;(inFlows[e.to] ??= []).push(e)
   }
   const isSplit = (id) => ['xor', 'or'].includes(graph.nodes[id]) && (outFlows[id]?.length ?? 0) > 1
+  const taken = takenFlows(graph)
 
   const L = []
   L.push('<?xml version="1.0" encoding="UTF-8"?>')
@@ -217,14 +259,17 @@ export function bpmnFor (graph) {
     // A diverging gateway conditions ALL its outgoing flows and declares no
     // default. An inclusive (`or`) split makes every branch `=true`, so every
     // branch is taken and matches the scenario's scheduled tasks. An exclusive
-    // (`xor`) split takes exactly ONE branch: the first outgoing flow is `=false`
-    // and the rest `=true`, so the engine deterministically takes the first true
-    // flow while the `=false` branch stays faithfully present — rather than an
-    // unreachable `default` an all-`=true` gateway would never fall back to. A
-    // non-split flow carries no condition.
+    // (`xor`) split takes exactly ONE selected branch (`takenFlows`): that flow
+    // is `=true` and every other flow is `=false`, so the engine deterministically
+    // routes down the one live branch while the dead branches stay faithfully
+    // present — rather than an unreachable `default` an all-`=true` gateway would
+    // never fall back to. The scenario derives its job set from the SAME
+    // `takenFlows`/`reachableNodes`, so a task behind a `=false` branch is never
+    // scheduled for a job the BPMN cannot create. A non-split flow carries no
+    // condition.
     let cond = null
     if (isSplit(e.from)) {
-      cond = (graph.nodes[e.from] === 'xor' && outFlows[e.from][0].id === e.id) ? '=false' : '=true'
+      cond = taken.has(e.id) ? '=true' : '=false'
     }
     if (cond) {
       L.push(`    <bpmn:sequenceFlow id="${xmlEscape(e.id)}" sourceRef="${xmlEscape(e.from)}" targetRef="${xmlEscape(e.to)}">`)
@@ -268,7 +313,12 @@ export function scenarioFor (graph) {
   const rects = layout(graph) // reuse the rank via layout coordinates
   const OX = 160; const COL = 190
   const rankOf = (id) => Math.round((rects[id].cx - OX) / COL)
-  const jobs = nodes.filter((id) => graph.nodes[id] === 'task')
+  // Only a task a token can REACH under the deterministic route (`reachableNodes`)
+  // becomes a job: a task behind a dead exclusive branch never activates, so
+  // scheduling its job would deadlock the runner (#1258 review). The BPMN
+  // conditions derive from the SAME routing, keeping the pair executable.
+  const reach = reachableNodes(graph)
+  const jobs = nodes.filter((id) => graph.nodes[id] === 'task' && reach.has(id))
     .map((id) => ({ element: id, jobType: id }))
   // A deterministic, causally-plausible completion order: by rank, then id.
   const completionOrder = jobs
@@ -278,7 +328,8 @@ export function scenarioFor (graph) {
     // GENERATED — see formal/corpus/generate.mjs. Edit the graph source instead.
     generated: 'formal/corpus/generate.mjs',
     process: graph.id,
-    // Every serviceTask becomes a job; the driver completes them in this order.
+    // Every REACHABLE serviceTask becomes a job; the driver completes them in
+    // this order (tasks behind a dead exclusive branch never activate).
     jobs,
     jobCompletionOrder: completionOrder,
     // This corpus has no message catch/throw or timer elements yet, so these
