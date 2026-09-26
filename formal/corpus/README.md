@@ -56,8 +56,12 @@ Per graph, `generate.mjs` writes:
 - `formal/corpus/bpmn/<Id>.bpmn` — BPMN 2.0 XML **with** a generated
   `<bpmndi:BPMNDiagram>` (a `BPMNShape` per node, a `BPMNEdge` with waypoints per
   flow) laid out left-to-right by a layered pass, so it renders for humans. Tasks
-  are `serviceTask`s whose job type is the node id; diverging exclusive/inclusive
-  gateways get a `default` flow and `=true` conditions so the model is executable.
+  are `serviceTask`s whose job type is the node id. A diverging gateway conditions
+  every outgoing flow and declares **no** `default` (which, with every branch
+  conditioned, would be provably unreachable): an inclusive (`or`) split makes
+  every branch `=true` so all are taken, and an exclusive (`xor`) split makes
+  exactly one branch `=true` and the rest `=false` so one deterministic route is
+  taken — keeping the model executable while faithfully representing every branch.
 - `formal/corpus/scenarios/<Id>.json` — the scenario script: a job per
   `serviceTask`, a deterministic `jobCompletionOrder`, and `messageCorrelation` /
   `timerTicks` slots (empty until a graph introduces message/timer elements).

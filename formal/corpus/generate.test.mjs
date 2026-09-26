@@ -101,15 +101,24 @@ test('--check passes on the committed artifacts (no drift)', () => {
   execFileSync('node', [path.join(here, 'generate.mjs'), '--check'], { stdio: 'pipe' })
 })
 
-test('inclusive splits take every branch; exclusive splits keep a default', () => {
-  // Regression (#1258 review): an inclusive (`or`) split activates every
-  // matching non-default flow, so marking a branch `default` makes it
-  // unreachable — yet the scenario schedules that branch's task. So an
-  // inclusive split must carry NO default and give every outgoing flow a
-  // condition; an exclusive (`xor`) split keeps exactly one default.
+test('diverging gateways condition every branch and declare no default', () => {
+  // Regression (#1258 review): a diverging gateway must not rely on a `default`
+  // flow. An inclusive (`or`) split takes EVERY matching flow, so a `default`
+  // would make its first branch unreachable while the scenario still schedules
+  // that branch's task — so every inclusive flow is `=true` and there is no
+  // default. An exclusive (`xor`) split takes exactly ONE branch; declaring a
+  // `default` plus all-`=true` conditions makes that default unreachable (the
+  // gateway never falls back), so instead every branch is conditioned — exactly
+  // one `=true`, the rest `=false` — and no default is declared.
   const outFlowsOf = (g, id) => g.edges.filter((e) => e.from === id)
-  const flowConditioned = (xml, id) =>
-    new RegExp(`<bpmn:sequenceFlow id="${id}"[^>]*>[\\s\\S]*?conditionExpression`).test(xml)
+  // Match ONLY the flow element with this id (up to its own `/>` or closing tag)
+  // so a condition on a *later* flow can never be mis-read as this one's.
+  const flowCondition = (xml, id) => {
+    const m = xml.match(new RegExp(`<bpmn:sequenceFlow id="${id}"[\\s\\S]*?(/>|</bpmn:sequenceFlow>)`))
+    assert.ok(m, `flow ${id} present`)
+    const c = m[0].match(/<bpmn:conditionExpression[^>]*>([\s\S]*?)<\/bpmn:conditionExpression>/)
+    return c ? c[1] : null
+  }
   let sawInclusive = false; let sawExclusive = false
   for (const g of graphs) {
     const xml = bpmnFor(g)
@@ -120,16 +129,18 @@ test('inclusive splits take every branch; exclusive splits keep a default', () =
       const gw = new RegExp(`<bpmn:${kind === 'or' ? 'inclusive' : 'exclusive'}Gateway id="${id}"([^>]*)>`)
       const m = xml.match(gw)
       assert.ok(m, `${g.id}: gateway ${id} present`)
-      const hasDefault = /default="/.test(m[1])
+      assert.ok(!/default="/.test(m[1]), `${g.id}: split ${id} must not declare a default`)
+      const conds = outs.map((e) => flowCondition(xml, e.id))
+      conds.forEach((c, i) => assert.ok(c !== null, `${g.id}: flow ${outs[i].id} needs a condition`))
       if (kind === 'or') {
         sawInclusive = true
-        assert.ok(!hasDefault, `${g.id}: inclusive split ${id} must not declare a default`)
-        for (const e of outs) {
-          assert.ok(flowConditioned(xml, e.id), `${g.id}: inclusive flow ${e.id} needs a condition`)
-        }
+        for (const c of conds) assert.equal(c, '=true', `${g.id}: inclusive split ${id} takes every branch`)
       } else {
         sawExclusive = true
-        assert.ok(hasDefault, `${g.id}: exclusive split ${id} must declare a default`)
+        assert.equal(conds.filter((c) => c === '=true').length, 1,
+          `${g.id}: exclusive split ${id} takes exactly one branch`)
+        assert.ok(conds.every((c) => c === '=true' || c === '=false'),
+          `${g.id}: exclusive split ${id} conditions every branch`)
       }
     }
   }

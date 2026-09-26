@@ -34,8 +34,8 @@ const repoTla = path.join(here, '..', 'tla')
 // The spec families a graph may target: the base TLA+ module a generated model
 // EXTENDS, and the check.sh glob that keeps it registered.
 export const FAMILIES = {
-  TokenFlow: { base: 'TokenFlow' },
-  ZeebeTokenFlow: { base: 'ZeebeTokenFlow' }
+  TokenFlow: { base: 'TokenFlow', glob: 'MC*.tla' },
+  ZeebeTokenFlow: { base: 'ZeebeTokenFlow', glob: 'ZMC*.tla' }
 }
 
 // node kind -> BPMN element + diagram footprint. `task` becomes a serviceTask
@@ -181,20 +181,20 @@ export function bpmnFor (graph) {
   L.push('    xmlns:di="http://www.omg.org/spec/DD/20100524/DI"')
   L.push('    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"')
   L.push('    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"')
-  L.push(`    id="Definitions_${graph.id}" targetNamespace="http://nanobpm.io/corpus">`)
+  L.push(`    id="Definitions_${xmlEscape(graph.id)}" targetNamespace="http://nanobpm.io/corpus">`)
   L.push(`  <bpmn:process id="${xmlEscape(graph.id)}" isExecutable="true">`)
 
   for (const id of nodes) {
     const kind = graph.nodes[id]
     const el = KIND[kind].el
     const attrs = [`id="${xmlEscape(id)}"`]
-    // Only an EXCLUSIVE split names a default flow: exactly one branch runs and
-    // the default is the fallback when no condition matches. An INCLUSIVE (`or`)
-    // split takes EVERY matching non-default flow, so a default would make its
-    // first branch unreachable (it fires only when none match) — the scenario
-    // schedules that branch's task, so encode "all branches" by giving every
-    // inclusive flow a `=true` condition and no default.
-    if (isSplit(id) && kind === 'xor') attrs.push(`default="${xmlEscape(outFlows[id][0].id)}"`)
+    // A diverging gateway declares NO default flow: a default is only ever taken
+    // when no outgoing condition matches, but every branch here is conditioned,
+    // so a default would be provably unreachable and misrepresent the graph. An
+    // INCLUSIVE (`or`) split conditions every branch `=true` (all are taken); an
+    // EXCLUSIVE (`xor`) split conditions every branch too — exactly one `=true`
+    // and the rest `=false` — so one deterministic route is taken and the other
+    // branch is still faithfully present (see the sequenceFlow loop below).
     const kids = []
     for (const e of inFlows[id] ?? []) kids.push(`      <bpmn:incoming>${xmlEscape(e.id)}</bpmn:incoming>`)
     for (const e of outFlows[id] ?? []) kids.push(`      <bpmn:outgoing>${xmlEscape(e.id)}</bpmn:outgoing>`)
@@ -214,15 +214,21 @@ export function bpmnFor (graph) {
   }
 
   for (const e of graph.edges) {
-    // An exclusive split conditions every branch except its default (the first
-    // outgoing flow); an inclusive split conditions ALL branches (no default),
-    // so every branch is taken and matches the scenario's scheduled tasks.
-    const fromKind = graph.nodes[e.from]
-    const conditional = isSplit(e.from) &&
-      (fromKind !== 'xor' || outFlows[e.from][0].id !== e.id)
-    if (conditional) {
+    // A diverging gateway conditions ALL its outgoing flows and declares no
+    // default. An inclusive (`or`) split makes every branch `=true`, so every
+    // branch is taken and matches the scenario's scheduled tasks. An exclusive
+    // (`xor`) split takes exactly ONE branch: the first outgoing flow is `=false`
+    // and the rest `=true`, so the engine deterministically takes the first true
+    // flow while the `=false` branch stays faithfully present — rather than an
+    // unreachable `default` an all-`=true` gateway would never fall back to. A
+    // non-split flow carries no condition.
+    let cond = null
+    if (isSplit(e.from)) {
+      cond = (graph.nodes[e.from] === 'xor' && outFlows[e.from][0].id === e.id) ? '=false' : '=true'
+    }
+    if (cond) {
       L.push(`    <bpmn:sequenceFlow id="${xmlEscape(e.id)}" sourceRef="${xmlEscape(e.from)}" targetRef="${xmlEscape(e.to)}">`)
-      L.push('      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=true</bpmn:conditionExpression>')
+      L.push(`      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${cond}</bpmn:conditionExpression>`)
       L.push('    </bpmn:sequenceFlow>')
     } else {
       L.push(`    <bpmn:sequenceFlow id="${xmlEscape(e.id)}" sourceRef="${xmlEscape(e.from)}" targetRef="${xmlEscape(e.to)}"/>`)
@@ -329,12 +335,18 @@ function main () {
     // The generated MC*/ZMC* models are written straight into formal/tla beside
     // the hand-written base modules (TokenFlow.tla, ZeebeTokenFlow.tla), so scan
     // them too — otherwise removing/renaming a graph leaves a stale model in the
-    // descriptor glob while --check reports clean. Exclude the base modules (the
-    // families' EXTENDS targets) and never recurse into sibling spec dirs.
-    const baseModules = new Set(Object.values(FAMILIES).map((f) => `${f.base}.tla`))
+    // descriptor glob while --check reports clean. Restrict the scan to the
+    // families' own generated-model globs (MC*.tla / ZMC*.tla) so a hand-written
+    // root module — a new spec's base, say — is never mistaken for a stray
+    // generated file. Base modules do not match those globs, so they are skipped
+    // for free.
+    const globToRe = (glob) =>
+      new RegExp('^' + glob.replace(/[.]/g, '\\$&').replace(/\*/g, '.*') + '$')
+    const generatedModelRes = Object.values(FAMILIES).map((f) => globToRe(f.glob))
+    const isGeneratedModel = (name) => generatedModelRes.some((re) => re.test(name))
     if (fs.existsSync(repoTla)) {
       for (const ent of fs.readdirSync(repoTla, { withFileTypes: true })) {
-        if (!ent.isFile() || !ent.name.endsWith('.tla') || baseModules.has(ent.name)) continue
+        if (!ent.isFile() || !isGeneratedModel(ent.name)) continue
         const p = path.join(repoTla, ent.name)
         if (!expected.has(p)) {
           console.error(`FAIL corpus drift: ${path.relative(path.join(here, '..', '..'), p)} has no graph source (delete it)`)

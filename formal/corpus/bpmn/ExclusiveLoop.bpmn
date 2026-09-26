@@ -18,7 +18,7 @@
       <bpmn:incoming>f3</bpmn:incoming>
       <bpmn:outgoing>f2</bpmn:outgoing>
     </bpmn:serviceTask>
-    <bpmn:exclusiveGateway id="X" default="f3">
+    <bpmn:exclusiveGateway id="X">
       <bpmn:incoming>f2</bpmn:incoming>
       <bpmn:outgoing>f3</bpmn:outgoing>
       <bpmn:outgoing>f4</bpmn:outgoing>
@@ -28,7 +28,9 @@
     </bpmn:endEvent>
     <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="A"/>
     <bpmn:sequenceFlow id="f2" sourceRef="A" targetRef="X"/>
-    <bpmn:sequenceFlow id="f3" sourceRef="X" targetRef="A"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="X" targetRef="A">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=false</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f4" sourceRef="X" targetRef="E">
       <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
