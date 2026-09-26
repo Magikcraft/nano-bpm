@@ -129,10 +129,16 @@ its Zeebe source: `canActivateParallelGateway` (a parallel join waits for every
 *distinct* incoming flow, #1233), `canActivateInclusiveGateway` +
 `hasActivePathToTheGateway` (an inclusive join is evaluated only on arrival,
 #1241), `cleanupSequenceFlowsTaken` (one taken record consumed per incoming
-flow on firing, surplus kept — the "Tetris" principle). Its state uses **only
-the shared observable vocabulary** — every variable maps to a Zeebe exporter
-record (`SEQUENCE_FLOW_TAKEN`, `ELEMENT_ACTIVATED`, `ELEMENT_COMPLETED`), since
-Zeebe's internal bookkeeping is visible only through what it exports.
+flow on firing, surplus kept — the "Tetris" principle). Its **observable
+projection** is drawn only from the shared vocabulary — each observable variable
+(`taken`, `active`, `done`) maps to a Zeebe exporter record (`SEQUENCE_FLOW_TAKEN`,
+`ELEMENT_ACTIVATED`, `ELEMENT_COMPLETED`), since Zeebe's internal bookkeeping is
+visible only through what it exports. Alongside these the module carries a small,
+explicitly marked set of **auxiliary** variables — control state derivable from
+those records (`queue`, `open`) and pure ghost bookkeeping (`fired`, `earlyPar`) —
+that exist only to drive the transition relation and state invariants and are
+**not** part of the observable projection (see the module's vocabulary-rule
+header for the per-variable justification).
 
 It registers through the multi-spec harness like any other family
 (`specs/ZeebeTokenFlow.spec`, model glob `ZMC*.tla`, its own
