@@ -15,11 +15,21 @@
 //!   * The **lease safety** the token-flow milestone vocabulary cannot express
 //!     — exclusivity (at-most-one live holder), reclaim after expiry, and
 //!     done-is-terminal — is anchored by replaying committed JobLease behaviours
-//!     (`trace_validation/joblease/*.json`, each an admitted `JobLease.tla`
-//!     behaviour) against `Engine::apply_command`, driving the engine's
-//!     `ActivateJobs` / `ExpireJobs` / `CompleteJob` surface and asserting its
-//!     job-lease `Event`s and the two spec invariants at every step. A
-//!     divergence fails the test — no tolerated mismatch, no retries.
+//!     (`trace_validation/joblease/*.json`) against `Engine::apply_command`,
+//!     driving the engine's `ActivateJobs` / `ExpireJobs` / `CompleteJob`
+//!     surface and asserting its job-lease `Event`s and the two spec invariants
+//!     at every step. A divergence fails the test — no tolerated mismatch, no
+//!     retries.
+//!
+//! Each committed behaviour is a **two-sided** anchor: the `spec_model`
+//! validator asserts it is an *admitted* `JobLease.tla` behaviour (every step an
+//! enabled spec action, invariants holding throughout), and the engine replay
+//! asserts the same fixture matches `engine-core`. Because both checks run
+//! against the *same* fixture, the engine is tied to the spec through it and
+//! neither can silently drift (finding #1257). The `spec_model` module is a
+//! small, commented mirror of the `.tla` transition relation — the
+//! reviewer-sanctioned "equivalent spec-side validator" alternative to
+//! generating fixtures from TLC.
 //!
 //! The lease pipeline deliberately does **not** go through the TokenFlow
 //! `gen-traces.sh` / `parse.mjs` fixtures (whose `pending`/`waiting`/`fireCount`
@@ -34,10 +44,225 @@ mod harness;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use harness::{Fixture, Graph, Milestone, TraceMapping};
 use nanobpmn_engine_core::{Command, Engine, Event, ProcessBuilder, ProcessDefinition};
 use serde_json::Value;
 
-use harness::{Fixture, Graph, Milestone, TraceMapping};
+// ---------------------------------------------------------------------------
+// Spec-side admissibility validator: a faithful mirror of the JobLease.tla
+// transition relation.
+//
+// Findings #1257: the committed JSON fixtures must not be *hand-written
+// expectations* that can silently drift from `formal/tla/joblease/JobLease.tla`.
+// The engine replay below proves each fixture matches the engine; this module
+// proves the *same fixture* is an admitted `JobLease.tla` behaviour — every step
+// is an ENABLED spec action with the fixture's exact expectation, the spec
+// invariants hold after each step, and the clock only advances (the `Tick`
+// guard). A fixture is therefore a two-sided anchor: engine <-> shared fixture
+// <-> spec. If either side drifts, one of the two checks fails.
+//
+// This is the reviewer-sanctioned "equivalent spec-side validator" alternative
+// to generating fixtures from TLC. It mirrors the transition relation directly
+// (guards + effects of Activate/Expire/Complete/Tick), so it stays a small,
+// commented reflection of the `.tla` rather than a second TLC toolchain.
+mod spec_model {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use serde_json::Value;
+
+    use super::{str_at, u64_at};
+
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Lock {
+        deadline: u64,
+        worker: String,
+    }
+
+    struct State {
+        timeout: u64,
+        locks: BTreeMap<String, BTreeSet<Lock>>,
+        done: BTreeSet<String>,
+        clock: u64,
+    }
+
+    impl State {
+        /// `LiveLocks(j)` — locks whose deadline is strictly in the future.
+        fn live_locks(&self, j: &str) -> BTreeSet<Lock> {
+            self.locks
+                .get(j)
+                .into_iter()
+                .flatten()
+                .filter(|l| l.deadline > self.clock)
+                .cloned()
+                .collect()
+        }
+
+        fn has_live_lock(&self, j: &str) -> bool {
+            !self.live_locks(j).is_empty()
+        }
+
+        /// Advance the logical clock to `now` via `Tick`s. `Tick` only ever moves
+        /// the clock forward, so a fixture whose timed steps go backwards is not
+        /// an admitted behaviour.
+        fn tick_to(&mut self, now: u64, ctx: &dyn Fn(String) -> String) -> Result<(), String> {
+            if now < self.clock {
+                return Err(ctx(format!(
+                    "clock cannot move backwards (Tick only advances): now {now} < clock {}",
+                    self.clock
+                )));
+            }
+            self.clock = now;
+            Ok(())
+        }
+
+        /// `AtMostOneLiveHolder` and `DoneIsTerminal` — the two state invariants
+        /// checked after every step, exactly as the `.tla` invariants.
+        fn assert_invariants(&self, ctx: &dyn Fn(String) -> String) -> Result<(), String> {
+            for j in self.locks.keys() {
+                if self.live_locks(j).len() > 1 {
+                    return Err(ctx(format!(
+                        "AtMostOneLiveHolder violated: {j} has >1 live lock"
+                    )));
+                }
+            }
+            for j in &self.done {
+                if !self.locks.get(j).is_none_or(BTreeSet::is_empty) {
+                    return Err(ctx(format!(
+                        "DoneIsTerminal violated: completed {j} still holds a lock"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Assert `fixture` is an admitted `JobLease.tla` behaviour: every step is an
+    /// enabled spec action carrying the fixture's exact expectation, and the spec
+    /// invariants hold throughout. Returns `Err` (never panics) on inadmissibility
+    /// so the detector test can prove the validator is not vacuous.
+    pub fn assert_admitted(fixture: &Value) -> Result<(), String> {
+        let model = str_at(fixture, "model")?;
+        let timeout = u64_at(fixture, "timeout")?;
+        let jobs: Vec<String> = fixture
+            .get("jobs")
+            .and_then(Value::as_array)
+            .ok_or("fixture missing `jobs`")?
+            .iter()
+            .map(|j| {
+                j.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "job id must be a string".to_string())
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Init: every job available (no locks), nothing done, clock 0.
+        let mut st = State {
+            timeout,
+            locks: jobs.iter().map(|j| (j.clone(), BTreeSet::new())).collect(),
+            done: BTreeSet::new(),
+            clock: 0,
+        };
+
+        let steps = fixture
+            .get("steps")
+            .and_then(Value::as_array)
+            .ok_or("fixture missing `steps`")?;
+
+        for (i, step) in steps.iter().enumerate() {
+            let action = str_at(step, "action")?;
+            let ctx = |msg: String| format!("spec-model {model} step {i} ({action}): {msg}");
+            match action.as_str() {
+                "activate" => {
+                    let job = str_at(step, "job")?;
+                    let worker = str_at(step, "worker")?;
+                    let now = u64_at(step, "now")?;
+                    let expect_leased = step
+                        .get("expect_leased")
+                        .and_then(Value::as_bool)
+                        .ok_or_else(|| ctx("missing/!bool `expect_leased`".into()))?;
+                    if !st.locks.contains_key(&job) {
+                        return Err(ctx(format!("unknown job {job}")));
+                    }
+                    st.tick_to(now, &ctx)?;
+                    // `Activate(j, w)` guard: `~done[j] /\ ~HasLiveLock(j)`.
+                    let enabled = !st.done.contains(&job) && !st.has_live_lock(&job);
+                    if enabled != expect_leased {
+                        return Err(ctx(format!(
+                            "Activate({job},{worker}) enabled={enabled} but fixture expects leased={expect_leased}"
+                        )));
+                    }
+                    if enabled {
+                        // Effect: `locks[j] = LiveLocks(j) \cup {new}` — drop the
+                        // stale expired lock, keep any live one (there is none
+                        // under the guard), add the new lease.
+                        let mut next = st.live_locks(&job);
+                        next.insert(Lock {
+                            deadline: now + st.timeout,
+                            worker,
+                        });
+                        st.locks.insert(job, next);
+                    }
+                    st.assert_invariants(&ctx)?;
+                }
+                "expire" => {
+                    let now = u64_at(step, "now")?;
+                    let expect: BTreeSet<String> = step
+                        .get("expect_expired")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| ctx("missing `expect_expired` array".into()))?
+                        .iter()
+                        .map(|j| {
+                            j.as_str()
+                                .map(str::to_string)
+                                .ok_or_else(|| ctx("job id must be a string".into()))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    st.tick_to(now, &ctx)?;
+                    // `Expire(j)` is enabled per job with a lock at/past deadline;
+                    // the engine's sweep reclaims every such job at once.
+                    let reclaimed: BTreeSet<String> = st
+                        .locks
+                        .iter()
+                        .filter(|(_, ls)| ls.iter().any(|l| l.deadline <= st.clock))
+                        .map(|(j, _)| j.clone())
+                        .collect();
+                    if reclaimed != expect {
+                        return Err(ctx(format!(
+                            "Expire reclaims {reclaimed:?} but fixture expects {expect:?}"
+                        )));
+                    }
+                    // Effect: `locks[j] = LiveLocks(j)` for every reclaimed job.
+                    for j in &reclaimed {
+                        let live = st.live_locks(j);
+                        st.locks.insert(j.clone(), live);
+                    }
+                    st.assert_invariants(&ctx)?;
+                }
+                "complete" => {
+                    let job = str_at(step, "job")?;
+                    if !st.locks.contains_key(&job) {
+                        return Err(ctx(format!("unknown job {job}")));
+                    }
+                    // `Complete(j)` guard: `~done[j] /\ locks[j] # {}` — the
+                    // `Activated` latch, not a live lock (a past-deadline,
+                    // not-yet-swept job still completes).
+                    let enabled = !st.done.contains(&job)
+                        && !st.locks.get(&job).is_none_or(BTreeSet::is_empty);
+                    if !enabled {
+                        return Err(ctx(format!(
+                            "Complete({job}) is disabled in the spec (job is done or holds no lock)"
+                        )));
+                    }
+                    st.done.insert(job.clone());
+                    st.locks.insert(job, BTreeSet::new());
+                    st.assert_invariants(&ctx)?;
+                }
+                other => return Err(ctx(format!("unknown action {other:?}"))),
+            }
+        }
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Activation-lifecycle anchor: reuse the #1226 harness driver.
@@ -91,9 +316,33 @@ impl TraceMapping for JobLeaseLifecycleMapping {
 
 /// The activation lifecycle of a single leased job conforms to the engine: a
 /// created job is activated to exactly one holder and driven to completion,
-/// producing the spec's milestone multiset. Reuses `harness::validate`.
+/// producing the spec's milestone multiset (via `harness::validate`).
+///
+/// Finding #1257: the milestone list is token-flow vocabulary, so on its own it
+/// would only prove a hand-written process matches a hand-written list. To make
+/// this a genuine *JobLease* anchor, the create -> activate -> complete lifecycle
+/// it exercises is first asserted to be an admitted `JobLease.tla` behaviour
+/// through the spec-side validator (the same one guarding the committed
+/// fixtures), tying the milestone claim to the spec rather than to a bare
+/// expectation.
 #[test]
 fn job_lease_lifecycle_conforms_to_engine() {
+    // The lifecycle as a JobLease behaviour: activate the single job to one
+    // holder at now=0, then complete it. Assert it is spec-admitted before
+    // anchoring the engine's milestone multiset against it.
+    let lifecycle_behaviour = serde_json::json!({
+        "spec": "JobLease",
+        "model": "lease-lifecycle",
+        "timeout": 1000,
+        "jobs": ["work"],
+        "steps": [
+            { "action": "activate", "job": "work", "worker": "w1", "now": 0, "expect_leased": true },
+            { "action": "complete", "job": "work" }
+        ]
+    });
+    spec_model::assert_admitted(&lifecycle_behaviour)
+        .expect("the lifecycle is an admitted JobLease.tla behaviour");
+
     let mut nodes = BTreeMap::new();
     nodes.insert("start".to_string(), "start".to_string());
     nodes.insert("work".to_string(), "task".to_string());
@@ -353,13 +602,41 @@ fn replay_lease_behaviour(fixture: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Every committed JobLease behaviour replays against the engine with matching
-/// lease events and no invariant violation.
+/// Every committed JobLease behaviour is a two-sided anchor: it is an admitted
+/// `JobLease.tla` behaviour (the spec-side validator) **and** it replays against
+/// the engine with matching lease events and no invariant violation. Checking
+/// both against the *same* fixture ties the engine to the spec through it, so
+/// neither the fixture nor the engine can silently drift from `JobLease.tla`.
 #[test]
 fn job_lease_traces_conform_to_engine() {
     for (path, fixture) in load_lease_fixtures() {
+        spec_model::assert_admitted(&fixture)
+            .unwrap_or_else(|e| panic!("{path}: not a JobLease.tla-admitted behaviour: {e}"));
         replay_lease_behaviour(&fixture).unwrap_or_else(|e| panic!("{path}: {e}"));
     }
+}
+
+/// The spec-side validator must actually *reject* an inadmissible behaviour, or
+/// the admissibility half of the anchor above would be vacuous. Tamper with the
+/// `exclusive-lease` behaviour so it claims the second, concurrent activation is
+/// leased — which `JobLease.tla`'s `~HasLiveLock` guard forbids — and assert the
+/// validator reports the divergence (Red/Green: the validator is proven to fire).
+#[test]
+fn spec_model_detects_inadmissible_behaviour() {
+    let (_, mut fixture) = load_lease_fixtures()
+        .into_iter()
+        .find(|(_, v)| v.get("model").and_then(Value::as_str) == Some("exclusive-lease"))
+        .expect("the exclusive-lease behaviour is committed");
+    fixture["steps"][1]["expect_leased"] = Value::Bool(true);
+    let result = spec_model::assert_admitted(&fixture);
+    assert!(
+        result.is_err(),
+        "the spec-side validator must reject a behaviour that violates the exclusive-lease guard"
+    );
+    assert!(
+        result.unwrap_err().contains("Activate"),
+        "the inadmissibility report should name the disabled Activate action"
+    );
 }
 
 /// The replay must actually *catch* a divergence, or the conformance test above

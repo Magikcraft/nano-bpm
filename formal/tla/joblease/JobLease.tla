@@ -19,11 +19,17 @@
 (*     worker (crash / partition) is indistinguishable from an overrun and   *)
 (*     is reclaimed the same way — this is the *reclaim* path.               *)
 (*   - `CompleteJob{job_key}` completes an *activated* job by key alone      *)
-(*     (`Event::JobCompleted`); the lock holder is irrelevant, but a job     *)
-(*     whose lock already expired is no longer activated, so completing it   *)
-(*     fails (`JobNotActivated`) until it is re-activated. That is the       *)
-(*     at-least-once contract: an expired lease costs at most a redelivery,  *)
-(*     never a lost job and never two live holders.                          *)
+(*     (`Event::JobCompleted`); the lock holder is irrelevant. A job stays   *)
+(*     in the `Activated` state — and so remains completable — until an      *)
+(*     explicit `ExpireJobs` sweep reclaims its past-deadline lock: the      *)
+(*     deadline passing does *not* by itself un-activate the job. So a job    *)
+(*     whose deadline has passed but whose lock has not yet been swept can    *)
+(*     still complete (the engine gates on the `activated` latch, not on a   *)
+(*     live lock — `engine/mod.rs` `CompleteJob`); only once `ExpireJobs`    *)
+(*     has reclaimed the lock does completion fail (`JobNotActivated`) until  *)
+(*     re-activation. That is the at-least-once contract: an expired lease    *)
+(*     costs at most a redelivery, never a lost job and never two live       *)
+(*     holders.                                                              *)
 (*                                                                           *)
 (* `clock` is the host-driven logical time the engine keeps out of its own   *)
 (* clock (a periodic "tick"): `ActivateJobs`/`ExpireJobs` carry `now`.       *)
@@ -84,11 +90,19 @@ Init ==
 \* `clock + Timeout`. The guard `~HasLiveLock(j)` is the engine's exclusive-lease
 \* rule (`select_activatable_job_keys` skips a job with a live lock). Reclaiming
 \* an expired/lost lease is simply this action firing again once the old lock is
-\* no longer live.
+\* no longer live. The engine records a *single* current lock (`job.deadline` is
+\* replaced on `JobActivated`), so a direct reactivation at `clock >= deadline`
+\* — which `job_activatable` permits without a preceding `ExpireJobs` — drops the
+\* stale expired lock rather than retaining it. Modelling that with
+\* `LiveLocks(j) \cup {new}` (not `locks[j] \cup {new}`) keeps this faithful:
+\* under the guard `LiveLocks(j) = {}`, so the result is the singleton `{new}`,
+\* yet the union still yields two *live* locks (tripping `AtMostOneLiveHolder`)
+\* if a weaker guard ever admitted a concurrent holder — the reason locks are a
+\* set at all.
 Activate(j, w) ==
     /\ ~done[j]
     /\ ~HasLiveLock(j)
-    /\ locks' = [locks EXCEPT ![j] = @ \cup {[worker |-> w, deadline |-> clock + Timeout]}]
+    /\ locks' = [locks EXCEPT ![j] = LiveLocks(j) \cup {[worker |-> w, deadline |-> clock + Timeout]}]
     /\ UNCHANGED <<done, clock>>
 
 \* `ExpireJobs{now}` / `Engine::expire_jobs`: release every lock on `j` that is
@@ -99,12 +113,18 @@ Expire(j) ==
     /\ locks' = [locks EXCEPT ![j] = LiveLocks(j)]
     /\ UNCHANGED <<done, clock>>
 
-\* `CompleteJob{job_key}` / `Engine::complete_job`: an *activated* job (one with
-\* a live lock) completes by key. Completion clears the job's locks: a completed
-\* job can never be redelivered, so reclaim can never resurrect it.
+\* `CompleteJob{job_key}` / `Engine::complete_job`: an *activated* job completes
+\* by key. The engine gates completion on the `activated` latch — a job that has
+\* been activated and not yet reclaimed — *not* on a still-live lock: a job whose
+\* deadline has passed but whose lock `ExpireJobs` has not yet swept is still in
+\* the `Activated` state and completes. So the guard is "a lock is still recorded
+\* on the job" (`locks[j] # {}`), which stays true across the deadline until
+\* `Expire` clears it — modelling the latch rather than only `HasLiveLock`.
+\* Completion clears the job's locks: a completed job can never be redelivered,
+\* so reclaim can never resurrect it.
 Complete(j) ==
     /\ ~done[j]
-    /\ HasLiveLock(j)
+    /\ locks[j] # {}
     /\ done'  = [done EXCEPT ![j] = TRUE]
     /\ locks' = [locks EXCEPT ![j] = {}]
     /\ UNCHANGED clock
