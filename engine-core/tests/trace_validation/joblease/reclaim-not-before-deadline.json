@@ -1,0 +1,13 @@
+{
+  "spec": "JobLease",
+  "model": "reclaim-not-before-deadline",
+  "note": "JobLease.tla Expire guard: Activate(j1,w1) at now=0 (deadline 1000); Expire at now=500 reclaims nothing (the lock is not yet at its deadline), so a second Activate(j1,w2) at now=500 is still refused — the lease holds until its deadline. w1 completes.",
+  "timeout": 1000,
+  "jobs": ["j1"],
+  "steps": [
+    { "action": "activate", "job": "j1", "worker": "w1", "now": 0, "expect_leased": true },
+    { "action": "expire", "now": 500, "expect_expired": [] },
+    { "action": "activate", "job": "j1", "worker": "w2", "now": 500, "expect_leased": false },
+    { "action": "complete", "job": "j1" }
+  ]
+}
