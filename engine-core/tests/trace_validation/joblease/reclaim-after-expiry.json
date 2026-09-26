@@ -1,0 +1,13 @@
+{
+  "spec": "JobLease",
+  "model": "reclaim-after-expiry",
+  "note": "JobLease.tla reclaim path: Activate(j1,w1) at now=0 (deadline 1000); Tick to 1000; Expire(j1) reclaims the past-deadline lock (JobLockExpired); Activate(j1,w2) redelivers to the OTHER worker; Complete(j1). Reclaim never drops the job and never produces two concurrent holders.",
+  "timeout": 1000,
+  "jobs": ["j1"],
+  "steps": [
+    { "action": "activate", "job": "j1", "worker": "w1", "now": 0, "expect_leased": true },
+    { "action": "expire", "now": 1000, "expect_expired": ["j1"] },
+    { "action": "activate", "job": "j1", "worker": "w2", "now": 1000, "expect_leased": true },
+    { "action": "complete", "job": "j1" }
+  ]
+}

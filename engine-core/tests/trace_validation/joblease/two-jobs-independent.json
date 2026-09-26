@@ -1,0 +1,15 @@
+{
+  "spec": "JobLease",
+  "model": "two-jobs-independent",
+  "note": "JobLease_MC2 shape: two independent jobs under one clock. Activate(j1,w1); Complete(j1) (j1 is now Done and holds no lock); Activate(j2,w1) — the same worker leases a different job; Expire at now=1000 reclaims only j2's lock (j1 is Done, DoneIsTerminal — a completed job is never re-expired or redelivered); Activate(j2,w2) redelivers j2; Complete(j2).",
+  "timeout": 1000,
+  "jobs": ["j1", "j2"],
+  "steps": [
+    { "action": "activate", "job": "j1", "worker": "w1", "now": 0, "expect_leased": true },
+    { "action": "complete", "job": "j1" },
+    { "action": "activate", "job": "j2", "worker": "w1", "now": 0, "expect_leased": true },
+    { "action": "expire", "now": 1000, "expect_expired": ["j2"] },
+    { "action": "activate", "job": "j2", "worker": "w2", "now": 1000, "expect_leased": true },
+    { "action": "complete", "job": "j2" }
+  ]
+}
