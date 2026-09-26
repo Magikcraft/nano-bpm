@@ -185,17 +185,31 @@ function num (fn, key) { return (fn && key in fn) ? fn[key] : 0 }
 const REQUIRED_STATE_VARS = ['pending', 'waiting', 'fireCount', 'completed']
 
 function assertObservableVocabulary (spec, model, states) {
-  const defined = new Set()
-  for (const s of states) for (const k of Object.keys(s.vars)) defined.add(k)
-  const missing = REQUIRED_STATE_VARS.filter((v) => !defined.has(v))
-  if (missing.length) {
+  if (!states.length) {
     process.stderr.write(
-      `error: ${spec}/${model}: trace milestone extraction expects the TokenFlow-family ` +
-      `state vocabulary but the witnessed states do not define [${missing.join(', ')}]. A ` +
-      `sibling spec with a different state vocabulary must extend parse.mjs milestones() ` +
-      `with its own mapping (see formal/README.md, #1227/#1240) rather than silently ` +
-      `emitting a sparse trace.\n`)
+      `error: ${spec}/${model}: no witness states were parsed from the TLC output; ` +
+      `cannot extract a milestone trace.\n`)
     process.exit(1)
+  }
+  // Require the observable vocabulary in *every* witnessed state, not merely the
+  // union across states. `extractStates` deliberately drops any conjunct whose
+  // value fails to parse, so a union check would let a single malformed/incomplete
+  // state slip through as long as some other state defined the same variable;
+  // `milestones()` would then default that transition's missing map to `{}` and
+  // silently omit (or miscount) observations. A per-state check turns any parse
+  // gap — or a sibling spec's divergent state vocabulary — into a loud failure.
+  for (const s of states) {
+    const missing = REQUIRED_STATE_VARS.filter((v) => !(v in s.vars))
+    if (missing.length) {
+      process.stderr.write(
+        `error: ${spec}/${model}: state ${s.step} (${s.action}) does not define the ` +
+        `TokenFlow-family observable variables [${missing.join(', ')}]. This means TLC ` +
+        `printed a value parse.mjs could not parse (so extractStates dropped it), or a ` +
+        `sibling spec uses a different state vocabulary and must extend parse.mjs ` +
+        `milestones() with its own mapping (see formal/README.md, #1227/#1240) rather ` +
+        `than silently emitting a sparse trace.\n`)
+      process.exit(1)
+    }
   }
 }
 
