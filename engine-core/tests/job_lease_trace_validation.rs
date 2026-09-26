@@ -22,8 +22,10 @@
 //!     retries.
 //!
 //! Each committed behaviour is a **two-sided** anchor: the `spec_model`
-//! validator asserts it is an *admitted* `JobLease.tla` behaviour (every step an
-//! enabled spec action, invariants holding throughout), and the engine replay
+//! validator asserts it is an *admitted* `JobLease.tla` behaviour (every step is
+//! an enabled spec action — or, for an engine sweep that reclaims nothing, a
+//! spec *stutter* step — with invariants holding throughout), and the engine
+//! replay
 //! asserts the same fixture matches `engine-core`. Because both checks run
 //! against the *same* fixture, the engine is tied to the spec through it and
 //! neither can silently drift (finding #1257). The `spec_model` module is a
@@ -56,8 +58,10 @@ use serde_json::Value;
 // expectations* that can silently drift from `formal/tla/joblease/JobLease.tla`.
 // The engine replay below proves each fixture matches the engine; this module
 // proves the *same fixture* is an admitted `JobLease.tla` behaviour — every step
-// is an ENABLED spec action with the fixture's exact expectation, the spec
-// invariants hold after each step, and the clock only advances (the `Tick`
+// is an ENABLED spec action with the fixture's exact expectation (or, for an
+// engine `ExpireJobs` sweep that reclaims nothing, an admitted spec STUTTER
+// step — see the `expire` arm), the spec invariants hold after each step, and
+// the clock only advances (the `Tick`
 // guard). A fixture is therefore a two-sided anchor: engine <-> shared fixture
 // <-> spec. If either side drifts, one of the two checks fails.
 //
@@ -256,10 +260,23 @@ mod spec_model {
                             "Expire reclaims {reclaimed:?} but fixture expects {expect:?}"
                         )));
                     }
-                    // Effect: `locks[j] = LiveLocks(j)` for every reclaimed job.
-                    for j in &reclaimed {
-                        let live = st.live_locks(j);
-                        st.locks.insert(j.clone(), live);
+                    if reclaimed.is_empty() {
+                        // Engine `ExpireJobs` sweep that reclaims nothing: no
+                        // `Expire(j)` spec action is enabled (its guard
+                        // `\E l \in locks[j] : l.deadline <= clock` holds for no
+                        // job — the `reclaimed == expect == {}` check above
+                        // already proves that for every job), so this engine-API
+                        // no-op maps to a spec STUTTER step: an admitted
+                        // `[Next]_vars` behaviour that changes no state. It is
+                        // modeled explicitly as a stutter here rather than
+                        // masqueraded as an enabled `Expire` action (advisory
+                        // #1257), keeping the two-sided anchor honest.
+                    } else {
+                        // Effect: `locks[j] = LiveLocks(j)` for every reclaimed job.
+                        for j in &reclaimed {
+                            let live = st.live_locks(j);
+                            st.locks.insert(j.clone(), live);
+                        }
                     }
                     st.assert_invariants(&ctx)?;
                 }
