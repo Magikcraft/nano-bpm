@@ -82,6 +82,11 @@ mod spec_model {
         timeout: u64,
         locks: BTreeMap<String, BTreeSet<Lock>>,
         done: BTreeSet<String>,
+        /// The persistent `activated` latch (`JobLease.tla`'s `activated`): set by
+        /// `Activate`, never cleared by `Expire`, and the `Complete` precondition
+        /// (finding #1257). Mirrors the engine's `Job::activated`, which the
+        /// `JobLockExpired` reducer leaves set.
+        activated: BTreeSet<String>,
         clock: u64,
     }
 
@@ -115,8 +120,9 @@ mod spec_model {
             Ok(())
         }
 
-        /// `AtMostOneLiveHolder` and `DoneIsTerminal` — the two state invariants
-        /// checked after every step, exactly as the `.tla` invariants.
+        /// `AtMostOneLiveHolder`, `DoneIsTerminal`, and `CompletedWasActivated` —
+        /// the state invariants checked after every step, exactly as the `.tla`
+        /// invariants.
         fn assert_invariants(&self, ctx: &dyn Fn(String) -> String) -> Result<(), String> {
             for j in self.locks.keys() {
                 if self.live_locks(j).len() > 1 {
@@ -131,6 +137,13 @@ mod spec_model {
                         "DoneIsTerminal violated: completed {j} still holds a lock"
                     )));
                 }
+                // CompletedWasActivated: a completed job was activated at least
+                // once (the completion latch, finding #1257).
+                if !self.activated.contains(j) {
+                    return Err(ctx(format!(
+                        "CompletedWasActivated violated: completed {j} was never activated"
+                    )));
+                }
             }
             Ok(())
         }
@@ -143,6 +156,15 @@ mod spec_model {
     pub fn assert_admitted(fixture: &Value) -> Result<(), String> {
         let model = str_at(fixture, "model")?;
         let timeout = u64_at(fixture, "timeout")?;
+        // `JobLease.tla`: `ASSUME Timeout \in Nat /\ Timeout > 0`. A `timeout` of
+        // 0 names a constant no JobLease model can instantiate, so a fixture using
+        // it is not a behaviour of any admitted model — reject it here rather than
+        // let it pass a vacuous spec-admissibility check (finding #1257).
+        if timeout == 0 {
+            return Err(format!(
+                "spec-model {model}: timeout must be > 0 (JobLease.tla ASSUME Timeout > 0)"
+            ));
+        }
         let jobs: Vec<String> = fixture
             .get("jobs")
             .and_then(Value::as_array)
@@ -155,11 +177,12 @@ mod spec_model {
             })
             .collect::<Result<_, _>>()?;
 
-        // Init: every job available (no locks), nothing done, clock 0.
+        // Init: every job available (no locks), nothing done or activated, clock 0.
         let mut st = State {
             timeout,
             locks: jobs.iter().map(|j| (j.clone(), BTreeSet::new())).collect(),
             done: BTreeSet::new(),
+            activated: BTreeSet::new(),
             clock: 0,
         };
 
@@ -194,13 +217,15 @@ mod spec_model {
                     if enabled {
                         // Effect: `locks[j] = LiveLocks(j) \cup {new}` — drop the
                         // stale expired lock, keep any live one (there is none
-                        // under the guard), add the new lease.
+                        // under the guard), add the new lease. Set the persistent
+                        // `activated` latch (`activated' = [.. EXCEPT ![j] = TRUE]`).
                         let mut next = st.live_locks(&job);
                         next.insert(Lock {
                             deadline: now + st.timeout,
                             worker,
                         });
-                        st.locks.insert(job, next);
+                        st.locks.insert(job.clone(), next);
+                        st.activated.insert(job);
                     }
                     st.assert_invariants(&ctx)?;
                 }
@@ -243,18 +268,19 @@ mod spec_model {
                     if !st.locks.contains_key(&job) {
                         return Err(ctx(format!("unknown job {job}")));
                     }
-                    // `Complete(j)` guard: `~done[j] /\ locks[j] # {}` — the
-                    // `Activated` latch, not a live lock (a past-deadline,
-                    // not-yet-swept job still completes).
-                    let enabled = !st.done.contains(&job)
-                        && !st.locks.get(&job).is_none_or(BTreeSet::is_empty);
+                    // `Complete(j)` guard: `~done[j] /\ activated[j]` — the
+                    // persistent activation latch, NOT a live or recorded lock. A
+                    // job reclaimed by `Expire` (its lock swept) keeps the latch,
+                    // so it still completes without re-activation (finding #1257).
+                    let enabled = !st.done.contains(&job) && st.activated.contains(&job);
                     if !enabled {
                         return Err(ctx(format!(
-                            "Complete({job}) is disabled in the spec (job is done or holds no lock)"
+                            "Complete({job}) is disabled in the spec (job is done or was never activated)"
                         )));
                     }
                     st.done.insert(job.clone());
                     st.locks.insert(job, BTreeSet::new());
+                    // `activated` is a latch: unchanged by `Complete`.
                     st.assert_invariants(&ctx)?;
                 }
                 other => return Err(ctx(format!("unknown action {other:?}"))),
@@ -636,6 +662,29 @@ fn spec_model_detects_inadmissible_behaviour() {
     assert!(
         result.unwrap_err().contains("Activate"),
         "the inadmissibility report should name the disabled Activate action"
+    );
+}
+
+/// The spec-side validator must reject a `timeout` of 0: `JobLease.tla` assumes
+/// `Timeout > 0`, so no JobLease model can instantiate it and a fixture using it
+/// is not an admitted behaviour. Without this guard the two-sided anchor would
+/// silently accept an un-modellable fixture (finding #1257). Red/Green: prove the
+/// timeout-assumption check actually fires.
+#[test]
+fn spec_model_rejects_zero_timeout() {
+    let (_, mut fixture) = load_lease_fixtures()
+        .into_iter()
+        .find(|(_, v)| v.get("model").and_then(Value::as_str) == Some("activate-complete"))
+        .expect("the activate-complete behaviour is committed");
+    fixture["timeout"] = Value::from(0u64);
+    let result = spec_model::assert_admitted(&fixture);
+    assert!(
+        result.is_err(),
+        "the spec-side validator must reject a timeout of 0 (JobLease.tla ASSUME Timeout > 0)"
+    );
+    assert!(
+        result.unwrap_err().contains("timeout must be > 0"),
+        "the report should name the violated Timeout assumption"
     );
 }
 

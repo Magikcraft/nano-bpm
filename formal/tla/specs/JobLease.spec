@@ -31,9 +31,12 @@ SPEC_CONSTANTS=(
 #   has two concurrent live lease holders.
 # DoneIsTerminal — a completed job holds no lock, so reclaim can never
 #   redeliver / un-complete a finished job (reclaim correctness, safety).
+# CompletedWasActivated — a completed job was activated at least once (the
+#   engine gates completion on the persistent `activated` latch, not a live
+#   lock), so a job reclaimed by expiry stays completable (finding #1257).
 # ExpiredIsReclaimable — a job that is neither done nor live can always be
 #   re-activated (an expired/lost lease is never a dead end).
-SPEC_INVARIANTS=(TypeOK AtMostOneLiveHolder DoneIsTerminal ExpiredIsReclaimable)
+SPEC_INVARIANTS=(TypeOK AtMostOneLiveHolder DoneIsTerminal CompletedWasActivated ExpiredIsReclaimable)
 
 # AllEventuallyComplete — every job eventually completes despite arbitrary
 #   expiry and redelivery (the at-least-once contract: reclaim never drops a
