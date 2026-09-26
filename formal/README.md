@@ -201,7 +201,13 @@ another slice's directory.
 `lean-toolchain` on first use:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+# Pin the elan installer to a specific commit (v4.2.4) and verify its SHA-256
+# before executing it — never pipe an unpinned `master` script straight into a
+# shell (mirrors the CI installer in .github/workflows/ci.yml).
+ELAN_INIT_SHA256=a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53
+curl -fsSL https://raw.githubusercontent.com/leanprover/elan/227caca133724d5516bee25c2aeb3e609478f2d8/elan-init.sh -o /tmp/elan-init.sh
+echo "${ELAN_INIT_SHA256}  /tmp/elan-init.sh" | sha256sum -c -
+sh /tmp/elan-init.sh -y --default-toolchain none
 export PATH="$HOME/.elan/bin:$PATH"
 cd formal/lean && lake build          # build every Lean target
 ```
