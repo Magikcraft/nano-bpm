@@ -318,4 +318,49 @@ JoinFiresAtMostOnce == Acyclic => \A j \in ParJoins \cup IncJoins : fireCount[j]
 
 \* Every instance eventually completes, under the fairness above.
 Termination == <>completed
+
+-----------------------------------------------------------------------------
+(* Refinement mapping to the Zeebe reference spec (#1240, slice 2).           *)
+(*                                                                         *)
+(* Nano is a strict superset of Camunda 8: on Camunda's surface there is NO   *)
+(* tolerated divergence. `ZeebeTokenFlow.tla` is the Zeebe reference oracle,   *)
+(* derived directly from `zeebe/engine`, and its gateway guards are exposed as *)
+(* PURE predicates. This spec is trace-equivalent to it on the observable      *)
+(* vocabulary iff the only nontrivial semantic surface — the join activation   *)
+(* decision — coincides on every reachable state: every other action           *)
+(* (pass-through, task activation, end, split routing) is structurally         *)
+(* identical between the two, so the join guard is the sole refinement         *)
+(* obligation. `RefinesZeebe` discharges it by asserting, over the whole MC    *)
+(* corpus, that this spec's join-firing decision equals the independently      *)
+(* re-derived Zeebe decision. Because the Zeebe guard lives ONLY in            *)
+(* `ZeebeTokenFlow.tla`, an edit that drifts this spec's guard away from Zeebe *)
+(* fails the invariant until the reference (and hence the claim of Camunda     *)
+(* parity) is updated too.                                                     *)
+(*                                                                         *)
+(* Every historical nano-vs-Zeebe difference is a filed parity issue. The      *)
+(* first — the arrival-time inclusive-join guard — is #1241 (closed): before   *)
+(* it, a quiescence sweep re-evaluated waiting inclusive joins, so             *)
+(* MCInclusiveDivergentPath / MCInclusiveJoinSurplus completed where Zeebe      *)
+(* leaves them stuck. With #1241 landed, `RefinesZeebe` holds on the whole     *)
+(* corpus, so there is no open divergence to file.                            *)
+ZeebeRef == INSTANCE ZeebeTokenFlow WITH
+    queue    <- pending,
+    active   <- waiting,
+    open     <- joinOpen,
+    taken    <- joinTokens,
+    fired    <- fireCount,
+    earlyPar <- premature,
+    done     <- completed
+
+\* This spec's own join-firing decision, at a join's current arrivals — exactly
+\* the `fires` predicate inside `ArriveJoin`, lifted to a state predicate.
+NanoJoinReady(j) ==
+    LET arr == joinTokens[j] IN
+    IF j \in ParJoins THEN \A g \in In(j) : arr[g] >= 1
+    ELSE \/ (\A g \in In(j) : arr[g] >= 1)
+         \/ (\E g \in In(j) : arr[g] > 0) /\ ~HasActivePathTo(j, arr)
+
+RefinesZeebe ==
+    \A j \in ParJoins \cup IncJoins :
+        NanoJoinReady(j) = ZeebeRef!ZeebeJoinReady(j, joinTokens[j], LiveSources)
 =============================================================================

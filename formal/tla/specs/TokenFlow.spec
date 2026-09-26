@@ -52,7 +52,7 @@ SPEC_CONSTANTS=(
 
 # JoinFiresAtMostOnce only holds without cycles, so the spec guards it with
 # `Acyclic`, which is derived from the graph rather than declared.
-SPEC_INVARIANTS=(TypeOK JoinBookkeepingCoherent ParallelJoinWaitsForEveryFlow NoStuckInstance JoinFiresAtMostOnce)
+SPEC_INVARIANTS=(TypeOK JoinBookkeepingCoherent ParallelJoinWaitsForEveryFlow NoStuckInstance JoinFiresAtMostOnce RefinesZeebe)
 SPEC_PROPERTIES=(Termination)
 
 SPEC_EXPECTED=(

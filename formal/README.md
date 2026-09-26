@@ -8,9 +8,12 @@ about pure semantics (both land slice by slice).
 formal/
 ├── tla/
 │   ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
-│   ├── MC*.tla               # concrete process graphs to model-check
+│   ├── ZeebeTokenFlow.tla    # Zeebe reference token flow (#1240): correct Camunda-8 gateway/join semantics
+│   ├── MC*.tla               # concrete process graphs for TokenFlow
+│   ├── ZMC*.tla              # concrete process graphs for ZeebeTokenFlow (the Zeebe reference corpus)
 │   ├── specs/                # one <Name>.spec descriptor per spec family (the registry)
-│   │   └── TokenFlow.spec    # TokenFlow's constants/invariants/properties/expected/trace models
+│   │   ├── TokenFlow.spec    # TokenFlow's constants/invariants/properties/expected/trace models
+│   │   └── ZeebeTokenFlow.spec # the Zeebe reference spec's registration
 │   ├── check.sh              # discovers specs/*.spec, runs TLC per model, compares with each spec's EXPECTED
 │   ├── gen-traces.sh         # dumps TLC behaviours of the trace models to committed JSON fixtures
 │   ├── trace/parse.mjs       # TLC -tool output -> trace fixture JSON
@@ -114,6 +117,52 @@ The following are out of scope for now: sub-process scopes, boundary and
 intermediate events, incidents, listeners and multi-instance. Each one is a
 future extension of this spec.
 
+## `ZeebeTokenFlow.tla` — the Camunda 8 reference, and the Nano ⇔ Zeebe refinement
+
+Nano is a **strict superset of Camunda 8**: everything Camunda supports must
+behave *exactly* as Zeebe does — on Camunda's surface there is no tolerated
+divergence, a difference is a Nano defect. `ZeebeTokenFlow.tla` (#1240) is the
+reference that pins that claim down. It re-derives the gateway/join token flow
+**directly from `zeebe/engine`**, not from Nano, so a Nano-vs-Zeebe divergence
+surfaces as a failed refinement rather than being defined away. Each rule cites
+its Zeebe source: `canActivateParallelGateway` (a parallel join waits for every
+*distinct* incoming flow, #1233), `canActivateInclusiveGateway` +
+`hasActivePathToTheGateway` (an inclusive join is evaluated only on arrival,
+#1241), `cleanupSequenceFlowsTaken` (one taken record consumed per incoming
+flow on firing, surplus kept — the "Tetris" principle). Its state uses **only
+the shared observable vocabulary** — every variable maps to a Zeebe exporter
+record (`SEQUENCE_FLOW_TAKEN`, `ELEMENT_ACTIVATED`, `ELEMENT_COMPLETED`), since
+Zeebe's internal bookkeeping is visible only through what it exports.
+
+It registers through the multi-spec harness like any other family
+(`specs/ZeebeTokenFlow.spec`, model glob `ZMC*.tla`, its own
+invariants/properties/expected). The `ZMC*` corpus is a representative sample —
+parallel sync, inclusive sync, the arrival-time inclusive-join guard (#1241),
+and a not-1-safe surplus — that TLC confirms the reference reproduces with the
+same verdicts (and the same state counts) as the matching `MC*` models.
+
+**The refinement (slice 2).** `TokenFlow.tla` must be trace-equivalent to
+`ZeebeTokenFlow` on every Camunda-expressible model. Every action other than a
+join arrival (pass-through, task activation, end, split routing) is structurally
+identical between the two specs, so the join activation decision is the *sole*
+refinement obligation. `TokenFlow.tla` discharges it with the `RefinesZeebe`
+invariant, checked over the **whole `MC*` corpus**: at every reachable state it
+asserts this spec's join-firing decision equals the Zeebe reference decision,
+which it obtains by instancing `ZeebeTokenFlow`'s pure guard predicates
+(`ZeebeJoinReady`). Because the Zeebe guard lives *only* in `ZeebeTokenFlow.tla`,
+an edit that drifts `TokenFlow`'s guard away from Zeebe fails `RefinesZeebe`
+until the reference — and hence the parity claim — is updated too. Every
+historical divergence is a filed parity issue; the first, the arrival-time
+inclusive-join guard, is #1241 (closed). With it landed, `RefinesZeebe` holds on
+the entire corpus, so there is no open divergence to file.
+
+The differential *runtime* half of #1240 — a single-source corpus generator
+(graph → BPMN+DI + `MC*.tla` + scenario), a Zeebe-exporter trace normaliser,
+the one-driver/two-backend scenario runner (Camunda v2 REST against Nano and a
+live Camunda 8), and the executable differential oracle + extension register —
+extends this static formal proof to executable traces and lands in its own
+follow-up slices (it needs a Zeebe/Camunda-8 runtime this proof does not).
+
 ## Expected outcomes and known defects
 
 The `SPEC_EXPECTED` table in a spec's descriptor (`formal/tla/specs/<Name>.spec`)
@@ -162,8 +211,8 @@ claimed by none, or if TLC prints a warning.
 
 ## Adding a spec family
 
-Each spec family (TokenFlow, and the future JobLease, RaftHandoff,
-SnapshotReplay, ZeebeTokenFlow) registers itself through a self-contained
+Each spec family (TokenFlow and ZeebeTokenFlow, and the future JobLease,
+RaftHandoff, SnapshotReplay) registers itself through a self-contained
 descriptor, so a new spec is added by **creating files in its own path** — never
 by editing `check.sh` or another spec's descriptor.
 
