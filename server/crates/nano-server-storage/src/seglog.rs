@@ -4962,12 +4962,10 @@ mod tests {
     mod snapshot_replay_conformance {
         use std::{fs, io, path::Path};
 
-        use nanobpmn_engine_core::{local_of, Command};
+        use nanobpmn_engine_core::{Command, local_of};
 
         use super::super::{cold_archive_span, deflate_all, list_cold, prune_cold_archive};
-        use super::{
-            bump_snapshot_to_future, compacted_dir_with_two_instances, snapshot_file,
-        };
+        use super::{bump_snapshot_to_future, compacted_dir_with_two_instances, snapshot_file};
         use crate::journal::Journal;
 
         /// The terminal outcome the spec's `RecoverOutcome` predicts for a world.
@@ -4989,7 +4987,10 @@ mod tests {
                          rejects (dir {})",
                         dir.display()
                     );
-                    assert!(!recovery.fresh, "recovered durable state must not read as fresh");
+                    assert!(
+                        !recovery.fresh,
+                        "recovered durable state must not read as fresh"
+                    );
                     // NoSilentRewind: every prior instance survives (no strictly-older history).
                     for &key in priors {
                         assert!(
@@ -4997,6 +4998,17 @@ mod tests {
                             "NoSilentRewind violated: recovery lost prior instance {key}"
                         );
                     }
+                    // NoSilentRewind covers non-instance durable state too: the
+                    // deployed process definition (a `DeploymentCreated`/process
+                    // record, not an instance row) must survive recovery, so a
+                    // regression that drops non-instance history is caught here and
+                    // not only by the instance checks above.
+                    assert!(
+                        !journal.state().processes.is_empty(),
+                        "NoSilentRewind violated: recovery lost the deployed process \
+                         definition (dir {})",
+                        dir.display()
+                    );
                     // NoSilentRewind: the key generator is not rewound — a fresh instance
                     // advances strictly past every prior key.
                     let (events, _) = journal
@@ -5078,8 +5090,15 @@ mod tests {
             let (dir, _key1, _key2) = compacted_dir_with_two_instances("conf-gap-nosnap");
             let c = covered(&dir);
             fs::remove_file(snapshot_file(&dir)).expect("drop the snapshot");
-            assert_eq!(prune_cold_archive(&dir, c), 1, "the cold prefix is pruned away");
-            assert!(cold_archive_span(&dir).unwrap().is_none(), "the gap is real");
+            assert_eq!(
+                prune_cold_archive(&dir, c),
+                1,
+                "the cold prefix is pruned away"
+            );
+            assert!(
+                cold_archive_span(&dir).unwrap().is_none(),
+                "the gap is real"
+            );
             assert_recovery(&dir, &[], Expect::Rejects);
             let _ = fs::remove_dir_all(&dir);
         }
@@ -5091,7 +5110,11 @@ mod tests {
         fn pruned_gap_unreadable_snapshot_rejects() {
             let (dir, _key1, _key2) = compacted_dir_with_two_instances("conf-gap-badsnap");
             let c = covered(&dir);
-            assert_eq!(prune_cold_archive(&dir, c), 1, "the cold prefix is pruned away");
+            assert_eq!(
+                prune_cold_archive(&dir, c),
+                1,
+                "the cold prefix is pruned away"
+            );
             bump_snapshot_to_future(&dir, c);
             assert_recovery(&dir, &[], Expect::Rejects);
             let _ = fs::remove_dir_all(&dir);
@@ -5135,12 +5158,167 @@ mod tests {
                 .position(|&b| b == b'\n')
                 .expect("an enveloped snapshot carries a header line");
             let mut snap: PersistedSnapshot = serde_json::from_slice(&raw[nl + 1..]).unwrap();
-            assert!(snap.covered_events > 0, "the floor must be nonzero to exercise the gap");
+            assert!(
+                snap.covered_events > 0,
+                "the floor must be nonzero to exercise the gap"
+            );
             snap.covered_events = 0;
             let mut out = raw[..=nl].to_vec();
             out.extend_from_slice(&serde_json::to_vec(&snap).unwrap());
             fs::write(&path, out).unwrap();
             assert_recovery(&dir, &[], Expect::Rejects);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Spec world: the snapshot + cold prefix are intact, but the SURVIVING
+        /// ACTIVE (hot-tail) segment carries a complete, well-formed frame naming
+        /// an event this build cannot decode (`DamageHotFrame` → `HotReadable` is
+        /// false). A complete unknown frame is never a torn write, so the hot tail
+        /// cannot be replayed and recovery must fail closed rather than silently
+        /// dropping it: `RecoverOutcome = Reject` (FailClosed, #1066/#1070/#1065).
+        /// This is the hot-segment analogue of `unreadable_cold_frame_rejects`.
+        #[test]
+        fn damaged_hot_segment_rejects() {
+            use super::super::ACTIVE_NAME;
+            let (dir, _key1, _key2) = compacted_dir_with_two_instances("conf-hotdamage");
+            // Overwrite the surviving active segment (the hot tail past the
+            // snapshot) with a complete unknown-variant frame.
+            fs::write(dir.join(ACTIVE_NAME), "{\"NosuchHotEvent\":{}}\n").unwrap();
+            assert_recovery(&dir, &[], Expect::Rejects);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Builds a compacted TWO-partition world for the `recover_multi` path:
+        /// two partitions share one segmented WAL, each owns one instance, a
+        /// combined snapshot subsumes the sealed prefix, and that prefix is
+        /// compacted off disk. Returns the dir + each partition's instance key.
+        /// The multi-partition mirror of `compacted_dir_with_two_instances`.
+        fn compacted_multi_dir(tag: &str) -> (std::path::PathBuf, u64, u64) {
+            use std::sync::{Arc, atomic::AtomicU64};
+
+            use nanobpmn_engine_core::{Engine, partition_of};
+
+            use super::super::{compact_multi, write_multi_snapshot};
+            use super::{demo, temp_dir};
+            use crate::journal::{ExportBatch, Journal, SharedWriter};
+
+            let dir = temp_dir(tag);
+            // Keep the exporter receiver alive so shared writes have a wired cell.
+            let (tx, _rx) = std::sync::mpsc::channel::<ExportBatch>();
+            let (key0, key1) = {
+                let (writer, recovery) =
+                    SharedWriter::open_segmented(&dir, &[0, 1], 2, None).expect("open multi");
+                let seg = Arc::clone(&recovery.shared);
+                let mut engines: std::collections::HashMap<u64, Engine> =
+                    recovery.engines.into_iter().collect();
+                let mut j0 =
+                    Journal::from_engine_shared(0, engines.remove(&0).unwrap(), true, &writer);
+                let mut j1 =
+                    Journal::from_engine_shared(1, engines.remove(&1).unwrap(), true, &writer);
+                j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+                j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+
+                let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+                j1.install_deployment(&deploy_events);
+                let (e0, _) = j0.apply_command(Command::create_instance("demo")).unwrap();
+                let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
+                let (e1, _) = j1.apply_command(Command::create_instance("demo")).unwrap();
+                let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+                assert_eq!(partition_of(key1), 1);
+
+                let (snap0, covered0) = j0.snapshot_and_rotate().expect("snapshot p0");
+                let (snap1, covered1) = j1.snapshot_and_rotate().expect("snapshot p1");
+                write_multi_snapshot(&dir, vec![(0, covered0, snap0), (1, covered1, snap1)])
+                    .expect("write combined snapshot");
+                assert_eq!(
+                    compact_multi(&seg, &[covered0, covered1], &[u64::MAX; 2]),
+                    1,
+                    "the sealed prefix is compacted for both partitions"
+                );
+                (key0, key1)
+            };
+            (dir, key0, key1)
+        }
+
+        /// Multi-partition NoSilentRewind: two partitions share one segmented WAL,
+        /// the combined snapshot subsumes the compacted sealed prefix, and
+        /// `recover_multi` reconstructs EVERY owned partition's full state
+        /// (instance rows + the deployed definition) — never a strictly-older
+        /// per-partition history. This anchors the spec's NoSilentRewind invariant
+        /// to the `recover_multi` migration path, which the single-partition
+        /// scenarios above do not exercise.
+        #[test]
+        fn multi_partition_reconstructs_full() {
+            use nanobpmn_engine_core::Engine;
+
+            use super::super::recover_multi;
+
+            let (dir, key0, key1) = compacted_multi_dir("conf-multi-full");
+            let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("recover multi");
+            assert!(
+                !recovery.fresh,
+                "recovered multi state must not read as fresh"
+            );
+            let engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            assert!(
+                engines[&0].instance(key0).is_some(),
+                "NoSilentRewind violated: partition 0 lost its instance {key0}"
+            );
+            assert!(
+                engines[&1].instance(key1).is_some(),
+                "NoSilentRewind violated: partition 1 lost its instance {key1}"
+            );
+            assert!(
+                !engines[&0].state().processes.is_empty(),
+                "NoSilentRewind violated: partition 0 lost the deployed definition"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Multi-partition FailClosed: the combined snapshot loads but is stale for
+        /// one owned partition (`covered < pp_base[p]`), so trusting it would
+        /// replay only that shard's surviving tail across the compacted gap and
+        /// rewind its key generator (#1065). `recover_multi` must reject loud:
+        /// `RecoverOutcome = Reject` (FailClosed). Anchors FailClosed to the
+        /// multi-partition path.
+        #[test]
+        fn multi_partition_stale_partition_snapshot_rejects() {
+            use super::super::{MULTI_SNAP_NAME, MultiPersistedSnapshot, recover_multi};
+
+            let (dir, _key0, _key1) = compacted_multi_dir("conf-multi-stale");
+            // Rewrite partition 1's entry so its `covered` sits below the
+            // compaction floor while the enveloped payload still parses — the
+            // per-partition stale-floor guard (not a decode failure) must reject.
+            let path = dir.join(MULTI_SNAP_NAME);
+            let raw = fs::read(&path).unwrap();
+            let nl = raw
+                .iter()
+                .position(|&b| b == b'\n')
+                .expect("an enveloped multi-snapshot carries a header line");
+            let mut snap: MultiPersistedSnapshot = serde_json::from_slice(&raw[nl + 1..]).unwrap();
+            let e = snap
+                .entries
+                .iter_mut()
+                .find(|e| e.partition == 1)
+                .expect("partition 1 snapshot entry");
+            assert!(
+                e.covered > 0,
+                "partition 1's compaction floor must be nonzero"
+            );
+            e.covered = 0;
+            let mut out = raw[..=nl].to_vec();
+            out.extend_from_slice(&serde_json::to_vec(&snap).unwrap());
+            fs::write(&path, out).unwrap();
+
+            let err = recover_multi(&dir, &[0, 1], 2, None)
+                .err()
+                .expect("recovery must refuse a stale partition snapshot, not rewind");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidData,
+                "fail-closed multi recovery must surface a typed InvalidData reject: {err}"
+            );
             let _ = fs::remove_dir_all(&dir);
         }
     }
