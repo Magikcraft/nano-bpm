@@ -9,6 +9,9 @@ formal/
 ├── tla/
 │   ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
 │   ├── MC*.tla               # concrete process graphs to model-check
+│   ├── raft/                 # RaftHandoff spec family (#1228): leadership handoff + reclaim
+│   │   ├── RaftHandoff.tla   # fence-epoch register (ADR 0019), anchored to nano-server-raft::fence
+│   │   └── RH*.tla           # models: fenced pass + a no-fencing split-brain violation
 │   ├── specs/                # one <Name>.spec descriptor per spec family (the registry)
 │   │   └── TokenFlow.spec    # TokenFlow's constants/invariants/properties/expected/trace models
 │   ├── check.sh              # discovers specs/*.spec, runs TLC per model, compares with each spec's EXPECTED
