@@ -136,6 +136,7 @@ jobs:
               - 'formal/**'
               - 'engine-core/src/**'
               - 'engine-core/tests/**'
+              - 'engine-core/examples/**'
               - '.github/workflows/ci.yml'
             # True unless EVERY changed file is pure presentation/frontend — the
             # marketing website (`website/**`), the console landing page HTML
@@ -621,6 +622,27 @@ jobs:
             echo "::notice::no formal/parity/gaps.json on $BASE_REF yet; baseline growth not checked"
             node formal/parity/check.mjs
           fi
+
+      # Lean 4 formal layer (formal/lean): builds every Lean target and runs the
+      # FEEL differential fuzz — the Lean reference semantics (formal/lean/Feel)
+      # vs. the Rust evaluator (engine-core/src/feel). A divergence fails hard;
+      # there is no tolerated mismatch and no retry.
+      - name: Install Lean (elan)
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o "$RUNNER_TEMP/elan-init.sh"
+          sh "$RUNNER_TEMP/elan-init.sh" -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@v4
+        with:
+          # elan installs the toolchain pinned in formal/lean/lean-toolchain on
+          # first `lake` invocation; cache it plus the Lake build outputs.
+          path: |
+            ~/.elan
+            formal/lean/.lake
+          key: lean-${{ hashFiles('formal/lean/lean-toolchain', 'formal/lean/lakefile.lean') }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Lean build + FEEL differential fuzz
+        run: formal/lean/feel-diff.sh
 
   processos:
     name: processos (clippy + test)

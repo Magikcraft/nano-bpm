@@ -10,6 +10,13 @@ formal/
 │   ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
 │   ├── MC*.tla               # concrete process graphs to model-check
 │   └── check.sh              # generates each TLC config, runs TLC, compares with EXPECTED
+├── lean/                     # Lean 4 reference semantics + differential fuzz (see below)
+│   ├── lean-toolchain        # pinned Lean version (elan reads this)
+│   ├── lakefile.lean         # Lake project: one lib target per slice + the feelfuzz exe
+│   ├── feel-diff.sh          # build Lean, generate a corpus, check Rust against it
+│   ├── Feel/                 # FEEL reference semantics + generator (this slice, #1230)
+│   ├── Replay/               # replay determinism (#1231) — adds files here only
+│   └── Roundtrip/            # processos IR ⇄ BPMN round-trip (#1232) — adds files here only
 └── parity/                   # Zeebe parity coverage matrix (see below)
     ├── zeebe-pin.json        # the Zeebe commit the matrix is derived from
     ├── fetch-zeebe.sh        # sparse-fetches the pinned sources
@@ -30,9 +37,12 @@ formal/tla/check.sh                      # every model (a few seconds)
 formal/tla/check.sh MCChainedInclusive   # one model
 ```
 
-CI runs the `formal (tlc)` job whenever `formal/**`, `engine-core/src/**` or
-`engine-core/tests/**` changes. The job also runs the parity matrix steps
-described below.
+CI runs the `formal (tlc)` job whenever `formal/**`, `engine-core/src/**`,
+`engine-core/tests/**` or `engine-core/examples/**` changes. The job runs the
+TLA+ model check, the parity matrix steps described below, and the Lean build +
+FEEL differential fuzz described under "Lean 4 layer". The job is skip-tolerant:
+it is required only when it runs, so a PR that touches none of those paths skips
+it cleanly.
 
 To read a counterexample trace, keep the logs:
 
@@ -159,6 +169,70 @@ together through trace validation is tracked in #1226: replay TLC-generated
 behaviours against `Engine::apply_command`. Until that lands, any change to
 the drain loop, the join functions or `path_reaches_join` should update
 `TokenFlow.tla` in the same PR.
+
+## Lean 4 layer
+
+`formal/lean/` is a single [Lake](https://github.com/leanprover/lean4) project
+holding the Lean 4 reference semantics and proofs. It is the wave-0 seam for the
+Lean slices of epic #1224: the shared `lakefile.lean` and `lean-toolchain` are
+authored once (#1230) and **pre-declare one library target per slice**, so each
+sibling only ADDS files inside its own subdirectory and never edits the shared
+lakefile or a shared barrel file.
+
+| Lib target | Directory | Slice |
+|---|---|---|
+| `Feel` | `formal/lean/Feel/` | FEEL reference semantics + differential fuzz (#1230) |
+| `Replay` | `formal/lean/Replay/` | replay determinism (#1231) |
+| `Roundtrip` | `formal/lean/Roundtrip/` | processos IR ⇄ BPMN round-trip (#1232) |
+
+`lakefile.lean` also declares the `feelfuzz` executable (`Feel.Fuzz`). Every
+target is a `@[default_target]`, so `lake build` builds them all. The package
+sets `warningAsError := true`, so any Lean warning fails the build — keep new
+code warning-clean.
+
+**Per-slice convention.** Add your `.lean` files under your own directory
+(`Feel/`, `Replay/`, `Roundtrip/`); the matching lib target globs its
+submodules automatically. Do not edit `lakefile.lean`, `lean-toolchain`, or
+another slice's directory.
+
+### Running
+
+`elan` manages the Lean toolchain and installs the pinned version from
+`lean-toolchain` on first use:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+export PATH="$HOME/.elan/bin:$PATH"
+cd formal/lean && lake build          # build every Lean target
+```
+
+### FEEL differential fuzz (#1230)
+
+The FEEL slice (`formal/lean/Feel/`) is a total reference evaluator for the FEEL
+subset that `engine-core/src/feel` implements. Per the epic's anti-drift rule,
+the reference is tied to the Rust implementation by a **differential fuzz**:
+
+- `Feel/Semantics.lean` is the reference evaluator, faithful to
+  `engine-core/src/feel/eval.rs` (three-valued and/or with short-circuit,
+  null-propagating comparisons, `if` on a non-bool condition → null, etc.).
+- `Feel/Gen.lean` is a type-directed generator that emits FEEL expressions with
+  bound contexts, keeping all numeric values exact integers within the
+  f64-exact range so number formatting cannot drift.
+- The `feelfuzz` exe prints a TSV corpus of `expr⇥ctx⇥reference-outcome`.
+- `engine-core/examples/feel_diff.rs` re-evaluates each row with the Rust
+  evaluator and asserts the canonical outcome is **byte-identical**. Any
+  divergence exits non-zero — there is no tolerated mismatch and no retry.
+
+Run the whole loop (build Lean → generate → check Rust) with the driver:
+
+```bash
+formal/lean/feel-diff.sh            # 3000 cases (override: FEEL_FUZZ_CASES or first arg)
+formal/lean/feel-diff.sh 20000      # more cases
+```
+
+To convince yourself the harness actually bites, perturb one arm of
+`Feel/Semantics.lean` (e.g. make `add` compute `a - b`), rerun `feel-diff.sh`,
+watch it fail with concrete diverging rows, then revert.
 
 ## Zeebe parity coverage matrix
 

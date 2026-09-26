@@ -1,0 +1,3 @@
+# Placeholder so the pre-declared `Replay` Lake target (issue #1231) has its
+# subdirectory tracked in git. The owner of #1231 adds `Replay/*.lean` files
+# here and deletes this file; no edit to the shared lakefile is needed.

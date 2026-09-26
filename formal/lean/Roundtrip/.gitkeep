@@ -1,0 +1,3 @@
+# Placeholder so the pre-declared `Roundtrip` Lake target (issue #1232) has its
+# subdirectory tracked in git. The owner of #1232 adds `Roundtrip/*.lean` files
+# here and deletes this file; no edit to the shared lakefile is needed.
