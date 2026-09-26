@@ -58,7 +58,17 @@ pub fn next_epoch(cur_epoch: u64, cur_leader: u64, me: u64) -> u64 {
     if cur_leader == me {
         cur_epoch
     } else {
-        cur_epoch + 1
+        // Exhaustion policy: the fence epoch is strictly monotone, so an
+        // unchecked `+ 1` at `u64::MAX` would wrap to 0 and regress the fence —
+        // an older announcement could then win and stale leadership be accepted.
+        // `cur_epoch` is not bounded below `u64::MAX` here (it can be adopted
+        // directly from a peer's `Promote` frame), so we fail closed rather than
+        // corrupt the fence. The space is unreachable in practice (it takes
+        // 2^64 overtakes to exhaust), so this is a defence-in-depth assertion,
+        // not a live failure mode.
+        cur_epoch.checked_add(1).expect(
+            "fence epoch space exhausted at u64::MAX; refusing to wrap and regress the fence",
+        )
     }
 }
 

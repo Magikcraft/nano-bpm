@@ -57,6 +57,22 @@ fn next_epoch_matches_adr() {
     assert_eq!(next_epoch(4, 2, 2), 4);
 }
 
+#[test]
+fn next_epoch_reasserts_own_hold_at_ceiling() {
+    // Re-asserting our own hold never climbs, so even at the ceiling it returns
+    // `cur_epoch` unchanged and does not trip the exhaustion guard.
+    assert_eq!(next_epoch(u64::MAX, 2, 2), u64::MAX);
+}
+
+#[test]
+#[should_panic(expected = "fence epoch space exhausted")]
+fn next_epoch_fails_closed_at_ceiling() {
+    // Overtaking a peer at `u64::MAX` cannot climb without wrapping to 0, which
+    // would regress the strictly-monotone fence and let a stale announcement
+    // win. The exhaustion policy fails closed instead of wrapping.
+    let _ = next_epoch(u64::MAX, 7, 2);
+}
+
 // --- A faithful in-Rust mirror of RaftHandoff.tla ----------------------------
 //
 // The state, actions and invariants below correspond one-to-one to the TLA+
