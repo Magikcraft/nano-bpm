@@ -155,11 +155,16 @@ mutual
 
   /-- An expression that (usually) evaluates to a boolean, and sometimes to
   `null` via a non-boolean operand of `and`/`or`/`not` — exercising three-valued
-  logic. -/
+  logic. The `and`/`or` cases also include a deliberately erroring right operand
+  (`1 + true`) behind a deciding left operand, so the documented
+  short-circuit-over-error behaviour (`false and (1 + true) = false`,
+  `true or (1 + true) = true`) is actually exercised: an engine that evaluated
+  the RHS eagerly and propagated its error would diverge here. -/
   partial def genBool (r : Rng) : Nat → Expr × Rng
     | 0 => let (b, r) := r.upto 2; (.boolLit (b == 1), r)
     | depth + 1 =>
-      let (k, r) := r.upto 9
+      let errRhs : Expr := .bin .add (.numLit 1) (.boolLit true)   -- `1 + true` → error
+      let (k, r) := r.upto 11
       match k with
       | 0 => let (b, r) := r.upto 2; (.boolLit (b == 1), r)
       | 1 => let (l, r) := genNum r depth; let (rr, r) := genNum r depth
@@ -171,6 +176,8 @@ mutual
       | 5 => let (l, r) := genBool r depth; let (rr, r) := genBool r depth; (.bin .or l rr, r)
       | 6 => let (l, r) := genBool r depth; (.bin .and l (.nullLit), r)   -- three-valued
       | 7 => let (l, r) := genBool r depth; (.bin .or l (.nullLit), r)    -- three-valued
+      | 8 => (.bin .and (.boolLit false) errRhs, r)  -- short-circuit masks RHS error → false
+      | 9 => (.bin .or (.boolLit true) errRhs, r)    -- short-circuit masks RHS error → true
       | _ => (.lnot .nullLit, r)                                          -- not null → null
 
   /-- A value of any type, freely mixing typed sub-generators with `null`,
