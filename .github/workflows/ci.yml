@@ -137,6 +137,7 @@ jobs:
               - 'engine-core/src/**'
               - 'engine-core/tests/**'
               - 'engine-core/examples/**'
+              - 'engine-core/Cargo.toml'
               - '.github/workflows/ci.yml'
             # True unless EVERY changed file is pure presentation/frontend — the
             # marketing website (`website/**`), the console landing page HTML
