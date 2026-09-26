@@ -501,17 +501,37 @@ fn setup_jobs(jobs: &[String]) -> Result<(Engine, BTreeMap<String, u64>), String
     }
     Ok((engine, keys))
 }
+/// One lease grant observed during replay: which job (`key`) was handed to which
+/// `worker`, and the half-open `[grant, deadline)` window it was live for.
+#[derive(Clone, Debug)]
+struct LiveWindow {
+    key: u64,
+    worker: String,
+    grant: u64,
+    deadline: u64,
+}
 
-/// The `activated_leases()` invariant: a job never appears twice, i.e. no job
-/// ever has two concurrent live holders (the engine-observable counterpart of
-/// `AtMostOneLiveHolder`).
-fn assert_at_most_one_live_holder(engine: &Engine) -> Result<(), String> {
-    let mut seen = BTreeSet::new();
-    for (key, _deadline) in engine.activated_leases() {
-        if !seen.insert(key) {
-            return Err(format!(
-                "AtMostOneLiveHolder violated: job {key} has two concurrent live leases"
-            ));
+/// The engine-observable `AtMostOneLiveHolder` invariant.
+///
+/// Checked against the *activation history* — every lease grant the engine
+/// actually made during replay — rather than a snapshot of `activated_leases()`.
+/// The latter is keyed by job (one `(job_key, deadline)` tuple per job record),
+/// so deduplicating it can never observe the same key twice and is vacuous: it
+/// is structurally incapable of witnessing two-holder behaviour. Two grants of
+/// the *same* job whose live `[grant, deadline)` windows overlap mean two workers
+/// held the job concurrently — the real violation — so we assert directly on the
+/// grant transitions instead.
+fn assert_at_most_one_live_holder(history: &[LiveWindow]) -> Result<(), String> {
+    for (i, a) in history.iter().enumerate() {
+        for b in &history[i + 1..] {
+            // Half-open windows: a grant at exactly the previous deadline (the
+            // lease expired, then was re-leased) does not overlap.
+            if a.key == b.key && a.grant < b.deadline && b.grant < a.deadline {
+                return Err(format!(
+                    "AtMostOneLiveHolder violated: job {} held by {} over [{}, {}) and by {} over [{}, {}) concurrently",
+                    a.key, a.worker, a.grant, a.deadline, b.worker, b.grant, b.deadline
+                ));
+            }
         }
     }
     Ok(())
@@ -552,6 +572,9 @@ fn replay_lease_behaviour(fixture: &Value) -> Result<(), String> {
     let (mut engine, keys) = setup_jobs(&jobs)?;
     let by_key: BTreeMap<u64, String> = keys.iter().map(|(j, k)| (*k, j.clone())).collect();
     let mut done: BTreeSet<String> = BTreeSet::new();
+    // Accumulated lease-grant history: the observable substrate for the
+    // `AtMostOneLiveHolder` invariant (see `assert_at_most_one_live_holder`).
+    let mut history: Vec<LiveWindow> = Vec::new();
 
     let steps = fixture
         .get("steps")
@@ -600,12 +623,18 @@ fn replay_lease_behaviour(fixture: &Value) -> Result<(), String> {
                             now.saturating_add(timeout)
                         )));
                     }
+                    history.push(LiveWindow {
+                        key: a.key,
+                        worker: worker.clone(),
+                        grant: now,
+                        deadline: a.deadline,
+                    });
                 } else if !activated.is_empty() {
                     return Err(ctx(format!(
                         "expected {job} to be unavailable to {worker} (live lock held), but it activated"
                     )));
                 }
-                assert_at_most_one_live_holder(&engine).map_err(ctx)?;
+                assert_at_most_one_live_holder(&history).map_err(ctx)?;
             }
             "expire" => {
                 let now = u64_at(step, "now")?;
@@ -631,7 +660,7 @@ fn replay_lease_behaviour(fixture: &Value) -> Result<(), String> {
                 if got != expect {
                     return Err(ctx(format!("reclaimed {got:?} but expected {expect:?}")));
                 }
-                assert_at_most_one_live_holder(&engine).map_err(ctx)?;
+                assert_at_most_one_live_holder(&history).map_err(ctx)?;
             }
             "complete" => {
                 let job = str_at(step, "job")?;
@@ -654,7 +683,7 @@ fn replay_lease_behaviour(fixture: &Value) -> Result<(), String> {
                         "DoneIsTerminal violated: completed job {job} was re-activated"
                     )));
                 }
-                assert_at_most_one_live_holder(&engine).map_err(ctx)?;
+                assert_at_most_one_live_holder(&history).map_err(ctx)?;
             }
             other => return Err(ctx(format!("unknown action {other:?}"))),
         }
@@ -742,6 +771,66 @@ fn spec_model_rejects_foreign_spec() {
     assert!(
         result.unwrap_err().contains("is not \"JobLease\""),
         "the report should name the rejected foreign spec"
+    );
+}
+
+/// The `AtMostOneLiveHolder` invariant helper must actually *fire* on a
+/// two-holder history, or asserting it throughout replay would be vacuous — the
+/// exact defect that deduplicating the job-keyed `activated_leases()` snapshot
+/// had (finding #1257). Feed the helper a hand-built activation history and prove
+/// it (a) rejects two grants of one job whose live windows overlap, (b) accepts
+/// non-overlapping (sequential) re-leases, and (c) treats the windows as
+/// half-open, so a re-lease at exactly the previous deadline is not an overlap.
+#[test]
+fn at_most_one_live_holder_detects_concurrent_holders() {
+    // (a) Two workers hold job 1 over overlapping windows -> violation.
+    let overlapping = vec![
+        LiveWindow {
+            key: 1,
+            worker: "w-a".into(),
+            grant: 0,
+            deadline: 10,
+        },
+        LiveWindow {
+            key: 1,
+            worker: "w-b".into(),
+            grant: 5,
+            deadline: 15,
+        },
+    ];
+    let err = assert_at_most_one_live_holder(&overlapping)
+        .expect_err("overlapping live windows on one job must violate AtMostOneLiveHolder");
+    assert!(
+        err.contains("AtMostOneLiveHolder violated"),
+        "the report should name the violated invariant, got: {err}"
+    );
+
+    // (b) Sequential re-lease of the same job (no overlap) is admissible, and
+    // (c) a re-lease starting exactly at the prior deadline is not an overlap
+    // (windows are half-open). A concurrent lease on a *different* job is fine.
+    let sequential = vec![
+        LiveWindow {
+            key: 1,
+            worker: "w-a".into(),
+            grant: 0,
+            deadline: 10,
+        },
+        LiveWindow {
+            key: 1,
+            worker: "w-b".into(),
+            grant: 10,
+            deadline: 20,
+        },
+        LiveWindow {
+            key: 2,
+            worker: "w-c".into(),
+            grant: 5,
+            deadline: 25,
+        },
+    ];
+    assert!(
+        assert_at_most_one_live_holder(&sequential).is_ok(),
+        "sequential re-leases and cross-job concurrency must not trip the invariant"
     );
 }
 
