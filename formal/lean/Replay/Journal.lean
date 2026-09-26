@@ -30,9 +30,28 @@ That is a **left fold** over the journal that threads two things:
   (`partition_of(max_key) == partition_id`); keys minted elsewhere are applied
   to state but never advance the local counter.
 
-Everything else on the rebuilt engine (`now`, round-robin cursors, dirty-var
-tracking, …) is defaulted and, per the Rust doc comments, "never affects
-replay/snapshot determinism", so the model omits it.
+Everything else on the rebuilt engine falls into two groups, and this model
+deliberately covers **neither** — it scopes its theorems to the fold-reconstructed
+projection `(state, nextLocal)` above, **not** to a bitwise-equal engine:
+
+* **Snapshot-persisted scalar metadata** — `partition_id`, `num_partitions`,
+  `now`, and `start_dispatch_rr` (`EngineSnapshot`,
+  `engine-core/src/engine/mod.rs`), which `from_snapshot`
+  (`engine-core/src/engine/memory.rs`) restores *verbatim* while a *full*
+  `replay_partition` re-defaults them (`num_partitions = 1`, `now = 0`,
+  `start_dispatch_rr = 0`). They are carried across the snapshot boundary rather
+  than being derived by the replay fold, so `snapshot ∘ replay(tail)` and a full
+  replay need not — and in general do not — agree on them. They are precisely the
+  fields the determinism theorem does *not* assert equality of; capturing them
+  would be modelling snapshot round-trip fidelity, a property distinct from the
+  fold-determinism proved here.
+* **Transient, non-snapshotted host bookkeeping** — `lenient_completion`,
+  dirty-var tracking, and the like, which per the Rust doc comments are "never
+  part of the snapshot" and "never affect replay/snapshot determinism".
+
+So `Replay.Determinism`'s results are stated over the replay-relevant projection
+`(state, nextLocal)` — the two fold-threaded values a silent rewind (#1065) would
+actually corrupt — and must not be read as engine-wide bitwise equality.
 
 The domain `state` and its applier `apply` are kept as *parameters*: the
 determinism property is structural in the fold, so the proof holds for **any**
@@ -121,7 +140,11 @@ def replay (pid : Nat) (apply : σ → Event → σ) (init : σ) (evs : List Eve
 A snapshot persists the reconstructed `state` and `nextLocal`, plus the
 `totalEvents` count of the `[0, totalEvents)` history it certifies — the field
 whose meaning `SNAPSHOT_FORMAT_VERSION` guards and whose *rewind* is the #1065
-incident. `deserialize ∘ serialize = id` on the replay-relevant fields models a
+incident. (The real `EngineSnapshot` also persists the scalar metadata
+`partition_id`, `num_partitions`, `now`, and `start_dispatch_rr`; those are the
+snapshot-carried fields deliberately outside this model's replay-relevant
+projection — see the module header — so `Snapshot` mirrors only the fold-derived
+subset.) `deserialize ∘ serialize = id` on those replay-relevant fields models a
 format-faithful round-trip. -/
 structure Snapshot (σ : Type) where
   state : σ

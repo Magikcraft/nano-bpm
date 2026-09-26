@@ -17,6 +17,13 @@ counter as well as the domain state — rules that class out structurally.
 The proof is short because replay is a pure left fold: it reduces to
 `foldl` distributing over `++` (`List.foldl_append`) composed with
 `take k ++ drop k = evs` (`List.take_append_drop`).
+
+**Scope.** `Engine` here is the replay-relevant projection `(state, nextLocal)`
+(see `Replay.Journal`), so "equals a full replay" is equality *of that
+projection*, not of a bitwise-identical Rust engine. The snapshot-carried scalars
+`partition_id`, `num_partitions`, `now`, and `start_dispatch_rr` are restored
+verbatim by `from_snapshot` while a full `replay_partition` re-defaults them, so
+they are outside the fold and outside these theorems by construction.
 -/
 
 namespace Replay
