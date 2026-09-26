@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# Model-check every TLA+ model in formal/tla with TLC, and compare each result
-# with its expected outcome.
+# Multi-spec TLA+ model-checking harness (#1226).
 #
-#   formal/tla/check.sh            # check every model
-#   formal/tla/check.sh MCFoo ...  # check the named models only
+#   formal/tla/check.sh              # check every model of every registered spec
+#   formal/tla/check.sh MCFoo ...    # check the named models only (any spec)
 #
-# The EXPECTED table below is the single record of what each model should do.
-# `pass` means TLC finds no error: every invariant and property holds, and no
-# state deadlocks. `violates:<P1>,<P2>,...` names the EXACT set of invariants
-# and properties TLC must report as violated; every property not listed is
-# thereby proven to hold. It records one of two things, and the row's comment
-# must say which:
+# Each spec family registers itself with a self-contained descriptor under
+# `formal/tla/specs/<Name>.spec` (see specs/TokenFlow.spec for the reference
+# example and the descriptor contract). A descriptor declares that spec's OWN
+# CONSTANTS mapping, INVARIANTS set, PROPERTIES set, model directory + glob, and
+# per-model EXPECTED verdict table. A new spec is added by CREATING a new
+# descriptor file in its own slice — never by editing this script or another
+# spec's descriptor. Discovery, the generated .cfg, and the drift guard are all
+# scoped PER SPEC, so one spec's models are never forced into another's table.
+#
+# The EXPECTED table in each descriptor is the single record of what each model
+# should do. `pass` means TLC finds no error: every invariant and property
+# holds, and no state deadlocks. `violates:<P1>,<P2>,...` names the EXACT set of
+# invariants and properties TLC must report as violated; every property not
+# listed is thereby proven to hold. It records one of two things, and the row's
+# comment must say which:
 #   - a known engine defect the model reproduces (cite its issue). The fix PR
 #     updates the spec to model the fixed engine, TLC stops reporting the
 #     violation, and this script fails until the entry is flipped. That is the
@@ -19,7 +27,8 @@
 #   - a deliberately unsound process graph, where the violation is the correct
 #     verdict on the graph (for example a BPMN lack of synchronization, which
 #     Zeebe also leaves stuck).
-# (The spec cannot see the Rust code; trace validation, #1226, closes that gap.)
+# Trace validation (#1226, Deliverable B; formal/tla/gen-traces.sh) closes the
+# spec-vs-Rust gap by replaying TLC behaviours against the engine.
 #
 # Set FORMAL_LOG_DIR to keep each model's generated .cfg and full TLC log
 # (including counterexample traces).
@@ -31,44 +40,11 @@ set -euo pipefail
 TLA_VERSION="1.7.4"
 TLA_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 
-# model                       expected outcome
-EXPECTED=(
-  "MCParallelDiamond           pass"
-  "MCInclusiveDiamond          pass"
-  "MCChainedInclusive          pass"
-  "MCInclusiveInParallel       pass"
-  "MCInclusiveInTransit        pass"
-  "MCExclusiveLoop             pass"
-  "MCParallelDuplicateFlows    pass"
-  # Unsound: two tokens on M->J, one on T->J. J fires once and, as in Zeebe, the
-  # surplus token waits forever for a partner. It never fires early (#1233).
-  "MCParallelJoinMultiArrival  violates:NoStuckInstance,Termination"
-  # Not 1-safe: every flow into J is taken twice, so J fires twice, keeping the
-  # surplus between firings ("Tetris" principle), and the instance completes.
-  "MCParallelJoinSurplus       violates:JoinFiresAtMostOnce"
-  # Not 1-safe: two tokens on XA->J, one on B->J. As in Zeebe (#1241), J fires
-  # twice when B's token is not last (the instance completes), and strands the
-  # surplus when both XA tokens arrive first. Before #1237 the first firing
-  # discarded the surplus; before #1241 a quiescence sweep fired it again.
-  "MCInclusiveJoinSurplus      violates:JoinFiresAtMostOnce,NoStuckInstance,Termination"
-  # Sound in Zeebe's reading, but not live: when A arrives while B is live and
-  # X then routes away from J, J is never re-evaluated and waits forever,
-  # exactly as in Zeebe (#1241).
-  "MCInclusiveDivergentPath    violates:NoStuckInstance,Termination"
-)
-
-# Every model is checked against the same, full property set. The generated
-# TLC config is identical for all models, so none can silently drop a property.
-# JoinFiresAtMostOnce only holds without cycles, so the spec guards it with
-# `Acyclic`, which is derived from the graph rather than declared.
-INVARIANTS=(TypeOK JoinBookkeepingCoherent ParallelJoinWaitsForEveryFlow NoStuckInstance JoinFiresAtMostOnce)
-PROPERTIES=(Termination)
-# TLC reports a temporal violation without naming the property, so the verdict
-# can only attribute it while there is exactly one.
-[[ ${#PROPERTIES[@]} -eq 1 ]] || { echo "error: check.sh attributes temporal violations to a single property" >&2; exit 1; }
-
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
+
+specs_dir="$here/specs"
+[[ -d "$specs_dir" ]] || { echo "error: no spec descriptors in $specs_dir" >&2; exit 1; }
 
 sha256() {
   if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
@@ -105,136 +81,226 @@ else
   fi
   [[ -f "$jar" ]] || fetch_tla2tools "$jar"
 fi
+export TLA2TOOLS_JAR="$jar"
 
-# bash 3.2 (macOS) has no associative arrays, so look outcomes up by scan.
-expected_outcome() {
-  local row model outcome
-  for row in "${EXPECTED[@]}"; do
-    read -r model outcome _ <<<"$row"
-    if [[ "$model" == "$1" ]]; then echo "$outcome"; return 0; fi
-  done
-  return 0
+# Descriptors, sorted for stable output.
+specs=()
+for s in "$specs_dir"/*.spec; do
+  [[ -e "$s" ]] || { echo "error: no *.spec descriptors in $specs_dir" >&2; exit 1; }
+  specs+=("$s")
+done
+
+# ---------------------------------------------------------------------------
+# Cross-spec guard: a model file must be claimed by exactly one spec, and no
+# committed model may EXTEND a registered spec base without being claimed. This
+# is the global safety net that keeps a spec's `.spec` descriptor the ONLY place
+# its models are registered, so a stray or double-claimed model can never be
+# silently unchecked.
+declare_names() { # spec_file -> prints "SPEC_NAME|SPEC_MODELS_DIR|SPEC_MODELS_GLOB"
+  ( set -euo pipefail
+    SPEC_NAME="" SPEC_MODELS_DIR="." SPEC_MODELS_GLOB=""
+    # shellcheck disable=SC1090
+    source "$1"
+    printf '%s|%s|%s\n' "$SPEC_NAME" "$SPEC_MODELS_DIR" "$SPEC_MODELS_GLOB" )
 }
 
-write_cfg() { # out
-  {
-    echo "SPECIFICATION Spec"
-    echo "CONSTANTS"
-    echo "    Nodes <- MCNodes"
-    echo "    Kind  <- MCKind"
-    echo "    Flows <- MCFlows"
-    echo "    Src   <- MCSrc"
-    echo "    Tgt   <- MCTgt"
-    echo "    Start <- MCStart"
-    echo "INVARIANTS"
-    printf '    %s\n' "${INVARIANTS[@]}"
-    echo "PROPERTIES"
-    printf '    %s\n' "${PROPERTIES[@]}"
-  } >"$1"
+resolve_models() { # dir glob -> prints basenames (no .tla), one per line
+  ( shopt -s nullglob; cd "$here/$1" 2>/dev/null || exit 0
+    for f in $2; do [[ -f "$f" ]] && echo "${f%.tla}"; done )
 }
 
-# Guard against drift between the table and the model files, in both directions.
 status=0
-for tla in MC*.tla; do
-  m="${tla%.tla}"
-  [[ -n "$(expected_outcome "$m")" ]] || { echo "error: $tla has no entry in EXPECTED" >&2; status=1; }
+registered_names=" "
+claimed=" "          # "name<space>" for each claimed model basename
+for s in "${specs[@]}"; do
+  IFS='|' read -r sname sdir sglob <<<"$(declare_names "$s")"
+  [[ -n "$sname" ]] || { echo "error: $s does not set SPEC_NAME" >&2; status=1; continue; }
+  registered_names="$registered_names$sname "
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    if [[ "$claimed" == *" $m "* ]]; then
+      echo "error: model $m is claimed by more than one spec descriptor" >&2
+      status=1
+    fi
+    claimed="$claimed$m "
+  done < <(resolve_models "$sdir" "$sglob")
 done
-seen=" "
-for row in "${EXPECTED[@]}"; do
-  read -r m _ <<<"$row"
-  if [[ "$seen" == *" $m "* ]]; then
-    echo "error: EXPECTED lists $m more than once" >&2; status=1
-  fi
-  seen="$seen$m "
-  [[ -f "$m.tla" ]] || { echo "error: EXPECTED lists $m but $m.tla does not exist" >&2; status=1; }
-  # A violated name must be one this script checks, or the row can never match.
-  # `Deadlock` is not among them: `violates:` rows run with -deadlock (below).
-  outcome="$(expected_outcome "$m")"
-  if [[ "$outcome" == violates:* ]]; then
-    for p in $(tr ',' ' ' <<<"${outcome#violates:}"); do
-      [[ " ${INVARIANTS[*]} ${PROPERTIES[*]} " == *" $p "* ]] ||
-        { echo "error: EXPECTED $m names $p, which is not a checked invariant or property" >&2; status=1; }
-    done
-  elif [[ "$outcome" != pass ]]; then
-    echo "error: EXPECTED $m has outcome $outcome; want pass or violates:<P1>,<P2>,..." >&2; status=1
-  fi
-done
+
+# Orphan guard: any committed *.tla that EXTENDS a registered spec base, is not
+# itself a registered base, and is not claimed, is an unregistered model.
+while IFS= read -r tla; do
+  base="$(basename "${tla%.tla}")"
+  [[ " $registered_names " == *" $base "* ]] && continue   # a spec base module
+  ext="$(sed -n 's/^[[:space:]]*EXTENDS[[:space:]]*//p' "$tla" | tr ',' ' ')"
+  for e in $ext; do
+    if [[ "$registered_names" == *" $e "* ]]; then
+      if [[ "$claimed" != *" $base "* ]]; then
+        echo "error: $tla EXTENDS $e but is claimed by no spec descriptor (add it to that spec's SPEC_MODELS_GLOB/EXPECTED)" >&2
+        status=1
+      fi
+      break
+    fi
+  done
+done < <(find "$here" -name '*.tla' -not -path '*/specs/*')
 [[ $status -eq 0 ]] || exit $status
 
-models=()
-if [[ $# -gt 0 ]]; then
-  models=("$@")
-else
-  for row in "${EXPECTED[@]}"; do read -r m _ <<<"$row"; models+=("$m"); done
+# ---------------------------------------------------------------------------
+# Per-spec model checking. Runs each spec in a fresh subshell so its SPEC_*
+# variables are isolated. Returns non-zero if any model of the spec fails.
+run_spec() { # spec_file [model...]
+  set -euo pipefail
+  local spec_file="$1"; shift
+  SPEC_NAME="" SPEC_MODELS_DIR="." SPEC_MODELS_GLOB="" SPEC_TRACE_MODELS=()
+  SPEC_CONSTANTS=() SPEC_INVARIANTS=() SPEC_PROPERTIES=() SPEC_EXPECTED=()
+  # shellcheck disable=SC1090
+  source "$spec_file"
+  local modeldir="$here/$SPEC_MODELS_DIR"
+
+  # TLC reports a temporal violation without naming the property, so a verdict
+  # can only attribute it while there is exactly one.
+  [[ ${#SPEC_PROPERTIES[@]} -le 1 ]] || {
+    echo "error: ${SPEC_NAME}: check.sh attributes temporal violations to a single property" >&2; return 1; }
+
+  expected_outcome() { # model -> outcome ("" if none)
+    local row model outcome
+    for row in "${SPEC_EXPECTED[@]}"; do
+      read -r model outcome _ <<<"$row"
+      if [[ "$model" == "$1" ]]; then echo "$outcome"; return 0; fi
+    done
+  }
+
+  write_cfg() { # out
+    {
+      echo "SPECIFICATION Spec"
+      echo "CONSTANTS"
+      printf '    %s\n' "${SPEC_CONSTANTS[@]}"
+      if [[ ${#SPEC_INVARIANTS[@]} -gt 0 ]]; then
+        echo "INVARIANTS"; printf '    %s\n' "${SPEC_INVARIANTS[@]}"
+      fi
+      if [[ ${#SPEC_PROPERTIES[@]} -gt 0 ]]; then
+        echo "PROPERTIES"; printf '    %s\n' "${SPEC_PROPERTIES[@]}"
+      fi
+    } >"$1"
+  }
+
+  # Per-spec, two-way drift guard between the model files and the EXPECTED table.
+  local st=0 m
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    [[ -n "$(expected_outcome "$m")" ]] || { echo "error: ${SPEC_NAME}: $m.tla has no entry in EXPECTED" >&2; st=1; }
+  done < <( cd "$modeldir"; shopt -s nullglob; for f in $SPEC_MODELS_GLOB; do echo "${f%.tla}"; done )
+  local seen=" " row outcome p
+  for row in "${SPEC_EXPECTED[@]}"; do
+    read -r m _ <<<"$row"
+    if [[ "$seen" == *" $m "* ]]; then echo "error: ${SPEC_NAME}: EXPECTED lists $m more than once" >&2; st=1; fi
+    seen="$seen$m "
+    [[ -f "$modeldir/$m.tla" ]] || { echo "error: ${SPEC_NAME}: EXPECTED lists $m but $m.tla does not exist" >&2; st=1; }
+    outcome="$(expected_outcome "$m")"
+    if [[ "$outcome" == violates:* ]]; then
+      for p in $(tr ',' ' ' <<<"${outcome#violates:}"); do
+        [[ " ${SPEC_INVARIANTS[*]} ${SPEC_PROPERTIES[*]} " == *" $p "* ]] ||
+          { echo "error: ${SPEC_NAME}: EXPECTED $m names $p, which is not a checked invariant or property" >&2; st=1; }
+      done
+    elif [[ "$outcome" != pass ]]; then
+      echo "error: ${SPEC_NAME}: EXPECTED $m has outcome $outcome; want pass or violates:<P1>,<P2>,..." >&2; st=1
+    fi
+  done
+  [[ $st -eq 0 ]] || return $st
+
+  # The models to run: an explicit filter (intersected with this spec) or all.
+  local models=()
+  if [[ $# -gt 0 ]]; then
+    for m in "$@"; do [[ -n "$(expected_outcome "$m")" ]] && models+=("$m"); done
+    [[ ${#models[@]} -gt 0 ]] || return 0   # none of the filter belongs here
+  else
+    for row in "${SPEC_EXPECTED[@]}"; do read -r m _ <<<"$row"; models+=("$m"); done
+  fi
+
+  local metadir; metadir="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$metadir'" RETURN
+
+  for m in "${models[@]}"; do
+    local want log cfg code violated want_set got matches states
+    local continue_flag=()
+    want="$(expected_outcome "$m")"
+    log="$metadir/$m.log"; cfg="$metadir/$m.cfg"
+    write_cfg "$cfg"
+    if [[ "$want" == violates:* ]]; then continue_flag=(-continue -deadlock); fi
+    set +e
+    ( cd "$modeldir" && java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -cleanup \
+        ${continue_flag[@]+"${continue_flag[@]}"} \
+        -metadir "$metadir/$m" -config "$cfg" "$m.tla" ) >"$log" 2>&1
+    code=$?
+    set -e
+
+    violated="$(
+      {
+        grep -oE 'Invariant [A-Za-z0-9_]+ is violated' "$log" | awk '{print $2}'
+        if grep -q 'Temporal properties were violated' "$log"; then echo "${SPEC_PROPERTIES[0]}"; fi
+        if grep -q 'Deadlock reached' "$log"; then echo Deadlock; fi
+      } | sort -u | paste -sd, - || true
+    )"
+    want_set="$(tr ',' '\n' <<<"${want#violates:}" | sort -u | paste -sd, -)"
+    if [[ $code -eq 0 && -z "$violated" ]] && grep -q "Model checking completed. No error has been found." "$log"; then
+      got="pass"
+    elif [[ -n "$violated" ]]; then
+      got="violates:$violated"
+    else
+      got="error(exit $code)"
+    fi
+
+    matches=false
+    if [[ "$want" == pass ]]; then
+      if [[ "$got" == pass ]]; then matches=true; fi
+    elif [[ "$got" == "violates:$want_set" ]] && grep -q ' 0 states left on queue' "$log"; then
+      matches=true
+    fi
+
+    if [[ -n "${FORMAL_LOG_DIR:-}" ]]; then
+      mkdir -p "$FORMAL_LOG_DIR"; cp "$cfg" "$log" "$FORMAL_LOG_DIR/"
+    fi
+
+    states="$(grep -oE '[0-9,]+ distinct states found' "$log" | tail -1 || true)"
+    if grep -q '^Warning' "$log"; then
+      echo "FAIL  ${SPEC_NAME}/$m  TLC emitted a warning" >&2
+      grep -A1 '^Warning' "$log" >&2
+      st=1
+    elif $matches; then
+      echo "ok    ${SPEC_NAME}/$m  $got  ($states)"
+    else
+      echo "FAIL  ${SPEC_NAME}/$m  expected $want, got $got" >&2
+      cat "$log" >&2
+      st=1
+    fi
+  done
+  return $st
+}
+
+# Remember whether a model filter was given, before "$@" is consumed: the trace
+# drift guard runs only on a full check (below).
+full_run=true
+[[ $# -eq 0 ]] || full_run=false
+
+for s in "${specs[@]}"; do
+  run_spec "$s" "$@" || status=1
+done
+
+# Trace-validation fixture drift guard (#1226, Deliverable B). The committed
+# formal/tla/traces/<Spec>/<Model>.json fixtures anchor the specs to the engine
+# (engine-core/tests/trace_validation); they are a derived artifact. On a full
+# run, regenerate them and fail on drift, so a spec change that alters a
+# behaviour must refresh + commit the fixtures. gen-traces.sh needs node (to
+# parse TLC output): run the guard only when node is present — GitHub runners
+# ship it, so the formal CI job (which runs this script) enforces it, while a
+# local model-check without node simply skips it. It reuses the jar this script
+# already fetched (TLA2TOOLS_JAR is exported above).
+if [[ $status -eq 0 && "$full_run" == true ]]; then
+  if command -v node >/dev/null 2>&1; then
+    "$here/gen-traces.sh" --check || status=1
+  else
+    echo "note: node not found; skipping trace-validation fixture drift guard (formal/tla/gen-traces.sh --check)"
+  fi
 fi
 
-metadir="$(mktemp -d)"
-trap 'rm -rf "$metadir"' EXIT
-
-for m in "${models[@]}"; do
-  want="$(expected_outcome "$m")"
-  [[ -n "$want" ]] || { echo "error: unknown model $m" >&2; exit 1; }
-  log="$metadir/$m.log"
-  cfg="$metadir/$m.cfg"
-  write_cfg "$cfg"
-  # A `violates:` model runs with -continue so TLC explores the whole state
-  # space and reports every violated invariant, whatever order BFS reaches
-  # them in. It also runs with -deadlock, because TLC stops at a deadlock even
-  # under -continue. Nothing is lost: in TokenFlow a deadlock can only be a
-  # settled, uncompleted state with no waiting task (anything else enables a
-  # drain, a join fire or CompleteTask), where only an open join can disable
-  # CompleteInstance. That is exactly a NoStuckInstance violation, and it also
-  # violates Termination. `pass` rows keep TLC's deadlock check.
-  continue_flag=()
-  if [[ "$want" == violates:* ]]; then continue_flag=(-continue -deadlock); fi
-  set +e
-  java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -cleanup ${continue_flag[@]+"${continue_flag[@]}"} \
-    -metadir "$metadir/$m" -config "$cfg" "$m.tla" >"$log" 2>&1
-  code=$?
-  set -e
-
-  violated="$(
-    {
-      grep -oE 'Invariant [A-Za-z0-9_]+ is violated' "$log" | awk '{print $2}'
-      if grep -q 'Temporal properties were violated' "$log"; then echo "${PROPERTIES[0]}"; fi
-      if grep -q 'Deadlock reached' "$log"; then echo Deadlock; fi
-    } | sort -u | paste -sd, - || true
-  )"
-  # The expected set, normalized the same way, so row order does not matter.
-  want_set="$(tr ',' '\n' <<<"${want#violates:}" | sort -u | paste -sd, -)"
-  if [[ $code -eq 0 && -z "$violated" ]] && grep -q "Model checking completed. No error has been found." "$log"; then
-    got="pass"
-  elif [[ -n "$violated" ]]; then
-    got="violates:$violated"
-  else
-    got="error(exit $code)"
-  fi
-
-  matches=false
-  if [[ "$want" == pass ]]; then
-    if [[ "$got" == pass ]]; then matches=true; fi
-  elif [[ "$got" == "violates:$want_set" ]] && grep -q ' 0 states left on queue' "$log"; then
-    # The drained queue shows the whole state space was explored, so no
-    # unlisted property can hide behind a run that stopped early.
-    matches=true
-  fi
-
-  if [[ -n "${FORMAL_LOG_DIR:-}" ]]; then
-    mkdir -p "$FORMAL_LOG_DIR"
-    cp "$cfg" "$log" "$FORMAL_LOG_DIR/"
-  fi
-
-  states="$(grep -oE '[0-9,]+ distinct states found' "$log" | tail -1 || true)"
-  if grep -q '^Warning' "$log"; then
-    echo "FAIL  $m  TLC emitted a warning" >&2
-    grep -A1 '^Warning' "$log" >&2
-    status=1
-  elif $matches; then
-    echo "ok    $m  $got  ($states)"
-  else
-    echo "FAIL  $m  expected $want, got $got" >&2
-    cat "$log" >&2
-    status=1
-  fi
-done
 exit $status
