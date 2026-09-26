@@ -19,8 +19,9 @@ mod harness;
 #[path = "trace_validation/token_flow.rs"]
 mod token_flow;
 
-use harness::{Fixture, Milestone, TraceMapping};
 use std::path::PathBuf;
+
+use harness::{Fixture, Milestone, TraceMapping};
 use token_flow::TokenFlowMapping;
 
 fn traces_dir() -> PathBuf {
@@ -84,7 +85,10 @@ fn harness_detects_injected_divergence() {
             let mut ms = self.0.engine_milestones(events);
             // Drop the first join firing the engine reported: the spec still
             // expects it, so the multisets must diverge.
-            if let Some(pos) = ms.iter().position(|m| matches!(m, Milestone::JoinFired { .. })) {
+            if let Some(pos) = ms
+                .iter()
+                .position(|m| matches!(m, Milestone::JoinFired { .. }))
+            {
                 ms.remove(pos);
             }
             ms
@@ -94,7 +98,11 @@ fn harness_detects_injected_divergence() {
     let fixtures = load_fixtures();
     let fixture = fixtures
         .iter()
-        .find(|f| f.milestones.iter().any(|m| matches!(m, Milestone::JoinFired { .. })))
+        .find(|f| {
+            f.milestones
+                .iter()
+                .any(|m| matches!(m, Milestone::JoinFired { .. }))
+        })
         .expect("a trace-anchored model with a join firing");
 
     let broken = DropsAJoinFiring(TokenFlowMapping);

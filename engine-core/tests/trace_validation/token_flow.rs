@@ -3,8 +3,9 @@
 //! implementation sibling specs copy the *shape* of, while reusing the
 //! `harness` driver itself.
 
-use super::harness::{Fixture, Milestone, TraceMapping};
 use nanobpmn_engine_core::{Event, ProcessBuilder, ProcessDefinition};
+
+use super::harness::{Fixture, Milestone, TraceMapping};
 
 /// TokenFlow → engine binding.
 ///

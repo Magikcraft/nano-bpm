@@ -37,9 +37,10 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+
 use nanobpmn_engine_core::{Command, Engine, Event, ProcessDefinition};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 /// One observable milestone in the shared spec/engine vocabulary. Ordering is
 /// derived so a `Vec<Milestone>` can be sorted into a canonical multiset for
@@ -105,7 +106,9 @@ impl Fixture {
         {
             nodes.insert(
                 k.clone(),
-                kind.as_str().ok_or("node kind must be a string")?.to_string(),
+                kind.as_str()
+                    .ok_or("node kind must be a string")?
+                    .to_string(),
             );
         }
         let mut flows = Vec::new();
@@ -114,7 +117,11 @@ impl Fixture {
             .and_then(Value::as_array)
             .ok_or("graph.flows must be an array")?
         {
-            flows.push((str_field(f, "id")?, str_field(f, "from")?, str_field(f, "to")?));
+            flows.push((
+                str_field(f, "id")?,
+                str_field(f, "from")?,
+                str_field(f, "to")?,
+            ));
         }
         let mut milestones = Vec::new();
         for m in v
@@ -127,7 +134,11 @@ impl Fixture {
         Ok(Fixture {
             spec,
             model,
-            graph: Graph { start, nodes, flows },
+            graph: Graph {
+                start,
+                nodes,
+                flows,
+            },
             milestones,
         })
     }
@@ -146,8 +157,12 @@ fn parse_milestone(v: &Value) -> Result<Milestone, String> {
             from: str_field(v, "from")?,
             to: str_field(v, "to")?,
         }),
-        Some("task") => Ok(Milestone::Task { node: str_field(v, "node")? }),
-        Some("joinFired") => Ok(Milestone::JoinFired { node: str_field(v, "node")? }),
+        Some("task") => Ok(Milestone::Task {
+            node: str_field(v, "node")?,
+        }),
+        Some("joinFired") => Ok(Milestone::JoinFired {
+            node: str_field(v, "node")?,
+        }),
         Some("completed") => Ok(Milestone::Completed),
         other => Err(format!("unknown milestone kind {other:?}")),
     }
@@ -193,9 +208,9 @@ pub fn run_to_quiescence(
     let mut quiesced = false;
     for _ in 0..MAX_ITERS {
         let pending: Option<(u64, String)> = events.iter().find_map(|e| match e {
-            Event::JobCreated { job_key, job_type, .. } if !completed.contains(job_key) => {
-                Some((*job_key, job_type.clone()))
-            }
+            Event::JobCreated {
+                job_key, job_type, ..
+            } if !completed.contains(job_key) => Some((*job_key, job_type.clone())),
             _ => None,
         });
         let Some((_, job_type)) = pending else {
