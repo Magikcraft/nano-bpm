@@ -159,6 +159,17 @@ mod spec_model {
     /// so the detector test can prove the validator is not vacuous.
     pub fn assert_admitted(fixture: &Value) -> Result<(), String> {
         let model = str_at(fixture, "model")?;
+        // Enforce this directory's spec-registration boundary: a fixture under
+        // `trace_validation/joblease` is only a `JobLease.tla` behaviour if it
+        // declares `"spec": "JobLease"`. A JSON copied in with a different or
+        // absent spec must be rejected rather than silently reported as JobLease
+        // conformance (finding #1257).
+        let spec = str_at(fixture, "spec")?;
+        if spec != "JobLease" {
+            return Err(format!(
+                "spec-model {model}: fixture spec {spec:?} is not \"JobLease\""
+            ));
+        }
         let timeout = u64_at(fixture, "timeout")?;
         // `JobLease.tla`: `ASSUME Timeout \in Nat /\ Timeout > 0`. A `timeout` of
         // 0 names a constant no JobLease model can instantiate, so a fixture using
@@ -225,7 +236,13 @@ mod spec_model {
                         // `activated` latch (`activated' = [.. EXCEPT ![j] = TRUE]`).
                         let mut next = st.live_locks(&job);
                         next.insert(Lock {
-                            deadline: now + st.timeout,
+                            // Mirror the engine's saturating deadline
+                            // (`engine-core/src/engine/mod.rs` uses
+                            // `saturating_add`) so the validator is total over
+                            // the u64 input domain: a `now`/`timeout` near
+                            // `u64::MAX` saturates rather than overflowing
+                            // (panic in debug, wrap in release) (finding #1257).
+                            deadline: now.saturating_add(st.timeout),
                             worker,
                         });
                         st.locks.insert(job.clone(), next);
@@ -576,11 +593,11 @@ fn replay_lease_behaviour(fixture: &Value) -> Result<(), String> {
                     if a.worker != worker {
                         return Err(ctx(format!("holder {} != expected {worker}", a.worker)));
                     }
-                    if a.deadline != now + timeout {
+                    if a.deadline != now.saturating_add(timeout) {
                         return Err(ctx(format!(
                             "deadline {} != now+timeout {}",
                             a.deadline,
-                            now + timeout
+                            now.saturating_add(timeout)
                         )));
                     }
                 } else if !activated.is_empty() {
@@ -702,6 +719,29 @@ fn spec_model_rejects_zero_timeout() {
     assert!(
         result.unwrap_err().contains("timeout must be > 0"),
         "the report should name the violated Timeout assumption"
+    );
+}
+
+/// The spec-side validator must reject a fixture whose `spec` is not `JobLease`:
+/// the `trace_validation/joblease` directory is a spec-registration boundary, so
+/// a JSON copied in with a different or unknown spec must not be silently
+/// reported as JobLease conformance (finding #1257). Red/Green: prove the
+/// spec-field check actually fires.
+#[test]
+fn spec_model_rejects_foreign_spec() {
+    let (_, mut fixture) = load_lease_fixtures()
+        .into_iter()
+        .find(|(_, v)| v.get("model").and_then(Value::as_str) == Some("activate-complete"))
+        .expect("the activate-complete behaviour is committed");
+    fixture["spec"] = Value::from("SomeOtherSpec");
+    let result = spec_model::assert_admitted(&fixture);
+    assert!(
+        result.is_err(),
+        "the spec-side validator must reject a fixture whose spec is not JobLease"
+    );
+    assert!(
+        result.unwrap_err().contains("is not \"JobLease\""),
+        "the report should name the rejected foreign spec"
     );
 }
 
